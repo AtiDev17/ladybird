@@ -750,6 +750,38 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
     // A wheel step is routed against the offsets the compositor holds now, which a step it just took may
     // have moved ahead of any rendering update.
     m_navigable->adopt_pending_async_scroll_offsets(Compositor::AsyncScrollUpdateFreshness::FromCompositor);
+
+    auto visual_viewport = document->visual_viewport();
+    auto can_attempt_async_scroll = m_navigable->page().async_scrolling_enabled() && m_navigable->has_compositor_context();
+
+    // Hands the wheel input to the compositor, which scrolls from the offsets it holds now; the operation it starts
+    // for the input is the one a caller follows.
+    auto enqueue_async_scroll = [&](Gfx::FloatPoint delta_in_device_pixels) {
+        auto viewport_rect = m_navigable->page().css_to_device_rect(m_navigable->viewport_rect()).to_type<int>();
+        auto device_position = m_navigable->page().css_to_device_point(visual_viewport_position);
+        auto async_scroll_position = Gfx::FloatPoint { static_cast<float>(device_position.x().value()), static_cast<float>(device_position.y().value()) };
+        auto operation_tracking = async_scroll_operation
+            ? Compositor::AsyncScrollOperationTracking::Yes
+            : Compositor::AsyncScrollOperationTracking::No;
+        auto enqueue_result = m_navigable->compositor_context().async_scroll_by(
+            document->unique_id(), async_scroll_position, delta_in_device_pixels, viewport_rect, wheel_delta_precision, scroll_gesture_phase, operation_tracking);
+        if (enqueue_result.operation_id.has_value() && async_scroll_operation)
+            *async_scroll_operation = AsyncScrollOperation { m_navigable, *enqueue_result.operation_id };
+        dbgln_if(COMPOSITOR_DEBUG, "[Compositor] {} wheel async scroll at {},{} with device delta {},{}",
+            enqueue_result.accepted ? "Enqueued"sv : "Could not enqueue"sv,
+            async_scroll_position.x(), async_scroll_position.y(),
+            delta_in_device_pixels.x(), delta_in_device_pixels.y());
+        return enqueue_result.accepted;
+    };
+
+    // The end of a gesture is reported to the compositor before the gesture settles here, so that a snap scroll
+    // the compositor starts for it is the scroll the settlement finds in flight rather than one of its own.
+    if (scroll_gesture_phase == ScrollGesturePhase::Ended && !async_scroll_performed_default_action && can_attempt_async_scroll
+        && visual_viewport->scale() == 1.0 && enqueue_async_scroll({})) {
+        async_scroll_performed_default_action = true;
+        m_navigable->adopt_pending_async_scroll_offsets(Compositor::AsyncScrollUpdateFreshness::FromCompositor);
+    }
+
     m_navigable->note_user_scroll_gesture_phase(scroll_gesture_phase);
 
     // Wheel activity marks the scroll gesture as still in progress even when it no longer moves any scrolling box.
@@ -757,8 +789,6 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
     m_navigable->note_user_scroll_input_intent(wheel_delta_precision == WheelDeltaPrecision::Discrete
             ? Painting::SnapSelectionStrategy::Type::Direction
             : Painting::SnapSelectionStrategy::Type::EndPosition);
-
-    auto visual_viewport = document->visual_viewport();
 
     document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseWheel);
 
@@ -784,47 +814,15 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
         return m_navigable->perform_a_snapped_momentum_scroll(*scrolling_box, wheel_step_delta);
     };
 
-    auto wheel_step_selects_a_snap_position = [&] {
-        auto* target_layout_node = target->layout_node();
-        if (!target_layout_node)
-            return false;
-        auto* scrolling_box = scrolling_box_for_scroll_step(*target_layout_node, wheel_step_delta);
-        if (!scrolling_box)
-            return false;
-        auto snap_axes = Painting::snap_axes_of_scroll_container(*scrolling_box);
-        return (snap_axes.x && wheel_step_delta.x() != 0) || (snap_axes.y && wheel_step_delta.y() != 0);
-    };
-
-    auto can_attempt_async_scroll = m_navigable->page().async_scrolling_enabled() && m_navigable->has_compositor_context();
     if (can_attempt_async_scroll && async_scroll_performed_default_action) {
         dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Not attempting wheel async scroll: default action already performed");
     } else if (can_attempt_async_scroll && visual_viewport->scale() != 1.0) {
         dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Not attempting wheel async scroll: visual viewport is scaled");
     } else if (can_attempt_async_scroll) {
-        if (target.has_value() && wheel_delta_precision == WheelDeltaPrecision::Discrete && wheel_step_selects_a_snap_position()) {
-            // The step's snap position is selected by the default action below, so that the wheel event still has its
-            // chance to cancel the scroll and a nested navigable still gets the step first.
-            dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Not attempting wheel async scroll: the step selects a snap position");
-        } else if (target.has_value()) {
-            auto viewport_rect = m_navigable->page().css_to_device_rect(m_navigable->viewport_rect()).to_type<int>();
-            auto async_scroll_delta = Gfx::FloatPoint { static_cast<float>(wheel_delta_x), static_cast<float>(wheel_delta_y) };
-            auto device_position = m_navigable->page().css_to_device_point(visual_viewport_position);
-            auto async_scroll_position = Gfx::FloatPoint { static_cast<float>(device_position.x().value()), static_cast<float>(device_position.y().value()) };
+        if (target.has_value()) {
             auto device_pixels_per_css_pixel = static_cast<float>(m_navigable->page().client().device_pixels_per_css_pixel());
-            auto async_scroll_delta_in_device_pixels = async_scroll_delta.scaled(device_pixels_per_css_pixel);
-            auto operation_tracking = async_scroll_operation
-                ? Compositor::AsyncScrollOperationTracking::Yes
-                : Compositor::AsyncScrollOperationTracking::No;
-            auto snap_container_handling = Compositor::snap_container_handling_for(wheel_delta_precision, scroll_gesture_phase);
-            auto enqueue_result = m_navigable->compositor_context().async_scroll_by(
-                document->unique_id(), async_scroll_position, async_scroll_delta_in_device_pixels, viewport_rect, snap_container_handling, operation_tracking);
-            async_scroll_performed_default_action = enqueue_result.accepted;
-            if (enqueue_result.operation_id.has_value() && async_scroll_operation)
-                *async_scroll_operation = AsyncScrollOperation { m_navigable, *enqueue_result.operation_id };
-            dbgln_if(COMPOSITOR_DEBUG, "[Compositor] {} wheel async scroll at {},{} with device delta {},{}",
-                async_scroll_performed_default_action ? "Enqueued"sv : "Could not enqueue"sv,
-                async_scroll_position.x(), async_scroll_position.y(),
-                async_scroll_delta_in_device_pixels.x(), async_scroll_delta_in_device_pixels.y());
+            auto async_scroll_delta_in_device_pixels = Gfx::FloatPoint { static_cast<float>(wheel_delta_x), static_cast<float>(wheel_delta_y) }.scaled(device_pixels_per_css_pixel);
+            async_scroll_performed_default_action = enqueue_async_scroll(async_scroll_delta_in_device_pixels);
         } else {
             dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Not attempting wheel async scroll: no paintable target");
         }

@@ -13,8 +13,10 @@ use crate::painting::chrome_geometry::{
 };
 use crate::painting::display_list::commands::*;
 use crate::painting::ffi::ScrollDirection;
+use crate::painting::host::FfiSnapContainerGeometry;
 use crate::painting::paintable_geometry;
 use crate::painting::record::PaintRecorder;
+use crate::painting::scroll_snap;
 use crate::painting::style_queries;
 use libgfx_rust::{FloatPoint, FloatRect, FloatSize, IntRect};
 
@@ -210,12 +212,11 @@ impl<O: Observer> PaintRecorder<'_, O> {
         } else {
             return;
         };
-        let scrollable_node_identity = self.data(paintable).scrollable_node_identity;
+        let node_identity = self.data(paintable).node_identity;
         debug_assert!(
-            scrollable_node_identity != 0,
+            node_identity != 0,
             "a scroll node's identity is resolved by the visual context update"
         );
-        let snap_axes = crate::painting::scroll_snap_axes::snap_axes_of_scroll_container(self.layout_arena, paintable);
         let parent_scroll_node_index = match self.nearest_scrollable_ancestor(paintable) {
             Some(ancestor) => self.data(ancestor).own_scroll_node_index,
             None => VISUAL_VIEWPORT_NODE_INDEX,
@@ -239,7 +240,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
         let hit_test_facts = self.hit_test_facts(paintable);
         self.recorder.compositor_scroll_node(CompositorScrollNode {
             document_id: UniqueNodeId(self.inputs.document_id),
-            scrollable_node_id: UniqueNodeId(scrollable_node_identity),
+            scrollable_node_id: UniqueNodeId(node_identity),
             scroll_node_index: self.data(paintable).own_scroll_node_index,
             parent_scroll_node_index,
             scrollport_rect,
@@ -250,8 +251,41 @@ impl<O: Observer> PaintRecorder<'_, O> {
             is_viewport,
             can_be_wheel_scrolled_horizontally: hit_test_facts.could_be_scrolled_horizontally,
             can_be_wheel_scrolled_vertically: hit_test_facts.could_be_scrolled_vertically,
-            snaps_scroll_position_horizontally: snap_axes.x,
-            snaps_scroll_position_vertically: snap_axes.y,
+        });
+        if let Some(geometry) = scroll_snap::snap_container_geometry(self.layout_arena, paintable) {
+            self.record_snap_geometry(paintable, geometry);
+        }
+    }
+
+    // The compositor selects snap positions for the scrolls it performs from the same geometry the
+    // main thread selects from, recorded with the scroll node so that it is as current as the rest
+    // of the display list.
+    fn record_snap_geometry(&mut self, paintable: NodeSlotId, geometry: FfiSnapContainerGeometry) {
+        let document_id = UniqueNodeId(self.inputs.document_id);
+        let scroll_node_index = self.data(paintable).own_scroll_node_index;
+        self.recorder.compositor_snap_container(CompositorSnapContainer {
+            document_id,
+            scroll_node_index,
+            snapport: geometry.snapport,
+            min_scroll_offset: geometry.min_scroll_offset,
+            max_scroll_offset: geometry.max_scroll_offset,
+            strictness: geometry.strictness,
+            snaps_x: geometry.axes.x,
+            snaps_y: geometry.axes.y,
+            horizontal_writing_mode: geometry.horizontal_writing_mode,
+        });
+        let recorder = &mut self.recorder;
+        scroll_snap::for_each_snap_area(self.layout_arena, paintable, |_, area| {
+            recorder.compositor_snap_area(CompositorSnapArea {
+                document_id,
+                scroll_node_index,
+                area_node_id: UniqueNodeId(area.node_id),
+                pseudo_element_type: area.pseudo_element_type,
+                rect: area.rect,
+                align_x: area.align_x,
+                align_y: area.align_y,
+                always_stop: area.always_stop,
+            });
         });
     }
 

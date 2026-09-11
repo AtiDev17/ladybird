@@ -5,6 +5,7 @@
  */
 
 #include <AK/ByteBuffer.h>
+#include <AK/Math.h>
 #include <AK/Queue.h>
 #include <AK/Stream.h>
 #include <Compositor/CompositorState.h>
@@ -15,6 +16,7 @@
 #include <LibIPC/Message.h>
 #include <LibTest/TestCase.h>
 #include <LibWeb/Page/InputEvent.h>
+#include <LibWeb/Painting/DisplayListDamage.h>
 #include <LibWeb/Painting/DisplayListPlayerSkia.h>
 #include <LibWeb/Painting/VisualContextTreeTestBuilder.h>
 #include <LibWebView/PausedDebuggerOverlay.h>
@@ -76,27 +78,6 @@ TEST_CASE(caret_blink_phase_is_sampled_from_its_web_content_reset_time)
 
     caret.should_blink = false;
     EXPECT(Web::Painting::caret_is_visible_at_time(caret, NumericLimits<i64>::max()));
-}
-
-// Round-trips a freshly built display list through the IPC encoder, so the context receives it
-// the way the compositor process would.
-static NonnullRefPtr<Web::Painting::DisplayList> decode_display_list(Web::Painting::AccumulatedVisualContextTree const& visual_context_tree, ByteBuffer command_bytes, Optional<Gfx::Color> surface_clear_color = {}, Optional<Web::Painting::DisplayList::AsyncScrollingMetadata> async_scrolling_metadata = {})
-{
-    auto command_runs = Web::Painting::compute_display_list_command_runs(command_bytes);
-    auto display_list = Web::Painting::DisplayList::create_from_command_bytes(visual_context_tree, move(command_bytes), move(command_runs));
-    if (surface_clear_color.has_value())
-        display_list->set_surface_clear_color(*surface_clear_color);
-    if (async_scrolling_metadata.has_value())
-        display_list->set_async_scrolling_metadata(*async_scrolling_metadata);
-
-    IPC::MessageBuffer buffer;
-    IPC::Encoder encoder { buffer };
-    MUST(encoder.encode(*display_list));
-
-    FixedMemoryStream stream { buffer.data().span() };
-    Queue<IPC::Attachment> attachments;
-    IPC::Decoder decoder { stream, attachments };
-    return MUST(decoder.decode<NonnullRefPtr<Web::Painting::DisplayList>>());
 }
 
 static NonnullRefPtr<Web::Painting::DisplayList> make_display_list(Web::Painting::AccumulatedVisualContextTree const& visual_context_tree, Optional<Gfx::Color> color, Optional<Gfx::Color> surface_clear_color = {}, Web::Painting::ContextRef context = {})
@@ -213,8 +194,6 @@ static NonnullRefPtr<Web::Painting::DisplayList> make_scrollable_viewport_displa
             .is_viewport = true,
             .can_be_wheel_scrolled_horizontally = false,
             .can_be_wheel_scrolled_vertically = true,
-            .snaps_scroll_position_horizontally = false,
-            .snaps_scroll_position_vertically = false,
         });
 
     if (wheel_hit_test_context.has_value()) {
@@ -427,7 +406,7 @@ TEST_CASE(wheel_hit_testing_uses_the_current_visual_animation_tree)
         { 20, 20 },
         { 0, 10 },
         { 0, 0, 100, 100 },
-        Web::Compositor::SnapContainerHandling::ScrollOnCompositor,
+        Web::WheelDeltaPrecision::Precise, Web::ScrollGesturePhase::None,
         Web::Compositor::AsyncScrollOperationTracking::No);
     EXPECT(result.enqueue_result.accepted);
 }
@@ -458,7 +437,7 @@ TEST_CASE(wheel_hit_testing_ignores_targets_from_a_larger_visual_context_tree)
         { 20, 20 },
         { 0, 10 },
         { 0, 0, 100, 100 },
-        Web::Compositor::SnapContainerHandling::ScrollOnCompositor,
+        Web::WheelDeltaPrecision::Precise, Web::ScrollGesturePhase::None,
         Web::Compositor::AsyncScrollOperationTracking::No);
     EXPECT(result.enqueue_result.accepted);
 }
@@ -1067,6 +1046,15 @@ struct PresentingContextFixture {
         return spin_event_loop_until(event_loop, 100, [&] { return compositor_client.presented_frames.size() > already_presented; });
     }
 
+    void expect_no_frame()
+    {
+        auto already_presented = compositor_client.presented_frames.size();
+        compositor_state->present_frame(context_id, viewport_rect);
+        compositor_state->present_pending_frames_for_testing();
+        EXPECT_EQ(compositor_state->pending_async_present_count_for_testing(), 0u);
+        EXPECT_EQ(compositor_client.presented_frames.size(), already_presented);
+    }
+
     TestCompositorClient::PresentedFrame present(Optional<Gfx::IntRect> rect = {})
     {
         auto already_presented = compositor_client.presented_frames.size();
@@ -1119,7 +1107,7 @@ struct RasterizingContextFixture {
     }
 };
 
-TEST_CASE(re_presenting_identical_state_reports_empty_damage)
+TEST_CASE(re_presenting_identical_state_does_not_submit_a_frame)
 {
     PresentingContextFixture fixture;
     auto visual_context_tree = make_visual_context_tree();
@@ -1129,10 +1117,193 @@ TEST_CASE(re_presenting_identical_state_reports_empty_damage)
     EXPECT_EQ(first_frame.damage_rect, fixture.viewport_rect);
     EXPECT_EQ(first_frame.content_rect, fixture.viewport_rect);
 
-    EXPECT(fixture.present().damage_rect.is_empty());
+    fixture.expect_no_frame();
 
     fixture.install(make_fills_display_list(visual_context_tree, { { { 2, 2, 4, 4 }, Gfx::Color::Red } }), visual_context_tree);
-    EXPECT(fixture.present().damage_rect.is_empty());
+    fixture.expect_no_frame();
+}
+
+TEST_CASE(offscreen_changes_do_not_acquire_a_backing_store_or_block_later_frames)
+{
+    RasterizingContextFixture fixture;
+    auto tree = make_translated_visual_context_tree({ 0, 100 });
+    auto display_list = make_fills_display_list(tree, { { { 2, 2, 4, 4 }, Gfx::Color::Red, in_spatial_node(1) } });
+    fixture.context.install_display_list_update(display_list, tree, {});
+    fixture.rasterize();
+    auto surface = fixture.context.latest_rendered_surface();
+
+    auto offscreen_tree = make_translated_visual_context_tree({ 0, 200 }, tree.structural_epoch());
+    fixture.context.update_visual_context_tree(offscreen_tree, {});
+    EXPECT(!fixture.prepare().has_value());
+    EXPECT(!fixture.context.is_present_blocked());
+    EXPECT_EQ(fixture.context.latest_rendered_surface(), surface);
+
+    auto visible_tree = make_translated_visual_context_tree({ 0, 0 }, tree.structural_epoch());
+    fixture.context.update_visual_context_tree(visible_tree, {});
+    EXPECT_EQ(fixture.rasterize(), (Gfx::IntRect { 1, 1, 6, 15 }));
+    EXPECT_EQ(fixture.pixel(3, 3), Gfx::Color::Red);
+    EXPECT(!fixture.prepare().has_value());
+    EXPECT_EQ(fixture.rasterize(fixture.viewport_rect), fixture.viewport_rect);
+}
+
+static Web::Compositor::VisualAnimation rotation_animation(Web::Painting::SpatialNodeIndex spatial, MonotonicTime anchor)
+{
+    return {
+        .target_kind = Web::Compositor::VisualAnimation::TargetKind::Transform,
+        .visual_context_node_indices = { spatial.value() },
+        .monotonic_time_at_anchor_ns = anchor.nanoseconds(),
+        .iteration_duration_ms = 1000,
+        .easing = {},
+        .keyframes = {
+            { 0, {}, Web::Compositor::VisualAnimationTransformList { { Web::Compositor::VisualAnimationTransformOperationKind::Rotate, { 0 } } } },
+            { 1, {}, Web::Compositor::VisualAnimationTransformList { { Web::Compositor::VisualAnimationTransformOperationKind::Rotate, { 2 * AK::Pi<float> } } } },
+        },
+    };
+}
+
+TEST_CASE(offscreen_rotations_sleep_until_scroll_or_viewport_changes)
+{
+    RasterizingContextFixture fixture;
+    Web::Painting::VisualContextTreeTestBuilder builder;
+    auto scroll = builder.append_scroll(Web::Painting::VISUAL_VIEWPORT_NODE_INDEX);
+    auto spatial = builder.append_transform(scroll, Gfx::FloatMatrix4x4::identity(), { 4, 104 });
+    auto tree = builder.finish();
+    auto anchor = MonotonicTime::now();
+    tree.set_visual_animations({ rotation_animation(spatial, anchor) });
+    fixture.context.install_display_list_update(
+        make_fills_display_list(tree, { { { 2, 102, 4, 4 }, Gfx::Color::Red, { spatial } } }), tree, {});
+    fixture.rasterize();
+    EXPECT(fixture.context.has_active_visual_animations());
+    EXPECT(!fixture.context.visual_animations_need_frame());
+    EXPECT(!fixture.context.visual_animations_need_frame());
+
+    fixture.context.update_scroll_state(scroll_state_snapshot_with_offset(scroll, { 0, -100 }));
+    EXPECT(fixture.context.visual_animations_need_frame());
+    EXPECT(fixture.context.advance_visual_animations(anchor + AK::Duration::from_milliseconds(2250)));
+    fixture.rasterize();
+    EXPECT_EQ(fixture.pixel(3, 3), Gfx::Color::Red);
+    auto matrix = fixture.context.sampled_visual_context_tree_for_testing().accumulated_matrix(
+        spatial, {}, Web::Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::Yes);
+    EXPECT(fabsf(matrix[0, 0]) < 0.001f);
+    EXPECT(fabsf(matrix[1, 0] - 1) < 0.001f);
+
+    fixture.context.update_scroll_state({});
+    EXPECT(!fixture.context.visual_animations_need_frame());
+    fixture.context.viewport_size_updated({ 16, 120 }, Web::Compositor::WindowResizingInProgress::No);
+    EXPECT(fixture.context.visual_animations_need_frame());
+    fixture.context.viewport_size_updated({ 16, 16 }, Web::Compositor::WindowResizingInProgress::No);
+    EXPECT(!fixture.context.visual_animations_need_frame());
+
+    fixture.context.install_display_list_update(
+        make_fills_display_list(tree, { { { 2, 2, 4, 4 }, Gfx::Color::Red, { spatial } } }), tree, {});
+    EXPECT(fixture.context.visual_animations_need_frame());
+}
+
+TEST_CASE(offscreen_opacity_animations_sleep_and_resume_at_the_current_phase)
+{
+    RasterizingContextFixture fixture;
+    Web::Painting::VisualContextTreeTestBuilder builder;
+    auto scroll = builder.append_scroll(Web::Painting::VISUAL_VIEWPORT_NODE_INDEX);
+    auto effect = builder.append_effects(Web::Painting::NO_EFFECT_NODE, scroll);
+    auto child_effect = builder.append_effects(effect, scroll);
+    auto tree = builder.finish();
+    auto anchor = MonotonicTime::now();
+    tree.set_visual_animations({ {
+        .target_kind = Web::Compositor::VisualAnimation::TargetKind::Opacity,
+        .visual_context_node_indices = { effect.value() },
+        .monotonic_time_at_anchor_ns = anchor.nanoseconds(),
+        .iteration_duration_ms = 1000,
+        .easing = {},
+        .keyframes = { { 0, {}, 1.0f }, { 1, {}, 0.0f } },
+    } });
+    fixture.context.install_display_list_update(
+        make_fills_display_list(tree, { { { 2, 102, 4, 4 }, Gfx::Color::Red, { scroll, Web::Painting::NO_CLIP_NODE, child_effect } }, { { 0, 0, 1, 1 }, Gfx::Color::Green } }), tree, {});
+    fixture.rasterize();
+    EXPECT(fixture.context.has_active_visual_animations());
+    EXPECT(!fixture.context.visual_animations_need_frame());
+    EXPECT(!fixture.context.visual_animations_need_frame());
+    fixture.context.update_scroll_state(scroll_state_snapshot_with_offset(scroll, { 0, -100 }));
+    EXPECT(fixture.context.visual_animations_need_frame());
+    EXPECT(fixture.context.advance_visual_animations(anchor + AK::Duration::from_milliseconds(2500)));
+    fixture.rasterize();
+    EXPECT_EQ(fixture.pixel(3, 3).alpha(), 128);
+    fixture.context.update_scroll_state({});
+    EXPECT(!fixture.context.visual_animations_need_frame());
+    fixture.context.viewport_size_updated({ 16, 120 }, Web::Compositor::WindowResizingInProgress::No);
+    EXPECT(fixture.context.visual_animations_need_frame());
+}
+
+TEST_CASE(finished_animations_do_not_keep_offscreen_animations_awake)
+{
+    RasterizingContextFixture fixture;
+    Web::Painting::VisualContextTreeTestBuilder builder;
+    auto spatial = builder.append_transform(Web::Painting::VISUAL_VIEWPORT_NODE_INDEX, Gfx::FloatMatrix4x4::identity());
+    auto effect = builder.append_effects(Web::Painting::NO_EFFECT_NODE, spatial);
+    auto tree = builder.finish();
+    auto finished = rotation_animation(spatial, MonotonicTime::now());
+    finished.iteration_count = 1;
+    finished.local_time_at_anchor_ms = 2000;
+    finished.keyframes = {
+        { 0, {}, Web::Compositor::VisualAnimationTransformList { { Web::Compositor::VisualAnimationTransformOperationKind::TranslateY, { 0 } } } },
+        { 1, {}, Web::Compositor::VisualAnimationTransformList { { Web::Compositor::VisualAnimationTransformOperationKind::TranslateY, { -100 } } } },
+    };
+    tree.set_visual_animations({ finished, {
+                                               .target_kind = Web::Compositor::VisualAnimation::TargetKind::Opacity,
+                                               .visual_context_node_indices = { effect.value() },
+                                               .monotonic_time_at_anchor_ns = MonotonicTime::now().nanoseconds(),
+                                               .iteration_duration_ms = 1000,
+                                               .easing = {},
+                                               .keyframes = { { 0, {}, 1.0f }, { 1, {}, 0.5f } },
+                                           } });
+    fixture.context.install_display_list_update(
+        make_fills_display_list(tree, { { { 2, 202, 4, 4 }, Gfx::Color::Red, { spatial, Web::Painting::NO_CLIP_NODE, effect } } }), tree, {});
+    fixture.rasterize();
+    EXPECT(fixture.context.has_active_visual_animations());
+    EXPECT(!fixture.context.visual_animations_need_frame());
+    fixture.context.install_display_list_update(
+        make_fills_display_list(tree, { { { 2, 102, 4, 4 }, Gfx::Color::Red, { spatial, Web::Painting::NO_CLIP_NODE, effect } } }), tree, {});
+    EXPECT(fixture.context.visual_animations_need_frame());
+    Vector<Web::Compositor::VisualAnimation> animations;
+    for (auto const& animation : tree.visual_animations())
+        animations.append(animation);
+    auto anchor = MonotonicTime::now();
+    animations[0].monotonic_time_at_anchor_ns = anchor.nanoseconds();
+    animations[0].local_time_at_anchor_ms = 500;
+    tree.set_visual_animations(move(animations));
+    fixture.context.install_display_list_update(
+        make_fills_display_list(tree, { { { 2, 202, 4, 4 }, Gfx::Color::Red, { spatial, Web::Painting::NO_CLIP_NODE, effect } } }), tree, {});
+    fixture.context.advance_visual_animations(anchor);
+    EXPECT(fixture.context.visual_animations_need_frame());
+    fixture.context.advance_visual_animations(anchor + AK::Duration::from_milliseconds(500));
+    EXPECT(!fixture.context.visual_animations_need_frame());
+}
+
+TEST_CASE(rotation_bounds_include_angles_that_can_reveal_offscreen_content)
+{
+    Web::Painting::VisualContextTreeTestBuilder builder;
+    auto spatial = builder.append_transform(Web::Painting::VISUAL_VIEWPORT_NODE_INDEX, Gfx::FloatMatrix4x4::identity());
+    auto tree = builder.finish();
+    auto display_list = make_fills_display_list(tree, { { { 50, 0, 4, 4 }, Gfx::Color::Red, { spatial } } });
+    Array rotation_nodes { spatial };
+    EXPECT(Web::Painting::animated_content_may_affect_viewport(
+        display_list->command_bytes(), tree, {}, rotation_nodes, {}, { 0, 50, 10, 10 }));
+    EXPECT(!Web::Painting::animated_content_may_affect_viewport(
+        display_list->command_bytes(), tree, {}, rotation_nodes, {}, { 0, 100, 10, 10 }));
+}
+
+TEST_CASE(rotation_bounds_preserve_work_for_unbounded_commands_and_animated_clips)
+{
+    Web::Painting::VisualContextTreeTestBuilder builder;
+    auto spatial = builder.append_transform(Web::Painting::VISUAL_VIEWPORT_NODE_INDEX, Gfx::FloatMatrix4x4::identity(), { 4, 104 });
+    auto clip = builder.append_clip(Web::Painting::NO_CLIP_NODE, spatial, { 0, 0, 8, 8 });
+    auto tree = builder.finish();
+    Array rotation_nodes { spatial };
+    auto unbounded = make_fills_display_list(tree, { { { 2, 102, 4, 4 }, Gfx::Color::Red, { spatial }, false } });
+    EXPECT(Web::Painting::animated_content_may_affect_viewport(
+        unbounded->command_bytes(), tree, {}, rotation_nodes, {}, test_viewport_rect));
+    auto clipped = make_fills_display_list(tree, { { { 0, 0, 8, 8 }, Gfx::Color::Red, { Web::Painting::VISUAL_VIEWPORT_NODE_INDEX, clip } } });
+    EXPECT(Web::Painting::animated_content_may_affect_viewport(
+        clipped->command_bytes(), tree, {}, rotation_nodes, {}, test_viewport_rect));
 }
 
 TEST_CASE(changed_command_reports_its_inflated_rect)
@@ -1192,7 +1363,7 @@ TEST_CASE(tree_only_update_damages_transformed_commands)
     EXPECT_EQ(fixture.present().damage_rect, (Gfx::IntRect { 1, 1, 10, 6 }));
 
     fixture.compositor_state->update_visual_context_tree(fixture.context_id, make_translated_visual_context_tree({ 8, 0 }), {});
-    EXPECT(fixture.present().damage_rect.is_empty());
+    fixture.expect_no_frame();
 }
 
 TEST_CASE(surface_clear_color_change_forces_full_damage)
@@ -1332,11 +1503,11 @@ TEST_CASE(canvas_content_changes_damage_the_canvas_rect)
     append_display_list_command(command_bytes, draw_canvas, draw_canvas.dst_rect);
     fixture.install(decode_display_list(visual_context_tree, move(command_bytes)), visual_context_tree);
     fixture.present();
-    EXPECT(fixture.present().damage_rect.is_empty());
+    fixture.expect_no_frame();
 
     canvas_surface_registry.set_canvas_surface(canvas_id, make_canvas_surface());
     EXPECT_EQ(fixture.present().damage_rect, (Gfx::IntRect { 3, 3, 6, 6 }));
-    EXPECT(fixture.present().damage_rect.is_empty());
+    fixture.expect_no_frame();
 }
 
 TEST_CASE(compositor_initiated_presents_request_full_damage)
@@ -1374,7 +1545,7 @@ TEST_CASE(child_context_presents_repaint_the_parent)
     fixture.compositor_state->update_display_list(child_context_id, make_fills_display_list(child_visual_context_tree, { { child_viewport_rect, Gfx::Color::Red } }), child_visual_context_tree, {}, {});
     fixture.compositor_state->present_frame(child_context_id, child_viewport_rect);
     fixture.present();
-    EXPECT(fixture.present().damage_rect.is_empty());
+    fixture.expect_no_frame();
 
     fixture.compositor_state->update_display_list(child_context_id, make_fills_display_list(child_visual_context_tree, { { child_viewport_rect, Gfx::Color::Blue } }), child_visual_context_tree, {}, {});
     auto already_presented = fixture.compositor_client.presented_frames.size();
@@ -1407,8 +1578,6 @@ TEST_CASE(async_scroll_presents_report_the_damage_of_the_scrolled_content)
             .is_viewport = true,
             .can_be_wheel_scrolled_horizontally = false,
             .can_be_wheel_scrolled_vertically = true,
-            .snaps_scroll_position_horizontally = false,
-            .snaps_scroll_position_vertically = false,
         });
     append_display_list_command(
         command_bytes,
@@ -1425,8 +1594,6 @@ TEST_CASE(async_scroll_presents_report_the_damage_of_the_scrolled_content)
             .is_viewport = false,
             .can_be_wheel_scrolled_horizontally = false,
             .can_be_wheel_scrolled_vertically = true,
-            .snaps_scroll_position_horizontally = false,
-            .snaps_scroll_position_vertically = false,
         });
     append_display_list_command(
         command_bytes,
@@ -1445,13 +1612,13 @@ TEST_CASE(async_scroll_presents_report_the_damage_of_the_scrolled_content)
     fixture.present();
 
     auto already_presented = fixture.compositor_client.presented_frames.size();
-    EXPECT(fixture.compositor_state->async_scroll_by(fixture.context_id, { 20, 20 }, { 0, 5 }, Web::Compositor::SnapContainerHandling::ScrollOnCompositor));
+    EXPECT(fixture.compositor_state->async_scroll_by(fixture.context_id, { 20, 20 }, { 0, 5 }, Web::WheelDeltaPrecision::Precise, Web::ScrollGesturePhase::None));
     auto nested_scroll_frame = fixture.wait_for_frame(already_presented);
     EXPECT_EQ(nested_scroll_frame.content_rect, fixture.viewport_rect);
     EXPECT_EQ(nested_scroll_frame.damage_rect, (Gfx::IntRect { 9, 4, 42, 17 }));
 
     already_presented = fixture.compositor_client.presented_frames.size();
-    EXPECT(fixture.compositor_state->async_scroll_by(fixture.context_id, { 80, 80 }, { 0, 10 }, Web::Compositor::SnapContainerHandling::ScrollOnCompositor));
+    EXPECT(fixture.compositor_state->async_scroll_by(fixture.context_id, { 80, 80 }, { 0, 10 }, Web::WheelDeltaPrecision::Precise, Web::ScrollGesturePhase::None));
     auto viewport_scroll_frame = fixture.wait_for_frame(already_presented);
     EXPECT_EQ(viewport_scroll_frame.content_rect, (Gfx::IntRect { 0, 10, 100, 100 }));
     EXPECT_EQ(viewport_scroll_frame.damage_rect, fixture.viewport_rect);
@@ -1526,4 +1693,381 @@ TEST_CASE(visual_animation_samples_derive_a_tree_and_leave_the_source_untouched)
     auto source_translation = tree.accumulated_matrix(spatial, {}, include_viewport)[0, 3];
     EXPECT_EQ(source_translation, 12.0f);
     EXPECT_EQ(tree.effects_opacity(effect), Optional<float> { 0.75f });
+}
+
+// A viewport that snaps along its y axis, with snap areas every 100 pixels.
+static NonnullRefPtr<Web::Painting::DisplayList> make_snap_container_display_list(Web::Painting::AccumulatedVisualContextTree const& visual_context_tree)
+{
+    ByteBuffer command_bytes;
+    Web::UniqueNodeID document_id { 1 };
+    Web::Painting::SpatialNodeIndex scroll_node_index { 1 };
+    VERIFY(visual_context_tree.spatial_node_count() > scroll_node_index.value());
+
+    append_display_list_command(
+        command_bytes,
+        Web::Painting::CompositorScrollNode {
+            .document_id = document_id,
+            .scrollable_node_id = Web::UniqueNodeID { 2 },
+            .scroll_node_index = scroll_node_index,
+            .parent_scroll_node_index = Web::Painting::VISUAL_VIEWPORT_NODE_INDEX,
+            .scrollport_rect = { 0, 0, 100, 100 },
+            .min_scroll_offset = { 0, 0 },
+            .max_scroll_offset = { 400, 400 },
+            .scroll_node_kind = Web::Painting::CompositorScrollNodeKind::Viewport,
+            .pseudo_element_type = 0,
+            .is_viewport = true,
+            .can_be_wheel_scrolled_horizontally = true,
+            .can_be_wheel_scrolled_vertically = true,
+        });
+    append_display_list_command(
+        command_bytes,
+        Web::Painting::CompositorSnapContainer {
+            .document_id = document_id,
+            .scroll_node_index = scroll_node_index,
+            .snapport = Web::CSSPixelRect { 0, 0, 100, 100 },
+            .min_scroll_offset = Web::CSSPixelPoint { 0, 0 },
+            .max_scroll_offset = Web::CSSPixelPoint { 400, 400 },
+            .strictness = to_underlying(Web::CSS::ScrollSnapStrictness::Mandatory),
+            .snaps_x = false,
+            .snaps_y = true,
+            .horizontal_writing_mode = true,
+        });
+    for (int i = 0; i < 5; ++i) {
+        append_display_list_command(
+            command_bytes,
+            Web::Painting::CompositorSnapArea {
+                .document_id = document_id,
+                .scroll_node_index = scroll_node_index,
+                .area_node_id = Web::UniqueNodeID { 10 + i },
+                .pseudo_element_type = 0,
+                .rect = Web::CSSPixelRect { 0, 100 * i, 100, 100 },
+                .align_x = to_underlying(Web::CSS::ScrollSnapAlign::None),
+                .align_y = to_underlying(Web::CSS::ScrollSnapAlign::Start),
+                .always_stop = false,
+            });
+    }
+
+    return decode_display_list(visual_context_tree, move(command_bytes), {},
+        Web::Painting::DisplayList::AsyncScrollingMetadata {
+            .viewport_rect = { 0, 0, 100, 100 },
+            .device_pixels_per_css_pixel = 1.0,
+        });
+}
+
+static constexpr Web::Compositor::AsyncScrollNodeStableID snap_container_stable_id { .node_id = Web::UniqueNodeID { 2 }, .kind = Web::Compositor::AsyncScrollNodeKind::Viewport, .pseudo_element_type = 0 };
+
+struct SnapContainerContextFixture {
+    RecordingWebContentClient client;
+    Web::Painting::CanvasSurfaceRegistry canvas_surface_registry;
+    Compositor::ContextState context { Web::Compositor::CompositorContextId { 0 }, 0, client, canvas_surface_registry, true };
+    Web::Painting::AccumulatedVisualContextTree visual_context_tree { make_scrollable_viewport_visual_context_tree() };
+    MonotonicTime now { MonotonicTime::now() };
+
+    SnapContainerContextFixture()
+    {
+        context.install_display_list_update(make_snap_container_display_list(visual_context_tree), visual_context_tree, {});
+    }
+
+    Compositor::ContextState::AsyncScrollResult discrete_step(Gfx::FloatPoint delta, AK::Duration after = {})
+    {
+        return context.async_scroll_by(Web::UniqueNodeID { 1 }, { 50, 50 }, delta, { 0, 0, 100, 100 }, Web::WheelDeltaPrecision::Discrete, Web::ScrollGesturePhase::None, Web::Compositor::AsyncScrollOperationTracking::Yes, now + after);
+    }
+
+    // Everything the context published since the last call, merged the way WebContent merges it. The context pushes
+    // its pending updates to WebContent whenever it asks for a rendering update, so what was pushed is read back
+    // together with what is still pending.
+    Web::Compositor::PendingAsyncScrollUpdates take_updates()
+    {
+        auto publications = move(client.pushed_updates);
+        client.pushed_updates.clear();
+        publications.append(context.take_pending_async_scroll_updates());
+
+        Web::Compositor::PendingAsyncScrollUpdates merged;
+        for (auto& publication : publications) {
+            merged.sequence = max(merged.sequence, publication.sequence);
+            for (auto const& scroll_offset : publication.scroll_offsets) {
+                merged.scroll_offsets.remove_all_matching([&](auto const& existing) { return existing.stable_node_id == scroll_offset.stable_node_id; });
+                merged.scroll_offsets.append(scroll_offset);
+            }
+            merged.completed_operation_ids.extend(move(publication.completed_operation_ids));
+            merged.operation_ids_taken_over_by_user_input.extend(move(publication.operation_ids_taken_over_by_user_input));
+            merged.started_snap_scrolls.extend(move(publication.started_snap_scrolls));
+        }
+        return merged;
+    }
+
+    Web::Compositor::PendingAsyncScrollUpdates finish_animations(AK::Duration after)
+    {
+        (void)context.advance_smooth_scroll_animations(now + after);
+        VERIFY(!context.has_active_smooth_scroll_animations());
+        return take_updates();
+    }
+};
+
+TEST_CASE(a_discrete_wheel_step_on_a_snap_container_starts_a_snap_scroll)
+{
+    SnapContainerContextFixture fixture;
+
+    auto result = fixture.discrete_step({ 0, 10 });
+    EXPECT(result.enqueue_result.accepted);
+    EXPECT(result.enqueue_result.operation_id.has_value());
+    EXPECT(result.frame_to_present.has_value());
+    EXPECT(fixture.context.has_active_smooth_scroll_animations());
+
+    auto updates = fixture.take_updates();
+    EXPECT(updates.completed_operation_ids.is_empty());
+    EXPECT_EQ(updates.started_snap_scrolls.size(), 1u);
+    auto started = updates.started_snap_scrolls.first();
+    EXPECT_EQ(started.stable_node_id, snap_container_stable_id);
+    EXPECT_EQ(started.operation_id, *result.enqueue_result.operation_id);
+    EXPECT_EQ(started.initial_scroll_offset, Web::CSSPixelPoint(0, 0));
+    EXPECT_EQ(started.selection.position, Web::CSSPixelPoint(0, 100));
+    EXPECT_EQ(started.unsnapped_scroll_destination, Web::CSSPixelPoint(0, 10));
+    EXPECT(!started.selection.evaluated_x);
+    EXPECT(started.selection.evaluated_y);
+    EXPECT(started.selection.snapped_areas.x.is_empty());
+    EXPECT_EQ(started.selection.snapped_areas.y.size(), 1u);
+    EXPECT_EQ(started.selection.snapped_areas.y.first().node_id, Web::UniqueNodeID(11));
+
+    updates = fixture.finish_animations(AK::Duration::from_seconds(1));
+    EXPECT(updates.completed_operation_ids.contains_slow(started.operation_id));
+    EXPECT(updates.started_snap_scrolls.is_empty());
+    EXPECT_EQ(updates.scroll_offsets.size(), 1u);
+    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 100));
+}
+
+TEST_CASE(consecutive_discrete_wheel_steps_travel_from_the_offset_they_asked_for)
+{
+    SnapContainerContextFixture fixture;
+
+    auto first_step = fixture.discrete_step({ 0, 10 });
+    auto first_operation_id = *first_step.enqueue_result.operation_id;
+    EXPECT_EQ(fixture.take_updates().started_snap_scrolls.size(), 1u);
+
+    // The second step asks for an offset short of the snap position the first is scrolling to, so it is consumed.
+    auto second_step = fixture.discrete_step({ 0, 10 }, AK::Duration::from_milliseconds(10));
+    EXPECT(second_step.enqueue_result.accepted);
+    EXPECT(second_step.enqueue_result.operation_id.has_value());
+    auto updates = fixture.take_updates();
+    EXPECT(updates.started_snap_scrolls.is_empty());
+    EXPECT(updates.completed_operation_ids.contains_slow(*second_step.enqueue_result.operation_id));
+    EXPECT(!updates.completed_operation_ids.contains_slow(first_operation_id));
+
+    // The third step travels on from the 20 pixels the gesture has asked for, past the snap position in flight.
+    auto third_step = fixture.discrete_step({ 0, 100 }, AK::Duration::from_milliseconds(20));
+    updates = fixture.take_updates();
+    EXPECT(updates.completed_operation_ids.contains_slow(first_operation_id));
+    EXPECT_EQ(updates.started_snap_scrolls.size(), 1u);
+    EXPECT_EQ(updates.started_snap_scrolls.first().operation_id, *third_step.enqueue_result.operation_id);
+    EXPECT_EQ(updates.started_snap_scrolls.first().unsnapped_scroll_destination, Web::CSSPixelPoint(0, 120));
+    EXPECT_EQ(updates.started_snap_scrolls.first().selection.position, Web::CSSPixelPoint(0, 200));
+
+    updates = fixture.finish_animations(AK::Duration::from_seconds(1));
+    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 200));
+
+    // A step arriving once the gesture has run out of input travels from where the scrolling box rests.
+    fixture.discrete_step({ 0, 10 }, AK::Duration::from_seconds(2));
+    updates = fixture.take_updates();
+    EXPECT_EQ(updates.started_snap_scrolls.size(), 1u);
+    EXPECT_EQ(updates.started_snap_scrolls.first().initial_scroll_offset, Web::CSSPixelPoint(0, 200));
+    EXPECT_EQ(updates.started_snap_scrolls.first().selection.position, Web::CSSPixelPoint(0, 300));
+}
+
+TEST_CASE(a_discrete_wheel_step_along_a_non_snapping_axis_scrolls_by_its_delta)
+{
+    SnapContainerContextFixture fixture;
+
+    auto result = fixture.discrete_step({ 10, 0 });
+    EXPECT(result.enqueue_result.accepted);
+    EXPECT(!fixture.context.has_active_smooth_scroll_animations());
+
+    auto updates = fixture.take_updates();
+    EXPECT(updates.started_snap_scrolls.is_empty());
+    EXPECT(updates.completed_operation_ids.contains_slow(*result.enqueue_result.operation_id));
+    EXPECT_EQ(updates.scroll_offsets.size(), 1u);
+    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(10, 0));
+}
+
+TEST_CASE(a_scroll_by_the_main_thread_ends_the_wheel_gesture_on_the_compositor)
+{
+    SnapContainerContextFixture fixture;
+
+    fixture.discrete_step({ 0, 10 });
+    auto updates = fixture.finish_animations(AK::Duration::from_seconds(1));
+    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 100));
+
+    // The main thread adopted the snap scroll's offsets and then scrolled the box itself.
+    auto scroll_state_snapshot = scroll_state_snapshot_with_offset(Web::Painting::SpatialNodeIndex { 1 }, { 0, -300 });
+    scroll_state_snapshot.set_adopted_async_scroll_sequence(updates.sequence);
+    fixture.context.update_scroll_state(move(scroll_state_snapshot));
+
+    fixture.discrete_step({ 0, 10 }, AK::Duration::from_milliseconds(100));
+    updates = fixture.take_updates();
+    EXPECT_EQ(updates.started_snap_scrolls.size(), 1u);
+    EXPECT_EQ(updates.started_snap_scrolls.first().initial_scroll_offset, Web::CSSPixelPoint(0, 300));
+    EXPECT_EQ(updates.started_snap_scrolls.first().selection.position, Web::CSSPixelPoint(0, 400));
+}
+
+TEST_CASE(a_discrete_wheel_step_takes_over_a_smooth_scroll_the_main_thread_started)
+{
+    SnapContainerContextFixture fixture;
+
+    auto first_step = fixture.discrete_step({ 0, 10 });
+    auto first_operation_id = *first_step.enqueue_result.operation_id;
+    fixture.take_updates();
+
+    auto programmatic_scroll = fixture.context.smooth_scroll_to(snap_container_stable_id, { 0, 350 }, { 0, 0 }, { 0, 0, 100, 100 }, Web::Compositor::ScrollAnimationKind::SmoothScroll);
+    EXPECT(programmatic_scroll.enqueue_result.accepted);
+    auto programmatic_operation_id = *programmatic_scroll.enqueue_result.operation_id;
+    auto updates = fixture.take_updates();
+    EXPECT(updates.completed_operation_ids.contains_slow(first_operation_id));
+
+    auto second_step = fixture.discrete_step({ 0, 10 }, AK::Duration::from_milliseconds(20));
+    updates = fixture.take_updates();
+    EXPECT(updates.operation_ids_taken_over_by_user_input.contains_slow(programmatic_operation_id));
+    EXPECT_EQ(updates.started_snap_scrolls.size(), 1u);
+    EXPECT_EQ(updates.started_snap_scrolls.first().operation_id, *second_step.enqueue_result.operation_id);
+    EXPECT_EQ(updates.started_snap_scrolls.first().initial_scroll_offset, Web::CSSPixelPoint(0, 0));
+    EXPECT_EQ(updates.started_snap_scrolls.first().selection.position, Web::CSSPixelPoint(0, 100));
+}
+
+TEST_CASE(started_snap_scrolls_round_trip_through_ipc)
+{
+    Web::Compositor::PendingAsyncScrollUpdates updates;
+    updates.sequence = 7;
+    updates.started_snap_scrolls.append({
+        .stable_node_id = snap_container_stable_id,
+        .operation_id = 3,
+        .initial_scroll_offset = { Web::CSSPixels(0), Web::CSSPixels(12.5) },
+        .unsnapped_scroll_destination = { 0, 22 },
+        .selection = {
+            .position = { 0, 100 },
+            .snapped_x = false,
+            .snapped_y = true,
+            .evaluated_x = false,
+            .evaluated_y = true,
+            .snapped_areas = { .x = {}, .y = { { .node_id = Web::UniqueNodeID { 11 }, .pseudo_element_type = 3 } } },
+        },
+        .settles_gesture = true,
+    });
+
+    IPC::MessageBuffer buffer;
+    IPC::Encoder encoder { buffer };
+    MUST(encoder.encode(updates));
+
+    FixedMemoryStream stream { buffer.data().span() };
+    Queue<IPC::Attachment> attachments;
+    IPC::Decoder decoder { stream, attachments };
+    auto decoded = MUST(decoder.decode<Web::Compositor::PendingAsyncScrollUpdates>());
+
+    EXPECT_EQ(decoded.sequence, 7u);
+    EXPECT_EQ(decoded.started_snap_scrolls.size(), 1u);
+    auto const& started = decoded.started_snap_scrolls.first();
+    EXPECT_EQ(started.stable_node_id, snap_container_stable_id);
+    EXPECT_EQ(started.operation_id, 3u);
+    EXPECT_EQ(started.initial_scroll_offset, Web::CSSPixelPoint(Web::CSSPixels(0), Web::CSSPixels(12.5)));
+    EXPECT_EQ(started.selection.position, Web::CSSPixelPoint(0, 100));
+    EXPECT_EQ(started.unsnapped_scroll_destination, Web::CSSPixelPoint(0, 22));
+    EXPECT(started.settles_gesture);
+    EXPECT(!started.selection.snapped_x);
+    EXPECT(started.selection.snapped_y);
+    EXPECT(!started.selection.evaluated_x);
+    EXPECT(started.selection.evaluated_y);
+    EXPECT_EQ(started.selection.snapped_areas.y.size(), 1u);
+    EXPECT_EQ(started.selection.snapped_areas.y.first().node_id, Web::UniqueNodeID(11));
+    EXPECT_EQ(started.selection.snapped_areas.y.first().pseudo_element_type, 3u);
+}
+
+TEST_CASE(a_precise_pan_snaps_when_its_gesture_ends)
+{
+    SnapContainerContextFixture fixture;
+    auto pan = [&](Gfx::FloatPoint delta, Web::ScrollGesturePhase phase, AK::Duration after) {
+        return fixture.context.async_scroll_by(Web::UniqueNodeID { 1 }, { 50, 50 }, delta, { 0, 0, 100, 100 }, Web::WheelDeltaPrecision::Precise, phase, Web::Compositor::AsyncScrollOperationTracking::Yes, fixture.now + after);
+    };
+
+    // The finger pans the box to where it is released, past a snap position on the way.
+    EXPECT(pan({ 0, 130 }, Web::ScrollGesturePhase::Ongoing, {}).enqueue_result.accepted);
+    auto updates = fixture.take_updates();
+    EXPECT(updates.started_snap_scrolls.is_empty());
+    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 130));
+
+    auto gesture_end = pan({ 0, 0 }, Web::ScrollGesturePhase::Ended, AK::Duration::from_milliseconds(10));
+    EXPECT(gesture_end.enqueue_result.accepted);
+    EXPECT(gesture_end.enqueue_result.operation_id.has_value());
+    EXPECT(fixture.context.has_active_smooth_scroll_animations());
+    updates = fixture.take_updates();
+    EXPECT_EQ(updates.started_snap_scrolls.size(), 1u);
+    auto started = updates.started_snap_scrolls.first();
+    EXPECT_EQ(started.operation_id, *gesture_end.enqueue_result.operation_id);
+    EXPECT(started.settles_gesture);
+    EXPECT_EQ(started.initial_scroll_offset, Web::CSSPixelPoint(0, 130));
+    EXPECT_EQ(started.selection.position, Web::CSSPixelPoint(0, 100));
+
+    // The gesture has ended, so ending it again snaps nothing.
+    EXPECT(!pan({ 0, 0 }, Web::ScrollGesturePhase::Ended, AK::Duration::from_milliseconds(20)).enqueue_result.accepted);
+}
+
+TEST_CASE(the_momentum_of_a_flick_selects_a_snap_position_once)
+{
+    SnapContainerContextFixture fixture;
+    auto flick = [&](Gfx::FloatPoint delta, Web::ScrollGesturePhase phase, AK::Duration after) {
+        return fixture.context.async_scroll_by(Web::UniqueNodeID { 1 }, { 50, 50 }, delta, { 0, 0, 100, 100 }, Web::WheelDeltaPrecision::Precise, phase, Web::Compositor::AsyncScrollOperationTracking::Yes, fixture.now + after);
+    };
+
+    EXPECT(flick({ 0, 50 }, Web::ScrollGesturePhase::Ongoing, {}).enqueue_result.accepted);
+    // The first momentum delta says nothing about where the momentum is headed, so it scrolls by its delta.
+    EXPECT(flick({ 0, 100 }, Web::ScrollGesturePhase::Momentum, AK::Duration::from_milliseconds(10)).enqueue_result.accepted);
+    auto updates = fixture.take_updates();
+    EXPECT(updates.started_snap_scrolls.is_empty());
+    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 150));
+
+    // The second decays by 0.6, so the momentum has 150 pixels left to travel, and snaps where that is headed.
+    auto selecting_delta = flick({ 0, 60 }, Web::ScrollGesturePhase::Momentum, AK::Duration::from_milliseconds(20));
+    EXPECT(selecting_delta.enqueue_result.accepted);
+    updates = fixture.take_updates();
+    EXPECT_EQ(updates.started_snap_scrolls.size(), 1u);
+    auto started = updates.started_snap_scrolls.first();
+    EXPECT_EQ(started.operation_id, *selecting_delta.enqueue_result.operation_id);
+    EXPECT(!started.settles_gesture);
+    EXPECT_EQ(started.initial_scroll_offset, Web::CSSPixelPoint(0, 150));
+    EXPECT_EQ(started.selection.position, Web::CSSPixelPoint(0, 300));
+
+    // The rest of the momentum is consumed by the scroll under way, and the end of the gesture leaves it be.
+    auto consumed_delta = flick({ 0, 30 }, Web::ScrollGesturePhase::Momentum, AK::Duration::from_milliseconds(30));
+    EXPECT(consumed_delta.enqueue_result.accepted);
+    updates = fixture.take_updates();
+    EXPECT(updates.started_snap_scrolls.is_empty());
+    EXPECT(updates.scroll_offsets.is_empty());
+    EXPECT(updates.completed_operation_ids.contains_slow(*consumed_delta.enqueue_result.operation_id));
+
+    EXPECT(!flick({ 0, 0 }, Web::ScrollGesturePhase::Ended, AK::Duration::from_milliseconds(40)).enqueue_result.accepted);
+    EXPECT(fixture.context.has_active_smooth_scroll_animations());
+
+    updates = fixture.finish_animations(AK::Duration::from_seconds(10));
+    EXPECT(updates.completed_operation_ids.contains_slow(started.operation_id));
+    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 300));
+}
+
+TEST_CASE(momentum_that_never_decays_snaps_from_where_the_gesture_started_at_its_end)
+{
+    SnapContainerContextFixture fixture;
+    auto flick = [&](Gfx::FloatPoint delta, Web::ScrollGesturePhase phase, AK::Duration after) {
+        return fixture.context.async_scroll_by(Web::UniqueNodeID { 1 }, { 50, 50 }, delta, { 0, 0, 100, 100 }, Web::WheelDeltaPrecision::Precise, phase, Web::Compositor::AsyncScrollOperationTracking::Yes, fixture.now + after);
+    };
+
+    // Momentum that keeps gathering pace says nothing about where it is headed, so every delta scrolls by itself.
+    EXPECT(flick({ 0, 50 }, Web::ScrollGesturePhase::Ongoing, {}).enqueue_result.accepted);
+    EXPECT(flick({ 0, 50 }, Web::ScrollGesturePhase::Momentum, AK::Duration::from_milliseconds(10)).enqueue_result.accepted);
+    EXPECT(flick({ 0, 50 }, Web::ScrollGesturePhase::Momentum, AK::Duration::from_milliseconds(20)).enqueue_result.accepted);
+    EXPECT(flick({ 0, 60 }, Web::ScrollGesturePhase::Momentum, AK::Duration::from_milliseconds(30)).enqueue_result.accepted);
+    auto updates = fixture.take_updates();
+    EXPECT(updates.started_snap_scrolls.is_empty());
+    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 210));
+
+    EXPECT(flick({ 0, 0 }, Web::ScrollGesturePhase::Ended, AK::Duration::from_milliseconds(40)).enqueue_result.accepted);
+    updates = fixture.take_updates();
+    EXPECT_EQ(updates.started_snap_scrolls.size(), 1u);
+    EXPECT(updates.started_snap_scrolls.first().settles_gesture);
+    EXPECT_EQ(updates.started_snap_scrolls.first().initial_scroll_offset, Web::CSSPixelPoint(0, 210));
+    EXPECT_EQ(updates.started_snap_scrolls.first().selection.position, Web::CSSPixelPoint(0, 200));
 }

@@ -1807,20 +1807,6 @@ void Document::record_partial_relayout_escape(PartialRelayoutEscapeReason reason
         Layout::RustFFI::layout_arena_record_partial_relayout_escape(m_layout_node_arena->handle());
 }
 
-// Anchor names publish geometry that anchor() functions on positioned boxes anywhere in the
-// document consume, and only a full layout pass re-resolves all of them, so anchor positioning
-// in use takes updates off the partial relayout path entirely.
-bool Document::any_anchor_names_are_registered() const
-{
-    if (m_anchor_name_map.has_registered_names())
-        return true;
-    for (auto const& shadow_root : m_shadow_roots) {
-        if (shadow_root.anchor_name_map().has_registered_names())
-            return true;
-    }
-    return false;
-}
-
 void Document::set_needs_container_query_evaluation_after_layout(Element const& query_container)
 {
     m_query_containers_needing_container_query_evaluation_after_layout.set(const_cast<Element&>(query_container));
@@ -2114,7 +2100,6 @@ Document::PartialRelayoutResult Document::try_partial_relayout(Vector<Layout::Ru
         .document_needs_full_layout_tree_update = needs_full_layout_tree_update(),
         .container_query_evaluation_is_pending = !m_query_containers_needing_container_query_evaluation_after_layout.is_empty(),
         .should_collect_devtools_layout_data = should_collect_devtools_layout_data,
-        .any_anchor_names_are_registered = any_anchor_names_are_registered(),
     };
     if (!Layout::RustFFI::layout_arena_partial_relayout_may_be_attempted(
             layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root),
@@ -2190,7 +2175,10 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
     if (!navigable || navigable->active_document().ptr() != this)
         return;
 
-    if (reason != UpdateLayoutReason::HTMLEventLoopRenderingUpdate && animation_sampling_scope == ThrottledAnimationSamplingScope::Document)
+    // Internal layout dependencies do not observe compositor animation values.
+    if (reason != UpdateLayoutReason::HTMLEventLoopRenderingUpdate
+        && reason != UpdateLayoutReason::ChildDocumentStyleUpdate
+        && animation_sampling_scope == ThrottledAnimationSamplingScope::Document)
         flush_throttled_animation_style_update();
 
     VERIFY(!m_is_running_update_layout);
@@ -7614,8 +7602,17 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
     if (any_of(effect.target_properties(), [&](auto const& property) { return !first_is_one_of(property.id(), CSS::PropertyID::Opacity, CSS::PropertyID::BackgroundColor, CSS::PropertyID::Filter) && !is_transform_family_property(property.id()); }))
         return {};
     auto target = effect.target_abstract_element();
-    if (!target.has_value() || target->element().namespace_uri() == Namespace::SVG)
+    if (!target.has_value())
         return {};
+    if (target->element().namespace_uri() == Namespace::SVG) {
+        // NB: An outer SVG viewport embedded in HTML uses the CSS box transform independently of its SVG
+        //     contents. Internal SVG transforms also affect SVG geometry and must remain on the main thread.
+        auto const* layout_node = target->unsafe_layout_node();
+        auto parent = target->element().parent_element();
+        if (!targets_transform || !layout_node || layout_node->kind() != Layout::RustFFI::NodeKind::SVGSVGBox
+            || !parent || parent->namespace_uri() != Namespace::HTML)
+            return {};
+    }
     auto monotonic_time_at_anchor_ms = [&]() -> Optional<double> {
         if (!is_initial_pending_css_transition) {
             auto frame_timestamp = target->document().last_animation_frame_timestamp();
@@ -7752,7 +7749,7 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
                     if (!effect.target_properties().contains(CSS::PropertyNameAndID::from_id(property_id)))
                         continue;
                     auto property = entry.properties.get(CSS::PropertyNameAndID::from_id(property_id));
-                    if (!property.has_value() || !property->has<CSS::RustStyleValueHandle>()) {
+                    if (!property.has_value()) {
                         if (transform_property_count == 1) {
                             skip_keyframe = true;
                             break;
@@ -7760,7 +7757,17 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
                         new_cache.is_valid = false;
                         break;
                     }
-                    auto style_value = resolved_compositor_animation_style_value(property_id, property->get<CSS::RustStyleValueHandle>(), *target);
+                    // NB: Synthesized endpoints use the underlying style, just as main-thread keyframe sampling does.
+                    auto style_value = property->visit(
+                        [&](Animations::KeyframeEffect::KeyFrameSet::UseInitial) -> RefPtr<CSS::StyleValue const> {
+                            auto computed_style = target->computed_style();
+                            if (!computed_style)
+                                return {};
+                            return computed_style->computed_style_value(property_id, CSS::ComputedValues::WithAnimationsApplied::No);
+                        },
+                        [&](CSS::RustStyleValueHandle const& value) {
+                            return resolved_compositor_animation_style_value(property_id, value, *target);
+                        });
                     if (!style_value) {
                         new_cache.is_valid = false;
                         break;
@@ -7887,9 +7894,29 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
     return build_animation_for_target(target_kind);
 }
 
+static Optional<double> next_throttled_animation_iteration_event_time(Animations::Animation const& animation, Animations::KeyframeEffect const& effect)
+{
+    if (!animation.is_css_animation() || animation.pending()
+        || animation.play_state() != Bindings::AnimationPlayState::Running
+        || animation.playback_rate() <= 0 || !isfinite(animation.playback_rate())
+        || !animation.timeline() || !animation.timeline()->is_monotonically_increasing()
+        || effect.start_delay().type != Animations::TimeValue::Type::Milliseconds
+        || effect.iteration_duration().type != Animations::TimeValue::Type::Milliseconds
+        || effect.iteration_duration().value <= 0 || !isfinite(effect.iteration_duration().value)
+        || !effect.can_skip_per_frame_style_update()
+        || !isinf(effect.iteration_count()) || !effect.is_in_the_active_phase()
+        || effect.can_skip_per_frame_animation_tick())
+        return {};
+
+    // NB: Observable infinite throttled animations need a rendering update at the next iteration boundary,
+    //     not at every display refresh. Seeking and cancellation already request their own updates.
+    return effect.start_delay().value
+        + (effect.previous_current_iteration() + 1 - effect.iteration_start()) * effect.iteration_duration().value;
+}
+
 void Document::schedule_compositor_animation_wakeup(double delay_ms)
 {
-    auto timer_delay_ms = clamp(static_cast<i64>(ceil(delay_ms)), 1, static_cast<i64>(NumericLimits<int>::max()));
+    auto timer_delay_ms = static_cast<int>(ceil(clamp(delay_ms, 1.0, static_cast<double>(NumericLimits<int>::max()))));
     auto deadline = MonotonicTime::now() + AK::Duration::from_milliseconds(timer_delay_ms);
     if (m_compositor_animation_wakeup_timer && m_compositor_animation_wakeup_timer->is_active()
         && m_compositor_animation_wakeup_deadline.has_value() && *m_compositor_animation_wakeup_deadline <= deadline)
@@ -7938,6 +7965,15 @@ void Document::service_compositor_animation_wakeup(double timestamp)
                 reached_wakeup = true;
                 if (is_compositor_handled)
                     reached_compositor_active_start = true;
+            }
+        }
+        if (auto iteration_event_time = next_throttled_animation_iteration_event_time(animation, effect); iteration_event_time.has_value()) {
+            if (current_time->value < *iteration_event_time) {
+                auto delay = (*iteration_event_time - current_time->value) / animation.playback_rate();
+                if (!next_wakeup_delay_ms.has_value() || delay < *next_wakeup_delay_ms)
+                    next_wakeup_delay_ms = delay;
+            } else {
+                reached_wakeup = true;
             }
         }
         if (!is_compositor_handled || isinf(effect.iteration_count()))
@@ -8712,6 +8748,16 @@ void Document::update_animations_and_send_events(double timestamp)
                 continue;
             }
             effect.clear_per_frame_animation_tick_was_skipped();
+            if (auto iteration_event_time = next_throttled_animation_iteration_event_time(animation, effect); iteration_event_time.has_value()) {
+                auto current_time = animation.current_time();
+                if (current_time.has_value() && current_time->type == Animations::TimeValue::Type::Milliseconds) {
+                    auto delay = (*iteration_event_time - current_time->value) / animation.playback_rate();
+                    if (delay > 0) {
+                        schedule_compositor_animation_wakeup(delay);
+                        continue;
+                    }
+                }
+            }
         }
         ++m_style_invalidation_counters.animation_frame_pump_requests;
         page().client().request_frame();

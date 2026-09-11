@@ -17,6 +17,7 @@
 #include <LibGfx/CornerRadii.h>
 #include <LibGfx/Point.h>
 #include <LibGfx/Rect.h>
+#include <LibWeb/Compositor/ScrollSnapSelection.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
@@ -68,8 +69,6 @@ struct AsyncScrollNode {
     bool is_viewport { false };
     bool can_be_wheel_scrolled_horizontally { false };
     bool can_be_wheel_scrolled_vertically { false };
-    bool snaps_scroll_position_horizontally { false };
-    bool snaps_scroll_position_vertically { false };
 };
 
 // A region with a non-passive wheel listener. Wheels inside it must stay on the main thread because script may cancel.
@@ -107,8 +106,16 @@ struct ViewportScrollbar {
     bool vertical { false };
 };
 
+// A scroll node that is a snap container, with the geometry snap positions are selected from.
+struct AsyncSnapContainer {
+    AsyncScrollNodeID node_id;
+    SnapContainerGeometry geometry;
+    Vector<SnapAreaGeometry> areas;
+};
+
 struct AsyncScrollingState {
     Vector<AsyncScrollNode> scroll_nodes;
+    Vector<AsyncSnapContainer> snap_containers;
     Vector<WheelHitTestTarget> wheel_hit_test_targets;
     Vector<MainThreadWheelEventRegion> main_thread_wheel_event_regions;
     Vector<ViewportScrollbar> viewport_scrollbars;
@@ -125,6 +132,7 @@ struct AsyncScrollingState {
     u64 wheel_event_listener_state_generation { 0 };
     bool has_blocking_wheel_event_listeners { false };
     bool has_blocking_wheel_event_region_covering_viewport { false };
+    double device_pixels_per_css_pixel { 1.0 };
 };
 
 enum class WheelRoutingAdmission {
@@ -134,16 +142,6 @@ enum class WheelRoutingAdmission {
     NoScrollNode,
     StaleWheelEventListeners,
 };
-
-// A discrete wheel step and the momentum of a flick both scroll straight to the snap position they select, and only
-// the main thread holds the snap positions to select from, so the compositor declines the deltas of either whose
-// scrolling box snaps along an axis they travel in.
-enum class SnapContainerHandling : u8 {
-    ScrollOnCompositor,
-    DeferToMainThread,
-};
-
-WEB_API SnapContainerHandling snap_container_handling_for(WheelDeltaPrecision, ScrollGesturePhase);
 
 enum class WheelScrollAdmission {
     Accepted,
@@ -157,7 +155,7 @@ WEB_API AsyncScrollingState async_scrolling_state_from_display_list(Painting::Di
 WEB_API WheelRoutingAdmission wheel_routing_admission_for(AsyncScrollingState const&);
 WEB_API Utf16View wheel_routing_admission_to_utf16_view(WheelRoutingAdmission);
 WEB_API bool blocks_wheel_event_at_position(AsyncScrollingState const&, RefPtr<Painting::DisplayList const> const&, Painting::AccumulatedVisualContextTree const*, Painting::ScrollStateSnapshot const&, Gfx::FloatPoint position);
-WEB_API WheelScrollAdmission admit_wheel_scroll(AsyncScrollingState const&, RefPtr<Painting::DisplayList const> const&, Painting::AccumulatedVisualContextTree const*, Painting::ScrollStateSnapshot const&, Gfx::FloatPoint position, Gfx::FloatPoint delta, SnapContainerHandling, bool blocking_wheel_event_regions_are_current);
+WEB_API WheelScrollAdmission admit_wheel_scroll(AsyncScrollingState const&, RefPtr<Painting::DisplayList const> const&, Painting::AccumulatedVisualContextTree const*, Painting::ScrollStateSnapshot const&, Gfx::FloatPoint position, Gfx::FloatPoint delta, bool blocking_wheel_event_regions_are_current);
 
 }
 

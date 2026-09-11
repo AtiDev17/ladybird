@@ -446,7 +446,7 @@ bool CompositorState::handle_pinch_event(Web::Compositor::CompositorContextId co
     return apply_context_update_result(context_id, *context, context->handle_pinch_event(event));
 }
 
-Web::Compositor::AsyncScrollEnqueueResult CompositorState::async_scroll_by(Web::Compositor::CompositorContextId context_id, Web::UniqueNodeID expected_document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::Compositor::SnapContainerHandling snap_container_handling, Web::Compositor::AsyncScrollOperationTracking operation_tracking)
+Web::Compositor::AsyncScrollEnqueueResult CompositorState::async_scroll_by(Web::Compositor::CompositorContextId context_id, Web::UniqueNodeID expected_document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, Web::Compositor::AsyncScrollOperationTracking operation_tracking)
 {
     if (!m_async_scrolling_enabled)
         return {};
@@ -454,14 +454,14 @@ Web::Compositor::AsyncScrollEnqueueResult CompositorState::async_scroll_by(Web::
     auto* context = context_if_present(context_id);
     VERIFY(context);
 
-    auto result = context->async_scroll_by(expected_document_id, position, delta, viewport_rect, snap_container_handling, operation_tracking);
+    auto result = context->async_scroll_by(expected_document_id, position, delta, viewport_rect, wheel_delta_precision, scroll_gesture_phase, operation_tracking);
     if (result.frame_to_present.has_value())
         schedule_present_frame(context_id, *context, *result.frame_to_present);
     publish_pending_async_scroll_updates(context_id, *context);
     return result.enqueue_result;
 }
 
-Web::Compositor::AsyncScrollEnqueueResult CompositorState::smooth_scroll_to(Web::Compositor::CompositorContextId context_id, Web::Compositor::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel, Web::Compositor::ScrollAnimationKind animation_kind)
+Web::Compositor::AsyncScrollEnqueueResult CompositorState::smooth_scroll_to(Web::Compositor::CompositorContextId context_id, Web::Compositor::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Web::Compositor::ScrollAnimationKind animation_kind)
 {
     if (!m_async_scrolling_enabled)
         return {};
@@ -469,7 +469,7 @@ Web::Compositor::AsyncScrollEnqueueResult CompositorState::smooth_scroll_to(Web:
     auto* context = context_if_present(context_id);
     VERIFY(context);
 
-    auto result = context->smooth_scroll_to(stable_node_id, offset, main_thread_offset, viewport_rect, device_pixels_per_css_pixel, animation_kind);
+    auto result = context->smooth_scroll_to(stable_node_id, offset, main_thread_offset, viewport_rect, animation_kind);
     if (result.frame_to_present.has_value())
         schedule_present_frame(context_id, *context, *result.frame_to_present);
     publish_pending_async_scroll_updates(context_id, *context);
@@ -485,7 +485,7 @@ void CompositorState::cancel_smooth_scroll(Web::Compositor::CompositorContextId 
     publish_pending_async_scroll_updates(context_id, *context);
 }
 
-bool CompositorState::async_scroll_by(Web::Compositor::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::Compositor::SnapContainerHandling snap_container_handling)
+bool CompositorState::async_scroll_by(Web::Compositor::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase)
 {
     if (!m_async_scrolling_enabled)
         return false;
@@ -494,7 +494,7 @@ bool CompositorState::async_scroll_by(Web::Compositor::CompositorContextId conte
     if (!context)
         return false;
 
-    return apply_context_update_result(context_id, *context, context->async_scroll_by(position, delta, snap_container_handling));
+    return apply_context_update_result(context_id, *context, context->async_scroll_by(position, delta, wheel_delta_precision, scroll_gesture_phase));
 }
 
 Web::Compositor::PendingAsyncScrollUpdates CompositorState::take_pending_async_scroll_updates(Web::Compositor::CompositorContextId context_id)
@@ -580,7 +580,7 @@ void CompositorState::resume_presentation_after_becoming_visible(Web::Compositor
         auto& context = *context_entry.value;
         if (root_context_of(context) != &root_context)
             continue;
-        if (context.has_active_smooth_scroll_animations() || context.has_active_visual_animations())
+        if (context.has_active_smooth_scroll_animations() || context.visual_animations_need_frame())
             vsync_scheduler_for_display(display_id_for_context(context)).schedule(display_refresh_rate_for_context(context));
         if (context.rendering_opportunity_requested())
             vsync_scheduler_for_display(display_id_for_context(context)).schedule(display_refresh_rate_for_context(context));
@@ -652,7 +652,7 @@ bool CompositorState::present_frame(Web::Compositor::CompositorContextId context
     auto composited_context_resolver = resolver_for(context_id);
     auto prepared_frame = context.prepare_frame(*m_display_list_player, pending_frame, &composited_context_resolver);
     if (!prepared_frame.has_value())
-        return false;
+        return !context.pending_present_frame_viewport_rect().has_value();
 
     m_pending_async_presents.append(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id);
     auto* pending_present = &m_pending_async_presents.last();
@@ -689,7 +689,7 @@ void CompositorState::schedule_pending_present_frame(Web::Compositor::Compositor
         // may already be up to date (and therefore not schedule a new present),
         // so explicitly keep the effective display's scheduler ticking while
         // a nested animation is active.
-        if ((context.has_active_smooth_scroll_animations() || context.has_active_visual_animations()) && context_is_effectively_visible(context))
+        if ((context.has_active_smooth_scroll_animations() || context.visual_animations_need_frame()) && context_is_effectively_visible(context))
             vsync_scheduler_for_display(display_id_for_context(context)).schedule(display_refresh_rate_for_context(context));
         return;
     }
@@ -777,29 +777,27 @@ void CompositorState::present_pending_frames_on_vsync(Optional<u64> display_id, 
             }
         }
 
-        auto has_active_animation_on_display = (context.has_active_smooth_scroll_animations() || context.has_active_visual_animations()) && display_id_for_context(context) == display_id;
+        auto has_active_animation_on_display = (context.has_active_smooth_scroll_animations() || context.visual_animations_need_frame()) && display_id_for_context(context) == display_id;
         if (!context.has_pending_present_frame_scheduled_on(display_id) && !has_active_animation_on_display)
             continue;
 
         if (auto animation_frame = context.advance_smooth_scroll_animations(frame_time); animation_frame.has_value())
             context.queue_present_frame(ContextState::PendingFrame::repainting_changes(*animation_frame));
         publish_pending_async_scroll_updates(context_id, context);
-        if (context.has_active_visual_animations()) {
+        if (context.visual_animations_need_frame()) {
             context.advance_visual_animations(frame_time);
-            // Visual animation damage deliberately covers the full viewport until we track the animated nodes' bounds
-            // before and after sampling.
             if (auto viewport_rect = context.viewport_rect_for_ui_overlay(); viewport_rect.has_value())
                 context.queue_present_frame(ContextState::PendingFrame::repainting_changes(*viewport_rect));
         }
 
         auto pending_present_frame = context.take_pending_present_frame_if_unblocked();
         if (!pending_present_frame.has_value()) {
-            has_active_animation_on_display = (context.has_active_smooth_scroll_animations() || context.has_active_visual_animations()) && display_id_for_context(context) == display_id;
+            has_active_animation_on_display = (context.has_active_smooth_scroll_animations() || context.visual_animations_need_frame()) && display_id_for_context(context) == display_id;
             if (context.has_pending_present_frame_scheduled_on(display_id) || has_active_animation_on_display)
                 vsync_scheduler_for_display(display_id).schedule(display_refresh_rate_for_context(context));
             continue;
         }
-        if (context.has_active_smooth_scroll_animations() || context.has_active_visual_animations())
+        if (context.has_active_smooth_scroll_animations() || context.visual_animations_need_frame())
             schedule_present_frame(context_id, context, ContextState::PendingFrame::repainting_changes(pending_present_frame->viewport_rect));
         present_frame(context_id, context, *pending_present_frame);
     }

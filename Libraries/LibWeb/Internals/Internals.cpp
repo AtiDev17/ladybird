@@ -1902,7 +1902,7 @@ Utf16String Internals::async_scrolling_state_wheel_routing_admission()
     return Utf16String::from_utf16(Compositor::wheel_routing_admission_to_utf16_view(admission));
 }
 
-static Compositor::WheelScrollAdmission wheel_scroll_admission_at(DOM::Document& document, double x, double y, double delta_x, double delta_y, bool precise, bool force_stale_wheel_event_regions)
+static Compositor::WheelScrollAdmission wheel_scroll_admission_at(DOM::Document& document, double x, double y, double delta_x, double delta_y, bool force_stale_wheel_event_regions)
 {
     auto snapshot = capture_async_scrolling_state(document);
     if (!snapshot.has_value())
@@ -1914,13 +1914,12 @@ static Compositor::WheelScrollAdmission wheel_scroll_admission_at(DOM::Document&
         snapshot->document->scroll_state_snapshot(),
         { static_cast<float>(x), static_cast<float>(y) },
         { static_cast<float>(delta_x), static_cast<float>(delta_y) },
-        Compositor::snap_container_handling_for(wheel_delta_precision_from(precise), ScrollGesturePhase::None),
         snapshot->state.has_blocking_wheel_event_listeners && !force_stale_wheel_event_regions);
 }
 
-bool Internals::async_scrolling_state_can_wheel_scroll_at(double x, double y, double delta_x, double delta_y, bool precise, bool force_stale_wheel_event_regions)
+bool Internals::async_scrolling_state_can_wheel_scroll_at(double x, double y, double delta_x, double delta_y, bool force_stale_wheel_event_regions)
 {
-    return wheel_scroll_admission_at(window().associated_document(), x, y, delta_x, delta_y, precise, force_stale_wheel_event_regions) == Compositor::WheelScrollAdmission::Accepted;
+    return wheel_scroll_admission_at(window().associated_document(), x, y, delta_x, delta_y, force_stale_wheel_event_regions) == Compositor::WheelScrollAdmission::Accepted;
 }
 
 static Utf16String wheel_scroll_admission_to_string(Compositor::WheelScrollAdmission admission)
@@ -1940,13 +1939,13 @@ static Utf16String wheel_scroll_admission_to_string(Compositor::WheelScrollAdmis
     VERIFY_NOT_REACHED();
 }
 
-Utf16String Internals::async_scrolling_state_wheel_scroll_admission_at(double x, double y, double delta_x, double delta_y, bool precise, bool force_stale_wheel_event_regions)
+Utf16String Internals::async_scrolling_state_wheel_scroll_admission_at(double x, double y, double delta_x, double delta_y, bool force_stale_wheel_event_regions)
 {
-    auto admission = wheel_scroll_admission_at(window().associated_document(), x, y, delta_x, delta_y, precise, force_stale_wheel_event_regions);
+    auto admission = wheel_scroll_admission_at(window().associated_document(), x, y, delta_x, delta_y, force_stale_wheel_event_regions);
     return wheel_scroll_admission_to_string(admission);
 }
 
-Utf16String Internals::async_scrolling_state_wheel_target_at(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase phase)
+Utf16String Internals::async_scrolling_state_wheel_target_at(double x, double y, double delta_x, double delta_y)
 {
     auto snapshot = capture_async_scrolling_state(window().associated_document());
     if (!snapshot.has_value())
@@ -1959,8 +1958,7 @@ Utf16String Internals::async_scrolling_state_wheel_target_at(double x, double y,
     auto target = scroll_tree.hit_test_scroll_node_for_wheel(
         snapshot->visual_context_tree,
         { static_cast<float>(x), static_cast<float>(y) },
-        { static_cast<float>(delta_x), static_cast<float>(delta_y) },
-        Compositor::snap_container_handling_for(wheel_delta_precision_from(precise), scroll_gesture_phase_from(phase)));
+        { static_cast<float>(delta_x), static_cast<float>(delta_y) });
     if (target.blocked_by_main_thread_region)
         return "main-thread"_utf16;
     if (target.blocked_by_wheel_event_region || !target.node_id.has_value())
@@ -2152,8 +2150,58 @@ static GC::Ref<JS::Object> async_scrolling_state_to_object(HTML::Window& window,
         MUST(scroll_nodes->create_data_property_or_throw(i, node));
     }
 
+    auto rect_to_object = [&](CSSPixelRect const& rect) {
+        auto rect_object = JS::Object::create(realm, nullptr);
+        rect_object->define_direct_property("x"_utf16_fly_string, JS::Value(rect.x().to_double()), JS::default_attributes);
+        rect_object->define_direct_property("y"_utf16_fly_string, JS::Value(rect.y().to_double()), JS::default_attributes);
+        rect_object->define_direct_property("width"_utf16_fly_string, JS::Value(rect.width().to_double()), JS::default_attributes);
+        rect_object->define_direct_property("height"_utf16_fly_string, JS::Value(rect.height().to_double()), JS::default_attributes);
+        return rect_object;
+    };
+    auto point_to_object = [&](CSSPixelPoint const& point) {
+        auto point_object = JS::Object::create(realm, nullptr);
+        point_object->define_direct_property("x"_utf16_fly_string, JS::Value(point.x().to_double()), JS::default_attributes);
+        point_object->define_direct_property("y"_utf16_fly_string, JS::Value(point.y().to_double()), JS::default_attributes);
+        return point_object;
+    };
+    auto keyword_to_string = [&](auto keyword) {
+        return JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(CSS::to_string(keyword)));
+    };
+
+    auto snap_containers = MUST(JS::Array::create(realm, state.snap_containers.size()));
+    for (size_t i = 0; i < state.snap_containers.size(); ++i) {
+        auto const& snap_container = state.snap_containers[i];
+        auto container = JS::Object::create(realm, nullptr);
+        container->define_direct_property("documentID"_utf16_fly_string, JS::Value(static_cast<double>(snap_container.node_id.document_id.value())), JS::default_attributes);
+        container->define_direct_property("scrollNodeIndex"_utf16_fly_string, JS::Value(snap_container.node_id.scroll_node_index.value()), JS::default_attributes);
+        container->define_direct_property("snapport"_utf16_fly_string, rect_to_object(snap_container.geometry.snapport), JS::default_attributes);
+        container->define_direct_property("minScrollOffset"_utf16_fly_string, point_to_object(snap_container.geometry.min_scroll_offset), JS::default_attributes);
+        container->define_direct_property("maxScrollOffset"_utf16_fly_string, point_to_object(snap_container.geometry.max_scroll_offset), JS::default_attributes);
+        container->define_direct_property("strictness"_utf16_fly_string, keyword_to_string(snap_container.geometry.strictness), JS::default_attributes);
+        container->define_direct_property("snapsX"_utf16_fly_string, JS::Value(snap_container.geometry.axes.x), JS::default_attributes);
+        container->define_direct_property("snapsY"_utf16_fly_string, JS::Value(snap_container.geometry.axes.y), JS::default_attributes);
+        container->define_direct_property("horizontalWritingMode"_utf16_fly_string, JS::Value(snap_container.geometry.horizontal_writing_mode), JS::default_attributes);
+
+        auto areas = MUST(JS::Array::create(realm, snap_container.areas.size()));
+        for (size_t area_index = 0; area_index < snap_container.areas.size(); ++area_index) {
+            auto const& snap_area = snap_container.areas[area_index];
+            auto area = JS::Object::create(realm, nullptr);
+            area->define_direct_property("nodeID"_utf16_fly_string, JS::Value(static_cast<double>(snap_area.identity.node_id.value())), JS::default_attributes);
+            area->define_direct_property("pseudoElementType"_utf16_fly_string, JS::Value(snap_area.identity.pseudo_element_type), JS::default_attributes);
+            area->define_direct_property("rect"_utf16_fly_string, rect_to_object(snap_area.rect), JS::default_attributes);
+            area->define_direct_property("alignX"_utf16_fly_string, keyword_to_string(snap_area.align_x), JS::default_attributes);
+            area->define_direct_property("alignY"_utf16_fly_string, keyword_to_string(snap_area.align_y), JS::default_attributes);
+            area->define_direct_property("alwaysStop"_utf16_fly_string, JS::Value(snap_area.always_stop), JS::default_attributes);
+            MUST(areas->create_data_property_or_throw(area_index, area));
+        }
+        container->define_direct_property("areas"_utf16_fly_string, areas, JS::default_attributes);
+        MUST(snap_containers->create_data_property_or_throw(i, container));
+    }
+
     object->define_direct_property("scrollNodeCount"_utf16_fly_string, JS::Value(state.scroll_nodes.size()), JS::default_attributes);
     object->define_direct_property("scrollNodes"_utf16_fly_string, scroll_nodes, JS::default_attributes);
+    object->define_direct_property("snapContainers"_utf16_fly_string, snap_containers, JS::default_attributes);
+    object->define_direct_property("devicePixelsPerCssPixel"_utf16_fly_string, JS::Value(state.device_pixels_per_css_pixel), JS::default_attributes);
     object->define_direct_property("hasBlockingWheelEventListeners"_utf16_fly_string, JS::Value(state.has_blocking_wheel_event_listeners), JS::default_attributes);
     object->define_direct_property("blockingWheelEventRegionCount"_utf16_fly_string, JS::Value(state.blocking_wheel_event_regions.size()), JS::default_attributes);
     object->define_direct_property("mainThreadWheelEventRegionCount"_utf16_fly_string, JS::Value(state.main_thread_wheel_event_regions.size()), JS::default_attributes);
