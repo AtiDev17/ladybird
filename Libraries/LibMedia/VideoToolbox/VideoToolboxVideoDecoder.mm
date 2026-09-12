@@ -648,6 +648,8 @@ VideoToolboxVideoDecoder::~VideoToolboxVideoDecoder()
     // Tearing down the session hands the media engine's remaining frames to the output callback, which touches
     // members that would otherwise already be gone by the time the session is destroyed.
     m_session.clear();
+
+    m_surface_pool->shed_storage();
 }
 
 DecoderErrorOr<void> VideoToolboxVideoDecoder::ensure_session_for_frame(CodedFrame const& coded_frame)
@@ -765,8 +767,12 @@ void VideoToolboxVideoDecoder::enqueue_decoded_output_while_locked(CodingIndepen
     if (m_decode_failure.has_value())
         return;
 
+    auto surface = surface_or_error.release_value();
+    auto surface_use = surface->begin_use();
+
     DecodedOutput output {
-        .surface = surface_or_error.release_value(),
+        .surface = move(surface),
+        .surface_use = move(surface_use),
         .timestamp = timestamp,
         .duration = duration,
         .size = { static_cast<int>(CVPixelBufferGetWidth(pixel_buffer)), static_cast<int>(CVPixelBufferGetHeight(pixel_buffer)) },

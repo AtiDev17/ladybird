@@ -16,12 +16,12 @@
 #include <LibGfx/YUVData.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/VideoFrameHandle.h>
+#include <LibMedia/VideoSurface.h>
 #include <LibSync/Mutex.h>
 
 namespace Media {
 
 class PooledVideoFrameSlot;
-class VideoSurface;
 
 // The identity and lifetime bookkeeping shared by every kind of frame pool. Each slot owns a shared-memory buffer
 // beginning with the acquisition ID that a remote consumer validates its handle against; what follows the ID is the
@@ -39,6 +39,10 @@ public:
     void add_hold(u32 slot_index);
     void release_hold(u32 slot_index);
 
+    // Marks each slot's storage for freeing when its hold count drops to zero. This marker is cleared upon the
+    // next acquire.
+    void shed_storage();
+
     // The buffer backing a held slot, for lending to consumer processes.
     Core::AnonymousBuffer slot_buffer(u32 slot_index) const;
 
@@ -52,7 +56,10 @@ protected:
 
     struct Slot {
         Core::AnonymousBuffer buffer;
+        // A slot keeps its surface once it has one, so that the decoder handing the same one back is recognized.
+        // Only the use says the pixels are live, and only a held slot has one.
         RefPtr<VideoSurface> surface;
+        VideoSurfaceUse surface_use;
         u64 last_slot_acquisition_id { 0 };
         u64 allocated_buffer_id { 0 };
         u32 hold_count { 0 };
@@ -61,7 +68,7 @@ protected:
     // Appends a slot with no payload, for a pool that has no free slot to reuse.
     Optional<u32> try_grow_while_locked();
 
-    virtual void slot_freed_while_locked(Slot&) { }
+    virtual void drop_slot_storage_while_locked(Slot&) = 0;
 
     u32 held_slot_count_while_locked() const;
     void publish_acquisition_while_locked(Slot&);
@@ -72,6 +79,7 @@ protected:
 private:
     VideoFramePoolID const m_id;
     Function<void()> m_slot_freed_callback;
+    bool m_shed_storage_on_release { false };
 };
 
 // A pool of shared-memory framebuffers that are allocated on demand up to a limited budget. Each slot's buffer fd must
@@ -95,22 +103,17 @@ public:
     Optional<AcquiredSlot> try_acquire(size_t byte_count);
     ErrorOr<NonnullRefPtr<PooledVideoFrameSlot>> try_adopt_acquired_slot(AcquiredSlot const&);
 
-    // Marks the buffers for freeing when their hold count drops to zero. This marker is cleared upon the next acquire.
-    void shed_buffers();
-
     size_t allocated_byte_count() const;
 
 private:
     explicit VideoFramePool(size_t byte_budget);
 
-    void slot_freed_while_locked(Slot&) override;
+    void drop_slot_storage_while_locked(Slot&) override;
 
-    void drop_slot_buffer_while_locked(Slot&);
     void free_excess_buffers_while_locked();
 
     size_t const m_byte_budget { 0 };
     size_t m_allocated_bytes { 0 };
-    bool m_shed_buffers_on_release { false };
 };
 
 // A pool of surfaces produced by a hardware decoder. The decoder allocates and recycles them, so this pool tracks
@@ -133,6 +136,8 @@ public:
 
 private:
     VideoFrameSurfacePool() = default;
+
+    void drop_slot_storage_while_locked(Slot&) override;
 
     HashMap<u32, u32> m_slot_indices_by_surface_id;
 };
@@ -182,6 +187,7 @@ public:
 private:
     Core::AnonymousBuffer m_slot_buffer;
     RefPtr<VideoSurface> m_surface;
+    VideoSurfaceUse m_surface_use;
     VideoFramePoolID m_pool_id { 0 };
     u32 m_slot_index { 0 };
     u64 m_slot_acquisition_id { 0 };
@@ -207,6 +213,7 @@ public:
 
     void notify_slot_announced(VideoFramePoolID, u32 slot_index, Core::AnonymousBuffer slot_buffer, RefPtr<VideoSurface> surface);
     void notify_pool_retired(VideoFramePoolID);
+    void notify_all_pools_retired();
 
     RefPtr<VideoFrame> resolve_frame(VideoFrameHandle const&, Function<void()> on_release) const;
 

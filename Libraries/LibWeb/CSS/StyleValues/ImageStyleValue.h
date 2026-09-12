@@ -79,6 +79,7 @@ public:
     static ValueComparingNonnullRefPtr<ImageStyleValue const> create(URL const&);
     static ValueComparingNonnullRefPtr<ImageStyleValue const> create(URL const&, Optional<::URL::URL> style_resource_base_url);
     static ValueComparingNonnullRefPtr<ImageStyleValue const> create(::URL::URL const&);
+    static ValueComparingNonnullRefPtr<ImageStyleValue const> adopt_rust_style_value_data(StyleValueFFI::StyleValueData const*);
     virtual ~ImageStyleValue() override;
 
     virtual void load_any_resources(DOM::Document&) override;
@@ -99,6 +100,7 @@ private:
     GC::Ptr<HTML::SharedResourceRequest> fetch_image(DOM::Document&) const;
     Optional<::URL::URL> resolved_url(DOM::Document const&) const;
     ::URL::URL style_resource_base_url(DOM::Document const&) const;
+    ImageStyleValueResource* resource_registered_by_clients(DOM::Document const&) const;
 
     // NB: StyleValue dispatches operations by type tag, so it may call private impls.
     friend class StyleValue;
@@ -114,6 +116,7 @@ private:
     Optional<::URL::URL> m_style_resource_base_url;
     Optional<bool> m_parent_style_sheet_origin_clean;
     bool m_should_absolutize_url_for_computed_value { false };
+    mutable Optional<::URL::URL> m_resolved_url;
 
     mutable HashTable<Client*> m_clients;
 };

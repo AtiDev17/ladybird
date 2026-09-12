@@ -106,6 +106,22 @@ void ImageStyleValueResource::notify_image_style_values_did_update()
         registration.key->notify_clients_did_update();
 }
 
+static HashMap<StyleValueFFI::StyleValueData const*, ImageStyleValue const*>& facades_by_rust_style_value_data()
+{
+    static auto& facades = *new HashMap<StyleValueFFI::StyleValueData const*, ImageStyleValue const*>;
+    return facades;
+}
+
+ValueComparingNonnullRefPtr<ImageStyleValue const> ImageStyleValue::adopt_rust_style_value_data(StyleValueFFI::StyleValueData const* data)
+{
+    if (auto facade = facades_by_rust_style_value_data().get(data); facade.has_value()) {
+        // The transferred reference duplicates the one the shared facade already holds.
+        StyleValueFFI::rust_style_value_release(data);
+        return **facade;
+    }
+    return adopt_ref(*new (nothrow) ImageStyleValue(data));
+}
+
 ValueComparingNonnullRefPtr<ImageStyleValue const> ImageStyleValue::create(URL const& url)
 {
     return adopt_ref(*new (nothrow) ImageStyleValue(url));
@@ -127,21 +143,27 @@ ImageStyleValue::ImageStyleValue(URL const& url, Optional<::URL::URL> style_reso
     , m_parent_style_sheet_origin_clean(parent_style_sheet_origin_clean)
     , m_should_absolutize_url_for_computed_value(should_absolutize_url_for_computed_value)
 {
+    facades_by_rust_style_value_data().set(m_value.data(), this);
 }
 
 ImageStyleValue::ImageStyleValue(StyleValueFFI::StyleValueData const* data)
     : AbstractImageStyleValue(Type::Image, data)
 {
     auto const& context = data->image.resource_context;
-    if (context.has_base_url) {
+    if (context.has_base_url)
         m_style_resource_base_url = DOMURL::parse(url_text_from_rust_data(context.base_url));
-    }
     if (context.has_parent_style_sheet_origin_clean)
         m_parent_style_sheet_origin_clean = context.parent_style_sheet_origin_clean;
     m_should_absolutize_url_for_computed_value = context.should_absolutize_url_for_computed_value;
+    facades_by_rust_style_value_data().set(m_value.data(), this);
 }
 
-ImageStyleValue::~ImageStyleValue() = default;
+ImageStyleValue::~ImageStyleValue()
+{
+    auto& facades = facades_by_rust_style_value_data();
+    if (auto it = facades.find(m_value.data()); it != facades.end() && it->value == this)
+        facades.remove(it);
+}
 
 GC::Ptr<HTML::SharedResourceRequest> ImageStyleValue::fetch_image(DOM::Document& document) const
 {
@@ -157,13 +179,26 @@ GC::Ptr<HTML::SharedResourceRequest> ImageStyleValue::fetch_image(DOM::Document&
 
 void ImageStyleValue::load_any_resources(DOM::Document& document)
 {
+    if (resource_registered_by_clients(document))
+        return;
+    if (auto resolved_url = this->resolved_url(document); resolved_url.has_value() && document.css_image_resource(*resolved_url))
+        return;
     fetch_image(document);
+}
+
+ImageStyleValueResource* ImageStyleValue::resource_registered_by_clients(DOM::Document const& document) const
+{
+    for (auto const* client : m_clients) {
+        if (client->m_resource && client->document().ptr() == &document)
+            return client->m_resource;
+    }
+    return nullptr;
 }
 
 void ImageStyleValue::set_style_sheet(StyleSheetState* style_sheet)
 {
-
     m_style_resource_base_url.clear();
+    m_resolved_url.clear();
     m_parent_style_sheet_origin_clean.clear();
     m_should_absolutize_url_for_computed_value = false;
 
@@ -176,6 +211,7 @@ void ImageStyleValue::set_style_sheet(StyleSheetState* style_sheet)
 void ImageStyleValue::update_style_sheet_resource_context(StyleSheetState const& style_sheet)
 {
     m_style_resource_base_url = style_sheet.style_resource_base_url();
+    m_resolved_url.clear();
     m_parent_style_sheet_origin_clean = style_sheet.is_origin_clean();
     m_should_absolutize_url_for_computed_value = true;
 }
@@ -225,19 +261,22 @@ void ImageStyleValue::register_client(Client& client) const
     if (!document)
         return;
 
-    auto resolved_url = this->resolved_url(*document);
-    if (!resolved_url.has_value())
-        return;
-
-    ImageStyleValueResource* resource = document->css_image_resource(*resolved_url);
+    auto* resource = resource_registered_by_clients(*document);
     if (!resource) {
-        auto resource_request = fetch_image(*document);
+        auto resolved_url = this->resolved_url(*document);
+        if (!resolved_url.has_value())
+            return;
 
-        // NB: This can only fail if the URL is invalid or ResourceLoader is not initialized, neither of which should be
-        //     the case here.
-        VERIFY(resource_request);
+        resource = document->css_image_resource(*resolved_url);
+        if (!resource) {
+            auto resource_request = fetch_image(*document);
 
-        resource = &document->create_css_image_resource(*resource_request);
+            // NB: This can only fail if the URL is invalid or ResourceLoader is not initialized, neither of which should be
+            //     the case here.
+            VERIFY(resource_request);
+
+            resource = &document->create_css_image_resource(*resource_request);
+        }
     }
 
     resource->register_image_style_value(*this);
@@ -258,9 +297,9 @@ void ImageStyleValue::unregister_client(Client& client) const
     if (!document)
         return;
 
-    auto url = resource->url();
     resource->unregister_image_style_value(*this);
-    document->remove_css_image_resource_if_unused(url);
+    if (resource->can_be_removed())
+        document->remove_css_image_resource_if_unused(resource->url());
 }
 
 void ImageStyleValue::notify_clients_did_update() const
@@ -271,11 +310,18 @@ void ImageStyleValue::notify_clients_did_update() const
 
 Optional<::URL::URL> ImageStyleValue::resolved_url(DOM::Document const& document) const
 {
+    if (m_resolved_url.has_value())
+        return m_resolved_url;
+
     auto url = url_text_from_rust_data(m_value->image.url);
     if (url.is_empty())
         return {};
 
-    return DOMURL::parse(url, style_resource_base_url(document));
+    auto resolved_url = DOMURL::parse(url, style_resource_base_url(document));
+    // A value without a base URL of its own follows the document's base URL as that changes.
+    if (m_style_resource_base_url.has_value())
+        m_resolved_url = resolved_url;
+    return resolved_url;
 }
 
 ::URL::URL ImageStyleValue::style_resource_base_url(DOM::Document const& document) const

@@ -198,7 +198,7 @@ TEST_CASE(excess_free_buffers_are_dropped_to_fit_the_budget)
     EXPECT(pool->allocated_byte_count() <= slot_buffer_size * Media::VideoFramePool::MIN_SLOT_COUNT);
 }
 
-TEST_CASE(shed_buffers_frees_all_but_held_slots)
+TEST_CASE(shed_storage_frees_all_but_held_slots)
 {
     auto pool = make_pool();
     auto held = pool->try_acquire(resolved_frame_byte_count()).release_value();
@@ -209,7 +209,7 @@ TEST_CASE(shed_buffers_frees_all_but_held_slots)
     auto released = pool->try_acquire(FRAME_BYTE_COUNT).release_value();
     pool->release_hold(released.index);
 
-    pool->shed_buffers();
+    pool->shed_storage();
 
     // Only the held slot's buffer remains, and it still resolves.
     EXPECT_EQ(pool->allocated_byte_count(), measured_slot_buffer_size(resolved_frame_byte_count()));
@@ -234,7 +234,7 @@ TEST_CASE(acquisition_ends_shedding_of_held_buffers)
     auto pool = make_pool();
     auto held = pool->try_acquire(FRAME_BYTE_COUNT).release_value();
 
-    pool->shed_buffers();
+    pool->shed_storage();
 
     // An acquisition returns the pool to service, so the buffer held through the shed is
     // recycled rather than freed when its hold releases.
@@ -588,6 +588,82 @@ TEST_CASE(surface_pool_keeps_a_recycled_surface_on_its_slot)
     EXPECT_EQ(second.index, first.index);
     EXPECT_EQ(second.allocated_buffer_id, first.allocated_buffer_id);
     EXPECT_NE(second.slot_acquisition_id, first.slot_acquisition_id);
+}
+
+TEST_CASE(surface_pool_stops_using_a_surface_once_its_holds_run_out)
+{
+    auto pool = MUST(Media::VideoFrameSurfacePool::create());
+    auto surface = make_surface();
+
+    auto first = pool->try_acquire(surface).value();
+    EXPECT(surface->is_in_use());
+
+    pool->release_hold(first.index);
+
+    // The decoder is free to decode into it again, which it can only be recognized for having done because the
+    // slot kept hold of the surface through it.
+    EXPECT(!surface->is_in_use());
+
+    auto second = pool->try_acquire(surface).value();
+    EXPECT(surface->is_in_use());
+    EXPECT_EQ(second.index, first.index);
+    EXPECT_EQ(second.allocated_buffer_id, first.allocated_buffer_id);
+}
+
+TEST_CASE(a_resolved_frame_keeps_using_a_surface_its_slot_has_released)
+{
+    auto pool = MUST(Media::VideoFrameSurfacePool::create());
+    auto surface = make_surface();
+    auto acquired = pool->try_acquire(surface).value();
+
+    auto directory = Media::VideoFrameSlotDirectory::create();
+    directory->notify_slot_announced(pool->id(), acquired.index, pool->slot_buffer(acquired.index), pool->slot_surface(acquired.index));
+
+    auto handle = Media::VideoFrameHandle {
+        .pool_id = pool->id(),
+        .slot_index = acquired.index,
+        .slot_acquisition_id = acquired.slot_acquisition_id,
+        .timestamp = AK::Duration::from_milliseconds(40),
+        .duration = AK::Duration::from_milliseconds(20),
+        .size = { 16, 16 },
+        .bit_depth = 8,
+        .subsampling = Media::Subsampling(true, true),
+        .cicp = {},
+    };
+    auto frame = directory->resolve_frame(handle, [] { });
+    EXPECT(frame != nullptr);
+
+    // A lend can be released from under a frame, so the frame is what has to say it is still reading the pixels.
+    pool->release_hold(acquired.index);
+    EXPECT(surface->is_in_use());
+
+    frame = nullptr;
+    EXPECT(!surface->is_in_use());
+}
+
+TEST_CASE(shed_storage_releases_surfaces_as_their_holds_run_out)
+{
+    auto pool = MUST(Media::VideoFrameSurfacePool::create());
+    auto held_surface = make_surface();
+    auto free_surface = make_surface();
+
+    auto held = pool->try_acquire(held_surface).value();
+    auto freed = pool->try_acquire(free_surface).value();
+    pool->release_hold(freed.index);
+
+    pool->shed_storage();
+
+    // Nothing but this test refers to a surface the pool has let go of, while the held one is still being read.
+    EXPECT_EQ(free_surface->ref_count(), 1u);
+    EXPECT(held_surface->is_in_use());
+
+    pool->release_hold(held.index);
+    EXPECT_EQ(held_surface->ref_count(), 1u);
+    EXPECT(!held_surface->is_in_use());
+
+    // The identities went with them, so a surface the pool held through the shed is a stranger to it again.
+    auto reacquired = pool->try_acquire(held_surface).value();
+    EXPECT_NE(reacquired.allocated_buffer_id, held.allocated_buffer_id);
 }
 
 TEST_CASE(surface_pool_gives_distinct_surfaces_distinct_slots)
