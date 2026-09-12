@@ -168,12 +168,8 @@ void ViewImplementation::set_url(URL::URL url)
     if (m_url == url)
         return;
 
-    auto previous_host = current_host();
     m_url = move(url);
     update_bookmark_action();
-
-    if (current_host() != previous_host)
-        apply_zoom_for_current_host();
 
     if (on_url_change)
         on_url_change(m_url);
@@ -2080,9 +2076,10 @@ void ViewImplementation::update_zoom()
 
 String ViewImplementation::current_host() const
 {
-    if (!m_url.host().has_value())
+    auto const& state = m_top_level_traversable.replicated_state();
+    if (!state.has_value() || !state->active_document_url.host().has_value())
         return {};
-    return m_url.serialized_host();
+    return state->active_document_url.serialized_host();
 }
 
 void ViewImplementation::apply_zoom_for_current_host()
@@ -2113,8 +2110,12 @@ void ViewImplementation::handle_resize()
 
 void ViewImplementation::initialize_client(CreateNewClient create_new_client, Optional<Web::HTML::CrossProcessId> initial_document_state_id)
 {
-    if (create_new_client == CreateNewClient::Yes)
+    if (create_new_client == CreateNewClient::Yes) {
         fail_pending_debugger_requests();
+        // NB: The replacement process has no hovered link and cannot clear the outgoing page's status label.
+        if (on_link_unhover)
+            on_link_unhover();
+    }
     if (m_debugger_paused) {
         set_debugger_paused(false);
         if (on_debugger_resumed)
@@ -2162,7 +2163,8 @@ void ViewImplementation::initialize_client(CreateNewClient create_new_client, Op
     client().async_set_zoom_level(m_client_state.page_index, m_zoom_level);
     client().async_set_viewport(m_client_state.page_index, viewport_size(), m_device_pixel_ratio, m_is_fullscreen);
     client().async_set_maximum_frames_per_second(m_client_state.page_index, m_maximum_frames_per_second);
-    client().async_update_visibility_state(m_client_state.page_index, m_top_level_traversable.id(), m_top_level_traversable.system_visibility_state());
+    if (m_client_state.hosts_committed_entry)
+        client().async_update_visibility_state(m_client_state.page_index, m_top_level_traversable.id(), m_top_level_traversable.system_visibility_state());
     auto compositor_context_id = client().compositor_context_id_for_page(m_client_state.page_index);
     Application::the().update_compositor_viewport(compositor_context_id, viewport_size().to_type<int>());
     Application::the().update_compositor_context_visibility(compositor_context_id, m_top_level_traversable.system_visibility_state());

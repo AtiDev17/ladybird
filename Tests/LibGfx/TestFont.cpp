@@ -17,6 +17,7 @@
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibTest/TestCase.h>
+#include <core/SkTypeface.h>
 #include <harfbuzz/hb.h>
 
 #define TEST_INPUT(x) ("test-inputs/" x)
@@ -58,6 +59,24 @@ TEST_CASE(monochrome_emoji_font_is_not_emoji_font)
 TEST_CASE(text_font_is_not_emoji_font)
 {
     EXPECT(!font_is_emoji(TEST_INPUT("fonts/text.ttf"sv)));
+}
+
+TEST_CASE(skia_typeface_retains_font_data_after_ladybird_typeface_is_destroyed)
+{
+    sk_sp<SkTypeface const> skia_typeface;
+    ByteBuffer expected_table;
+    constexpr auto cmap_tag = SkSetFourByteTag('c', 'm', 'a', 'p');
+    {
+        auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/text.ttf"sv)));
+        auto typeface = MUST(Gfx::Typeface::try_load_from_temporary_memory(file->bytes()));
+        skia_typeface = sk_ref_sp(static_cast<Gfx::TypefaceSkia const&>(*typeface).sk_typeface());
+        expected_table = MUST(ByteBuffer::create_uninitialized(skia_typeface->getTableSize(cmap_tag)));
+        EXPECT(!expected_table.is_empty());
+        EXPECT_EQ(skia_typeface->getTableData(cmap_tag, 0, expected_table.size(), expected_table.data()), expected_table.size());
+    }
+    auto actual_table = MUST(ByteBuffer::create_uninitialized(expected_table.size()));
+    EXPECT_EQ(skia_typeface->getTableData(cmap_tag, 0, actual_table.size(), actual_table.data()), actual_table.size());
+    EXPECT_EQ(actual_table, expected_table);
 }
 
 static NonnullRefPtr<Gfx::Font> load_text_font(float point_size)
@@ -196,6 +215,61 @@ TEST_CASE(pending_font_does_not_load_fallback_fonts)
     cascade->set_last_resort_font(font);
     EXPECT_EQ(&cascade->font_for_code_point('a'), font.ptr());
     EXPECT_EQ(fallback_loads, 0u);
+}
+
+TEST_CASE(pending_font_can_resolve_synchronously_without_loading_fallbacks)
+{
+    auto local_font = load_text_font(24);
+    auto fallback_font = load_text_font(16);
+    auto cascade = Gfx::FontCascadeList::create();
+    u32 local_loads = 0;
+    u32 fallback_loads = 0;
+    cascade->add_pending_face({ { 'a', 'a' } }, [&] {
+        ++local_loads;
+        return Gfx::PendingFontState::Invisible; }, [local_font] { return local_font; });
+    cascade->add_pending_face({ { 'a', 'a' } }, [&] {
+        ++fallback_loads;
+        return Gfx::PendingFontState::Invisible;
+    });
+    cascade->add(fallback_font);
+    cascade->set_last_resort_font(fallback_font);
+    EXPECT_EQ(&cascade->font_for_code_point('b'), fallback_font.ptr());
+    EXPECT_EQ(local_loads, 0u);
+    EXPECT_EQ(&cascade->font_for_code_point('a'), local_font.ptr());
+    EXPECT_EQ(&cascade->font_for_code_point('a'), local_font.ptr());
+    EXPECT_EQ(local_loads, 1u);
+    EXPECT_EQ(fallback_loads, 0u);
+}
+
+TEST_CASE(first_available_font_resolves_resident_faces_in_cascade_order)
+{
+    auto local_font = load_text_font(24);
+    auto fallback_font = load_text_font(16);
+    auto cascade = Gfx::FontCascadeList::create();
+    bool resident = false;
+    u32 excluded_loads = 0;
+    u32 fallback_loads = 0;
+    cascade->add_pending_face({ { 'a', 'a' } }, [&] {
+        ++excluded_loads;
+        return Gfx::PendingFontState::Invisible;
+    });
+    cascade->add_pending_face({ { ' ', ' ' } }, [] { return Gfx::PendingFontState::Invisible; }, [&]() -> RefPtr<Gfx::Font const> { return resident ? local_font.ptr() : nullptr; });
+    cascade->add_pending_face({ { 0, 0x10FFFF } }, [&] {
+        ++fallback_loads;
+        return Gfx::PendingFontState::Visible;
+    });
+    cascade->add(fallback_font);
+    cascade->set_last_resort_font(fallback_font);
+    EXPECT_EQ(&cascade->first_available_font(), fallback_font.ptr());
+    resident = true;
+    EXPECT_EQ(&cascade->first_available_font(), local_font.ptr());
+    EXPECT_EQ(excluded_loads, 0u);
+    EXPECT_EQ(fallback_loads, 0u);
+
+    auto preferred = Gfx::FontCascadeList::create();
+    preferred->add(fallback_font);
+    preferred->extend(*cascade);
+    EXPECT_EQ(&preferred->first_available_font(), fallback_font.ptr());
 }
 
 TEST_CASE(loaded_font_precedes_pending_font_after_extending_cascade)
