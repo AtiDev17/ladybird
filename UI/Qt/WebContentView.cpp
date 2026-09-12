@@ -156,6 +156,7 @@ WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient
 #else
         schedule_repaint();
 #endif
+        emit ready_to_paint();
     };
 
     on_cursor_change = [this](auto cursor) {
@@ -682,7 +683,7 @@ void WebContentView::wheelEvent(QWheelEvent* event)
         return;
     }
 
-    if (event->modifiers().testFlag(Qt::ControlModifier)) {
+    if (event->modifiers().testFlag(Qt::ControlModifier) && !wheel_event_scrolls_continuously(*event)) {
         event->ignore();
         return;
     }

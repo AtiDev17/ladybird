@@ -6,6 +6,8 @@ set(SOURCES
     AutocompleteMuxer.cpp
     AutocompleteRanker.cpp
     AutocompleteService.cpp
+    BlobURLStore.cpp
+    BrowsingSession.cpp
     BookmarkStore.cpp
     CanonicalBrowsingContext.cpp
     CanonicalBrowsingContextGroup.cpp
@@ -41,7 +43,6 @@ set(SOURCES
     Omnibox.cpp
     OmniboxEngagement.cpp
     Plugins/ImageCodecPlugin.cpp
-    PrivateBrowsing.cpp
     Process.cpp
     ProcessHandle.cpp
     ProcessManager.cpp
@@ -129,13 +130,32 @@ compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebDriver/WebDriverBrowserServer.ipc
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebUIClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebUIServerEndpoint.h)
 
-add_custom_target(generate_build_information
-    COMMAND ${Python3_EXECUTABLE} ${LADYBIRD_SOURCE_DIR}/Meta/generate-build-information.py
-        ${LADYBIRD_SOURCE_DIR} ${CMAKE_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR}/BuildInformation.h
+set(build_information_header "${CMAKE_CURRENT_BINARY_DIR}/BuildInformation.h")
+set(build_information_stamp "${CMAKE_CURRENT_BINARY_DIR}/BuildInformation.stamp")
+set(build_information_depfile "${CMAKE_CURRENT_BINARY_DIR}/BuildInformation.d")
+set(build_information_generator "${LADYBIRD_SOURCE_DIR}/Meta/Generators/generate-build-information.py")
+
+add_custom_command(
+    COMMAND
+        "${Python3_EXECUTABLE}" "${build_information_generator}"
+        "${LADYBIRD_SOURCE_DIR}" "${CMAKE_BINARY_DIR}" "${build_information_header}"
         "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
-    BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/BuildInformation.h
+        --depfile "${build_information_depfile}"
+        --stamp "${build_information_stamp}"
+    COMMAND
+        ${CMAKE_COMMAND} -E touch "${build_information_stamp}"
+    DEPENDS
+        "${build_information_generator}"
+        "${LADYBIRD_BUILD_HEAD}"
+        "${LADYBIRD_BUILD_HEAD_LOG}"
+        "${CMAKE_BINARY_DIR}/CMakeCache.txt"
+        "${CMAKE_BINARY_DIR}/compile_commands.json"
+    DEPFILE "${build_information_depfile}"
+    OUTPUT "${build_information_stamp}"
+    BYPRODUCTS "${build_information_header}"
     VERBATIM
 )
+add_custom_target(generate_build_information DEPENDS ${build_information_stamp})
 
 ladybird_lib(LibWebView webview EXPLICIT_SYMBOL_EXPORT)
 add_dependencies(LibWebView generate_build_information)

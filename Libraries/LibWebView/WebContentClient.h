@@ -49,9 +49,10 @@
 #include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWeb/Page/ViewportIsFullscreen.h>
 #include <LibWeb/StorageAPI/StorageEndpoint.h>
+#include <LibWebView/BlobURLStore.h>
+#include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Debugger.h>
 #include <LibWebView/Forward.h>
-#include <LibWebView/PrivateBrowsing.h>
 #include <WebContent/WebContentClientEndpoint.h>
 #include <WebContent/WebContentServerEndpoint.h>
 
@@ -78,11 +79,17 @@ public:
     virtual Messages::WebContentClient::MatchLocalFontResponse match_local_font(String name) override;
     virtual Messages::WebContentClient::MatchSystemFontForCodePointResponse match_system_font_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) override;
     virtual Messages::WebContentClient::ResolveGenericFontResponse resolve_generic_font(String family, u16 weight, u8 slope) override;
+    virtual Messages::WebContentClient::DidAddBlobUrlEntryResponse did_add_blob_url_entry(Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) override;
+    virtual void did_remove_blob_url_entries(Vector<Utf16String> urls, URL::Origin origin) override;
+    virtual void did_retain_blob_url_token(Web::HTML::CrossProcessId navigable_id, URL::BlobURLEntry::Token token) override;
+    virtual Messages::WebContentClient::DidRequestBlobUrlEntryResponse did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) override;
 
     WebContentClient(NonnullOwnPtr<IPC::Transport>, IsPrivate, u64 initial_page_id, Web::HTML::CrossProcessId root_navigable_id);
     ~WebContentClient();
 
     IsPrivate is_private() const { return m_is_private; }
+    BrowsingSession& session() const { return *m_session; }
+    void remove_blob_url_entries();
 
     void assign_view(Badge<Application>, ViewImplementation&);
     void set_initial_top_level_history_entry(Badge<Application>, Web::HTML::SessionHistoryEntryDescriptor entry) { m_initial_top_level_history_entry = move(entry); }
@@ -323,6 +330,7 @@ private:
     void fail_renderer_owned_downloads();
 
     IsPrivate m_is_private { IsPrivate::No };
+    RefPtr<BrowsingSession> m_session;
     bool m_process_lost { false };
 
     HashMap<u64, NonnullRawPtr<ViewImplementation>> m_views;

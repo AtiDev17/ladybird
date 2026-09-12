@@ -17,7 +17,7 @@
 #include <LibGfx/Rect.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Forward.h>
-#include <LibWebView/PrivateBrowsing.h>
+#include <LibWebView/BrowsingSession.h>
 #include <LibWebView/ViewImplementation.h>
 
 #include <QPixmap>
@@ -129,6 +129,7 @@ public:
     QPoint map_point_to_global_position(Gfx::IntPoint) const;
 
 signals:
+    void ready_to_paint();
     void urls_dropped(QList<QUrl> const&);
 
 private:
