@@ -345,14 +345,14 @@ void Internals::gc()
 
 void Internals::gc_async(GC::Ref<WebIDL::Promise> promise)
 {
-    auto& realm = window().principal_realm();
-
-    // Queue a task so that the collection runs outside the JS execution context.
-    HTML::queue_a_task(HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(GC::Heap::the(), [&realm, promise] {
+    // Queue a LibCore event to run the collection, so that it runs outside the JS execution context with as small a
+    // stack as possible.
+    Core::deferred_invoke([promise = GC::make_root(promise)] {
+        auto& realm = WebIDL::promise_realm(*promise);
         HTML::TemporaryExecutionContext execution_context { realm };
         realm.vm().heap().collect_garbage();
-        WebIDL::resolve_promise(promise);
-    }));
+        WebIDL::resolve_promise(*promise);
+    });
 }
 
 WebIDL::ExceptionOr<void> Internals::mark_as_garbage(Utf16String const& variable_name)
@@ -2129,7 +2129,7 @@ GC::Ref<JS::Object> Internals::style_invalidation_counters_object() const
     object->define_direct_property("customPropertyCycleParticipants"_utf16_fly_string, JS::Value(counters.custom_property_cycle_participants), JS::default_attributes);
     object->define_direct_property("styleCascadeMicroseconds"_utf16_fly_string, JS::Value(counters.style_cascade_microseconds), JS::default_attributes);
     object->define_direct_property("styleValuesMicroseconds"_utf16_fly_string, JS::Value(counters.style_values_microseconds), JS::default_attributes);
-    object->define_direct_property("scrollableOverflowRecalculations"_utf16_fly_string, JS::Value(counters.scrollable_overflow_recalculations), JS::default_attributes);
+    object->define_direct_property("scrollableOverflowRecalculations"_utf16_fly_string, JS::Value(Layout::RustFFI::layout_arena_scrollable_overflow_recalculation_count(document.layout_node_arena().handle(), false)), JS::default_attributes);
     return object;
 }
 

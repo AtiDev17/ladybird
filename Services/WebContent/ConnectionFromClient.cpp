@@ -2807,11 +2807,6 @@ void ConnectionFromClient::broadcast_channel_message(Web::HTML::BroadcastChannel
     Web::HTML::BroadcastChannel::deliver_message_locally(message);
 }
 
-void ConnectionFromClient::did_worker_agent_finish_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token)
-{
-    Web::HTML::WorkerAgentParent::did_finish_loading_worker_script(owner_token);
-}
-
 void ConnectionFromClient::did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     Web::HTML::WorkerAgentParent::did_fail_loading_worker_script(owner_token);
@@ -2825,6 +2820,11 @@ void ConnectionFromClient::did_worker_agent_report_exception(Web::HTML::WorkerAg
 void ConnectionFromClient::did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     Web::HTML::WorkerAgentParent::did_close_worker(owner_token);
+}
+
+void ConnectionFromClient::did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token)
+{
+    Web::HTML::WorkerAgentParent::did_worker_agent_die(owner_token);
 }
 
 // https://html.spec.whatwg.org/multipage/speculative-loading.html#nav-traversal-ui:close-a-top-level-traversable

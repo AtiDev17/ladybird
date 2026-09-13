@@ -208,7 +208,6 @@
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/IntersectionObserver/IntersectionObserver.h>
-#include <LibWeb/Layout/AnonymousBoxStyle.h>
 #include <LibWeb/Layout/BlockContainer.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/NodeArena.h>
@@ -656,23 +655,11 @@ Layout::NodeArena& Document::layout_node_arena()
         m_layout_node_arena = make_ref_counted<Layout::NodeArena>();
         m_layout_node_arena->set_document({}, this);
         Layout::RustFFI::FfiStyleRecordHostCallbacks style_record_host_callbacks {
+            .style_engine = style_computer().style_engine().rust_handle(),
             .context = this,
-            .derive_anonymous_style_record = [](void* context, u64 parent_style_record, Layout::RustFFI::FfiAnonymousStyleKind kind, Layout::RustFFI::FfiAnonymousStyleOverrides overrides) -> Layout::RustFFI::FfiDerivedStyleRecord {
-                auto& style_computer = static_cast<Document*>(context)->style_computer();
-                auto style_record = Layout::derive_pinned_anonymous_box_style_record(style_computer, CSS::StyleRecordID { parent_style_record }, kind, overrides);
-                return { .record = style_record.value(), .payloads = style_computer.style_record_payloads(style_record) };
+            .shell_style_changed = [](void*, void* shell, u64 record, void const* payloads, bool attach_resources) {
+                as<Layout::NodeWithStyle>(*static_cast<Layout::Node*>(shell)).refresh_style_from_arena(CSS::StyleRecordID { record }, payloads, attach_resources);
             },
-            .reinherit_anonymous_style_record = [](void* context, u64 style_record, u64 parent_style_record) -> Layout::RustFFI::FfiDerivedStyleRecord {
-                auto& style_computer = static_cast<Document*>(context)->style_computer();
-                auto reinherited_style_record = Layout::reinherit_pinned_anonymous_box_style_record(style_computer, CSS::StyleRecordID { style_record }, CSS::StyleRecordID { parent_style_record });
-                return { .record = reinherited_style_record.value(), .payloads = style_computer.style_record_payloads(reinherited_style_record) };
-            },
-            .unpin_style_record = [](void* context, u64 style_record) { static_cast<Document*>(context)->style_computer().unpin_style_record(CSS::StyleRecordID { style_record }); },
-            .reinherit_owned_anonymous_box_style = [](void*, void* shell, u64 parent_style_record) -> bool {
-                return as<Layout::NodeWithStyle>(*static_cast<Layout::Node*>(shell)).reinherit_owned_computed_values_from(CSS::StyleRecordID { parent_style_record });
-            },
-            .reset_table_box_style_used_by_wrapper = [](void*, void* table_box_shell) { as<Layout::Box>(*static_cast<Layout::Node*>(table_box_shell)).reset_table_box_computed_values_used_by_wrapper_to_init_values(); },
-            .shell_style_changed = [](void*, void* shell) { as<Layout::NodeWithStyle>(*static_cast<Layout::Node*>(shell)).refresh_style_from_arena(); },
         };
         Layout::RustFFI::layout_arena_set_style_record_host_callbacks(m_layout_node_arena->handle(), style_record_host_callbacks);
         Layout::RustFFI::layout_arena_set_shell_factory(m_layout_node_arena->handle(), this, [](void* context, Layout::RustFFI::NodeSlotId slot, Layout::RustFFI::NodeKind kind) {
@@ -707,6 +694,8 @@ Layout::NodeArena& Document::layout_node_arena()
 void Document::reset_style_invalidation_counters() const
 {
     m_style_invalidation_counters = {};
+    if (m_layout_node_arena)
+        Layout::RustFFI::layout_arena_scrollable_overflow_recalculation_count(m_layout_node_arena->handle(), true);
     CSS::reset_longhand_wrappers_minted();
 }
 
@@ -1526,8 +1515,6 @@ void Document::tear_down_layout_tree()
     if (auto* layout_root = exchange(m_layout_root, nullptr))
         layout_node_arena().free_subtree(Layout::Node::slot_id(layout_root));
     m_paint_state = nullptr;
-    if (m_layout_node_arena)
-        Layout::RustFFI::layout_arena_clear_scrollable_overflow_contained_boxes(m_layout_node_arena->handle());
     m_needs_full_layout_tree_update = true;
 }
 
@@ -1875,41 +1862,17 @@ void Document::end_style_stabilization_epoch()
     m_animations_created_in_stabilization_epoch.clear();
 }
 
-static void relayout_subtree(Layout::Box& subtree_root)
-{
-    Layout::LayoutRustBridge bridge;
-    // Absolutely positioned boundaries re-resolve their own size and position by replaying
-    // their layout from saved inputs; SVG root boundaries keep the frozen geometry saved at
-    // the previous commit. The commit sink resolves the committed row to splice out in either
-    // path.
-    if (subtree_root.is_absolutely_positioned()) {
-        VERIFY(subtree_root.has_saved_abspos_layout_inputs());
-        bridge.replay_saved_abspos_layout(subtree_root);
-    } else {
-        bridge.compute_subtree_layout(subtree_root);
-    }
-}
-
 // Refreshes every structure derived from committed layout results, shared by the partial and
 // full layout paths so neither can forget one.
-void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, LayoutCommitScope layout_commit_scope)
+void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed)
 {
     // NB: Called during layout update.
     m_layout_root->invalidate_text_blocks_cache();
 
     set_needs_to_record_display_list();
 
-    // A commit that changed the tree can have replaced boxes referenced by the cached
-    // contained-boxes index; refresh it before overflow measurement follows them. A pending full
-    // recalculation rebuilds the index inside its own measurement traversal instead.
-    if (layout_tree_changed == LayoutTreeChanged::Yes && !Layout::RustFFI::layout_arena_needs_full_scrollable_overflow_recalculation(layout_node_arena().handle()))
-        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root));
-    if (layout_commit_scope == LayoutCommitScope::Full)
-        update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit);
-    else
-        update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::HandledByAfterLayoutCommit);
-
     set_needs_accumulated_visual_contexts_update(true);
+    prepare_for_rendering();
 
     // A tree update can replace layout nodes referenced by selection state.
     if (auto range = get_selection()->range())
@@ -2153,12 +2116,13 @@ Document::PartialRelayoutResult Document::try_partial_relayout(Vector<Layout::Ru
     }
 
     layout_node_arena().sync_enrolled_content_for_layout();
+    Layout::LayoutRustBridge bridge;
     for (auto* root : partial_relayout_roots)
-        relayout_subtree(*root);
+        bridge.compute_subtree_layout(*root);
 
     ++m_partial_layout_count;
 
-    after_layout_commit(layout_tree_was_built_in_partial_branch ? LayoutTreeChanged::Yes : LayoutTreeChanged::No, LayoutCommitScope::Subtree);
+    after_layout_commit(layout_tree_was_built_in_partial_branch ? LayoutTreeChanged::Yes : LayoutTreeChanged::No);
     if (needs_style_update_after_layout() || !layout_is_up_to_date())
         return PartialRelayoutResult::NeedsAnotherLayoutPass;
     return PartialRelayoutResult::Done;
@@ -2222,7 +2186,7 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
             && reason == UpdateLayoutReason::InspectDevToolsLayoutData;
 
         if (layout_is_up_to_date() && !force_devtools_layout_data_collection) {
-            update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::UpdateAfterMeasure);
+            prepare_for_rendering();
             return;
         }
 
@@ -2280,7 +2244,7 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
         style_invalidation_counters().relayouts_performed++;
         ++m_full_layout_count;
 
-        after_layout_commit(LayoutTreeChanged::Yes, LayoutCommitScope::Full);
+        after_layout_commit(LayoutTreeChanged::Yes);
 
         if constexpr (UPDATE_LAYOUT_DEBUG) {
             dbgln("LAYOUT {} {} µs", to_string(reason), timer.elapsed_time().to_microseconds());
@@ -2633,7 +2597,7 @@ void Document::finish_animated_style_update()
         effect->request_observation_sample();
 }
 
-void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates derived_structure_updates)
+void Document::prepare_for_rendering()
 {
     if (!m_layout_node_arena)
         return;
@@ -2654,39 +2618,21 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
         });
     }
 
-    auto outcome = Painting::rust_update_scrollable_overflow(*this,
-        derived_structure_updates == ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit);
-    if (!outcome.performed_recalculation)
-        return;
-
-    style_invalidation_counters().scrollable_overflow_recalculations++;
-
-    if (derived_structure_updates != ScrollableOverflowDerivedStructureUpdates::UpdateAfterMeasure)
-        return;
-
-    // Nothing derived from scrollable overflow needs updating. In particular, this keeps transform
-    // changes that ride the accumulated-visual-context value-update path free of display list
-    // re-recording when the overflow they produce is unchanged.
-    if (!outcome.any_overflow_changed)
-        return;
-
-    if (outcome.any_has_scrollable_overflow_flipped) {
+    auto outcome = Painting::rust_prepare_for_rendering(*this, m_needs_accumulated_visual_contexts_update);
+    if (outcome.requires_visual_context_update)
         set_needs_accumulated_visual_contexts_update(true);
-    } else if (!m_needs_accumulated_visual_contexts_update) {
-        // Sticky insets only depend on scrollport geometry and which ancestor is scrollable, neither of
-        // which changes without a flip; the constraints capture the scroll ancestor's scrollable
-        // overflow size though, so they have to be refreshed. When a full visual context rebuild is
-        // already pending it recaptures constraints anyway, and skipping the refresh then also avoids
-        // touching scroll nodes whose committed rows a subtree relayout may have replaced.
-        paint_state().refresh_sticky_constraints(*this);
+    if (outcome.visual_context_values_changed)
+        paint_state().did_update_visual_context_values();
+    if (outcome.requires_display_list_recording) {
+        set_needs_to_record_display_list();
+        m_document->set_needs_repaint();
     }
-    set_needs_to_record_display_list();
-    m_document->set_needs_repaint();
 }
 
 void Document::update_paint_and_hit_testing_properties_if_needed()
 {
     // NB: Called during paint property resolution.
+    prepare_for_rendering();
     if (m_needs_accumulated_visual_contexts_update) {
         m_needs_accumulated_visual_contexts_update = false;
         if (has_committed_viewport_box())
@@ -5756,7 +5702,9 @@ void Document::destroy()
         page().navigable_document_destroyed({}, *navigable);
     }
 
-    // FIXME: 10. Remove document from the owner set of each WorkerGlobalScope object whose set contains document.
+    // 10. Remove document from the owner set of each WorkerGlobalScope object whose set contains document.
+    HTML::relevant_settings_object(*this).release_owned_worker_agents();
+
     // FIXME: 11. For each workletGlobalScope in document's worklet global scopes, terminate workletGlobalScope.
 }
 
@@ -7863,11 +7811,6 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
             VERIFY_NOT_REACHED();
         }();
         auto visual_context_node_indices = Painting::rust_visual_animation_target_node_indices(*layout_node, visual_context_tree, ffi_target_kind);
-        if (visual_context_node_indices.is_empty()) {
-            if (missing_visual_context_node)
-                *missing_visual_context_node = true;
-            return {};
-        }
 
         Compositor::VisualAnimation visual_animation {
             .target_kind = target_kind,
@@ -7886,8 +7829,15 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
             .easing = Compositor::VisualAnimationEasing::from_css(effect.timing_function()),
             .keyframes = move(keyframes),
         };
-        if (!visual_animation.is_valid())
+        // NB: Validate the animation before requesting a missing target node. Otherwise an unsupported
+        //     animation can repeatedly force and release that node while retrying compositor selection.
+        if (!visual_animation.has_valid_animation_parameters())
             return {};
+        if (visual_animation.visual_context_node_indices.is_empty()) {
+            if (missing_visual_context_node)
+                *missing_visual_context_node = true;
+            return {};
+        }
         return visual_animation;
     };
 
@@ -7904,11 +7854,11 @@ static Optional<double> next_throttled_animation_iteration_event_time(Animations
         || effect.iteration_duration().type != Animations::TimeValue::Type::Milliseconds
         || effect.iteration_duration().value <= 0 || !isfinite(effect.iteration_duration().value)
         || !effect.can_skip_per_frame_style_update()
-        || !isinf(effect.iteration_count()) || !effect.is_in_the_active_phase()
+        || !effect.is_in_the_active_phase()
         || effect.can_skip_per_frame_animation_tick())
         return {};
 
-    // NB: Observable infinite throttled animations need a rendering update at the next iteration boundary,
+    // NB: Observable throttled animations need a rendering update at the next iteration boundary,
     //     not at every display refresh. Seeking and cancellation already request their own updates.
     return effect.start_delay().value
         + (effect.previous_current_iteration() + 1 - effect.iteration_start()) * effect.iteration_duration().value;
@@ -7976,7 +7926,8 @@ void Document::service_compositor_animation_wakeup(double timestamp)
                 reached_wakeup = true;
             }
         }
-        if (!is_compositor_handled || isinf(effect.iteration_count()))
+        bool is_offscreen_handled = effect.is_offscreen_throttled() && effect.can_skip_per_frame_style_update();
+        if ((!is_compositor_handled && !is_offscreen_handled) || isinf(effect.iteration_count()))
             continue;
         auto active_end = effect.start_delay().value + effect.iteration_duration().value * effect.iteration_count();
         if (current_time->value < active_end) {
@@ -8150,6 +8101,100 @@ void Document::update_compositor_animations()
         return Layout::RustFFI::layout_arena_transform_subtree_is_clipped_outside(
             layout_node->arena_handle(), Layout::Node::slot_id(layout_node), root_bounds,
             Painting::rect_to_viewport_transform(*this, visual_context_tree));
+    };
+
+    auto paint_only_effect_is_offscreen = [&](Animations::KeyframeEffect const& effect, Element const& target) {
+        if (effect.pseudo_element_type().has_value() || target.namespace_uri() != Namespace::HTML
+            || target.is_document_element() || &target == body())
+            return false;
+
+        // NB: Only properties whose changes are confined to painting are eligible. In particular, color can
+        //     affect SVG stroke geometry, and filters and transforms can bring offscreen pixels into view.
+        bool paint_stays_within_border_box = true;
+        for (auto const& property : effect.target_properties()) {
+            switch (property.id()) {
+            case CSS::PropertyID::BackgroundColor:
+            case CSS::PropertyID::BackgroundPositionX:
+            case CSS::PropertyID::BackgroundPositionY:
+            case CSS::PropertyID::BackgroundSize:
+            case CSS::PropertyID::BackgroundRepeat:
+            case CSS::PropertyID::BackgroundOrigin:
+            case CSS::PropertyID::BackgroundClip:
+            case CSS::PropertyID::BackgroundBlendMode:
+            case CSS::PropertyID::BorderTopColor:
+            case CSS::PropertyID::BorderRightColor:
+            case CSS::PropertyID::BorderBottomColor:
+            case CSS::PropertyID::BorderLeftColor:
+                break;
+            case CSS::PropertyID::BoxShadow:
+            case CSS::PropertyID::OutlineColor:
+            case CSS::PropertyID::OutlineOffset:
+            case CSS::PropertyID::OutlineStyle:
+            case CSS::PropertyID::OutlineWidth:
+            case CSS::PropertyID::TextDecorationColor:
+            case CSS::PropertyID::TextDecorationStyle:
+            case CSS::PropertyID::TextDecorationThickness:
+                paint_stays_within_border_box = false;
+                break;
+            default:
+                return false;
+            }
+        }
+
+        auto const* layout_node = target.unsafe_layout_node();
+        if (!layout_node || !layout_node->is_box())
+            return false;
+
+        // NB: A descendant can explicitly inherit even a normally non-inherited paint property. Reject
+        //     content that can escape ancestor clips or be rendered elsewhere through SVG references.
+        bool subtree_can_escape = false;
+        layout_node->for_each_in_inclusive_subtree_of_type<Layout::NodeWithStyle>([&](auto const& descendant) {
+            if (descendant.is_svg_box() || descendant.is_fixed_position()
+                || (&descendant != layout_node && descendant.is_absolutely_positioned())) {
+                subtree_can_escape = true;
+                return TraversalDecision::Break;
+            }
+            return TraversalDecision::Continue;
+        });
+        if (subtree_can_escape)
+            return false;
+
+        auto viewport_bounds = CSSPixelRect { { 0, 0 }, viewport_rect().size() };
+        auto rect_to_viewport_transform = Painting::rect_to_viewport_transform(*this, visual_context_tree);
+        auto bounds_in_viewport = [&](Layout::Node const& node) -> CSSPixelRect {
+            return Layout::RustFFI::layout_arena_bounding_client_rect(
+                node.arena_handle(), Layout::Node::slot_id(&node), rect_to_viewport_transform);
+        };
+        for (auto const* ancestor = layout_node; ancestor; ancestor = ancestor->parent()) {
+            // NB: Compositor transforms and sticky positioning can move content without resampling its style.
+            //     Filters outside a clip can also expand otherwise clipped paint back into the viewport.
+            if (ancestor->has_css_transform() || ancestor->perspective().has_value() || ancestor->is_sticky_position()
+                || ancestor->filter().has_filters())
+                return false;
+            if (auto const* element = as_if<Element>(ancestor->dom_node())) {
+                if (in_effect_transform_effects_by_target.contains(element))
+                    return false;
+                if (auto effects = competing_effects.get(*element); effects.has_value() && effects->filter.winner)
+                    return false;
+            }
+        }
+        auto visible_bounds = viewport_bounds;
+        for (auto const* container = layout_node->containing_block(); container; container = container->containing_block()) {
+            if (container->overflow_x() == CSS::Overflow::Visible || container->overflow_y() == CSS::Overflow::Visible)
+                continue;
+            if (container->overflow_x() == CSS::Overflow::Clip || container->overflow_y() == CSS::Overflow::Clip) {
+                auto const& margin = container->style_group<CSS::ComputedValues::MiscResetValues>().overflow_clip_margin;
+                if (margin.top.offset != 0 || margin.right.offset != 0 || margin.bottom.offset != 0 || margin.left.offset != 0)
+                    continue;
+            }
+            visible_bounds = visible_bounds.intersected(bounds_in_viewport(*container));
+            if (visible_bounds.is_empty())
+                return true;
+        }
+
+        // NB: Otherwise, only a leaf box with bounded paint can be proven invisible from its own bounds.
+        return paint_stays_within_border_box && !layout_node->has_children()
+            && !bounds_in_viewport(*layout_node).intersects(visible_bounds);
     };
 
     auto observation_has_another_transform_animation = [&](Element const& animated_target, Element const& observation_target, Animations::KeyframeEffect const& current_effect) {
@@ -8368,6 +8413,20 @@ void Document::update_compositor_animations()
         if (animation.is_idle() || (!effect.is_in_effect() && !effect.is_in_the_before_phase()))
             continue;
         auto& target = abstract_target->element();
+
+        bool can_throttle_paint_only_effect = animation.play_state() == Bindings::AnimationPlayState::Running
+            && !animation.pending() && animation.playback_rate() > 0 && isfinite(animation.playback_rate())
+            && animation.timeline() && animation.timeline()->is_monotonically_increasing()
+            && effect.is_in_the_active_phase()
+            && effect.start_delay().type == Animations::TimeValue::Type::Milliseconds
+            && effect.iteration_duration().type == Animations::TimeValue::Type::Milliseconds
+            && effect.iteration_duration().value > 0 && isfinite(effect.iteration_duration().value)
+            && effect.end_delay().value == 0;
+        if (can_throttle_paint_only_effect && paint_only_effect_is_offscreen(effect, target)) {
+            effect.set_is_offscreen_throttled(true);
+            schedule_next_phase_wakeup(effect, animation);
+            continue;
+        }
 
         bool targets_opacity = effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Opacity));
         bool targets_background_color = effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::BackgroundColor));
@@ -10418,28 +10477,6 @@ void Document::schedule_accumulated_visual_context_update(Element& element, Accu
         if (auto* document_element = this->document_element(); document_element && document_element->unsafe_layout_node())
             schedule_accumulated_visual_context_update(*document_element->unsafe_layout_node(), scope);
     }
-}
-
-void Document::schedule_scrollable_overflow_recalculation(Layout::Node const& layout_node)
-{
-    // SVG layout consumes transforms when computing geometry, so a transform change on SVG content
-    // has to perform layout, matching the behavior of the transform presentation attribute.
-    if (layout_node.is_svg_box()) {
-        const_cast<Layout::Node&>(layout_node).set_needs_layout_update(DOM::SetNeedsLayoutReason::StyleChange);
-        return;
-    }
-
-    Layout::RustFFI::layout_arena_schedule_scrollable_overflow_recalculation(layout_node.arena_handle(), Layout::Node::slot_id(&layout_node));
-}
-
-void Document::schedule_scrollable_overflow_recalculation(Element& element)
-{
-    if (auto* layout_node = element.unsafe_layout_node())
-        schedule_scrollable_overflow_recalculation(*layout_node);
-    element.for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement const& pseudo_element) {
-        if (auto* pseudo_element_layout_node = pseudo_element.unsafe_layout_node())
-            schedule_scrollable_overflow_recalculation(*pseudo_element_layout_node);
-    });
 }
 
 Painting::SnappedAreas const& Document::snapped_areas_of_scroll_container(Compositor::AsyncScrollNodeStableID const& stable_node_id) const

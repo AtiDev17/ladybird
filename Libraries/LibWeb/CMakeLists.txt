@@ -350,6 +350,7 @@ set(SOURCES
     DOM/Slottable.cpp
     DOM/StaticNodeList.cpp
     DOM/StaticRange.cpp
+    DOM/SubtreeInsertionScope.cpp
     DOM/StyleElementBase.cpp
     DOM/Text.cpp
     DOM/TreeWalker.cpp
@@ -776,7 +777,6 @@ set(SOURCES
     Internals/XRTest.cpp
     IntersectionObserver/IntersectionObserver.cpp
     IntersectionObserver/IntersectionObserverEntry.cpp
-    Layout/AnonymousBoxStyle.cpp
     Layout/Box.cpp
     Layout/ImageProvider.cpp
     Layout/LayoutRustBridge.cpp

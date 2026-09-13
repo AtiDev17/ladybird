@@ -10,13 +10,14 @@ use crate::css::display::FfiDisplay;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::layout::node_facts;
-use crate::painting::host::FfiScrollableOverflowHostCallbacks;
+use crate::painting::host::FfiGeometryHostCallbacks;
 use crate::painting::paintable_data::FfiOverflowData;
-use crate::painting::paintable_rows::{PaintableRowsMut, PaintableRowsRead};
+use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
 use crate::painting::visual_context::node_values;
 use crate::painting::{paintable_geometry, style_queries, text_fragment};
 use libgfx_rust::matrix::{AffineTransform, FloatMatrix4x4};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 /// Index boxes whose containing block differs from their layout parent. Direct children are
@@ -265,7 +266,7 @@ fn padding_inflated_scrollable_overflow(
 
 fn fragment_node_is_in_focused_text_control(
     layout_arena: &LayoutNodeArena,
-    overflow_callbacks: &FfiScrollableOverflowHostCallbacks,
+    overflow_callbacks: Option<&FfiGeometryHostCallbacks>,
     node: NodeSlotId,
 ) -> bool {
     let flags = layout_arena.node_flags_if_live(node);
@@ -277,7 +278,7 @@ fn fragment_node_is_in_focused_text_control(
     if shell.is_null() {
         return false;
     }
-    overflow_callbacks.layout_node_is_in_focused_text_control(shell)
+    overflow_callbacks.is_some_and(|callbacks| callbacks.layout_node_is_in_focused_text_control(shell))
 }
 
 #[derive(Clone, Copy)]
@@ -288,19 +289,23 @@ pub(crate) struct OverflowAssignment {
 }
 
 impl OverflowAssignment {
-    pub(crate) fn apply(self, layout_arena: &mut PaintableRowsMut<'_>) {
+    pub(crate) fn apply(self, layout_arena: &impl PaintableRowsRead) {
+        let previously_measured = layout_arena
+            .paintable_side_data(self.box_paintable)
+            .overflow_measured_this_commit
+            .get();
         let (scroll_metadata_changed, scrollability_flipped) = {
-            let data = layout_arena.paintable_data_mut(self.box_paintable);
+            let data = layout_arena.paintable_side_data(self.box_paintable);
             let scroll_metadata_changed = self
                 .overflow_relative_to_padding_box
-                .is_some_and(|overflow| overflow != data.overflow_relative_to_padding_box);
+                .is_some_and(|overflow| overflow != data.overflow_relative_to_padding_box.get());
             let scrollability_flipped = self.overflow_relative_to_padding_box.is_some_and(|overflow| {
-                overflow.has_scrollable_overflow != data.overflow_relative_to_padding_box.has_scrollable_overflow
+                overflow.has_scrollable_overflow != data.overflow_relative_to_padding_box.get().has_scrollable_overflow
             });
             if let Some(overflow) = self.overflow_relative_to_padding_box {
-                data.overflow_relative_to_padding_box = overflow;
+                data.overflow_relative_to_padding_box.set(overflow);
             }
-            data.overflow_measured_this_commit = true;
+            data.overflow_measured_this_commit.set(true);
             (scroll_metadata_changed, scrollability_flipped)
         };
         if self.overflow_relative_to_padding_box.is_some() {
@@ -310,10 +315,20 @@ impl OverflowAssignment {
                 .set(true);
         }
         if scroll_metadata_changed {
-            layout_arena.mark_paint_cache_self_dirty(self.box_paintable);
+            if previously_measured {
+                layout_arena.scrollable_overflow.geometry_changed.set(true);
+            }
+            layout_arena
+                .paintable_rows()
+                .mark_paint_cache_self_dirty(self.box_paintable);
         }
         if scrollability_flipped {
-            layout_arena.mark_descendant_subtree_caches_dirty_in_paint_subtree(self.box_paintable);
+            if previously_measured {
+                layout_arena.scrollable_overflow.scrollability_changed.set(true);
+            }
+            layout_arena
+                .paintable_rows()
+                .mark_descendant_subtree_caches_dirty_in_paint_subtree(self.box_paintable);
             layout_arena.note_visual_context_box_dirty(
                 self.box_paintable,
                 VisualContextBoxDirtyKind::ScrollableOverflowFlipped,
@@ -344,7 +359,7 @@ fn store_overflow_data(
 pub(crate) fn measure_scrollable_overflow(
     layout_arena: &impl PaintableRowsRead,
     non_child_boxes_by_containing_block: &HashMap<NodeSlotId, Vec<NodeSlotId>>,
-    overflow_callbacks: &FfiScrollableOverflowHostCallbacks,
+    overflow_callbacks: Option<&FfiGeometryHostCallbacks>,
     box_paintable: NodeSlotId,
 ) -> Vec<OverflowAssignment> {
     // Each box occurs under only one containing block, so this traversal visits each box at most once and can stage
@@ -363,21 +378,21 @@ pub(crate) fn measure_scrollable_overflow(
 fn measure_scrollable_overflow_impl(
     layout_arena: &impl PaintableRowsRead,
     non_child_boxes_by_containing_block: &HashMap<NodeSlotId, Vec<NodeSlotId>>,
-    overflow_callbacks: &FfiScrollableOverflowHostCallbacks,
+    overflow_callbacks: Option<&FfiGeometryHostCallbacks>,
     box_paintable: NodeSlotId,
     assignments: &mut Vec<OverflowAssignment>,
 ) -> CssPixelRect {
     let still_valid_overflow = {
-        let data = layout_arena.paintable_data(box_paintable);
-        if data.overflow_measured_this_commit {
-            return CssPixelRect::from(data.overflow_relative_to_padding_box.rect)
+        let data = layout_arena.paintable_side_data(box_paintable);
+        if data.overflow_measured_this_commit.get() && data.overflow_valid_across_recommits.get() {
+            return CssPixelRect::from(data.overflow_relative_to_padding_box.get().rect)
                 .translated_by(paintable_geometry::absolute_padding_box_rect(layout_arena, box_paintable).location());
         }
         layout_arena
             .paintable_side_data(box_paintable)
             .overflow_valid_across_recommits
             .get()
-            .then_some(data.overflow_relative_to_padding_box)
+            .then_some(data.overflow_relative_to_padding_box.get())
     };
 
     let box_node = box_paintable;
@@ -503,7 +518,7 @@ fn measure_scrollable_overflow_impl(
         let child_display = child_style.map_or_else(FfiDisplay::block, |style| style.display());
 
         {
-            let child_data = layout_arena.paintable_data(child_node);
+            let child_data = layout_arena.paintable_side_data(child_node);
             if child_position == positioning::STATIC
                 && child_display.is_inline_outside()
                 && !child_is_floating
@@ -526,7 +541,7 @@ fn measure_scrollable_overflow_impl(
                     // The committed line fragment already contributes this content box. A box with no border whose
                     // cached overflow fits inside the content box cannot expand its containing block's overflow.
                     if content_box_relative_to_padding_box
-                        .contains_rect(child_data.overflow_relative_to_padding_box.rect.into())
+                        .contains_rect(child_data.overflow_relative_to_padding_box.get().rect.into())
                     {
                         continue;
                     }
@@ -708,4 +723,230 @@ fn measure_scrollable_overflow_impl(
     );
 
     scrollable_overflow_rect
+}
+
+/// Geometry caches and their pending effects belong to the arena, independently of the
+/// visual-context state temporarily borrowed or taken by painting traversals.
+#[derive(Default)]
+pub(crate) struct ScrollableOverflowState {
+    pub(crate) host: Cell<Option<FfiGeometryHostCallbacks>>,
+    pub(crate) viewport: Cell<Option<NodeSlotId>>,
+    pub(crate) full_layout_commit: Cell<bool>,
+    pub(crate) contained_boxes_dirty: Cell<bool>,
+    pub(crate) non_child_boxes: RefCell<HashMap<NodeSlotId, Vec<NodeSlotId>>>,
+    pub(crate) geometry_changed: Cell<bool>,
+    pub(crate) scrollability_changed: Cell<bool>,
+    pub(crate) recalculations: Cell<u64>,
+}
+
+impl LayoutNodeArena {
+    pub(crate) fn ensure_overflow_contained_boxes(&self) {
+        if !self.scrollable_overflow.contained_boxes_dirty.replace(false) {
+            return;
+        }
+        let mut index = self.scrollable_overflow.non_child_boxes.borrow_mut();
+        if let Some(viewport) = self.scrollable_overflow.viewport.get() {
+            refill_contained_boxes_index(&self.paintable_rows(), viewport, &mut index);
+        } else {
+            index.clear();
+        }
+    }
+
+    pub(crate) fn did_commit_full_layout(&self, viewport: NodeSlotId) {
+        self.scrollable_overflow.viewport.set(Some(viewport));
+        self.scrollable_overflow.full_layout_commit.set(true);
+        self.scrollable_overflow.contained_boxes_dirty.set(true);
+        self.set_needs_full_scrollable_overflow_recalculation();
+    }
+
+    pub(crate) fn ensure_scrollable_overflow(&self, slot: NodeSlotId) {
+        if !self.paintable_row_is_populated(slot)
+            || !self
+                .scrollable_overflow
+                .viewport
+                .get()
+                .is_some_and(|viewport| self.paintable_row_is_populated(viewport))
+        {
+            return;
+        }
+        {
+            let cache = self.paintable_side_data(slot);
+            if cache.overflow_valid_across_recommits.get() {
+                cache.overflow_measured_this_commit.set(true);
+                return;
+            }
+        }
+        // Ordinary inline fragments have paint geometry but no independently measured scrolling area.
+        // Rows holding scroll state still need measurement, as they do during rendering preparation.
+        if !self.node_kind_if_live(slot).is_some_and(node_facts::kind_is_box) && !box_holds_scroll_state(self, slot) {
+            return;
+        }
+        self.ensure_overflow_contained_boxes();
+        let rows = self.paintable_rows();
+        let assignments = measure_scrollable_overflow(
+            &rows,
+            &self.scrollable_overflow.non_child_boxes.borrow(),
+            self.scrollable_overflow.host.get().as_ref(),
+            slot,
+        );
+        for assignment in assignments {
+            assignment.apply(&rows);
+        }
+    }
+}
+
+/// Whether a box is measured eagerly after a full commit rather than only when an ancestor's
+/// measurement reaches it: a scroll container, or a box whose element or pseudo-element stores a
+/// scroll offset that the new overflow may have to clamp. The offset lives on the DOM side, which
+/// sets `NodeFlag::HasScrollOffset` whenever it stores one and whenever a box becomes an element's
+/// or pseudo-element's box, so the answer is one style query and one flag read.
+fn box_holds_scroll_state(arena: &LayoutNodeArena, slot: NodeSlotId) -> bool {
+    crate::painting::style_queries::is_scroll_container(arena, slot)
+        || arena.node_flags_if_live(slot) & crate::layout::node_data::NodeFlag::HasScrollOffset as u32 != 0
+}
+
+pub(crate) fn update_scrollable_overflow(arena: &LayoutNodeArena) {
+    let Some(viewport) = arena.scrollable_overflow.viewport.get() else {
+        return;
+    };
+    let full_layout_commit = arena.scrollable_overflow.full_layout_commit.replace(false);
+    let (pending_boxes, needs_full_recalculation) = arena.take_scrollable_overflow_recalculation_state();
+    if (pending_boxes.is_empty() && !needs_full_recalculation) || !arena.paintable_row_is_populated(viewport) {
+        return;
+    }
+    arena
+        .scrollable_overflow
+        .recalculations
+        .set(arena.scrollable_overflow.recalculations.get() + 1);
+    arena.ensure_overflow_contained_boxes();
+
+    // Ordinary boxes are measured when their contribution or geometry is queried. Settle
+    // scroll containers and stored offsets before DOM reads or painting observe them.
+    // Keep already measured ancestors in the set so changes invalidate their paint caches
+    // even when a cached recording would otherwise skip the subtree.
+    let mut roots = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut add = |slot: NodeSlotId| {
+        if arena.paintable_row_is_populated(slot) && seen.insert(slot) {
+            roots.push(slot);
+            true
+        } else {
+            false
+        }
+    };
+    if needs_full_recalculation {
+        arena.for_each_node_in_layout_subtree_in_pre_order(viewport, |slot| {
+            if arena.paintable_row_is_populated(slot)
+                && (slot == viewport
+                    || box_holds_scroll_state(arena, slot)
+                    || (!full_layout_commit && arena.paintable_side_data(slot).overflow_measured_this_commit.get()))
+            {
+                add(slot);
+            }
+        });
+    } else {
+        for slot in pending_boxes {
+            if !arena.slot_is_live(slot) || !arena.paintable_row_is_populated(slot) {
+                continue;
+            }
+            if !arena.paintable_side_data(slot).overflow_measured_this_commit.get() {
+                // A subtree commit can replace scroll containers whose overflow does not
+                // propagate through the relayout root (for example, overflow: hidden).
+                arena.for_each_node_in_layout_subtree_in_pre_order(slot, |child| {
+                    if arena.paintable_row_is_populated(child) && box_holds_scroll_state(arena, child) {
+                        add(child);
+                    }
+                });
+            }
+            add(slot);
+            let mut block = arena.node_containing_block_if_live(slot);
+            while let Some(slot) = block {
+                if !add(slot) {
+                    break;
+                }
+                block = arena.node_containing_block_if_live(slot);
+            }
+        }
+    }
+    for slot in roots {
+        arena.ensure_scrollable_overflow(slot);
+        if let Some(host) = arena.scrollable_overflow.host.get() {
+            let shell = arena.shell_if_live(slot);
+            if !shell.is_null() {
+                // SAFETY: The registered host receives a live shell. No mutable arena or
+                // cache borrow is held while it re-enters geometry queries to clamp the offset.
+                unsafe { (host.clamp_scroll_offset_if_nonzero)(host.context, shell) };
+            }
+        }
+    }
+}
+
+/// Retain the last published transform group so a style change can invalidate overflow
+/// even after the DOM or an animation has released its previous style record.
+pub(crate) struct OverflowStyle(std::ptr::NonNull<crate::css::computed_value_types::TransformValues>);
+
+impl OverflowStyle {
+    pub(crate) fn new(style: crate::css::computed_value_views::ComputedValuesView<'_>) -> Self {
+        let values = std::ptr::from_ref(style.transform());
+        crate::css::computed_values::retain_group_payload(
+            crate::css::computed_value_types::STYLE_GROUP_INDEX_TRANSFORM,
+            values.cast(),
+        );
+        Self(std::ptr::NonNull::from(style.transform()))
+    }
+
+    fn matches(&self, style: crate::css::computed_value_views::ComputedValuesView<'_>) -> bool {
+        let new = style.transform();
+        if std::ptr::eq(self.0.as_ptr(), new) {
+            return true;
+        }
+        // SAFETY: This snapshot retains the immutable group until it is replaced or dropped.
+        let old = unsafe { self.0.as_ref() };
+        old.transformations == new.transformations
+            && old.translate == new.translate
+            && old.rotate == new.rotate
+            && old.scale == new.scale
+            && old.transform_box == new.transform_box
+            && old.transform_origin_x == new.transform_origin_x
+            && old.transform_origin_y == new.transform_origin_y
+            && old.transform_origin_z == new.transform_origin_z
+    }
+}
+
+impl Drop for OverflowStyle {
+    fn drop(&mut self) {
+        crate::css::computed_values::release_group_payload(
+            crate::css::computed_value_types::STYLE_GROUP_INDEX_TRANSFORM,
+            self.0.as_ptr().cast(),
+        );
+    }
+}
+
+impl LayoutNodeArena {
+    pub(crate) fn invalidate_overflow_after_style_change(&self, slot: NodeSlotId) {
+        if !self.paintable_row_is_populated(slot) {
+            return;
+        }
+        let Some(style) = self.node_style_if_live(slot) else {
+            return;
+        };
+        let changed = {
+            let mut cache = self.paintable_side_data_mut(slot);
+            let changed = cache
+                .overflow_style
+                .as_ref()
+                .is_some_and(|previous| !previous.matches(style));
+            cache.overflow_style = Some(OverflowStyle::new(style));
+            changed
+        };
+        if !changed {
+            return;
+        }
+        if self.node_kind_if_live(slot).is_some_and(node_facts::kind_is_svg_box) {
+            // SVG consumes transforms during layout, unlike CSS box overflow measurement.
+            self.set_needs_layout_update(slot, true);
+        } else {
+            self.schedule_scrollable_overflow_recalculation(slot);
+        }
+    }
 }

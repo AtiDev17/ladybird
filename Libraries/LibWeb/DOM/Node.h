@@ -266,6 +266,8 @@ public:
     WebIDL::ExceptionOr<GC::Ref<Node>> remove_child(GC::Ref<Node>);
 
     void insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_observers = false);
+    void parser_insert_before(GC::Ref<Node> node, GC::Ptr<Node> child);
+    void parser_append_child(GC::Ref<Node> node) { parser_insert_before(node, nullptr); }
     void remove(bool suppress_observers = false);
     void remove_all_children(bool suppress_observers = false);
 
@@ -378,6 +380,7 @@ public:
         enum class Type {
             Inserted,
             Removal,
+            AllChildrenRemoved,
             Mutation,
         };
         enum class AffectsElements {
@@ -615,9 +618,28 @@ protected:
     ErrorOr<Utf16String> name_or_description(NameOrDescription, Document const&, HashTable<UniqueNodeID>&, IsDescendant = IsDescendant::No, ShouldComputeRole = ShouldComputeRole::Yes) const;
 
 private:
+    enum class LayoutSubtreeRemoval {
+        DetachInPlace,
+        RebuildParent,
+    };
+    enum class AncestorsMayHaveFirstLetter {
+        No,
+        Yes,
+    };
+
+    void run_node_iterator_pre_removing_steps();
+    bool schedule_list_item_renumber_for_removal();
+    void report_removal_to_style_engine(Node& parent);
+    void update_layout_tree_for_removal(Node& parent, LayoutSubtreeRemoval, AncestorsMayHaveFirstLetter);
+    void assign_slottables_after_removal(Node& parent, Node& parent_root);
+    void run_removing_steps(Node& parent, Node& parent_root, bool was_connected);
+    void add_transient_registered_observers_for_removal(Node& parent);
+    void queue_tree_mutation_record_for_removal(Node& parent, GC::Ptr<Node> old_previous_sibling, GC::Ptr<Node> old_next_sibling);
+
     void queue_tree_mutation_record(ReadonlySpan<GC::Root<Node>> added_nodes, ReadonlySpan<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
 
     void live_range_pre_remove();
+    void live_range_pre_remove_all_children();
 
     void insert_before_impl(GC::Ref<Node>, GC::Ptr<Node> child);
     void insert_nodes_before(ReadonlySpan<GC::Root<Node>>, GC::Ptr<Node> child, bool suppress_observers, GC::Ref<Node> metadata_node, ChildrenChangedMetadata::AffectsElements);

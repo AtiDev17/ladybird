@@ -499,12 +499,7 @@ public:
     [[nodiscard]] u64 full_layout_count() const { return m_full_layout_count; }
     [[nodiscard]] bool layout_is_up_to_date() const;
     void clear_devtools_layout_inspection_data();
-    enum class ScrollableOverflowDerivedStructureUpdates : u8 {
-        UpdateAfterMeasure,
-        HandledByAfterLayoutCommit,
-        HandledByFullLayoutCommit,
-    };
-    void update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates);
+    void prepare_for_rendering();
     void update_paint_and_hit_testing_properties_if_needed();
     void sample_animation_effects_needing_style_update();
     void update_style_computer_viewport_rect();
@@ -621,6 +616,9 @@ public:
     void set_has_element_with_auto_directionality() { m_has_element_with_auto_directionality = true; }
     bool has_form_or_fieldset_element() const { return m_has_form_or_fieldset_element; }
     void set_has_form_or_fieldset_element() { m_has_form_or_fieldset_element = true; }
+
+    SubtreeInsertionScope* subtree_insertion_scope() const { return m_subtree_insertion_scope; }
+    void set_subtree_insertion_scope(Badge<SubtreeInsertionScope>, SubtreeInsertionScope* scope) { m_subtree_insertion_scope = scope; }
 
     bool parser_cannot_change_the_mode() const { return m_parser_cannot_change_the_mode; }
     void set_parser_cannot_change_the_mode(bool parser_cannot_change_the_mode) { m_parser_cannot_change_the_mode = parser_cannot_change_the_mode; }
@@ -1152,7 +1150,6 @@ public:
         u64 custom_property_cycle_participants { 0 };
         u64 style_cascade_microseconds { 0 };
         u64 style_values_microseconds { 0 };
-        u64 scrollable_overflow_recalculations { 0 };
     };
     StyleInvalidationCounters& style_invalidation_counters() const { return m_style_invalidation_counters; }
     void reset_style_invalidation_counters() const;
@@ -1178,8 +1175,6 @@ public:
     bool can_compute_client_rects_without_accumulated_visual_contexts_update(Layout::Node const&) const;
     void schedule_accumulated_visual_context_update(Element&, AccumulatedVisualContextUpdateScope);
     void schedule_accumulated_visual_context_update(Layout::Node const&, AccumulatedVisualContextUpdateScope);
-    void schedule_scrollable_overflow_recalculation(Element&);
-    void schedule_scrollable_overflow_recalculation(Layout::Node const&);
 
     Painting::SnappedAreas const& snapped_areas_of_scroll_container(Compositor::AsyncScrollNodeStableID const&) const;
     void set_snapped_areas_of_scroll_container(Compositor::AsyncScrollNodeStableID const&, Painting::SnappedAreas);
@@ -1515,11 +1510,7 @@ private:
         No,
         Yes,
     };
-    enum class LayoutCommitScope : u8 {
-        Subtree,
-        Full,
-    };
-    void after_layout_commit(LayoutTreeChanged, LayoutCommitScope);
+    void after_layout_commit(LayoutTreeChanged);
 
     void run_unloading_cleanup_steps();
 
@@ -1641,6 +1632,7 @@ private:
     bool m_needs_mathml_and_svg_user_agent_style_sheets { false };
     bool m_has_element_with_auto_directionality { false };
     bool m_has_form_or_fieldset_element { false };
+    SubtreeInsertionScope* m_subtree_insertion_scope { nullptr };
 
     bool m_parser_cannot_change_the_mode { false };
 

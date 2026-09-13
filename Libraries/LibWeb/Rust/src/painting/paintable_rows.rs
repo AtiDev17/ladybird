@@ -27,6 +27,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overflow_queries_do_not_measure_ordinary_inline_fragments() {
+        use crate::css::css_pixels::{CssPixelRect, CssPixels};
+        use crate::layout::node_data::NodeKind;
+        use crate::painting::paintable_geometry;
+
+        let mut arena = LayoutNodeArena::new();
+        let node = arena.allocate_for_test().slot;
+        arena.data(node).kind.set(NodeKind::InlineNode);
+        arena.populate_paintable_row(node);
+        arena.scrollable_overflow.viewport.set(Some(node));
+        let rect = CssPixelRect::new(
+            CssPixels::from_integer(0),
+            CssPixels::from_integer(0),
+            CssPixels::from_integer(100),
+            CssPixels::from_integer(80),
+        );
+        arena
+            .paintable_rows_mut()
+            .paintable_data_mut(node)
+            .local_padding_box_union = rect.into();
+
+        let rows = arena.paintable_rows();
+        assert_eq!(paintable_geometry::scrollable_overflow_rect(&rows, node), None);
+        assert!(!paintable_geometry::has_scrollable_overflow(&rows, node));
+        assert!(!arena.paintable_side_data(node).overflow_measured_this_commit.get());
+    }
+
+    #[test]
+    fn overflow_queries_refresh_invalidated_data_while_geometry_is_borrowed() {
+        use crate::css::css_pixels::{CssPixelRect, CssPixels};
+        use crate::layout::node_data::NodeKind;
+        use crate::painting::paintable_geometry;
+
+        let mut arena = LayoutNodeArena::new();
+        let node = arena.allocate_for_test().slot;
+        arena.data(node).kind.set(NodeKind::InlineNode);
+        arena.set_node_flag(node, NodeFlag::HasScrollOffset, true);
+        arena.populate_paintable_row(node);
+        arena.scrollable_overflow.viewport.set(Some(node));
+        let rect = CssPixelRect::new(
+            CssPixels::from_integer(0),
+            CssPixels::from_integer(0),
+            CssPixels::from_integer(100),
+            CssPixels::from_integer(80),
+        );
+        arena
+            .paintable_rows_mut()
+            .paintable_data_mut(node)
+            .local_padding_box_union = rect.into();
+        let cache = arena.paintable_side_data(node);
+        cache.overflow_relative_to_padding_box.set(FfiOverflowData {
+            rect: CssPixelRect::new(rect.x, rect.y, CssPixels::from_integer(500), rect.height).into(),
+            has_scrollable_overflow: true,
+        });
+        cache.overflow_valid_across_recommits.set(true);
+        cache.overflow_measured_this_commit.set(true);
+        drop(cache);
+
+        let rows = arena.paintable_rows();
+        let geometry = rows.paintable_data(node);
+        let previous_geometry = *geometry;
+        rows.clear_cached_overflow_data(node);
+        assert_eq!(paintable_geometry::scrollable_overflow_rect(&rows, node), Some(rect));
+        assert!(!paintable_geometry::has_scrollable_overflow(&rows, node));
+        assert_eq!(*geometry, previous_geometry);
+        assert!(arena.scrollable_overflow.geometry_changed.get());
+        assert!(arena.scrollable_overflow.scrollability_changed.get());
+    }
+
+    #[test]
     fn overflow_cache_invalidation_is_independent_of_borrowed_geometry() {
         let mut arena = LayoutNodeArena::new();
         let node = arena.allocate_for_test().slot;
@@ -35,10 +105,7 @@ mod tests {
             .paintable_side_data(node)
             .overflow_valid_across_recommits
             .set(true);
-        arena
-            .paintable_rows_mut()
-            .paintable_data_mut(node)
-            .overflow_measured_this_commit = true;
+        arena.paintable_side_data(node).overflow_measured_this_commit.set(true);
         arena.paintable_rows_mut().begin_paintable_row_recommit(node);
         assert!(arena.paintable_side_data(node).overflow_valid_across_recommits.get());
 
@@ -48,7 +115,7 @@ mod tests {
         rows.clear_cached_overflow_data(node);
         assert_eq!(*geometry, previous_geometry);
         assert!(!arena.paintable_side_data(node).overflow_valid_across_recommits.get());
-        assert!(!geometry.overflow_measured_this_commit);
+        assert!(!arena.paintable_side_data(node).overflow_measured_this_commit.get());
     }
 }
 
@@ -384,10 +451,13 @@ where
             let data = self.paintable_data_mut(id);
             data.offset = used_values::FfiCssPixelPoint::default();
             data.content_size = used_values::FfiCssPixelSize::default();
-            data.overflow_measured_this_commit = false;
             data.local_padding_box_union = used_values::FfiCssPixelRect::default();
             data.local_border_box_union = used_values::FfiCssPixelRect::default();
         }
+        self.arena
+            .paintable_side_data(id)
+            .overflow_measured_this_commit
+            .set(false);
         // The paint cache is deliberately kept; the commit diff marks rows whose committed
         // fragment identity or offset actually changed.
         self.arena.paintable_side_data_mut(id).clear_committed_records();
@@ -537,17 +607,6 @@ impl LayoutNodeArena {
 
     pub(crate) fn set_needs_full_scrollable_overflow_recalculation(&self) {
         self.needs_full_scrollable_overflow_recalculation.set(true);
-    }
-
-    /// Rebuilds the supplemental contained-boxes index from committed rows under `root`.
-    pub(crate) fn rebuild_scrollable_overflow_contained_boxes(&self, root: NodeSlotId) {
-        let paintable_rows = self.paintable_rows();
-        let mut paint_state = self.paint_state().borrow_mut();
-        crate::painting::scrollable_overflow::refill_contained_boxes_index(
-            &paintable_rows,
-            root,
-            &mut paint_state.scrollable_overflow_non_child_boxes,
-        );
     }
 
     pub(crate) fn take_scrollable_overflow_recalculation_state(&self) -> (Vec<NodeSlotId>, bool) {
@@ -700,6 +759,9 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn populate_paintable_row(&mut self, layout_node: NodeSlotId) {
+        let overflow_style = self
+            .node_style_if_live(layout_node)
+            .map(crate::painting::scrollable_overflow::OverflowStyle::new);
         let store = &mut self.paintable_rows;
         let index = layout_node.slot_index() as usize;
         let chunks = &mut store.chunks;
@@ -723,7 +785,10 @@ impl LayoutNodeArena {
             slot_generation: layout_node.generation(),
             ..PaintableData::default()
         };
-        side_data[index] = PaintableSideData::default();
+        side_data[index] = PaintableSideData {
+            overflow_style,
+            ..Default::default()
+        };
         paint_caches[index].clear();
         absolute_rect_memo[index] = None;
         visual_context_records[index] = None;

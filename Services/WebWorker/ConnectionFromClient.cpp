@@ -244,11 +244,6 @@ void ConnectionFromClient::handle_file_return(i32 error, Optional<IPC::File> fil
     file_request.value().on_file_request_finish(error != 0 ? Error::from_errno(error) : ErrorOr<i32> { file->take_fd() });
 }
 
-void ConnectionFromClient::did_worker_agent_finish_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token)
-{
-    Web::HTML::WorkerAgentParent::did_finish_loading_worker_script(owner_token);
-}
-
 void ConnectionFromClient::did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     Web::HTML::WorkerAgentParent::did_fail_loading_worker_script(owner_token);
@@ -262,6 +257,11 @@ void ConnectionFromClient::did_worker_agent_report_exception(Web::HTML::WorkerAg
 void ConnectionFromClient::did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     Web::HTML::WorkerAgentParent::did_close_worker(owner_token);
+}
+
+void ConnectionFromClient::did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token)
+{
+    Web::HTML::WorkerAgentParent::did_worker_agent_die(owner_token);
 }
 
 void ConnectionFromClient::broadcast_channel_message(Web::HTML::BroadcastChannelMessage message)

@@ -102,7 +102,6 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, W
                     //         handles steps 11.5.5-11.5.7).
                     agent.owners.append(owner);
                     agent.client->async_connect_shared_worker(move(request.outside_port), request.outside_settings);
-                    notify_worker_script_load_success(owner);
                     return agent.id;
                 }
             }
@@ -208,7 +207,7 @@ void WorkerProcessManager::remove_web_content_owner(WebContentClient& client)
     }
 
     for (auto agent_id : agents_to_close)
-        remove_agent(agent_id);
+        remove_agent(agent_id, AgentRemovalCause::OwnerSetEmptied);
 }
 
 void WorkerProcessManager::remove_web_worker_owner(WebWorkerClient& client)
@@ -225,7 +224,7 @@ void WorkerProcessManager::remove_web_worker_owner(WebWorkerClient& client)
     }
 
     for (auto agent_id : agents_to_close)
-        remove_agent(agent_id);
+        remove_agent(agent_id, AgentRemovalCause::OwnerSetEmptied);
 }
 
 void WorkerProcessManager::broadcast_channel_message_from_web_content(Web::HTML::BroadcastChannelMessage const& message, IsPrivate is_private)
@@ -284,18 +283,6 @@ ErrorOr<void> WorkerProcessManager::simulate_request_server_connection_loss_for_
     return {};
 }
 
-void WorkerProcessManager::notify_worker_script_load_success(Owner const& owner)
-{
-    owner.client.visit(
-        [&](WebContentOwner const& web_content_owner) {
-            if (web_content_owner.client)
-                web_content_owner.client->async_did_worker_agent_finish_loading_script(owner.token);
-        },
-        [&](WebWorkerOwner const& web_worker_owner) {
-            web_worker_owner.client->async_did_worker_agent_finish_loading_script(owner.token);
-        });
-}
-
 void WorkerProcessManager::notify_worker_script_load_failure(Owner const& owner)
 {
     owner.client.visit(
@@ -332,6 +319,18 @@ void WorkerProcessManager::notify_worker_close(Owner const& owner)
         });
 }
 
+void WorkerProcessManager::notify_worker_death(Owner const& owner)
+{
+    owner.client.visit(
+        [&](WebContentOwner const& web_content_owner) {
+            if (web_content_owner.client)
+                web_content_owner.client->async_did_worker_agent_die(owner.token);
+        },
+        [&](WebWorkerOwner const& web_worker_owner) {
+            web_worker_owner.client->async_did_worker_agent_die(owner.token);
+        });
+}
+
 void WorkerProcessManager::worker_did_finish_loading_script(Web::HTML::WorkerAgentId agent_id, bool worker_is_secure_context)
 {
     auto maybe_agent = m_agents.find(agent_id);
@@ -340,9 +339,6 @@ void WorkerProcessManager::worker_did_finish_loading_script(Web::HTML::WorkerAge
 
     auto& agent = maybe_agent->value;
     agent.worker_is_secure_context = worker_is_secure_context;
-
-    for (auto const& owner : agent.owners)
-        notify_worker_script_load_success(owner);
 }
 
 void WorkerProcessManager::worker_did_fail_loading_script(Web::HTML::WorkerAgentId agent_id)
@@ -361,7 +357,7 @@ void WorkerProcessManager::worker_did_fail_loading_script(Web::HTML::WorkerAgent
         notify_worker_script_load_failure(owner);
 
     Core::deferred_invoke([this, agent_id] {
-        remove_agent(agent_id);
+        remove_agent(agent_id, AgentRemovalCause::AgentTerminated);
     });
 }
 
@@ -391,13 +387,31 @@ void WorkerProcessManager::worker_did_close(Web::HTML::WorkerAgentId agent_id)
         notify_worker_close(owner);
 
     Core::deferred_invoke([this, agent_id] {
-        remove_agent(agent_id);
+        remove_agent(agent_id, AgentRemovalCause::AgentTerminated);
     });
 }
 
 void WorkerProcessManager::worker_did_die(Web::HTML::WorkerAgentId agent_id)
 {
-    worker_did_close(agent_id);
+    auto maybe_agent = m_agents.find(agent_id);
+    if (maybe_agent == m_agents.end())
+        return;
+
+    // A close we initiated is expected to drop the connection; any other loss must not look like a clean close.
+    auto& agent = maybe_agent->value;
+    if (agent.closing) {
+        worker_did_close(agent_id);
+        return;
+    }
+
+    agent.closing = true;
+    auto owners = agent.owners;
+    for (auto const& owner : owners)
+        notify_worker_death(owner);
+
+    Core::deferred_invoke([this, agent_id] {
+        remove_agent(agent_id, AgentRemovalCause::AgentTerminated);
+    });
 }
 
 void WorkerProcessManager::worker_did_request_file(Web::HTML::WorkerAgentId agent_id, ByteString path, i32 request_id)
@@ -441,11 +455,16 @@ void WorkerProcessManager::worker_did_post_broadcast_channel_message(Web::HTML::
     }
 }
 
-void WorkerProcessManager::remove_agent(Web::HTML::WorkerAgentId agent_id)
+void WorkerProcessManager::remove_agent(Web::HTML::WorkerAgentId agent_id, AgentRemovalCause cause)
 {
     auto maybe_agent = m_agents.find(agent_id);
     if (maybe_agent == m_agents.end())
         return;
+
+    // A worker still reachable from an owner is actively needed, and closing it here would be the
+    // wrapper-lifetime bug this ownership model exists to prevent.
+    if (cause == AgentRemovalCause::OwnerSetEmptied)
+        VERIFY(maybe_agent->value.owners.is_empty());
 
     auto agent = move(maybe_agent->value);
     m_agents.remove(agent_id);
@@ -483,8 +502,10 @@ void WorkerProcessManager::remove_owner(Web::HTML::WorkerAgentId agent_id, Owner
     if (!agent_owned_by_specified_owner)
         return;
 
-    if (agent.agent_type == Web::HTML::AgentType::DedicatedWorker || agent.owners.is_empty())
-        remove_agent(agent_id);
+    if (agent.owners.is_empty())
+        remove_agent(agent_id, AgentRemovalCause::OwnerSetEmptied);
+    else if (agent.agent_type == Web::HTML::AgentType::DedicatedWorker)
+        remove_agent(agent_id, AgentRemovalCause::AgentTerminated);
 }
 
 Optional<u64> WorkerProcessManager::exclusive_performance_owner(pid_t pid) const
