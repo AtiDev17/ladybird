@@ -131,6 +131,7 @@ public:
     virtual Optional<URL::Origin> active_document_origin() const override;
     virtual bool active_document_is_fully_active() const override;
     virtual bool active_document_is(DOM::Document const&) const override;
+    virtual Vector<GC::Root<Navigable>> active_document_inclusive_descendant_navigables() override;
     virtual Optional<URL::URL> active_document_top_level_creation_url() const override;
     virtual Optional<URL::Origin> active_document_top_level_origin() const override;
     virtual bool active_document_has_cross_site_ancestor() const override;
@@ -143,10 +144,6 @@ public:
     void restore_scroll_position_data(SessionHistoryEntry const&);
 
     virtual Utf16String const& target_name() const override;
-
-    GC::Ptr<NavigableContainer> container() const;
-    void set_container(Badge<NavigableContainer>, GC::Ptr<NavigableContainer> container) { m_container = container; }
-    GC::Ptr<DOM::Document> container_document() const;
 
     [[nodiscard]] bool is_focused() const;
 
@@ -242,9 +239,6 @@ public:
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#rendering-opportunity
     [[nodiscard]] bool has_a_rendering_opportunity() const;
-
-    Page& page() { return m_page; }
-    Page const& page() const { return m_page; }
 
     Utf16String selected_text() const;
     Utf16String selected_html_for_clipboard() const;
@@ -505,11 +499,6 @@ private:
 
     // AD-HOC: Guards the parent document's load event delay count during cross-document navigation.
     Optional<DOM::DocumentLoadEventDelayer> m_navigation_load_event_guard;
-
-    // Implied link between navigable and its container.
-    GC::Ptr<NavigableContainer> m_container;
-
-    GC::Ref<Page> m_page;
 
     NavigationObserver::NavigationObserversList m_navigation_observers;
 

@@ -6,8 +6,11 @@
 
 #pragma once
 
+#include <AK/Badge.h>
 #include <AK/Utf16String.h>
+#include <AK/Vector.h>
 #include <LibGC/Ptr.h>
+#include <LibGC/Root.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibURL/URL.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
@@ -31,7 +34,19 @@ public:
 
     GC::Ptr<Navigable> parent() const { return m_parent; }
 
+    // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-container
+    GC::Ptr<NavigableContainer> container() const;
+    void set_container(Badge<NavigableContainer>, GC::Ptr<NavigableContainer> container) { m_container = container; }
+
+    // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-container-document
+    GC::Ptr<DOM::Document> container_document() const;
+
+    Page& page() { return m_page; }
+    Page const& page() const { return m_page; }
+
     bool is_ancestor_of(Navigable const&) const;
+
+    GC::Ptr<Navigable> find(CrossProcessId);
 
     virtual bool has_been_destroyed() const = 0;
 
@@ -46,6 +61,9 @@ public:
     virtual bool active_document_is_fully_active() const = 0;
     virtual bool active_document_is(DOM::Document const&) const = 0;
 
+    // https://html.spec.whatwg.org/multipage/document-sequences.html#inclusive-descendant-navigables
+    virtual Vector<GC::Root<Navigable>> active_document_inclusive_descendant_navigables() = 0;
+
     virtual Optional<URL::URL> active_document_top_level_creation_url() const = 0;
     virtual Optional<URL::Origin> active_document_top_level_origin() const = 0;
     virtual bool active_document_has_cross_site_ancestor() const = 0;
@@ -58,7 +76,7 @@ public:
     bool allowed_by_sandboxing_to_navigate(Navigable const& target, SourceSnapshotParams const&) const;
 
 protected:
-    Navigable() = default;
+    explicit Navigable(GC::Ref<Page>);
     void set_id(CrossProcessId id) { m_id = id; }
     void set_parent(GC::Ptr<Navigable> parent) { m_parent = parent; }
 
@@ -71,6 +89,11 @@ private:
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-parent
     GC::Ptr<Navigable> m_parent;
+
+    // Implied link between navigable and its container.
+    GC::Ptr<NavigableContainer> m_container;
+
+    GC::Ref<Page> m_page;
 };
 
 }

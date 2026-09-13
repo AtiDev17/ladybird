@@ -8,6 +8,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Navigable.h>
+#include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/SandboxingFlagSet.h>
 #include <LibWeb/HTML/SourceSnapshotParams.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
@@ -16,12 +17,39 @@
 
 namespace Web::HTML {
 
+Navigable::Navigable(GC::Ref<Page> page)
+    : m_page(page)
+{
+}
+
 Navigable::~Navigable() = default;
 
 void Navigable::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_parent);
+    visitor.visit(m_container);
+    visitor.visit(m_page);
+}
+
+// https://html.spec.whatwg.org/multipage/document-sequences.html#nav-container
+GC::Ptr<NavigableContainer> Navigable::container() const
+{
+    // The container of a navigable navigable is the navigable container whose nested navigable is navigable, or null if there is no such element.
+    return m_container;
+}
+
+// https://html.spec.whatwg.org/multipage/document-sequences.html#nav-container-document
+GC::Ptr<DOM::Document> Navigable::container_document() const
+{
+    auto container = this->container();
+
+    // 1. If navigable's container is null, then return null.
+    if (!container)
+        return nullptr;
+
+    // 2. Return navigable's container's node document.
+    return container->document();
 }
 
 bool Navigable::is_ancestor_of(Navigable const& other) const
@@ -31,6 +59,26 @@ bool Navigable::is_ancestor_of(Navigable const& other) const
             return true;
     }
     return false;
+}
+
+GC::Ptr<Navigable> Navigable::find(CrossProcessId id)
+{
+    // AD-HOC: Step 3 of destroy a child navigable, after which the navigable is no longer a child, is deferred until
+    //         its document has unloaded. A destroyed navigable is not found, although
+    //         Document::document_tree_child_navigables() still includes it until then.
+    if (has_been_destroyed())
+        return nullptr;
+    if (this->id() == id)
+        return this;
+
+    for (auto* container : NavigableContainer::all_instances()) {
+        auto child = container->content_navigable();
+        if (!child || !active_document_is(container->document()))
+            continue;
+        if (auto navigable = child->find(id))
+            return navigable;
+    }
+    return nullptr;
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-traversable
