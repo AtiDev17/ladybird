@@ -522,7 +522,6 @@
   },
   "background-attachment": {
     "style-group": "BackgroundValues",
-    "affects-accumulated-visual-contexts": true,
     "affects-layout": false,
     "animation-type": "discrete",
     "inherited": false,
@@ -574,7 +573,6 @@
     ]
   },
   "background-image": {
-    "affects-accumulated-visual-contexts": true,
     "style-group": "BackgroundValues",
     "affects-layout": false,
     "animation-type": "discrete",

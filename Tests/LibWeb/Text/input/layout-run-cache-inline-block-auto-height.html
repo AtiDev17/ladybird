@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #spacer { height: 30px; }
@@ -12,22 +13,26 @@
 <div id="spacer"></div>
 <div id="cached"><div id="content"></div></div>
 <script>
-    asyncTest(async (done) => {
-        document.body.offsetHeight;
-
-        const hitsBefore = internals.layoutRunCacheHitCount();
-
-        // The inline-block's auto height is resolved through
-        // compute_auto_height_for_block_formatting_context_root, which must answer from the
-        // committed height when the subtree is reused.
-        document.getElementById("spacer").style.height = "60px";
-        document.body.offsetHeight;
-
-        const hitDelta = internals.layoutRunCacheHitCount() - hitsBefore;
-        const cachedRect = document.getElementById("cached").getBoundingClientRect();
-
-        println(`hit delta: ${hitDelta}`);
-        println(`cached rect: ${cachedRect.top},${cachedRect.width},${cachedRect.height}`);
-        done();
+    layoutTest({
+        steps: [
+            {
+                name: "reused inline-block retains its automatic height",
+                mutate: () => {
+                    spacer.style.height = "60px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block REUSE SUBTREE
+                `,
+                check: equal => {
+                    const rect = cached.getBoundingClientRect();
+                    equal(rect.top, 60, "cached top");
+                    equal(rect.width, 150, "cached width");
+                    equal(rect.height, 45, "cached height");
+                },
+            },
+        ],
     });
 </script>

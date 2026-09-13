@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #spacer { width: 100px; height: 50px; }
@@ -12,19 +13,22 @@
 <div id="spacer"></div>
 <div id="cached" lang="en">istanbul</div>
 <script>
-    asyncTest(async (done) => {
-        document.body.offsetHeight;
-
-        // Locale-sensitive casing keys the rendered text on the language, so a lang
-        // change must invalidate the subtree's cached run; replaying it would keep
-        // the en-cased glyphs.
-        document.getElementById("cached").setAttribute("lang", "tr");
-        const hitsBefore = internals.layoutRunCacheHitCount();
-        document.getElementById("spacer").style.height = "80px";
-        document.body.offsetHeight;
-
-        const hitDelta = internals.layoutRunCacheHitCount() - hitsBefore;
-        println(`hit delta after lang change: ${hitDelta}`);
-        done();
+    layoutTest({
+        steps: [
+            {
+                name: "a language change invalidates the cached text layout",
+                mutate: () => {
+                    // Reusing the English run would preserve the wrong uppercased glyphs.
+                    cached.setAttribute("lang", "tr");
+                    spacer.style.height = "80px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block RUN (cache=miss)
+                `,
+            },
+        ],
     });
 </script>

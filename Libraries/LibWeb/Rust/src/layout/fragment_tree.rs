@@ -63,6 +63,19 @@ fn same_allocation<T>(left: Option<&std::rc::Rc<T>>, right: Option<&std::rc::Rc<
 
 impl Fragment {
     fn builds_identically_to(&self, previous: &Fragment) -> bool {
+        self.has_same_box_properties(previous)
+            && same_allocation(self.line_data.as_ref(), previous.line_data.as_ref())
+            && self.children.len() == previous.children.len()
+            && self
+                .children
+                .iter()
+                .zip(&previous.children)
+                .all(|(link, previous_link)| link.places_same_fragment_identically_to(previous_link))
+    }
+
+    /// Box properties excluding inline content and child fragments. Painting compares those
+    /// separately: a new descendant fragment does not necessarily change this box's commands.
+    pub(crate) fn has_same_box_properties(&self, previous: &Fragment) -> bool {
         self.node == previous.node
             && self.content_inline_size == previous.content_inline_size
             && self.content_block_size == previous.content_block_size
@@ -87,7 +100,6 @@ impl Fragment {
                 self.collapsed_table_borders.as_ref(),
                 previous.collapsed_table_borders.as_ref(),
             )
-            && same_allocation(self.line_data.as_ref(), previous.line_data.as_ref())
             && same_allocation(self.grid_layout_data.as_ref(), previous.grid_layout_data.as_ref())
             && same_allocation(self.flex_layout_data.as_ref(), previous.flex_layout_data.as_ref())
             && same_allocation(self.used_grid_tracks.as_ref(), previous.used_grid_tracks.as_ref())
@@ -95,18 +107,25 @@ impl Fragment {
             && same_allocation(self.computed_svg_path.as_ref(), previous.computed_svg_path.as_ref())
             && self.has_line_clamp_point == previous.has_line_clamp_point
             && self.is_invisible_for_line_clamp == previous.is_invisible_for_line_clamp
-            && self.children.len() == previous.children.len()
+    }
+
+    pub(crate) fn has_same_child_placements(&self, previous: &Fragment) -> bool {
+        self.children.len() == previous.children.len()
             && self
                 .children
                 .iter()
                 .zip(&previous.children)
-                .all(|(link, previous_link)| link.places_same_fragment_identically_to(previous_link))
+                .all(|(link, previous_link)| link.has_same_placement(previous_link))
     }
 }
 
 impl FragmentLink {
     fn places_same_fragment_identically_to(&self, previous: &FragmentLink) -> bool {
-        std::rc::Rc::ptr_eq(&self.fragment, &previous.fragment)
+        std::rc::Rc::ptr_eq(&self.fragment, &previous.fragment) && self.has_same_placement(previous)
+    }
+
+    pub(crate) fn has_same_placement(&self, previous: &FragmentLink) -> bool {
+        self.fragment.node == previous.fragment.node
             && self.committed_offset == previous.committed_offset
             && self.inset_left == previous.inset_left
             && self.inset_right == previous.inset_right

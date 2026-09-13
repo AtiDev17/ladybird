@@ -33,15 +33,15 @@ displayListTest({
             expect: `
                 @canvas RECORD (empty)
                 @viewport WALK
-                  @viewport/background/hit-test RECORD
+                  @viewport/background/hit-test REUSE
                   @viewport/scroll-metadata RECORD (empty)
                   @viewport/background SKIP
                   @viewport/border SKIP
                   BlockContainer<HTML>#html/descendants(background-and-borders) WALK
                   BlockContainer(anonymous)/descendants(background-and-borders) WALK
                   BlockContainer<DIALOG>#modal/descendants(background-and-borders) WALK
-                  @viewport/foreground/hit-test RECORD (empty)
-                  @viewport/foreground RECORD (empty)
+                  @viewport/foreground/hit-test REUSE
+                  @viewport/foreground REUSE
                   BlockContainer<HTML>#html/descendants(foreground) WALK
                   BlockContainer(anonymous)/descendants(foreground) WALK
                   BlockContainer<DIALOG>#modal/descendants(foreground) WALK

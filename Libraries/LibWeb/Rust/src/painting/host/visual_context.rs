@@ -4,8 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use super::*;
-
 use crate::css::ffi_support::FfiUtf16View;
 use crate::layout::used_values;
 use crate::layout::used_values::OptionalCssPixelRect;
@@ -167,7 +165,6 @@ pub struct FfiVisualContextHostCallbacks {
     pub tree_inputs: unsafe extern "C" fn(*mut c_void) -> FfiVisualContextTreeInputs,
     pub scroll_offset: unsafe extern "C" fn(*mut c_void, *mut c_void) -> used_values::FfiCssPixelPoint,
     pub node_identity: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i64,
-    pub root_background_source: unsafe extern "C" fn(*mut c_void) -> FfiRootBackgroundSource,
 }
 
 impl FfiVisualContextHostCallbacks {
@@ -182,10 +179,6 @@ impl FfiVisualContextHostCallbacks {
     pub(crate) fn scroll_offset(&self, layout_node_shell: *mut c_void) -> used_values::FfiCssPixelPoint {
         // SAFETY: The C++ host answers synchronously from a live layout node shell.
         unsafe { (self.scroll_offset)(self.context, layout_node_shell) }
-    }
-    pub(crate) fn root_background_source(&self) -> FfiRootBackgroundSource {
-        // SAFETY: The C++ host answers synchronously.
-        unsafe { (self.root_background_source)(self.context) }
     }
 }
 

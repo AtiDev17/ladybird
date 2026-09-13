@@ -811,17 +811,11 @@ void set_needs_repaint(Layout::Node const& node, InvalidateDisplayList should_in
         Layout::RustFFI::layout_arena_paintable_invalidate_for_repaint(node.arena_handle(), committed_row_slot(node));
 
         // The root element paints the body's propagated background, so a body repaint must also refresh the
-        // root's cached background. A root repaint can conversely flip whether propagation applies, changing
-        // what the body itself paints.
+        // root's cached background. Changes to the propagation source are handled during paint preparation.
         if (body_background_is_propagated_to_root(as<Layout::NodeWithStyle>(node))) {
             if (auto const* document_element = document.document_element()) {
                 if (auto const* document_element_layout_node = document_element->unsafe_layout_node())
                     invalidate_paint_cache(*document_element_layout_node);
-            }
-        } else if (node.is_root_element()) {
-            if (auto const* body = document.body()) {
-                if (auto const* body_layout_node = body->unsafe_layout_node())
-                    invalidate_paint_cache(*body_layout_node);
             }
         }
     }

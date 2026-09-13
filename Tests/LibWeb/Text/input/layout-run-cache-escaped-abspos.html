@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #containing-block { position: relative; width: 300px; height: 200px; }
@@ -14,20 +15,28 @@
     </div>
 </div>
 <script>
-    asyncTest(done => {
-        document.body.offsetWidth;
-
-        const absolute = document.getElementById("absolute");
-        const leftBefore = absolute.getBoundingClientRect().left;
-        const hitsBefore = internals.layoutRunCacheHitCount();
-
-        document.getElementById("containing-block").style.width = "200px";
-        document.body.offsetWidth;
-
-        const hitDelta = internals.layoutRunCacheHitCount() - hitsBefore;
-        println(`hit delta: ${hitDelta >= 1 ? ">=1" : hitDelta}`);
-        println(`left before: ${leftBefore}`);
-        println(`left after: ${absolute.getBoundingClientRect().left}`);
-        done();
+    let leftBefore;
+    layoutTest({
+        steps: [
+            {
+                name: "replaying fragments relays the escaped absolute descendant",
+                mutate: () => {
+                    leftBefore = absolute.getBoundingClientRect().left;
+                    document.getElementById("containing-block").style.width = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#shell/block RUN (cache=miss)
+                            BlockContainer<DIV>#cached/block REPLAY FRAGMENTS
+                          BlockContainer<DIV>#absolute/block RUN (cache=miss)
+                `,
+                check: equal => {
+                    equal(leftBefore, 290, "left before");
+                    equal(absolute.getBoundingClientRect().left, 190, "left after");
+                },
+            },
+        ],
     });
 </script>

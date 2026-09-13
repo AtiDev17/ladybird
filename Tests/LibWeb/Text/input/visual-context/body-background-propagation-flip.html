@@ -19,9 +19,21 @@
         lines.push(`rect x without propagation: ${box.getBoundingClientRect().x}`);
         document.documentElement.style.background = "";
         lines.push(`rect x with propagation restored: ${box.getBoundingClientRect().x}`);
+        for (const element of [document.body, box]) {
+            element.style.backgroundImage = "linear-gradient(red, blue)";
+            for (const attachment of ["fixed", "local", "scroll"]) {
+                element.style.backgroundAttachment = attachment;
+                settle();
+                document.documentElement.style.backgroundColor = "white";
+                settle();
+                document.documentElement.style.backgroundColor = "transparent";
+                settle();
+            }
+            element.style.backgroundImage = "none";
+        }
         settle();
         lines.push(`full builds: ${internals.accumulatedVisualContextTreeBuildCount() - fullBuilds}`);
-        lines.push(`incremental updates happened: ${internals.accumulatedVisualContextIncrementalUpdateCount() > incrementalUpdates}`);
+        lines.push(`incremental updates: ${internals.accumulatedVisualContextIncrementalUpdateCount() - incrementalUpdates}`);
 
         for (const line of lines)
             println(line);

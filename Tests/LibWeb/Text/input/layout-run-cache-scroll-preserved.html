@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #spacer { height: 40px; }
@@ -15,29 +16,30 @@
     <div id="tall"></div>
 </div>
 <script>
-    asyncTest(async (done) => {
-        document.body.offsetHeight;
-
-        const cached = document.getElementById("cached");
-        cached.scrollTop = 120;
-
-        const hitsBefore = internals.layoutRunCacheHitCount();
-
-        // Moving the scroller by growing a sibling must keep its scroll offset and its
-        // (absolute-coordinate) scrollable overflow consistent with the new position.
-        document.getElementById("spacer").style.height = "90px";
-        document.body.offsetHeight;
-
-        const hitDelta = internals.layoutRunCacheHitCount() - hitsBefore;
-
-        println(`hit delta: ${hitDelta}`);
-        println(`scrollTop: ${cached.scrollTop}`);
-        println(`scrollHeight: ${cached.scrollHeight}`);
-        println(`cached top: ${cached.getBoundingClientRect().top}`);
-
-        // Scrolling after the move must still work against the shifted geometry.
-        cached.scrollTop = 300;
-        println(`scrollTop after set: ${cached.scrollTop}`);
-        done();
+    layoutTest({
+        setup: () => {
+            cached.scrollTop = 120;
+        },
+        steps: [
+            {
+                name: "moving a reused scroller preserves scrolling",
+                mutate: () => {
+                    spacer.style.height = "90px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block REUSE SUBTREE
+                `,
+                check: equal => {
+                    equal(cached.scrollTop, 120, "scrollTop");
+                    equal(cached.scrollHeight, 400, "scrollHeight");
+                    equal(cached.getBoundingClientRect().top, 90, "cached top");
+                    cached.scrollTop = 300;
+                    equal(cached.scrollTop, 300, "scrollTop after set");
+                },
+            },
+        ],
     });
 </script>

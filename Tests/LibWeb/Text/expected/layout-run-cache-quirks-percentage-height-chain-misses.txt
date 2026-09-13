@@ -1,3 +1,1 @@
-compat mode: BackCompat
-hit delta: 0
-inner height: 50 -> 100
+PASS: changing the containing block height (work + checks)

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #cached {
@@ -12,21 +13,23 @@
     <div id="inner"></div>
 </div>
 <script>
-    asyncTest(async (done) => {
-        document.body.offsetHeight;
-
-        const hitsBefore = internals.layoutRunCacheHitCount();
-
-        // A mutation inside the subtree dirties it, so its committed output must not be
-        // reused.
-        document.getElementById("inner").style.height = "70px";
-        document.body.offsetHeight;
-
-        const hitDelta = internals.layoutRunCacheHitCount() - hitsBefore;
-        const cachedRect = document.getElementById("cached").getBoundingClientRect();
-
-        println(`hit delta: ${hitDelta}`);
-        println(`cached height: ${cachedRect.height}`);
-        done();
+    layoutTest({
+        steps: [
+            {
+                name: "a descendant mutation invalidates the cached run",
+                mutate: () => {
+                    inner.style.height = "70px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block RUN (cache=miss)
+                `,
+                check: equal => {
+                    equal(cached.getBoundingClientRect().height, 70, "cached height");
+                },
+            },
+        ],
     });
 </script>

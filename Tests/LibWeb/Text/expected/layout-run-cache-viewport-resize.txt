@@ -1,3 +1,1 @@
-hit delta: 1
-cached width: 100
-dependent width: 100
+PASS: viewport resize reuses the independent subtree (work + checks)

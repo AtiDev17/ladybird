@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html class="reftest-wait">
+<link rel="match" href="../expected/background-attachment-change-after-paint-ref.html">
+<style>
+    html { background: white; }
+    body { margin: 0; height: 1200px; }
+    .box { width: 100px; height: 100px; background-repeat: no-repeat; background-size: 100px 300px; }
+    #local { overflow: scroll; }
+    #local > div { height: 400px; }
+    #transformed { transform: translateX(20px); }
+</style>
+<div id="fixed" class="box"></div>
+<div id="local" class="box"><div></div></div>
+<div id="transformed"><div id="under-transform" class="box"></div></div>
+<script>
+    const nextFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
+    (async () => {
+        await nextFrame();
+        await nextFrame();
+        // Adding the images and changing attachment must work without rebuilding AVC.
+        for (const box of document.querySelectorAll(".box")) {
+            box.style.backgroundImage = "linear-gradient(to bottom, red 0px 100px, lime 100px 200px, blue 200px)";
+            box.style.backgroundAttachment = box.id === "local" ? "local" : "fixed";
+        }
+        await nextFrame();
+        await nextFrame();
+        window.scrollTo(0, 50);
+        document.getElementById("local").scrollTop = 75;
+        await nextFrame();
+        await nextFrame();
+        // Trigger another recording after the scrolled backgrounds have been painted.
+        document.body.style.color = "purple";
+        document.documentElement.classList.remove("reftest-wait");
+    })();
+</script>

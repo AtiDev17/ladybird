@@ -122,6 +122,90 @@ pub(crate) fn body_background_is_propagated_to_root(
         && layout_arena.node_flags_if_live(slot) & NodeFlag::IsBody as u32 != 0
 }
 
+fn background_layers_style(
+    layout_arena: &impl PaintableRowsRead,
+    root_background_source: FfiRootBackgroundSource,
+    node: NodeSlotId,
+) -> Option<ComputedValuesView<'_>> {
+    if body_background_is_propagated_to_root(layout_arena, node, root_background_source) {
+        return None;
+    }
+    let source = if style_queries::node_is_root_element(layout_arena, node)
+        && root_background_source.use_body_background_properties
+    {
+        root_background_source.body_layout_node
+    } else {
+        node
+    };
+    layout_arena.node_style_if_live(source)
+}
+
+fn any_background_layer_has_an_image_with_attachment(style: ComputedValuesView<'_>, wanted_attachment: u16) -> bool {
+    let background = style.background();
+    let Some(image_value) = style_queries::handle_value(&background.background_image) else {
+        return false;
+    };
+    let Some(attachment_value) = style_queries::handle_value(&background.background_attachment) else {
+        return false;
+    };
+    let image_items = style_queries::comma_items(image_value);
+    let attachment_items = style_queries::comma_items(attachment_value);
+    image_items.iter().enumerate().any(|(index, image)| {
+        let attachment = attachment_items[index % attachment_items.len()];
+        style_queries::is_abstract_image(image)
+            && matches!(attachment, StyleValueData::Keyword { keyword } if *keyword == wanted_attachment)
+    })
+}
+
+fn any_background_layer_has_a_fixed_attachment_image(style: ComputedValuesView<'_>) -> bool {
+    any_background_layer_has_an_image_with_attachment(style, crate::css::css_enums::keyword::FIXED)
+}
+
+pub(crate) fn background_depends_on_live_scroll_offset(
+    layout_arena: &impl PaintableRowsRead,
+    root_background_source: crate::painting::host::FfiRootBackgroundSource,
+    node: NodeSlotId,
+) -> bool {
+    let Some(background_style) = background_layers_style(layout_arena, root_background_source, node) else {
+        return false;
+    };
+    any_background_layer_has_an_image_with_attachment(background_style, crate::css::css_enums::keyword::LOCAL)
+}
+
+pub(crate) fn background_has_fixed_attachment(
+    layout_arena: &impl PaintableRowsRead,
+    root_background_source: crate::painting::host::FfiRootBackgroundSource,
+    node: NodeSlotId,
+) -> bool {
+    let is_root_element = style_queries::node_is_root_element(layout_arena, node);
+    let Some(background_style) = background_layers_style(layout_arena, root_background_source, node) else {
+        return false;
+    };
+    if !any_background_layer_has_a_fixed_attachment_image(background_style) {
+        return false;
+    }
+
+    // https://drafts.csswg.org/css-transforms-1/#transform-rendering
+    // For elements that are effected by a transform (i.e. have a transform applied to them, or to any of
+    // their ancestor elements) and do not have their background propagated to the canvas, a value of fixed
+    // for the background-attachment property is treated as if it had a value of scroll.
+    if !is_root_element {
+        let mut current = Some(node);
+        while let Some(walk_node) = current {
+            if layout_arena.node_kind_if_live(walk_node) == Some(crate::layout::node_data::NodeKind::Viewport) {
+                break;
+            }
+            if let Some(style) = layout_arena.node_style_if_live(walk_node)
+                && style_queries::has_css_transform(layout_arena, walk_node, style)
+            {
+                return false;
+            }
+            current = layout_arena.node_parent_if_live(walk_node);
+        }
+    }
+    true
+}
+
 pub(crate) struct BackgroundPaintSource<'a> {
     pub layers_style_if_live: Option<ComputedValuesView<'a>>,
     pub layer_image_facts_owner: NodeSlotId,
@@ -451,11 +535,11 @@ fn resolve_layers<'a, O: Observer>(
         // If the background-attachment value for this layer is fixed, then this property has no effect: in this case
         // the background positioning area is the initial containing block.
         if layer.attachment == background_attachment::FIXED
-            && recorder.data(paintable).has_fixed_background_visual_context
+            && background_has_fixed_attachment(recorder.layout_arena, recorder.inputs.root_background_source, paintable)
         {
             background_positioning_area = CssPixelRect::from_location_and_size(
                 crate::css::css_pixels::CssPixelPoint::default(),
-                CssPixelRect::from(recorder.inputs.css_viewport_rect).size(),
+                recorder.inputs.css_viewport_rect.size(),
             );
         }
 
@@ -763,7 +847,7 @@ pub(crate) fn resolve_background_for_paint<'a, O: Observer>(
         },
     };
     if source.is_root_element {
-        let mut canvas_rect = CssPixelRect::from(recorder.inputs.css_viewport_rect);
+        let mut canvas_rect = recorder.inputs.css_viewport_rect;
         if let Some(overflow_rect) =
             crate::painting::paintable_geometry::scrollable_overflow_rect(recorder.layout_arena, paintable)
         {

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #container { width: 300px; height: 100px; }
@@ -13,20 +14,32 @@
     <table id="fixed-table"><tr><td id="fixed-cell">x</td></tr></table>
 </div>
 <script>
-    test(() => {
-        document.body.offsetHeight;
-        const percentageHeightBefore = document.getElementById("percentage-table").getBoundingClientRect().height;
-        const hitsBefore = internals.layoutRunCacheHitCount();
-
-        // Table cells resolve percentage heights against the basis the table forwards from its
-        // containing block, so only the table with fixed cell heights is replayed. The shadow run
-        // cache oracle also probes the runs nested inside a replayed table, so the exact hit count
-        // is not stable; the percentage table's geometry shows that it was laid out again.
-        document.getElementById("container").style.height = "200px";
-        document.body.offsetHeight;
-
-        println(`fixed table replayed: ${internals.layoutRunCacheHitCount() - hitsBefore >= 1}`);
-        println(`percentage table height: ${percentageHeightBefore} -> ${document.getElementById("percentage-table").getBoundingClientRect().height}`);
-        println(`fixed table height: ${document.getElementById("fixed-table").getBoundingClientRect().height}`);
+    let heightBefore;
+    layoutTest({
+        steps: [
+            {
+                name: "only the fixed-height table is reused",
+                mutate: () => {
+                    heightBefore = document.getElementById("percentage-table").getBoundingClientRect().height;
+                    // The percentage-height cell observes the basis forwarded by its table.
+                    container.style.height = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          TableWrapper(anonymous)/block RUN (cache=miss)
+                            Box<TABLE>#percentage-table/table RUN (cache=miss)
+                              BlockContainer<TD>#percentage-cell/block (measurement) RUN (cache=bypass)
+                              BlockContainer<TD>#percentage-cell/block RUN (cache=miss)
+                          TableWrapper(anonymous)/block REUSE SUBTREE
+                `,
+                check: equal => {
+                    equal(heightBefore, 50, "percentage table height before");
+                    equal(document.getElementById("percentage-table").getBoundingClientRect().height, 100, "percentage table height after");
+                    equal(document.getElementById("fixed-table").getBoundingClientRect().height, 20, "fixed table height");
+                },
+            },
+        ],
     });
 </script>

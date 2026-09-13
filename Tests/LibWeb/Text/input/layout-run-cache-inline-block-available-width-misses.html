@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #narrowed-container { width: 300px; }
@@ -8,22 +9,29 @@
 </style>
 <div id="narrowed-container"><div id="inline-block-whose-max-content-no-longer-fits"><div class="wide"></div><div class="wide"></div></div></div>
 <script>
+    let before;
     function rectToString(rect) {
         return `${rect.left},${rect.top},${rect.width},${rect.height}`;
     }
-
-    asyncTest(async (done) => {
-        document.body.offsetHeight;
-        const onlyCacheRoot = document.getElementById("inline-block-whose-max-content-no-longer-fits");
-        const before = rectToString(onlyCacheRoot.getBoundingClientRect());
-
-        const hitsBefore = internals.layoutRunCacheHitCount();
-        document.getElementById("narrowed-container").style.width = "200px";
-        document.body.offsetHeight;
-
-        println(`hit delta: ${internals.layoutRunCacheHitCount() - hitsBefore}`);
-        println(`before: ${before}`);
-        println(`after: ${rectToString(onlyCacheRoot.getBoundingClientRect())}`);
-        done();
+    layoutTest({
+        steps: [
+            {
+                name: "available width forces wrapping",
+                mutate: () => {
+                    before = rectToString(document.getElementById("inline-block-whose-max-content-no-longer-fits").getBoundingClientRect());
+                    document.getElementById("narrowed-container").style.width = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#inline-block-whose-max-content-no-longer-fits/block RUN (cache=miss)
+                `,
+                check: equal => {
+                    equal(before, "0,0,240,20", "rect before");
+                    equal(rectToString(document.getElementById("inline-block-whose-max-content-no-longer-fits").getBoundingClientRect()), "0,0,200,40", "rect after");
+                },
+            },
+        ],
     });
 </script>

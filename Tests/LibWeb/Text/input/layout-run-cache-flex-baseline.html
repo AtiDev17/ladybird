@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; font: 16px/1 monospace; }
     #spacer { height: 20px; }
@@ -15,23 +16,29 @@
 <div id="spacer"></div>
 <div>x<div id="cached" style="display: inline-flex;"><div class="item" id="big">A</div><div class="item">b</div></div></div>
 <script>
-    asyncTest(async (done) => {
-        document.body.offsetHeight;
-
-        const bigBefore = document.getElementById("big").getBoundingClientRect();
-        const hitsBefore = internals.layoutRunCacheHitCount();
-
-        // Baseline alignment of the reused inline-flex against surrounding text depends on
-        // the baselines restored from the committed paintable.
-        document.getElementById("spacer").style.height = "50px";
-        document.body.offsetHeight;
-
-        const hitDelta = internals.layoutRunCacheHitCount() - hitsBefore;
-        const bigAfter = document.getElementById("big").getBoundingClientRect();
-
-        println(`hit delta: ${hitDelta >= 1 ? ">=1" : hitDelta}`);
-        println(`big moved by: ${bigAfter.top - bigBefore.top}`);
-        println(`big rect: ${bigAfter.left},${bigAfter.width},${bigAfter.height}`);
-        done();
+    let before;
+    layoutTest({
+        steps: [
+            {
+                name: "reused inline-flex retains its baseline",
+                mutate: () => {
+                    before = big.getBoundingClientRect();
+                    spacer.style.height = "50px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          Box<DIV>#cached/flex REUSE SUBTREE
+                `,
+                check: equal => {
+                    const after = big.getBoundingClientRect();
+                    equal(after.top - before.top, 30, "baseline movement");
+                    equal(after.left, 9.703125, "big left");
+                    equal(after.width, 80, "big width");
+                    equal(after.height, 32, "big height");
+                },
+            },
+        ],
     });
 </script>

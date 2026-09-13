@@ -886,9 +886,28 @@ WebIDL::UnsignedLongLong Internals::full_layout_count()
     return window().associated_document().full_layout_count();
 }
 
-WebIDL::UnsignedLongLong Internals::layout_run_cache_hit_count()
+void Internals::begin_layout_trace()
 {
-    return window().associated_document().layout_node_arena().formatting_context_run_cache_hit_count();
+    Layout::RustFFI::layout_arena_begin_layout_trace(window().associated_document().layout_node_arena().handle(),
+        [](void* node_shell, void* sink, void (*append)(void*, u8 const*, size_t)) {
+            auto description = static_cast<Layout::Node const*>(node_shell)->debug_description();
+            append(sink, description.bytes().data(), description.bytes().size());
+        });
+}
+
+void Internals::update_layout_for_testing()
+{
+    window().associated_document().update_layout(DOM::UpdateLayoutReason::InternalsLayoutTest);
+}
+
+Utf16String Internals::take_layout_trace()
+{
+    StringBuilder builder;
+    Layout::RustFFI::layout_arena_take_layout_trace(window().associated_document().layout_node_arena().handle(), &builder,
+        [](void* context, u8 const* bytes, size_t length) {
+            static_cast<StringBuilder*>(context)->append(StringView { bytes, length });
+        });
+    return Utf16String::from_utf8_without_validation(builder.string_view());
 }
 
 WebIDL::UnsignedLongLong Internals::table_cell_measurement_cache_miss_count()

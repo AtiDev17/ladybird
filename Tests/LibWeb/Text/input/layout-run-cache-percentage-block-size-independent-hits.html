@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #container { width: 300px; height: 100px; }
@@ -8,16 +9,27 @@
 </style>
 <div id="container"><div id="cached"><div id="inner"></div></div></div>
 <script>
-    test(() => {
-        document.body.offsetHeight;
-        const hitsBefore = internals.layoutRunCacheHitCount();
-
-        // Nothing inside #cached resolves a percentage against #container's height, so its run
-        // is replayed even though its available and percentage block sizes changed.
-        document.getElementById("container").style.height = "200px";
-        document.body.offsetHeight;
-
-        println(`hit delta: ${internals.layoutRunCacheHitCount() - hitsBefore}`);
-        println(`cached height: ${document.getElementById("cached").getBoundingClientRect().height}`);
+    let heightBefore;
+    layoutTest({
+        steps: [
+            {
+                name: "changing the containing block height",
+                mutate: () => {
+                    heightBefore = cached.getBoundingClientRect().height;
+                    // Nothing inside #cached observes the changed percentage block basis.
+                    container.style.height = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block REUSE SUBTREE
+                `,
+                check: equal => {
+                    equal(heightBefore, 40, "height before");
+                    equal(cached.getBoundingClientRect().height, 40, "height after");
+                },
+            },
+        ],
     });
 </script>

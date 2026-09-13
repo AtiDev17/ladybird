@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html class="reftest-wait">
+<link rel="match" href="../expected/body-background-propagation-change-after-paint-ref.html">
+<style>
+    html { background: white; }
+    body {
+        margin: 0;
+        height: 1200px;
+        transform: translateX(0);
+        background-image: linear-gradient(to bottom, red 0px 80px, lime 80px 160px, blue 160px);
+        background-size: 100% 240px;
+        background-repeat: no-repeat;
+        background-attachment: fixed;
+    }
+</style>
+<body></body>
+<script>
+    const nextFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
+    const paint = async () => { await nextFrame(); await nextFrame(); };
+    (async () => {
+        await paint();
+        window.scrollTo(0, 120);
+        await paint();
+        // The body's transform makes fixed attachment behave as scroll until its
+        // background propagates to the canvas. Exercise both cached owners.
+        document.documentElement.style.backgroundColor = "transparent";
+        await paint();
+        document.documentElement.style.backgroundColor = "white";
+        await paint();
+        document.documentElement.style.backgroundColor = "transparent";
+        await paint();
+        document.body.style.contain = "paint";
+        await paint();
+        document.body.style.contain = "none";
+        await paint();
+        // Replacing the source must also refresh the root's cached background.
+        document.body.replaceWith(document.body.cloneNode(false));
+        await paint();
+        window.scrollTo(0, 120);
+        await paint();
+        document.documentElement.style.backgroundColor = "white";
+        await paint();
+        document.documentElement.style.backgroundColor = "transparent";
+        await paint();
+        document.documentElement.classList.remove("reftest-wait");
+    })();
+</script>

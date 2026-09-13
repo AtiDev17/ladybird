@@ -1,2 +1,1 @@
-hit delta: 1
-cached height: 40
+PASS: changing the containing block height (work + checks)

@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <meta charset="utf-8">
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #spacer { width: 100px; height: 50px; }
@@ -16,37 +17,59 @@
     <div id="inner">straße אבג café words that wrap</div>
 </div>
 <script>
-    asyncTest(async (done) => {
-        const range = document.createRange();
-        range.setStart(inner.firstChild, 1);
-        range.setEnd(inner.firstChild, inner.firstChild.length - 2);
-        const selection = window.getSelection();
-        selection.addRange(range);
-        internals.dumpDisplayList();
-
-        // A paint-only background change must not invalidate the subtree's cached
-        // run; the relayout forced by the growing sibling must replay it.
-        document.getElementById("cached").style.backgroundColor = "lime";
-        const hitsBefore = internals.layoutRunCacheHitCount();
-        document.getElementById("spacer").style.height = "80px";
-        document.body.offsetHeight;
-
-        const hitDelta = internals.layoutRunCacheHitCount() - hitsBefore;
-        const selected = internals.dumpDisplayList();
-        selection.removeAllRanges();
-        const unselected = internals.dumpDisplayList();
-        selection.addRange(range);
-        const reselected = internals.dumpDisplayList();
-        // Rebuild the lines at a different width, then compare with the cached paint.
-        cached.style.width = "301px";
-        document.body.offsetHeight;
-        cached.style.width = "300px";
-        document.body.offsetHeight;
-        const fresh = internals.dumpDisplayList();
-        println(`hit delta after paint-only change: ${hitDelta}`);
-        println(`clearing selection changes paint: ${unselected !== selected}`);
-        println(`restoring selection restores paint: ${reselected === selected}`);
-        println(`cached selection matches fresh layout: ${fresh === selected}`);
-        done();
+    let range, selected;
+    layoutTest({
+        setup: () => {
+            range = document.createRange();
+            range.setStart(inner.firstChild, 1);
+            range.setEnd(inner.firstChild, inner.firstChild.length - 2);
+            getSelection().addRange(range);
+            internals.dumpDisplayList();
+        },
+        steps: [
+            {
+                name: "paint-only changes preserve the cached run and selection",
+                mutate: () => {
+                    cached.style.backgroundColor = "lime";
+                    spacer.style.height = "80px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block REUSE SUBTREE
+                `,
+                check: equal => {
+                    selected = internals.dumpDisplayList();
+                    getSelection().removeAllRanges();
+                    const unselected = internals.dumpDisplayList();
+                    getSelection().addRange(range);
+                    const reselected = internals.dumpDisplayList();
+                    equal(unselected !== selected, true, "clearing selection changes paint");
+                    equal(reselected, selected, "restoring selection restores paint");
+                },
+            },
+            {
+                name: "cached selection matches fresh layout",
+                mutate: () => {
+                    cached.style.width = "301px";
+                    internals.updateLayoutForTesting();
+                    cached.style.width = "300px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block RUN (cache=miss)
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block RUN (cache=miss)
+                `,
+                check: equal => {
+                    equal(internals.dumpDisplayList(), selected, "cached selection matches fresh layout");
+                },
+            },
+        ],
     });
 </script>

@@ -1,0 +1,9 @@
+text-clipped background: owner geometry unchanged = true
+text-clipped background: owner paint recorded = true
+text-clipped background: paint changed = true
+fieldset legend gap: owner geometry unchanged = true
+fieldset legend gap: owner paint recorded = true
+fieldset legend gap: paint changed = true
+table row background: owner geometry unchanged = true
+table row background: owner paint recorded = true
+table row background: paint changed = true

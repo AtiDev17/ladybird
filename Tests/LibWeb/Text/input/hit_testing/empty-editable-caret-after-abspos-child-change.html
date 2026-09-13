@@ -1,0 +1,50 @@
+<!doctype html>
+<script src="../include.js"></script>
+<style>
+    body { margin: 0; }
+    #editor { position: relative; width: 200px; height: 100px; background: silver; }
+    #child { position: absolute; left: 120px; top: 10px; width: 30px; height: 30px; }
+</style>
+<div id="editor" contenteditable="true"></div>
+<script>
+promiseTest(async () => {
+    if (document.readyState !== "complete")
+        await new Promise(resolve => window.addEventListener("load", resolve, { once: true }));
+    __outputElement.style.display = "none";
+    internals.recordDisplayListForTesting();
+    const output = [];
+    const caret = () => {
+        const position = document.caretPositionFromPoint(125, 15);
+        return position ? `${position.offsetNode.id} @${position.offset}` : "null";
+    };
+    const check = (name, expectedHitTestWork) => {
+        internals.beginDisplayListTrace();
+        internals.recordDisplayListForTesting();
+        const trace = internals.takeDisplayListTrace();
+        if (expectedHitTestWork)
+            output.push(`${name}, editor hit test updated: ${trace.includes(`#editor/foreground/hit-test ${expectedHitTestWork}\n`)}`);
+        output.push(`${name}, cached: ${caret()}`);
+        // Repeat without a mutation so a whole capture can be replayed as well.
+        internals.recordDisplayListForTesting();
+        output.push(`${name}, quiet: ${caret()}`);
+        internals.recordDisplayListForTesting(false, true);
+        output.push(`${name}, fresh: ${caret()}`);
+    };
+    check("empty editor");
+
+    // The child creates no inline fragments and changes neither the editor's
+    // dimensions nor its overflow, but the editor is no longer an empty caret target.
+    const child = document.createElement("div");
+    child.id = "child";
+    child.contentEditable = "false";
+    editor.appendChild(child);
+    output.push(`child is non-editable: ${!child.isContentEditable}`);
+    check("after insertion", "RECORD (empty)");
+
+    child.remove();
+    check("after removal", "RECORD");
+
+    __outputElement.style.display = "";
+    for (const line of output) println(line);
+});
+</script>

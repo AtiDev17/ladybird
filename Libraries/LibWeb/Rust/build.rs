@@ -3146,6 +3146,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         tree_builder_config,
         &[
             manifest_dir.join("src/layout/layout_node_arena.rs"),
+            manifest_dir.join("src/layout/trace.rs"),
             manifest_dir.join("src/layout/rendered_text.rs"),
             manifest_dir.join("src/layout/text_queries.rs"),
             manifest_dir.join("src/css/ffi_support.rs"),

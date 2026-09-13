@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #container { width: 300px; height: 100px; }
@@ -8,17 +9,28 @@
 </style>
 <div id="container"><div id="cached"><div id="inner"></div></div></div>
 <script>
-    test(() => {
-        document.body.offsetHeight;
-        const heightBefore = document.getElementById("cached").getBoundingClientRect().height;
-        const hitsBefore = internals.layoutRunCacheHitCount();
-
-        // The root's own min-height is a percentage of #container's height, which is not part of
-        // the run's assigned cells, so the stored run must not be replayed.
-        document.getElementById("container").style.height = "200px";
-        document.body.offsetHeight;
-
-        println(`hit delta: ${internals.layoutRunCacheHitCount() - hitsBefore}`);
-        println(`cached height: ${heightBefore} -> ${document.getElementById("cached").getBoundingClientRect().height}`);
+    let heightBefore;
+    layoutTest({
+        steps: [
+            {
+                name: "changing the containing block height",
+                mutate: () => {
+                    heightBefore = cached.getBoundingClientRect().height;
+                    // The root itself observes the percentage basis through min-height.
+                    container.style.height = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block RUN (cache=miss)
+                            BlockContainer<DIV>#cached/block (measurement) RUN (cache=bypass)
+                `,
+                check: equal => {
+                    equal(heightBefore, 50, "height before");
+                    equal(cached.getBoundingClientRect().height, 100, "height after");
+                },
+            },
+        ],
     });
 </script>

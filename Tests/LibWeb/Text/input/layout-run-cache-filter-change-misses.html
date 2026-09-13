@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #spacer { width: 100px; height: 50px; }
@@ -14,19 +15,22 @@
     <div id="inner"></div>
 </div>
 <script>
-    asyncTest(async (done) => {
-        document.body.offsetHeight;
-
-        // filter establishes a fixed-positioning containing block, so an effects
-        // change must invalidate the subtree's cached run even though the box
-        // geometry is unchanged.
-        document.getElementById("cached").style.filter = "blur(1px)";
-        const hitsBefore = internals.layoutRunCacheHitCount();
-        document.getElementById("spacer").style.height = "80px";
-        document.body.offsetHeight;
-
-        const hitDelta = internals.layoutRunCacheHitCount() - hitsBefore;
-        println(`hit delta after filter change: ${hitDelta}`);
-        done();
+    layoutTest({
+        steps: [
+            {
+                name: "a filter change invalidates the cached run",
+                mutate: () => {
+                    // A filter establishes a fixed-position containing block.
+                    cached.style.filter = "blur(1px)";
+                    spacer.style.height = "80px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block RUN (cache=miss)
+                `,
+            },
+        ],
     });
 </script>

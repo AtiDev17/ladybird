@@ -121,50 +121,50 @@ displayListTest({
             expect: `
                 @canvas RECORD (empty)
                 @viewport WALK
-                  @viewport/background/hit-test RECORD
+                  @viewport/background/hit-test REUSE
                   @viewport/scroll-metadata RECORD
                   @viewport/background SKIP
                   @viewport/border SKIP
                   BlockContainer<HTML>#html/descendants(background-and-borders) WALK
-                  @viewport/foreground/hit-test RECORD (empty)
-                  @viewport/foreground RECORD (empty)
+                  @viewport/foreground/hit-test REUSE
+                  @viewport/foreground REUSE
                   BlockContainer<HTML>#html/descendants(foreground) WALK
                   BlockContainer<HTML>#html WALK
-                    BlockContainer<HTML>#html/background/hit-test RECORD
+                    BlockContainer<HTML>#html/background/hit-test REUSE
                     BlockContainer<HTML>#html/scroll-metadata RECORD
-                    BlockContainer<HTML>#html/background RECORD (empty)
+                    BlockContainer<HTML>#html/background REUSE
                     BlockContainer<HTML>#html/border SKIP
                     BlockContainer<BODY>#body/descendants(background-and-borders) WALK
-                      BlockContainer<BODY>#body/background/hit-test RECORD
+                      BlockContainer<BODY>#body/background/hit-test REUSE
                       BlockContainer<BODY>#body/scroll-metadata RECORD
                       BlockContainer<BODY>#body/background SKIP
                       BlockContainer<BODY>#body/border SKIP
                       Box<DIV>#row.row/descendants(background-and-borders) WALK
-                        Box<DIV>#row.row/background/hit-test RECORD
+                        Box<DIV>#row.row/background/hit-test REUSE
                         Box<DIV>#row.row/scroll-metadata RECORD
                         Box<DIV>#row.row/background SKIP
                         Box<DIV>#row.row/border SKIP
                         BlockContainer<DIV>#row-0.box/descendants(background-and-borders) REUSE WHOLE CAPTURE
                         BlockContainer<DIV>#outer.box/descendants(background-and-borders) WALK
-                        BlockContainer<DIV>#row-2.box/descendants(background-and-borders) WALK
+                        BlockContainer<DIV>#row-2.box/descendants(background-and-borders) REUSE WHOLE CAPTURE
                       Box<DIV>#second-row.row/descendants(background-and-borders) REUSE WHOLE CAPTURE
-                    BlockContainer<HTML>#html/foreground/hit-test RECORD (empty)
-                    BlockContainer<HTML>#html/foreground RECORD (empty)
+                    BlockContainer<HTML>#html/foreground/hit-test REUSE
+                    BlockContainer<HTML>#html/foreground REUSE
                     BlockContainer<BODY>#body/descendants(foreground) WALK
-                      BlockContainer<BODY>#body/foreground/hit-test RECORD (empty)
-                      BlockContainer<BODY>#body/foreground RECORD (empty)
+                      BlockContainer<BODY>#body/foreground/hit-test REUSE
+                      BlockContainer<BODY>#body/foreground REUSE
                       Box<DIV>#row.row/descendants(foreground) WALK
-                        Box<DIV>#row.row/foreground/hit-test RECORD (empty)
-                        Box<DIV>#row.row/foreground RECORD (empty)
+                        Box<DIV>#row.row/foreground/hit-test REUSE
+                        Box<DIV>#row.row/foreground REUSE
                         BlockContainer<DIV>#row-0.box/descendants(foreground) REUSE WHOLE CAPTURE
                         BlockContainer<DIV>#outer.box/descendants(foreground) WALK
-                        BlockContainer<DIV>#row-2.box/descendants(foreground) WALK
+                        BlockContainer<DIV>#row-2.box/descendants(foreground) REUSE WHOLE CAPTURE
                         Box<DIV>#row.row/outline SKIP
-                        Box<DIV>#row.row/overlay/hit-test RECORD (empty)
+                        Box<DIV>#row.row/overlay/hit-test REUSE
                         Box<DIV>#row.row/overlay SKIP
                       Box<DIV>#second-row.row/descendants(foreground) REUSE WHOLE CAPTURE
                       BlockContainer<BODY>#body/outline SKIP
-                      BlockContainer<BODY>#body/overlay/hit-test RECORD (empty)
+                      BlockContainer<BODY>#body/overlay/hit-test REUSE
                       BlockContainer<BODY>#body/overlay SKIP
                     BlockContainer<DIV>#row-0.box REUSE WHOLE CAPTURE
                     BlockContainer<DIV>#outer.box WALK
@@ -216,16 +216,7 @@ displayListTest({
                       BlockContainer<DIV>#outer.box/outline SKIP
                       BlockContainer<DIV>#outer.box/overlay/hit-test RECORD
                       BlockContainer<DIV>#outer.box/overlay RECORD
-                    BlockContainer<DIV>#row-2.box WALK
-                      BlockContainer<DIV>#row-2.box/background/hit-test RECORD
-                      BlockContainer<DIV>#row-2.box/scroll-metadata RECORD
-                      BlockContainer<DIV>#row-2.box/background SKIP
-                      BlockContainer<DIV>#row-2.box/border RECORD
-                      BlockContainer<DIV>#row-2.box/foreground/hit-test RECORD
-                      BlockContainer<DIV>#row-2.box/foreground RECORD
-                      BlockContainer<DIV>#row-2.box/outline SKIP
-                      BlockContainer<DIV>#row-2.box/overlay/hit-test RECORD (empty)
-                      BlockContainer<DIV>#row-2.box/overlay SKIP
+                    BlockContainer<DIV>#row-2.box REUSE WHOLE CAPTURE
                     BlockContainer<DIV>#second-row-0.box REUSE WHOLE CAPTURE
                     BlockContainer<DIV>#second-row-1.box REUSE WHOLE CAPTURE
                     BlockContainer<DIV>#second-row-2.box REUSE WHOLE CAPTURE
@@ -239,27 +230,27 @@ displayListTest({
             expect: `
                 @canvas RECORD (empty)
                 @viewport WALK
-                  @viewport/background/hit-test RECORD
+                  @viewport/background/hit-test REUSE
                   @viewport/scroll-metadata RECORD
                   @viewport/background SKIP
                   @viewport/border SKIP
                   BlockContainer<HTML>#html/descendants(background-and-borders) WALK
-                  @viewport/foreground/hit-test RECORD (empty)
-                  @viewport/foreground RECORD (empty)
+                  @viewport/foreground/hit-test REUSE
+                  @viewport/foreground REUSE
                   BlockContainer<HTML>#html/descendants(foreground) WALK
                   BlockContainer<HTML>#html WALK
-                    BlockContainer<HTML>#html/background/hit-test RECORD
+                    BlockContainer<HTML>#html/background/hit-test REUSE
                     BlockContainer<HTML>#html/scroll-metadata RECORD
-                    BlockContainer<HTML>#html/background RECORD (empty)
+                    BlockContainer<HTML>#html/background REUSE
                     BlockContainer<HTML>#html/border SKIP
                     BlockContainer<BODY>#body/descendants(background-and-borders) WALK
-                      BlockContainer<BODY>#body/background/hit-test RECORD
+                      BlockContainer<BODY>#body/background/hit-test REUSE
                       BlockContainer<BODY>#body/scroll-metadata RECORD
                       BlockContainer<BODY>#body/background SKIP
                       BlockContainer<BODY>#body/border SKIP
                       Box<DIV>#row.row/descendants(background-and-borders) REUSE WHOLE CAPTURE
                       Box<DIV>#second-row.row/descendants(background-and-borders) WALK
-                        Box<DIV>#second-row.row/background/hit-test RECORD
+                        Box<DIV>#second-row.row/background/hit-test REUSE
                         Box<DIV>#second-row.row/scroll-metadata RECORD
                         Box<DIV>#second-row.row/background SKIP
                         Box<DIV>#second-row.row/border SKIP
@@ -267,24 +258,24 @@ displayListTest({
                         BlockContainer<DIV>#second-row-1.box/descendants(background-and-borders) REUSE WHOLE CAPTURE
                         BlockContainer<DIV>#inserted.box/descendants(background-and-borders) WALK
                         BlockContainer<DIV>#second-row-2.box/descendants(background-and-borders) WALK
-                    BlockContainer<HTML>#html/foreground/hit-test RECORD (empty)
-                    BlockContainer<HTML>#html/foreground RECORD (empty)
+                    BlockContainer<HTML>#html/foreground/hit-test REUSE
+                    BlockContainer<HTML>#html/foreground REUSE
                     BlockContainer<BODY>#body/descendants(foreground) WALK
-                      BlockContainer<BODY>#body/foreground/hit-test RECORD (empty)
-                      BlockContainer<BODY>#body/foreground RECORD (empty)
+                      BlockContainer<BODY>#body/foreground/hit-test REUSE
+                      BlockContainer<BODY>#body/foreground REUSE
                       Box<DIV>#row.row/descendants(foreground) REUSE WHOLE CAPTURE
                       Box<DIV>#second-row.row/descendants(foreground) WALK
-                        Box<DIV>#second-row.row/foreground/hit-test RECORD (empty)
-                        Box<DIV>#second-row.row/foreground RECORD (empty)
+                        Box<DIV>#second-row.row/foreground/hit-test REUSE
+                        Box<DIV>#second-row.row/foreground REUSE
                         BlockContainer<DIV>#second-row-0.box/descendants(foreground) REUSE WHOLE CAPTURE
                         BlockContainer<DIV>#second-row-1.box/descendants(foreground) REUSE WHOLE CAPTURE
                         BlockContainer<DIV>#inserted.box/descendants(foreground) WALK
                         BlockContainer<DIV>#second-row-2.box/descendants(foreground) WALK
                         Box<DIV>#second-row.row/outline SKIP
-                        Box<DIV>#second-row.row/overlay/hit-test RECORD (empty)
+                        Box<DIV>#second-row.row/overlay/hit-test REUSE
                         Box<DIV>#second-row.row/overlay SKIP
                       BlockContainer<BODY>#body/outline SKIP
-                      BlockContainer<BODY>#body/overlay/hit-test RECORD (empty)
+                      BlockContainer<BODY>#body/overlay/hit-test REUSE
                       BlockContainer<BODY>#body/overlay SKIP
                     BlockContainer<DIV>#row-0.box REUSE WHOLE CAPTURE
                     BlockContainer<DIV>#outer.box REUSE WHOLE CAPTURE

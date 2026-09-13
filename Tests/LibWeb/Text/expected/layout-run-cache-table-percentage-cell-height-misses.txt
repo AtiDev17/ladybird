@@ -1,3 +1,1 @@
-fixed table replayed: true
-percentage table height: 50 -> 100
-fixed table height: 20
+PASS: only the fixed-height table is reused (work + checks)

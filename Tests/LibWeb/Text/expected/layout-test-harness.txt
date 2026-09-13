@@ -1,0 +1,18 @@
+PASS: template literal indentation
+PASS: no layout work
+PASS: unexpected layout
+PASS: missing layout
+PASS: unrelated sibling work
+PASS: fragment replay is different from subtree reuse
+PASS: bypass is different from a miss
+PASS: shadow hit is still execution
+PASS: extra pass
+PASS: nested work
+PASS: repeated run
+PASS: measurement purpose
+PASS: traces mutation, flush and checks
+PASS: stops tracing after a throwing mutation
+PASS: stops tracing after a failed check
+PASS: requires expectations before mutating
+PASS: rejects asynchronous mutations
+PASS: rejects asynchronous checks

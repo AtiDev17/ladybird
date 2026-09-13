@@ -1,0 +1,6 @@
+PASS: quiet before abspos insertion (work)
+PASS: abspos insertion reuses all existing paint (work + checks)
+PASS: quiet after abspos insertion (work)
+PASS: abspos removal reuses all remaining paint (work + checks)
+PASS: quiet after abspos removal (work)
+PASS: abspos reinsertion after quiet frame reuses all existing paint (work + checks)

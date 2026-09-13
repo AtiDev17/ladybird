@@ -158,6 +158,7 @@ enum class InvalidateLayoutTreeReason {
     X(InspectDOMTree)                        \
     X(InspectDevToolsLayoutData)             \
     X(InputCaretRect)                        \
+    X(InternalsLayoutTest)                   \
     X(InternalsHitTest)                      \
     X(MediaQueryListMatches)                 \
     X(NavigableSelectedText)                 \

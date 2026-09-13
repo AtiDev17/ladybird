@@ -1,0 +1,5 @@
+PASS: a clean document performs no layout (work)
+PASS: a paint-only mutation performs no layout (work)
+PASS: partial layout identifies the boundary (work + checks)
+PASS: geometry reads in mutations and checks remain in the trace (work + checks)
+PASS: trace names survive removed nodes and subsequent layout (work)

@@ -44,7 +44,7 @@ fn commit_subtree(
     paintables: &mut crate::painting::paintable_build::PaintableCommit<'_>,
     links_by_slot: &HashMap<u32, &FragmentLink>,
     pass_fragments: &fragment_tree::CompletedPassFragments,
-    enclosing_line_root_content_changed: bool,
+    enclosing_line_root_changes: crate::painting::paintable_build::LineRootChanges,
 ) {
     let slot_index = node.slot_index();
     let entry = links_by_slot.get(&slot_index).copied();
@@ -54,11 +54,11 @@ fn commit_subtree(
         node,
         entry.is_some(),
         reuses_committed_subtree,
-        enclosing_line_root_content_changed,
+        enclosing_line_root_changes,
     );
 
     let mut has_pending_inline_box_geometry = false;
-    let mut line_root_content_changed_for_children = enclosing_line_root_content_changed;
+    let mut line_root_changes_for_children = enclosing_line_root_changes;
     if let Some(link) = entry
         && prepared.has_paintable_row
     {
@@ -75,11 +75,11 @@ fn commit_subtree(
             node,
             link,
             reuses_committed_subtree,
-            enclosing_line_root_content_changed,
+            enclosing_line_root_changes,
             prepared.previous_offset,
         );
         if fragment.line_data.is_some() {
-            line_root_content_changed_for_children = replaced.committed_fragment_identity_changed;
+            line_root_changes_for_children = replaced.line_root_changes;
         }
         if prepared.row_existed_before_this_commit
             && let Some((old_content_size, new_content_size)) = replaced.content_size_change
@@ -110,7 +110,7 @@ fn commit_subtree(
             &mut *paintables,
             links_by_slot,
             pass_fragments,
-            line_root_content_changed_for_children,
+            line_root_changes_for_children,
         );
         child = next;
     }
@@ -157,7 +157,7 @@ pub(crate) fn commit_replacing(
         &mut paintables,
         &links_by_slot,
         pass_fragments,
-        false,
+        Default::default(),
     );
     paintables.discard_absolute_rects_memoized_during_commit();
     CommitNotifications {

@@ -1,0 +1,3 @@
+PASS: identical inline output survives full relayout (work + checks)
+PASS: different text at the same size records new paint (work + checks)
+PASS: relayout preserves pending style paint invalidation (work + checks)

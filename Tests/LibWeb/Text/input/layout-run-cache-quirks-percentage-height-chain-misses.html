@@ -1,5 +1,6 @@
 <!DOCTYPE quirks>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #container { width: 300px; height: 100px; }
@@ -8,18 +9,28 @@
 </style>
 <div id="container"><div id="cached"><div id="inner"></div></div></div>
 <script>
-    test(() => {
-        document.body.offsetHeight;
-        const innerHeightBefore = document.getElementById("inner").getBoundingClientRect().height;
-        const hitsBefore = internals.layoutRunCacheHitCount();
-
-        // In quirks mode the auto-height #cached passes #container's height through to #inner's
-        // percentage height, so #cached's run depends on it and must not be replayed.
-        document.getElementById("container").style.height = "200px";
-        document.body.offsetHeight;
-
-        println(`compat mode: ${document.compatMode}`);
-        println(`hit delta: ${internals.layoutRunCacheHitCount() - hitsBefore}`);
-        println(`inner height: ${innerHeightBefore} -> ${document.getElementById("inner").getBoundingClientRect().height}`);
+    let heightBefore;
+    layoutTest({
+        steps: [
+            {
+                name: "changing the containing block height",
+                mutate: () => {
+                    heightBefore = inner.getBoundingClientRect().height;
+                    // In quirks mode the auto-height parent forwards the percentage block basis.
+                    container.style.height = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block RUN (cache=miss)
+                `,
+                check: equal => {
+                    equal(heightBefore, 50, "height before");
+                    equal(inner.getBoundingClientRect().height, 100, "height after");
+                    equal(document.compatMode, "BackCompat", "compat mode");
+                },
+            },
+        ],
     });
 </script>

@@ -1,1 +1,1 @@
-hit delta after lang change: 0
+PASS: a language change invalidates the cached text layout (work)

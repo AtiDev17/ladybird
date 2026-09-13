@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #flex { display: flex; align-items: flex-start; width: 300px; height: 100px; }
@@ -12,18 +13,30 @@
     <div id="plain"><div></div></div>
 </div>
 <script>
-    test(() => {
-        document.body.offsetHeight;
-        const inlineBlockHeightBefore = document.getElementById("inline-block").getBoundingClientRect().height;
-        const hitsBefore = internals.layoutRunCacheHitCount();
-
-        // The anonymous flex item around the inline content forwards the container's block size to
-        // the inline-block's percentage height, so its run depends on that size and misses, while
-        // #plain is replayed.
-        document.getElementById("flex").style.height = "200px";
-        document.body.offsetHeight;
-
-        println(`hit delta: ${internals.layoutRunCacheHitCount() - hitsBefore}`);
-        println(`inline-block height: ${inlineBlockHeightBefore} -> ${document.getElementById("inline-block").getBoundingClientRect().height}`);
+    let heightBefore;
+    layoutTest({
+        steps: [
+            {
+                name: "anonymous flex item forwards the changed percentage basis",
+                mutate: () => {
+                    heightBefore = document.getElementById("inline-block").getBoundingClientRect().height;
+                    flex.style.height = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          Box<DIV>#flex/flex RUN (cache=miss)
+                            BlockContainer(anonymous)/block (measurement, intrinsic) RUN (cache=bypass)
+                            BlockContainer(anonymous)/block RUN (cache=miss)
+                            BlockContainer<SPAN>#inline-block/block RUN (cache=miss)
+                            BlockContainer<DIV>#plain/block REUSE SUBTREE
+                `,
+                check: equal => {
+                    equal(heightBefore, 50, "inline-block height before");
+                    equal(document.getElementById("inline-block").getBoundingClientRect().height, 100, "inline-block height after");
+                },
+            },
+        ],
     });
 </script>

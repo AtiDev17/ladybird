@@ -1439,6 +1439,17 @@ pub(super) fn run_formatting_context(
         Ok(attempt) => attempt,
         Err(entry) => {
             let reuses_committed_subtree = entry.can_reuse_committed_subtree();
+            let _trace =
+                callbacks
+                    .arena()
+                    .layout_trace
+                    .run(callbacks.arena(), box_, fc_type, purpose, layout_mode, || {
+                        if reuses_committed_subtree {
+                            "REUSE SUBTREE"
+                        } else {
+                            "REPLAY FRAGMENTS"
+                        }
+                    });
             let outputs = if reuses_committed_subtree {
                 entry.outputs_for_reused_subtree()
             } else {
@@ -1451,6 +1462,12 @@ pub(super) fn run_formatting_context(
         // A later fresh run for this root supersedes a hit recorded earlier in the same pass.
         parent_fragments.clear_reused_subtree_root(box_);
     }
+    let _trace = callbacks
+        .arena()
+        .layout_trace
+        .run(callbacks.arena(), box_, fc_type, purpose, layout_mode, || {
+            cache_attempt.trace_action()
+        });
     let previous_line_data = cache_attempt.previous_line_data();
     let outputs = execute_formatting_context_run(
         purpose,
@@ -2064,6 +2081,7 @@ pub unsafe extern "C" fn rust_layout_run_root_layout(
         ..ContainingBlockConstraints::default()
     };
     let pass_fragments = RunRecords::with_unrooted(arena, root, |entry_records| {
+        let _trace = arena.layout_trace.pass(arena, None);
         let viewport_used = entry_records.create_used_values(&callbacks, root, root_constraints);
         let entry_fragments = std::rc::Rc::new(fragment_tree::RunFragmentBuilder::new_entry_accumulator(root));
         let entry_run = FormattingContextRun {
@@ -2216,6 +2234,7 @@ pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
         root
     };
     let pass_fragments = RunRecords::with_unrooted(arena, entry_root, |entry_records| {
+        let _trace = arena.layout_trace.pass(arena, Some(root));
         let entry_fragments = std::rc::Rc::new(fragment_tree::RunFragmentBuilder::new_entry_accumulator(entry_root));
         let entry_run = FormattingContextRun {
             purpose: LayoutPurpose::Commit,

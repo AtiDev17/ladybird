@@ -136,7 +136,9 @@ public:
     void set_content_blocking_enabled(bool enabled);
     WebIDL::UnsignedLongLong partial_layout_count();
     WebIDL::UnsignedLongLong full_layout_count();
-    WebIDL::UnsignedLongLong layout_run_cache_hit_count();
+    void begin_layout_trace();
+    void update_layout_for_testing();
+    Utf16String take_layout_trace();
     WebIDL::UnsignedLongLong table_cell_measurement_cache_miss_count();
     WebIDL::UnsignedLongLong intrinsic_measurement_count();
     WebIDL::UnsignedLongLong accumulated_visual_context_tree_build_count();

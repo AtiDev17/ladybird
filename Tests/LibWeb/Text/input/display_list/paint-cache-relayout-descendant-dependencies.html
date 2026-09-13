@@ -1,0 +1,44 @@
+<!doctype html>
+<script src="../include.js"></script>
+<script src="recording-test.js"></script>
+<style>
+    body { margin: 0; font: 16px/20px monospace; }
+    #clip { width: 200px; height: 40px; background: linear-gradient(red, blue); background-clip: text; color: transparent; }
+    fieldset { width: 200px; height: 60px; margin: 0; border: 4px solid black; }
+    table { width: 200px; table-layout: fixed; border-spacing: 4px; }
+    #row { background: linear-gradient(red, blue); }
+    td { height: 20px; padding: 0; }
+</style>
+<div id="clip"><div id="clipText">AAAA</div></div>
+<fieldset id="fieldset"><legend id="legend">Legend</legend></fieldset>
+<table><tbody><tr id="row"><td id="cell" style="width: 80px"></td><td></td></tr></tbody></table>
+<script>
+promiseTest(async () => {
+    if (document.readyState !== "complete")
+        await new Promise(resolve => window.addEventListener("load", resolve, { once: true }));
+    removeBodyWhitespace();
+    await document.fonts.ready;
+    __outputElement.style.display = "none";
+    const output = [];
+    for (const { name, owner, phase, mutate } of [
+        { name: "text-clipped background", owner: clip, phase: "background", mutate: () => { clipText.firstChild.data = "BBBB"; } },
+        { name: "fieldset legend gap", owner: fieldset, phase: "border", mutate: () => { legend.style.marginLeft = "30px"; } },
+        { name: "table row background", owner: row, phase: "background", mutate: () => { cell.style.width = "100px"; } },
+    ]) {
+        const before = internals.dumpDisplayList();
+        const rectBefore = JSON.stringify(owner.getBoundingClientRect());
+        internals.beginDisplayListTrace();
+        mutate();
+        internals.recordDisplayListForTesting(false, false);
+        const trace = internals.takeDisplayListTrace();
+        const rectAfter = JSON.stringify(owner.getBoundingClientRect());
+        const after = internals.dumpDisplayList();
+        const recordedOwner = trace.split("\n").some(line => line.trim().endsWith(`#${owner.id}/${phase} RECORD`));
+        output.push(`${name}: owner geometry unchanged = ${rectBefore === rectAfter}`);
+        output.push(`${name}: owner paint recorded = ${recordedOwner}`);
+        output.push(`${name}: paint changed = ${before !== after}`);
+    }
+    __outputElement.style.display = "";
+    for (const line of output) println(line);
+});
+</script>

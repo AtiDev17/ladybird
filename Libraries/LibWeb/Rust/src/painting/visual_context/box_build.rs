@@ -8,7 +8,7 @@ use super::reconcile::BoxNodeWriter;
 use super::scroll_state::{NO_SCROLL_STATE_SLOT, ScrollState, ScrollStateSlot};
 use super::*;
 use crate::layout::node_data::{NodeFlag, NodeSlotId};
-use crate::painting::host::{FfiRootBackgroundSource, FfiVisualContextHostCallbacks};
+use crate::painting::host::FfiVisualContextHostCallbacks;
 use crate::painting::paintable_data::*;
 use crate::painting::paintable_geometry;
 use crate::painting::paintable_rows::{PaintableRowsRead, PaintableRowsWrite};
@@ -18,7 +18,6 @@ pub(crate) struct BoxBuildEnvironment<'a, Arena> {
     pub layout_arena: &'a Arena,
     pub callbacks: &'a FfiVisualContextHostCallbacks,
     pub pixel_ratio: f64,
-    pub root_background_source: FfiRootBackgroundSource,
 }
 
 pub(crate) trait AnchorScrollShiftResolver {
@@ -36,9 +35,6 @@ pub(crate) struct PaintableVisualContextAssignment {
     pub has_accumulated_visual_context: bool,
     pub accumulated_visual_context: ContextRef,
     pub accumulated_visual_context_for_descendants: ContextRef,
-    pub fixed_background_visual_context: ContextRef,
-    pub has_fixed_background_visual_context: bool,
-    pub has_scroll_offset_dependent_background: bool,
     pub has_non_invertible_css_transform: bool,
     pub record: PaintableVisualContextRecord,
 }
@@ -53,9 +49,6 @@ impl PaintableVisualContextAssignment {
             has_accumulated_visual_context: data.has_accumulated_visual_context,
             accumulated_visual_context: data.accumulated_visual_context,
             accumulated_visual_context_for_descendants: data.accumulated_visual_context_for_descendants,
-            fixed_background_visual_context: data.fixed_background_visual_context,
-            has_fixed_background_visual_context: data.has_fixed_background_visual_context,
-            has_scroll_offset_dependent_background: data.has_scroll_offset_dependent_background,
             has_non_invertible_css_transform: data.has_flag(PaintableFlag::HasNonInvertibleCssTransform),
             record,
         }
@@ -71,9 +64,6 @@ impl PaintableVisualContextAssignment {
             data.has_accumulated_visual_context = self.has_accumulated_visual_context;
             data.accumulated_visual_context = self.accumulated_visual_context;
             data.accumulated_visual_context_for_descendants = self.accumulated_visual_context_for_descendants;
-            data.fixed_background_visual_context = self.fixed_background_visual_context;
-            data.has_fixed_background_visual_context = self.has_fixed_background_visual_context;
-            data.has_scroll_offset_dependent_background = self.has_scroll_offset_dependent_background;
             data.set_flag(
                 PaintableFlag::HasNonInvertibleCssTransform,
                 self.has_non_invertible_css_transform,
@@ -257,9 +247,6 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
     assignment.enclosing_scroll_node_index = VISUAL_VIEWPORT_NODE_INDEX;
     assignment.own_scroll_node_index = VISUAL_VIEWPORT_NODE_INDEX;
     assignment.node_identity = 0;
-    assignment.fixed_background_visual_context = ContextRef::default();
-    assignment.has_fixed_background_visual_context = false;
-    assignment.has_scroll_offset_dependent_background = false;
 
     let mut nearest_scroll_nodes_for_descendants = if is_fixed {
         NearestScrollNodeIndices {
@@ -534,39 +521,6 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
     assignment.has_accumulated_visual_context = true;
     assignment.accumulated_visual_context = own_state;
     sink.begin_descendants();
-
-    if super::node_values::wants_fixed_background_visual_context(
-        layout_arena,
-        env.root_background_source,
-        slot,
-        may_be_root_element,
-    ) {
-        // Rooted above every scroll-like node on the box's root path, the background stays put
-        // under scrolling while the box's own clips keep clipping it in their scrolled spaces.
-        let mut fixed_background_spatial = own_state.spatial;
-        let mut index = own_state.spatial;
-        while index != VISUAL_VIEWPORT_NODE_INDEX {
-            let node = sink.spatial_node_at(index);
-            if node.data.is_scroll_like() {
-                fixed_background_spatial = node.parent;
-            }
-            index = node.parent;
-        }
-        assignment.fixed_background_visual_context = ContextRef {
-            spatial: fixed_background_spatial,
-            ..own_state
-        };
-        assignment.has_fixed_background_visual_context = true;
-    }
-
-    if super::node_values::background_depends_on_live_scroll_offset(
-        layout_arena,
-        env.root_background_source,
-        slot,
-        may_be_root_element,
-    ) {
-        assignment.has_scroll_offset_dependent_background = true;
-    }
 
     // Build state for descendants: own state + perspective + clip + scroll.
     let mut state_for_descendants = own_state;

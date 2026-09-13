@@ -38,11 +38,6 @@ void NodeArena::free_subtree(RustFFI::NodeSlotId root)
     RustFFI::layout_arena_free_subtree(m_handle, root);
 }
 
-u64 NodeArena::formatting_context_run_cache_hit_count() const
-{
-    return RustFFI::layout_arena_fc_run_cache_hit_count(m_handle);
-}
-
 u64 NodeArena::table_cell_measurement_cache_miss_count() const
 {
     return RustFFI::layout_arena_table_cell_measurement_cache_miss_count(m_handle);

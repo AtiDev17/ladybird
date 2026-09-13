@@ -1,2 +1,1 @@
-hit delta: 1
-inline-block height: 50 -> 100
+PASS: anonymous flex item forwards the changed percentage basis (work + checks)

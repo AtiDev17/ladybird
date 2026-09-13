@@ -1,2 +1,1 @@
-hit delta: 0
-cached height: 70
+PASS: a descendant mutation invalidates the cached run (work + checks)

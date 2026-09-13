@@ -667,7 +667,6 @@ pub struct VisualContextState {
     pub dirty_boxes: dirty::VisualContextDirtySet,
     pub incremental_update_count: u64,
     pub last_tree_inputs: Option<crate::painting::host::FfiVisualContextTreeInputs>,
-    pub last_root_background_source: Option<crate::painting::host::FfiRootBackgroundSource>,
     pub last_full_build_reason: dirty::VisualContextGlobalRebuildReason,
     pub quarantined_slots_are_releasable: bool,
 }

@@ -1,2 +1,1 @@
-hit delta: 1
-cached rect: 60,150,45
+PASS: reused inline-block retains its automatic height (work + checks)

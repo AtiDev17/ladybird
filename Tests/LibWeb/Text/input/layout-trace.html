@@ -1,0 +1,88 @@
+<!doctype html>
+<script src="include.js"></script>
+<script src="layout-test.js"></script>
+<style>
+    body { margin: 0; }
+    #spacer { height: 10px; }
+    #target { display: flow-root; width: 100px; }
+    #child { height: 20px; }
+    #boundary { position: absolute; left: 200px; top: 0; width: 100px; height: 100px; }
+    #inside { height: 10px; }
+</style>
+<div id="spacer"></div>
+<div id="target"><div id="child"></div></div>
+<div id="boundary"><div id="inside"></div></div>
+<script>
+layoutTest({
+    steps: [
+        {
+            name: "a clean document performs no layout",
+            expect: "",
+        },
+        {
+            name: "a paint-only mutation performs no layout",
+            mutate: () => { target.style.backgroundColor = "green"; },
+            expect: "",
+        },
+        {
+            name: "partial layout identifies the boundary",
+            mutate: () => { inside.style.height = "30px"; },
+            expect: `
+                layout PARTIAL BlockContainer<DIV>#boundary
+                  BlockContainer<DIV>#boundary/block RUN (cache=miss)
+            `,
+            check: equal => equal(inside.getBoundingClientRect().height, 30, "inside height"),
+        },
+        {
+            name: "geometry reads in mutations and checks remain in the trace",
+            mutate: () => {
+                spacer.style.height = "20px";
+                spacer.getBoundingClientRect();
+                spacer.style.height = "30px";
+            },
+            expect: `
+                layout FULL
+                  @viewport/block RUN (cache=bypass)
+                    BlockContainer<HTML>/block RUN (cache=miss)
+                      BlockContainer<DIV>#target/block REUSE SUBTREE
+                  BlockContainer<DIV>#boundary/block RUN (cache=miss)
+                layout FULL
+                  @viewport/block RUN (cache=bypass)
+                    BlockContainer<HTML>/block RUN (cache=miss)
+                      BlockContainer<DIV>#target/block REUSE SUBTREE
+                  BlockContainer<DIV>#boundary/block RUN (cache=miss)
+                layout FULL
+                  @viewport/block RUN (cache=bypass)
+                    BlockContainer<HTML>/block RUN (cache=miss)
+                      BlockContainer<DIV>#target/block REUSE SUBTREE
+                  BlockContainer<DIV>#boundary/block RUN (cache=miss)
+            `,
+            check: equal => {
+                equal(target.getBoundingClientRect().top, 30, "top after flush");
+                spacer.style.height = "40px";
+                equal(target.getBoundingClientRect().top, 40, "top after check mutation");
+            },
+        },
+        {
+            name: "trace names survive removed nodes and subsequent layout",
+            mutate: () => {
+                child.style.height = "50px";
+                internals.updateLayoutForTesting();
+                target.remove();
+                internals.gc();
+            },
+            expect: `
+                layout FULL
+                  @viewport/block RUN (cache=bypass)
+                    BlockContainer<HTML>/block RUN (cache=miss)
+                      BlockContainer<DIV>#target/block RUN (cache=miss)
+                  BlockContainer<DIV>#boundary/block RUN (cache=miss)
+                layout FULL
+                  @viewport/block RUN (cache=bypass)
+                    BlockContainer<HTML>/block RUN (cache=miss)
+                  BlockContainer<DIV>#boundary/block RUN (cache=miss)
+            `,
+        },
+    ],
+});
+</script>

@@ -55,9 +55,6 @@ pub struct PaintableData {
     pub has_accumulated_visual_context: bool,
     pub accumulated_visual_context: ContextRef,
     pub accumulated_visual_context_for_descendants: ContextRef,
-    pub fixed_background_visual_context: ContextRef,
-    pub has_fixed_background_visual_context: bool,
-    pub has_scroll_offset_dependent_background: bool,
 }
 
 impl Default for PaintableData {
@@ -78,9 +75,6 @@ impl Default for PaintableData {
             has_accumulated_visual_context: false,
             accumulated_visual_context: ContextRef::default(),
             accumulated_visual_context_for_descendants: ContextRef::default(),
-            fixed_background_visual_context: ContextRef::default(),
-            has_fixed_background_visual_context: false,
-            has_scroll_offset_dependent_background: false,
         }
     }
 }

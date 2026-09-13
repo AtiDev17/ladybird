@@ -16,8 +16,8 @@ use super::reconcile::BoxNodeWriter;
 use super::refresh::compute_sticky_data;
 use super::scroll_state::ScrollState;
 use super::*;
-use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
-use crate::painting::host::{FfiRootBackgroundSource, FfiVisualContextHostCallbacks, FfiVisualContextTreeInputs};
+use crate::layout::node_data::{NodeKind, NodeSlotId};
+use crate::painting::host::{FfiVisualContextHostCallbacks, FfiVisualContextTreeInputs};
 use crate::painting::paint_order;
 use crate::painting::paintable_rows::PaintableRowsRead;
 use std::collections::{HashMap, HashSet};
@@ -74,7 +74,6 @@ struct WorkPlan {
 fn expand_dirty_entries(
     layout_arena: &impl PaintableRowsRead,
     dirty: &VisualContextDirtySet,
-    root_background_source: FfiRootBackgroundSource,
 ) -> Result<WorkPlan, VisualContextGlobalRebuildReason> {
     let mut work: HashMap<NodeSlotId, BoxDirtyBits> = HashMap::new();
     for (slot, bits) in &dirty.boxes {
@@ -89,23 +88,6 @@ fn expand_dirty_entries(
             bits.insert(VisualContextBoxDirtyKind::MovedWithDescendants);
         }
         work.entry(*slot).or_default().merge(bits);
-        let is_body = layout_arena.node_flags_if_live(*slot) & NodeFlag::IsBody as u32 != 0;
-        if is_body
-            && root_background_source.use_body_background_properties
-            && let Some(html) = paint_order::paint_parent(layout_arena, *slot)
-        {
-            work.entry(html)
-                .or_default()
-                .insert(VisualContextBoxDirtyKind::StyleStructuralChange);
-        }
-        if layout_arena.node_flags_if_live(*slot) & NodeFlag::IsHtmlHtmlElement as u32 != 0
-            && root_background_source.use_body_background_properties
-            && layout_arena.paintable_row_is_populated(root_background_source.body_layout_node)
-        {
-            work.entry(root_background_source.body_layout_node)
-                .or_default()
-                .insert(VisualContextBoxDirtyKind::StyleStructuralChange);
-        }
     }
     let mut revalidate_children_of = HashSet::new();
     for removed in &dirty.removed {
@@ -342,14 +324,13 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
     callbacks: &FfiVisualContextHostCallbacks,
     viewport: NodeSlotId,
     tree_inputs: FfiVisualContextTreeInputs,
-    root_background_source: FfiRootBackgroundSource,
     scope: VisualContextUpdateScope,
     state: &mut VisualContextState,
 ) -> IncrementalUpdateResult {
     let plan = if scope.rebuilds_every_box() {
         WorkPlan::default()
     } else {
-        match expand_dirty_entries(layout_arena, &state.dirty_boxes, root_background_source) {
+        match expand_dirty_entries(layout_arena, &state.dirty_boxes) {
             Ok(plan) => plan,
             Err(reason) => return IncrementalUpdateResult::NeedsFullBuild(reason),
         }
@@ -368,7 +349,6 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
         layout_arena,
         callbacks,
         pixel_ratio: tree_inputs.device_pixels_per_css_pixel,
-        root_background_source,
     };
     let viewport_output = layout_arena
         .paintable_visual_context_record(viewport)

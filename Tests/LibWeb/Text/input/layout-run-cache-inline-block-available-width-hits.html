@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #widened-container { width: 300px; }
@@ -8,22 +9,29 @@
 </style>
 <div id="widened-container"><div id="inline-block-whose-max-content-still-fits"><div id="content"></div></div></div>
 <script>
+    let before;
     function rectToString(rect) {
         return `${rect.left},${rect.top},${rect.width},${rect.height}`;
     }
-
-    asyncTest(async (done) => {
-        document.body.offsetHeight;
-        const onlyCacheRoot = document.getElementById("inline-block-whose-max-content-still-fits");
-        const before = rectToString(onlyCacheRoot.getBoundingClientRect());
-
-        const hitsBefore = internals.layoutRunCacheHitCount();
-        document.getElementById("widened-container").style.width = "320px";
-        document.body.offsetHeight;
-
-        println(`hit delta: ${internals.layoutRunCacheHitCount() - hitsBefore}`);
-        println(`before: ${before}`);
-        println(`after: ${rectToString(onlyCacheRoot.getBoundingClientRect())}`);
-        done();
+    layoutTest({
+        steps: [
+            {
+                name: "available width still fits max-content",
+                mutate: () => {
+                    before = rectToString(document.getElementById("inline-block-whose-max-content-still-fits").getBoundingClientRect());
+                    document.getElementById("widened-container").style.width = "320px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#inline-block-whose-max-content-still-fits/block REUSE SUBTREE
+                `,
+                check: equal => {
+                    equal(before, "0,0,50,20", "rect before");
+                    equal(rectToString(document.getElementById("inline-block-whose-max-content-still-fits").getBoundingClientRect()), "0,0,50,20", "rect after");
+                },
+            },
+        ],
     });
 </script>

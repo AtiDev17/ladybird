@@ -1,2 +1,1 @@
-hit delta: 1
-inner height: 0 -> 0
+PASS: changing the containing block height (work + checks)

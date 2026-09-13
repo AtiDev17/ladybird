@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html class="reftest-wait">
+<style>
+    body {
+        margin: 0;
+        height: 1200px;
+        transform: translateX(0);
+        background-image: linear-gradient(to bottom, red 0px 80px, lime 80px 160px, blue 160px);
+        background-size: 100% 240px;
+        background-repeat: no-repeat;
+        background-attachment: fixed;
+    }
+</style>
+<body></body>
+<script>
+    requestAnimationFrame(() => {
+        window.scrollTo(0, 120);
+        requestAnimationFrame(() => document.documentElement.classList.remove("reftest-wait"));
+    });
+</script>

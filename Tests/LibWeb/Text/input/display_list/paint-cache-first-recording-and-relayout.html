@@ -97,26 +97,26 @@ displayListTest({
             expect: `
                 @canvas RECORD (empty)
                 @viewport WALK
-                  @viewport/background/hit-test RECORD
+                  @viewport/background/hit-test REUSE
                   @viewport/scroll-metadata RECORD (empty)
                   @viewport/background SKIP
                   @viewport/border SKIP
                   BlockContainer<HTML>#html/descendants(background-and-borders) WALK
-                  @viewport/foreground/hit-test RECORD (empty)
-                  @viewport/foreground RECORD (empty)
+                  @viewport/foreground/hit-test REUSE
+                  @viewport/foreground REUSE
                   BlockContainer<HTML>#html/descendants(foreground) WALK
                   BlockContainer<HTML>#html WALK
-                    BlockContainer<HTML>#html/background/hit-test RECORD
+                    BlockContainer<HTML>#html/background/hit-test REUSE
                     BlockContainer<HTML>#html/scroll-metadata RECORD (empty)
-                    BlockContainer<HTML>#html/background RECORD (empty)
+                    BlockContainer<HTML>#html/background REUSE
                     BlockContainer<HTML>#html/border SKIP
                     BlockContainer<BODY>#body/descendants(background-and-borders) WALK
-                      BlockContainer<BODY>#body/background/hit-test RECORD
+                      BlockContainer<BODY>#body/background/hit-test REUSE
                       BlockContainer<BODY>#body/scroll-metadata RECORD (empty)
                       BlockContainer<BODY>#body/background SKIP
                       BlockContainer<BODY>#body/border SKIP
                       BlockContainer<DIV>#root/descendants(background-and-borders) WALK
-                        BlockContainer<DIV>#root/background/hit-test RECORD
+                        BlockContainer<DIV>#root/background/hit-test REUSE
                         BlockContainer<DIV>#root/scroll-metadata RECORD (empty)
                         BlockContainer<DIV>#root/background SKIP
                         BlockContainer<DIV>#root/border SKIP
@@ -126,14 +126,14 @@ displayListTest({
                           BlockContainer<DIV>#card1.card/scroll-metadata RECORD (empty)
                           BlockContainer<DIV>#card1.card/background SKIP
                           BlockContainer<DIV>#card1.card/border RECORD
-                    BlockContainer<HTML>#html/foreground/hit-test RECORD (empty)
-                    BlockContainer<HTML>#html/foreground RECORD (empty)
+                    BlockContainer<HTML>#html/foreground/hit-test REUSE
+                    BlockContainer<HTML>#html/foreground REUSE
                     BlockContainer<BODY>#body/descendants(foreground) WALK
-                      BlockContainer<BODY>#body/foreground/hit-test RECORD (empty)
-                      BlockContainer<BODY>#body/foreground RECORD (empty)
+                      BlockContainer<BODY>#body/foreground/hit-test REUSE
+                      BlockContainer<BODY>#body/foreground REUSE
                       BlockContainer<DIV>#root/descendants(foreground) WALK
-                        BlockContainer<DIV>#root/foreground/hit-test RECORD (empty)
-                        BlockContainer<DIV>#root/foreground RECORD (empty)
+                        BlockContainer<DIV>#root/foreground/hit-test REUSE
+                        BlockContainer<DIV>#root/foreground REUSE
                         BlockContainer<DIV>#card0.card/descendants(foreground) REUSE WHOLE CAPTURE
                         BlockContainer<DIV>#card1.card/descendants(foreground) WALK
                           BlockContainer<DIV>#card1.card/foreground/hit-test RECORD
@@ -142,10 +142,10 @@ displayListTest({
                           BlockContainer<DIV>#card1.card/overlay/hit-test RECORD (empty)
                           BlockContainer<DIV>#card1.card/overlay SKIP
                         BlockContainer<DIV>#root/outline SKIP
-                        BlockContainer<DIV>#root/overlay/hit-test RECORD (empty)
+                        BlockContainer<DIV>#root/overlay/hit-test REUSE
                         BlockContainer<DIV>#root/overlay SKIP
                       BlockContainer<BODY>#body/outline SKIP
-                      BlockContainer<BODY>#body/overlay/hit-test RECORD (empty)
+                      BlockContainer<BODY>#body/overlay/hit-test REUSE
                       BlockContainer<BODY>#body/overlay SKIP
                     BlockContainer<HTML>#html/outline SKIP
                   @viewport/outline SKIP

@@ -1,2 +1,1 @@
-hit delta: 0
-inner width: 100
+PASS: changed available width misses the cache (work + checks)

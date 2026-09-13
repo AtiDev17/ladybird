@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     #container { width: 400px; }
@@ -14,21 +15,23 @@
     </div>
 </div>
 <script>
-    asyncTest(async (done) => {
-        document.body.offsetHeight;
-
-        const hitsBefore = internals.layoutRunCacheHitCount();
-
-        // Narrowing the container changes the subtree's available space, so the saved
-        // inputs no longer match.
-        document.getElementById("container").style.width = "200px";
-        document.body.offsetHeight;
-
-        const hitDelta = internals.layoutRunCacheHitCount() - hitsBefore;
-        const innerRect = document.getElementById("inner").getBoundingClientRect();
-
-        println(`hit delta: ${hitDelta}`);
-        println(`inner width: ${innerRect.width}`);
-        done();
+    layoutTest({
+        steps: [
+            {
+                name: "changed available width misses the cache",
+                mutate: () => {
+                    container.style.width = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block RUN (cache=miss)
+                `,
+                check: equal => {
+                    equal(inner.getBoundingClientRect().width, 100, "inner width");
+                },
+            },
+        ],
     });
 </script>

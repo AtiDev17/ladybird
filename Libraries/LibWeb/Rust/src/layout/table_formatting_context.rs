@@ -926,6 +926,7 @@ pub(super) struct TableFormattingContext<'pass> {
     cell_inside_layout_inputs: Vec<AvailableSpace>,
     cell_pre_layout_content_block_sizes: Vec<CssPixels>,
     deferred_cell_inside_layouts: Vec<bool>,
+    cell_measurements: Vec<Option<TableCellMeasurement>>,
     columns: Vec<Column>,
     rows: Vec<Row>,
     collapsed_border_grid: Option<CollapsedBorderGrid>,
@@ -1039,6 +1040,7 @@ impl<'pass> TableFormattingContext<'pass> {
             cell_inside_layout_inputs: Vec::new(),
             cell_pre_layout_content_block_sizes: Vec::new(),
             deferred_cell_inside_layouts: Vec::new(),
+            cell_measurements: Vec::new(),
             columns: Vec::new(),
             rows: Vec::new(),
             collapsed_border_grid: None,
@@ -1085,6 +1087,7 @@ impl<'pass> TableFormattingContext<'pass> {
         self.cell_inside_layout_inputs = vec![AvailableSpace::default(); self.cells.len()];
         self.cell_pre_layout_content_block_sizes = vec![CssPixels::default(); self.cells.len()];
         self.deferred_cell_inside_layouts = vec![false; self.cells.len()];
+        self.cell_measurements = vec![None; self.cells.len()];
         self.needs_fixed_mode_row_measurement = false;
         self.prepare_table_participants(TableParticipantPreparation::CreateUsedValues);
         self.border_conflict_resolution();
@@ -2315,6 +2318,7 @@ impl<'pass> TableFormattingContext<'pass> {
         self.cell_inside_layout_inputs = vec![AvailableSpace::default(); self.cells.len()];
         self.cell_pre_layout_content_block_sizes = vec![CssPixels::default(); self.cells.len()];
         self.deferred_cell_inside_layouts = vec![false; self.cells.len()];
+        self.cell_measurements = vec![None; self.cells.len()];
         self.rows = table_grid.rows;
         self.columns = vec![Column::default(); table_grid.column_count];
         for cell in &self.cells {
@@ -2556,6 +2560,7 @@ impl<'pass> TableFormattingContext<'pass> {
         TableCellMeasurement {
             automatic_content_block_size: result.automatic_content_block_size,
             baselines: result.baselines,
+            depends_on_percentage_block_size: result.depends_on_percentage_block_size,
         }
     }
 
@@ -2643,6 +2648,7 @@ impl<'pass> TableFormattingContext<'pass> {
                 // This cell's final inside layout happens once row heights are final; measure its
                 // content in a throwaway state instead of laying out the committing state twice.
                 if let Some(measured) = self.measure_cell(cell, &used, inner, true) {
+                    self.cell_measurements[cell_index] = Some(measured);
                     used.set_content_block_size(measured.automatic_content_block_size);
                     content_baselines = Some(measured.baselines);
                 }
@@ -2963,9 +2969,32 @@ impl<'pass> TableFormattingContext<'pass> {
             }
             let cell = self.cells[cell_index];
             let adopt_automatic_content_block_size = !self.style(cell.box_).height().is_percentage();
-            let intrinsic_block_padding = Some(self.cell_intrinsic_block_padding(cell, collapsed));
+            let intrinsic_block_padding = self.cell_intrinsic_block_padding(cell, collapsed);
             let used = self.used_values(cell.box_);
             let measured_content_block_size = used.content_block_size.get();
+            if let Some(measurement) = self.cell_measurements[cell_index]
+                && run.purpose.is_measurement()
+                && self.style(cell.box_).height().is_auto()
+                && !self.node_facts(cell.box_).is_anonymous()
+                && !measurement.depends_on_percentage_block_size
+            {
+                // A measurement exports table sizes and row baselines, with no descendant
+                // fragments. Row sizing has already consumed this cell's measured height and
+                // baselines. Apply the final alignment padding without laying out its contents
+                // again. Keep percentage-height cells and anonymous flex/grid wrappers on the
+                // full path until their final-input dependencies are accounted for.
+                used.padding_top.set(used.padding_top.get() + intrinsic_block_padding.0);
+                used.padding_bottom
+                    .set(used.padding_bottom.get() + intrinsic_block_padding.1);
+                formatting_context::store_derived_baselines(&used, measurement.baselines);
+                formatting_context::propagate_percentage_block_size_dependency_to_containing_block(
+                    run.records,
+                    &run.callbacks,
+                    cell.box_,
+                    measurement.depends_on_percentage_block_size,
+                );
+                continue;
+            }
             // The first pass adopted the measured automatic block size so row sizing could read
             // it; restore the pre-layout size so the cell's children resolve percentages against
             // the same basis the measurement saw.
@@ -2976,7 +3005,7 @@ impl<'pass> TableFormattingContext<'pass> {
                 cell,
                 inner,
                 adopt_automatic_content_block_size,
-                intrinsic_block_padding,
+                Some(intrinsic_block_padding),
             );
             if adopt_automatic_content_block_size {
                 debug_assert_eq!(

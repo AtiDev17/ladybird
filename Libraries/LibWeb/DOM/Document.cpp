@@ -10464,19 +10464,6 @@ void Document::schedule_accumulated_visual_context_update(Element& element, Accu
         if (auto* pseudo_element_layout_node = pseudo_element.unsafe_layout_node())
             schedule_accumulated_visual_context_update(*pseudo_element_layout_node, scope);
     });
-
-    // https://drafts.csswg.org/css-backgrounds/#root-background
-    // The root and body boxes paint each other's propagated background layers, so a structural
-    // change on either has to reach both.
-    if (scope != AccumulatedVisualContextUpdateScope::Structure)
-        return;
-    if (element.is_document_element()) {
-        if (auto* body = this->body(); body && body->unsafe_layout_node())
-            schedule_accumulated_visual_context_update(*body->unsafe_layout_node(), scope);
-    } else if (&element == body()) {
-        if (auto* document_element = this->document_element(); document_element && document_element->unsafe_layout_node())
-            schedule_accumulated_visual_context_update(*document_element->unsafe_layout_node(), scope);
-    }
 }
 
 Painting::SnappedAreas const& Document::snapped_areas_of_scroll_container(Compositor::AsyncScrollNodeStableID const& stable_node_id) const

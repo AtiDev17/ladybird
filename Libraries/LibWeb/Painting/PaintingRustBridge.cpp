@@ -337,7 +337,10 @@ static Layout::NodeWithStyle::ImageObserver const* layer_image_observer(Layout::
 static Layout::RustFFI::FfiRootBackgroundSource rust_root_background_source(DOM::Document const& document)
 {
     Layout::RustFFI::FfiRootBackgroundSource source {};
+    source.root_layout_node = Layout::RustFFI::NodeSlotId { Layout::RustFFI::INVALID_NODE_SLOT_INDEX };
     source.body_layout_node = Layout::RustFFI::NodeSlotId { Layout::RustFFI::INVALID_NODE_SLOT_INDEX };
+    if (auto const* root = document.document_element(); root && root->unsafe_layout_node())
+        source.root_layout_node = Layout::Node::slot_id(root->unsafe_layout_node());
     auto const* html_element = document.html_element();
     source.use_body_background_properties = html_element && html_element->should_use_body_background_properties();
     if (auto const* body = document.body(); body && body->unsafe_layout_node())
@@ -374,10 +377,6 @@ Layout::RustFFI::FfiVisualContextHostCallbacks visual_context_host_callbacks(DOM
             if (auto dom_node = layout_node.dom_node(); dom_node && is<DOM::Element>(*dom_node))
                 return dom_node->unique_id().value();
             return 0;
-        },
-        .root_background_source = [](void* context) -> Layout::RustFFI::FfiRootBackgroundSource {
-            auto& document = *static_cast<DOM::Document*>(context);
-            return rust_root_background_source(document);
         },
     };
 }
@@ -484,7 +483,7 @@ void register_geometry_host(Layout::NodeArena& arena)
 Layout::RustFFI::FfiRenderingPreparationOutcome rust_prepare_for_rendering(DOM::Document& document, bool visual_context_update_pending)
 {
     return Layout::RustFFI::layout_arena_prepare_for_rendering(
-        layout_arena_handle(document), visual_context_host_callbacks(document), visual_context_update_pending);
+        layout_arena_handle(document), visual_context_host_callbacks(document), rust_root_background_source(document), visual_context_update_pending);
 }
 
 static CSS::PreferredColorScheme image_color_scheme(Layout::NodeWithStyle const& layout_node)

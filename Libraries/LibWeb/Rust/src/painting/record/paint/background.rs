@@ -13,7 +13,7 @@ use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::layout::node_facts;
 use crate::painting::border_radii::BorderRadii;
 use crate::painting::display_list::builder::PendingInlineClip;
-use crate::painting::display_list::commands::ContextRef;
+use crate::painting::display_list::commands::{ContextRef, VISUAL_VIEWPORT_NODE_INDEX};
 use crate::painting::display_list::commands::{OptionalAffineTransform, Repeat};
 use crate::painting::display_list::recorder::{FillPathParams, PaintStyle, PaintStyleOrColor};
 use crate::painting::force_dark::ForceDarkRole;
@@ -21,8 +21,8 @@ use crate::painting::node_painting;
 use crate::painting::paintable_data::FfiPixelBox;
 use crate::painting::record::PaintRecorder;
 use crate::painting::record::paint::background_resolution::{
-    BackgroundPaintInputs, ResolvedBackgroundLayer, operator_erases_destination_outside_the_drawn_geometry,
-    resolve_background_for_paint, resolve_background_layers,
+    BackgroundPaintInputs, ResolvedBackgroundLayer, background_has_fixed_attachment,
+    operator_erases_destination_outside_the_drawn_geometry, resolve_background_for_paint, resolve_background_layers,
 };
 use crate::painting::record::paint::gradient_resolution::{gradient_paint_value, record_gradient_fill};
 use crate::painting::record::paint::table_backgrounds;
@@ -466,13 +466,29 @@ fn paint_image_layer<O: Observer>(
 
     match layer.attachment {
         css_enums::background_attachment::FIXED => {
-            let data = recorder.data(paintable);
-            if data.has_fixed_background_visual_context && !recorder.recorder.is_recording_inside_group() {
+            if !recorder.recorder.is_recording_inside_group()
+                && background_has_fixed_attachment(
+                    recorder.layout_arena,
+                    recorder.inputs.root_background_source,
+                    paintable,
+                )
+            {
+                // Select an existing space above scrolling, retaining the clips and effects
+                // of the background paint. Background attachment doesn't add AVC nodes.
+                let tree = recorder.paint_state.visual_context.tree.as_ref().unwrap();
+                let mut spatial = recorder.data(paintable).accumulated_visual_context.spatial;
+                let mut index = spatial;
+                while index != VISUAL_VIEWPORT_NODE_INDEX {
+                    let node = &tree.spatial_nodes[index.0 as usize];
+                    if node.data.is_scroll_like() {
+                        spatial = node.parent;
+                    }
+                    index = node.parent;
+                }
                 let context = recorder.recorder.accumulated_visual_context();
-                recorder.recorder.set_accumulated_visual_context(ContextRef {
-                    spatial: data.fixed_background_visual_context.spatial,
-                    ..context
-                });
+                recorder
+                    .recorder
+                    .set_accumulated_visual_context(ContextRef { spatial, ..context });
             }
         }
         css_enums::background_attachment::LOCAL

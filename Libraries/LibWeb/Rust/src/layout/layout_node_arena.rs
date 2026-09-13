@@ -189,6 +189,7 @@ impl Hash for TableCellMeasurementKey {
 pub(crate) struct TableCellMeasurement {
     pub(crate) automatic_content_block_size: CssPixels,
     pub(crate) baselines: DerivedBaselines,
+    pub(crate) depends_on_percentage_block_size: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -514,8 +515,11 @@ pub(crate) struct LayoutNodeArena {
     rows_sharing_dom_node: RefCell<HashMap<*mut c_void, RowsSharingDomNode>>,
     dom_nodes_whose_bound_row_was_freed: Vec<*mut c_void>,
     fc_run_cache_store: super::fc_run_cache::FcRunCacheArenaStore,
+    pub(super) layout_trace: super::trace::LayoutTrace,
     pub(crate) paintable_rows: crate::painting::paintable_rows::PaintableRowStore,
     paint_state: RefCell<crate::painting::paint_state::PaintState>,
+    // Reuse workspace allocations without making recording scratch part of the committed paint state.
+    recording_scratch: RefCell<crate::painting::record::scratch::RecordingScratch>,
     pub(crate) scrollable_overflow: crate::painting::scrollable_overflow::ScrollableOverflowState,
     pub(crate) anchor_positioning_nodes: RefCell<HashSet<NodeSlotId>>,
     pub(crate) partial_relayout_boundary_roots: RefCell<Vec<NodeSlotId>>,
@@ -565,8 +569,10 @@ impl LayoutNodeArena {
             rows_sharing_dom_node: RefCell::new(HashMap::default()),
             dom_nodes_whose_bound_row_was_freed: Vec::new(),
             fc_run_cache_store: super::fc_run_cache::FcRunCacheArenaStore::default(),
+            layout_trace: super::trace::LayoutTrace::default(),
             paintable_rows: crate::painting::paintable_rows::PaintableRowStore::default(),
             paint_state: RefCell::new(crate::painting::paint_state::PaintState::default()),
+            recording_scratch: RefCell::new(crate::painting::record::scratch::RecordingScratch::default()),
             scrollable_overflow: Default::default(),
             anchor_positioning_nodes: RefCell::new(HashSet::default()),
             partial_relayout_boundary_roots: RefCell::new(Vec::new()),
@@ -2499,6 +2505,10 @@ impl LayoutNodeArena {
         &self.paint_state
     }
 
+    pub(crate) fn recording_scratch(&self) -> &RefCell<crate::painting::record::scratch::RecordingScratch> {
+        &self.recording_scratch
+    }
+
     pub(crate) fn node_flags_if_live(&self, id: NodeSlotId) -> u32 {
         if !self.slot_is_live(id) {
             return 0;
@@ -2881,16 +2891,6 @@ pub unsafe extern "C" fn layout_arena_live_slot_count(arena: *mut c_void) -> u32
     // SAFETY: The C++ wrapper keeps the arena alive for this call and
     // serializes all access on the document thread.
     unsafe { &*arena.cast::<LayoutNodeArena>() }.live_slot_count()
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_fc_run_cache_hit_count(arena: *mut c_void) -> u64 {
-    assert!(!arena.is_null(), "layout node arena handle is null");
-    // SAFETY: The C++ wrapper keeps the arena alive for this call and
-    // serializes all access on the document thread.
-    unsafe { &*arena.cast::<LayoutNodeArena>() }
-        .fc_run_cache_store()
-        .hit_count()
 }
 
 #[unsafe(no_mangle)]
@@ -3909,6 +3909,7 @@ mod tests {
                 first: Some(CssPixels::from_raw(64)),
                 last: None,
             },
+            depends_on_percentage_block_size: true,
         };
 
         let first_data = arena.data(first.slot);

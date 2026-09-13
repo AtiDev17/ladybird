@@ -709,9 +709,14 @@ pub struct FfiRenderingPreparationOutcome {
 pub unsafe extern "C" fn layout_arena_prepare_for_rendering(
     arena: *mut c_void,
     callbacks: FfiVisualContextHostCallbacks,
+    root_background_source: crate::painting::host::FfiRootBackgroundSource,
     visual_context_update_pending: bool,
 ) -> FfiRenderingPreparationOutcome {
     let arena = unsafe { arena_from_handle(arena) };
+    let background_source_changed = arena
+        .paint_state()
+        .borrow_mut()
+        .update_root_background_source(arena, root_background_source);
     crate::painting::scrollable_overflow::update_scrollable_overflow(arena);
     let changed = arena.scrollable_overflow.geometry_changed.replace(false);
     let flipped = arena.scrollable_overflow.scrollability_changed.replace(false);
@@ -731,7 +736,7 @@ pub unsafe extern "C" fn layout_arena_prepare_for_rendering(
         state.needs_to_refresh_scroll_state = true;
     }
     FfiRenderingPreparationOutcome {
-        requires_display_list_recording: changed,
+        requires_display_list_recording: changed || background_source_changed,
         requires_visual_context_update: flipped,
         visual_context_values_changed,
     }
@@ -1113,7 +1118,6 @@ fn fresh_visual_context_tree_build(
     viewport: NodeSlotId,
     callbacks: &FfiVisualContextHostCallbacks,
     inputs: crate::painting::host::FfiVisualContextTreeInputs,
-    root_background_source: crate::painting::host::FfiRootBackgroundSource,
     state: &mut crate::painting::visual_context::VisualContextState,
 ) -> crate::painting::host::FfiVisualContextUpdateOutcome {
     use crate::painting::visual_context::dirty::VisualContextUpdateScope;
@@ -1148,7 +1152,6 @@ fn fresh_visual_context_tree_build(
             callbacks,
             viewport,
             inputs,
-            root_background_source,
             VisualContextUpdateScope::FreshTree,
             state,
         ) {
@@ -1205,9 +1208,7 @@ pub unsafe extern "C" fn layout_arena_update_accumulated_visual_contexts(
     viewport: NodeSlotId,
     callbacks: FfiVisualContextHostCallbacks,
 ) -> crate::painting::host::FfiVisualContextUpdateOutcome {
-    use crate::painting::visual_context::dirty::{
-        VisualContextBoxDirtyKind, VisualContextGlobalRebuildReason, VisualContextUpdateScope,
-    };
+    use crate::painting::visual_context::dirty::{VisualContextGlobalRebuildReason, VisualContextUpdateScope};
     use crate::painting::visual_context::incremental::{
         IncrementalUpdateResult, debug_assert_every_live_node_is_owned, update_visual_context_tree,
     };
@@ -1216,7 +1217,6 @@ pub unsafe extern "C" fn layout_arena_update_accumulated_visual_contexts(
         return crate::painting::host::FfiVisualContextUpdateOutcome::default();
     }
     let inputs = callbacks.tree_inputs();
-    let root_background_source = callbacks.root_background_source();
     let mut state = std::mem::take(&mut arena_ref.paint_state().borrow_mut().visual_context);
     state.release_quarantined_slots_while_no_handle_is_retained();
 
@@ -1237,30 +1237,6 @@ pub unsafe extern "C" fn layout_arena_update_accumulated_visual_contexts(
     if state.tree.as_deref().is_some_and(|tree| tree.should_compact()) {
         reason = reason.max(VisualContextGlobalRebuildReason::Compaction);
     }
-    if let Some(last_source) = state.last_root_background_source
-        && (last_source.use_body_background_properties != root_background_source.use_body_background_properties
-            || last_source.body_layout_node != root_background_source.body_layout_node)
-    {
-        for body in [last_source.body_layout_node, root_background_source.body_layout_node] {
-            if arena_ref.paintable_row_is_populated(body) {
-                let pending_box_limit = arena_ref
-                    .paintable_row_count()
-                    .max(crate::painting::visual_context::dirty::MINIMUM_PENDING_DIRTY_BOX_LIMIT);
-                state.dirty_boxes.note_box(
-                    body,
-                    VisualContextBoxDirtyKind::StyleStructuralChange,
-                    pending_box_limit,
-                );
-                if let Some(html) = crate::painting::paint_order::paint_parent(&arena_ref.paintable_rows(), body) {
-                    state.dirty_boxes.note_box(
-                        html,
-                        VisualContextBoxDirtyKind::StyleStructuralChange,
-                        pending_box_limit,
-                    );
-                }
-            }
-        }
-    }
 
     loop {
         let scope = VisualContextUpdateScope::for_reason(reason);
@@ -1269,15 +1245,7 @@ pub unsafe extern "C" fn layout_arena_update_accumulated_visual_contexts(
         }
         let result = {
             let paintable_rows = arena_ref.paintable_rows();
-            update_visual_context_tree(
-                &paintable_rows,
-                &callbacks,
-                viewport,
-                inputs,
-                root_background_source,
-                scope,
-                &mut state,
-            )
+            update_visual_context_tree(&paintable_rows, &callbacks, viewport, inputs, scope, &mut state)
         };
         match result {
             IncrementalUpdateResult::Applied(mut outcome) => {
@@ -1301,7 +1269,6 @@ pub unsafe extern "C" fn layout_arena_update_accumulated_visual_contexts(
                 let requires_display_list_recording = outcome.delta.requires_display_list_recording;
                 state.dirty_boxes.clear();
                 state.last_tree_inputs = Some(inputs);
-                state.last_root_background_source = Some(root_background_source);
                 let structural_epoch = state.structural_epoch();
                 arena_mut.paint_state().borrow_mut().visual_context = state;
                 return crate::painting::host::FfiVisualContextUpdateOutcome {
@@ -1322,10 +1289,8 @@ pub unsafe extern "C" fn layout_arena_update_accumulated_visual_contexts(
     }
 
     state.last_full_build_reason = reason;
-    let outcome =
-        fresh_visual_context_tree_build(arena, viewport, &callbacks, inputs, root_background_source, &mut state);
+    let outcome = fresh_visual_context_tree_build(arena, viewport, &callbacks, inputs, &mut state);
     state.last_tree_inputs = Some(inputs);
-    state.last_root_background_source = Some(root_background_source);
     let arena_ref = unsafe { arena_from_handle(arena) };
     arena_ref.paint_state().borrow_mut().visual_context = state;
     outcome
@@ -1465,6 +1430,8 @@ pub unsafe extern "C" fn layout_arena_refresh_scroll_state(
 /// # Safety
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+/// Input arrays and byte buffers must remain valid and immutable throughout this call;
+/// fonts for enabled overlays must be live `Gfx::Font`s.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_record_display_list(
     arena: *mut c_void,
@@ -1476,19 +1443,6 @@ pub unsafe extern "C" fn layout_arena_record_display_list(
         let mut paint_state = arena.paint_state().borrow_mut();
         paint_state.pending_recording_trace = None;
         paint_state.pending_recording = None;
-        let has_blocking_wheel_event_region_covering_viewport =
-            inputs.has_blocking_wheel_event_region_covering_viewport;
-        if paint_state.recorded_has_blocking_wheel_event_region_covering_viewport
-            != Some(has_blocking_wheel_event_region_covering_viewport)
-        {
-            arena.mark_all_descendant_subtree_caches_dirty();
-            paint_state.recorded_has_blocking_wheel_event_region_covering_viewport =
-                Some(has_blocking_wheel_event_region_covering_viewport);
-        }
-        if paint_state.recorded_canvas_color != Some(inputs.canvas_color) {
-            arena.mark_all_paint_caches_dirty();
-            paint_state.recorded_canvas_color = Some(inputs.canvas_color);
-        }
     }
     let (recording, recording_from_scratch) = {
         let paint_state = arena.paint_state().borrow();
@@ -1496,26 +1450,28 @@ pub unsafe extern "C" fn layout_arena_record_display_list(
             return false;
         }
         let visual_context = &paint_state.visual_context;
-        let inputs = crate::painting::record::RecordingInputs::from_host_and_last_visual_context_update(
-            inputs,
-            visual_context
-                .last_tree_inputs
-                .expect("a recording follows a visual context update"),
-            visual_context
-                .last_root_background_source
-                .expect("a recording follows a visual context update"),
-        );
-        let command_cache_source = (!inputs.should_show_line_box_borders)
-            .then(|| paint_state.paint_command_cache_source.clone())
-            .flatten();
+        // SAFETY: The host lends the input arrays and buffers for this call. Only owned
+        // output and retained resources escape into the pending recording below.
+        let inputs = unsafe {
+            inputs.borrow_recording_inputs(
+                visual_context
+                    .last_tree_inputs
+                    .expect("a recording follows a visual context update"),
+                paint_state
+                    .root_background_source
+                    .expect("a recording follows paint preparation"),
+            )
+        };
+        let mut scratch = arena.recording_scratch().borrow_mut();
         arena.set_paint_recording_in_progress(true);
         let recording = crate::painting::record::traversal::record_display_list(
             arena,
             &paint_state,
+            &mut scratch,
             viewport,
-            inputs,
+            &inputs,
             paint_state.hit_test_list_generation + 1,
-            command_cache_source,
+            paint_state.paint_command_cache_source.clone(),
             paint_state.hit_test_item_cache_source.clone(),
             paint_state.trace_recordings || crate::painting::record::verify::enabled_by_environment(),
         );
@@ -1531,13 +1487,14 @@ pub unsafe extern "C" fn layout_arena_record_display_list(
                 })
             && !inputs.should_show_line_box_borders)
             .then(|| {
-                let mut inputs_for_recording_from_scratch = inputs;
+                let mut inputs_for_recording_from_scratch = inputs.clone();
                 inputs_for_recording_from_scratch.paint_command_cache_read_write = false;
                 crate::painting::record::traversal::record_display_list(
                     arena,
                     &paint_state,
+                    &mut scratch,
                     viewport,
-                    inputs_for_recording_from_scratch,
+                    &inputs_for_recording_from_scratch,
                     paint_state.hit_test_list_generation + 1,
                     None,
                     None,

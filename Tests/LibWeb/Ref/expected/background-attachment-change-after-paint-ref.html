@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html class="reftest-wait">
+<style>
+    html { background: white; }
+    body { margin: 0; height: 1200px; color: purple; }
+    .box {
+        width: 100px;
+        height: 100px;
+        background-image: linear-gradient(to bottom, red 0px 100px, lime 100px 200px, blue 200px);
+        background-repeat: no-repeat;
+        background-size: 100px 300px;
+        background-attachment: fixed;
+    }
+    #local { overflow: scroll; background-attachment: local; }
+    #local > div { height: 400px; }
+    #transformed { transform: translateX(20px); }
+</style>
+<div id="fixed" class="box"></div>
+<div id="local" class="box"><div></div></div>
+<div id="transformed"><div id="under-transform" class="box"></div></div>
+<script>
+    requestAnimationFrame(() => {
+        window.scrollTo(0, 50);
+        document.getElementById("local").scrollTop = 75;
+        requestAnimationFrame(() => document.documentElement.classList.remove("reftest-wait"));
+    });
+</script>

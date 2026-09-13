@@ -262,16 +262,11 @@ struct InlineLayoutDamage {
 /// surviving across layout passes on the node arena.
 #[derive(Default)]
 pub(crate) struct FcRunCacheArenaStore {
-    hit_count: Cell<u64>,
     entries: RefCell<Vec<Option<std::rc::Rc<FcRunCacheEntry>>>>,
     inline_layout_damage: RefCell<Vec<InlineLayoutDamage>>,
 }
 
 impl FcRunCacheArenaStore {
-    pub(crate) fn hit_count(&self) -> u64 {
-        self.hit_count.get()
-    }
-
     pub(crate) fn remove_entry(&self, slot: u32) {
         if let Some(entry) = self.entries.borrow_mut().get_mut(slot as usize) {
             *entry = None;
@@ -434,6 +429,16 @@ pub(super) enum FcRunCacheAttempt {
 }
 
 impl FcRunCacheAttempt {
+    pub(super) fn trace_action(&self) -> &'static str {
+        match self {
+            Self::Bypass => "RUN (cache=bypass)",
+            Self::Store {
+                shadow_entry: Some(_), ..
+            } => "RUN (cache=shadow-hit)",
+            Self::Store { .. } => "RUN (cache=miss)",
+        }
+    }
+
     /// Err carries the entry the caller must replay instead of running.
     #[expect(clippy::too_many_arguments)]
     pub(super) fn probe(
@@ -506,22 +511,13 @@ impl FcRunCacheAttempt {
         let validity = run_root_validity(callbacks, box_);
         let structural_epoch_bumps = store.take_inline_layout_damage(box_);
         match store.matching(box_.slot_index(), validity, &key) {
-            Some(entry) if mode == FcRunCacheMode::Shadow => {
-                // A shadow match is the same event a replay would be, so the
-                // hit counter reports it: the hit-count tests hold under the
-                // oracle as well.
-                store.hit_count.set(store.hit_count.get() + 1);
-                Ok(Self::Store {
-                    key,
-                    validity,
-                    shadow_entry: Some(entry),
-                    structurally_damaged_entry: None,
-                })
-            }
-            Some(entry) => {
-                store.hit_count.set(store.hit_count.get() + 1);
-                Err(entry)
-            }
+            Some(entry) if mode == FcRunCacheMode::Shadow => Ok(Self::Store {
+                key,
+                validity,
+                shadow_entry: Some(entry),
+                structurally_damaged_entry: None,
+            }),
+            Some(entry) => Err(entry),
             None => {
                 let structurally_damaged_entry =
                     store.structurally_damaged_entry(box_.slot_index(), validity, &key, structural_epoch_bumps);

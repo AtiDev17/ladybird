@@ -1,0 +1,68 @@
+<!doctype html>
+<script src="include.js"></script>
+<script src="layout-test.js"></script>
+<script>
+test(() => {
+    const expected = `
+        layout FULL
+          @viewport/block RUN (cache=bypass)
+            #target/block RUN (cache=miss)
+            #sibling/block REUSE SUBTREE
+    `;
+    const cases = [
+        ["template literal indentation", expected, expected, false],
+        ["no layout work", "", "\n", false],
+        ["unexpected layout", "", expected, true],
+        ["missing layout", expected, "", true],
+        ["unrelated sibling work", expected, expected.replace("REUSE SUBTREE", "RUN (cache=miss)"), true],
+        ["fragment replay is different from subtree reuse", expected, expected.replace("REUSE SUBTREE", "REPLAY FRAGMENTS"), true],
+        ["bypass is different from a miss", expected, expected.replace("cache=miss", "cache=bypass"), true],
+        ["shadow hit is still execution", expected, expected.replace("REUSE SUBTREE", "RUN (cache=shadow-hit)"), true],
+        ["extra pass", expected, expected + expected, true],
+        ["nested work", expected, expected.replace("    #sibling", "      #sibling"), true],
+        ["repeated run", expected, expected + "    #sibling/block REUSE SUBTREE\n", true],
+        ["measurement purpose", expected, expected.replace("#target/block", "#target/block (measurement)"), true],
+    ];
+    for (const [name, expected, actual, differs] of cases) {
+        const passed = (layoutTraceDifference(expected, actual) !== null) === differs;
+        println(`${passed ? "PASS" : "FAIL"}: ${name}`);
+    }
+
+    function exercise(name, step, expectedCalls, errorText) {
+        const calls = [];
+        const fakeInternals = {
+            beginLayoutTrace: () => calls.push("begin"),
+            updateLayoutForTesting: () => calls.push("flush"),
+            takeLayoutTrace: () => { calls.push("take"); return ""; },
+        };
+        let error = "";
+        try {
+            runLayoutTestStep(step(calls), fakeInternals);
+        } catch (caught) {
+            error = String(caught);
+        }
+        const passed = calls.join(",") === expectedCalls && (errorText ? error.includes(errorText) : !error);
+        println(`${passed ? "PASS" : "FAIL"}: ${name}`);
+    }
+    exercise("traces mutation, flush and checks", calls => ({
+        name: "interval", expect: "",
+        mutate: () => { calls.push("mutate"); },
+        check: equal => { calls.push("check"); equal(1, 1, "equality"); },
+    }), "begin,mutate,flush,check,take");
+    exercise("stops tracing after a throwing mutation", () => ({
+        name: "throw", expect: "", mutate: () => { throw new Error("mutation failed"); },
+    }), "begin,take", "mutation failed");
+    exercise("stops tracing after a failed check", () => ({
+        name: "check", expect: "", check: equal => equal(1, 2, "geometry"),
+    }), "begin,flush,take", "geometry: expected 2, got 1");
+    exercise("requires expectations before mutating", calls => ({
+        name: "missing", mutate: () => { calls.push("mutate"); },
+    }), "", "missing exact layout work expectation");
+    exercise("rejects asynchronous mutations", () => ({
+        name: "async", expect: "", mutate: () => Promise.resolve(),
+    }), "begin,take", "mutate must be synchronous");
+    exercise("rejects asynchronous checks", () => ({
+        name: "async", expect: "", check: () => Promise.resolve(),
+    }), "begin,flush,take", "check must be synchronous");
+});
+</script>

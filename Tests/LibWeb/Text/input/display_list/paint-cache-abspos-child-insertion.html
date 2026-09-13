@@ -1,0 +1,190 @@
+<!doctype html>
+<html id="html">
+<script src="../include.js"></script>
+<script src="recording-test.js"></script>
+<style>
+    body { margin: 0; font: 16px/20px monospace; }
+    #container { position: relative; width: 300px; height: 100px; background: silver; }
+    #existing, #sibling { position: relative; width: 100px; height: 40px; background: blue; }
+    #inserted { position: absolute; left: 160px; top: 20px; width: 100px; height: 20px; background: green; }
+</style>
+<body id="body">
+<div id="container"><div id="existing">Existing</div></div>
+<div id="sibling">Sibling</div>
+<script>
+let previousLayoutCount;
+const insertionStep = {
+    // The new child fits inside its containing block without moving existing boxes
+    // or changing overflow. Only its own paint and hit-test items need recording.
+    name: "abspos insertion reuses all existing paint",
+    mutate: () => {
+        previousLayoutCount = internals.fullLayoutCount() + internals.partialLayoutCount();
+        const inserted = document.createElement("div");
+        inserted.id = "inserted";
+        inserted.textContent = "New child";
+        container.appendChild(inserted);
+    },
+    check: equal => {
+        const layoutCount = internals.fullLayoutCount() + internals.partialLayoutCount();
+        equal(layoutCount > previousLayoutCount, true, "insertion performed layout");
+        equal(container.getBoundingClientRect().height, 100, "container height");
+        equal(existing.getBoundingClientRect().top, 0, "existing child position");
+        equal(sibling.getBoundingClientRect().top, 100, "sibling position");
+        equal(document.elementFromPoint(170, 30).id, "inserted", "inserted child hit target");
+    },
+    expect: `
+        @canvas RECORD (empty)
+        @viewport WALK
+          @viewport/background/hit-test REUSE
+          @viewport/scroll-metadata RECORD (empty)
+          @viewport/background SKIP
+          @viewport/border SKIP
+          BlockContainer<HTML>#html/descendants(background-and-borders) WALK
+          @viewport/foreground/hit-test REUSE
+          @viewport/foreground REUSE
+          BlockContainer<HTML>#html/descendants(foreground) WALK
+          BlockContainer<HTML>#html WALK
+            BlockContainer<HTML>#html/background/hit-test REUSE
+            BlockContainer<HTML>#html/scroll-metadata RECORD (empty)
+            BlockContainer<HTML>#html/background REUSE
+            BlockContainer<HTML>#html/border SKIP
+            BlockContainer<BODY>#body/descendants(background-and-borders) WALK
+              BlockContainer<BODY>#body/background/hit-test REUSE
+              BlockContainer<BODY>#body/scroll-metadata RECORD (empty)
+              BlockContainer<BODY>#body/background SKIP
+              BlockContainer<BODY>#body/border SKIP
+              BlockContainer<DIV>#container/descendants(background-and-borders) WALK
+              BlockContainer<DIV>#sibling/descendants(background-and-borders) REUSE WHOLE CAPTURE
+            BlockContainer<HTML>#html/foreground/hit-test REUSE
+            BlockContainer<HTML>#html/foreground REUSE
+            BlockContainer<BODY>#body/descendants(foreground) WALK
+              BlockContainer<BODY>#body/foreground/hit-test REUSE
+              BlockContainer<BODY>#body/foreground REUSE
+              BlockContainer<DIV>#container/descendants(foreground) WALK
+              BlockContainer<DIV>#sibling/descendants(foreground) REUSE WHOLE CAPTURE
+              BlockContainer<BODY>#body/outline SKIP
+              BlockContainer<BODY>#body/overlay/hit-test REUSE
+              BlockContainer<BODY>#body/overlay SKIP
+            BlockContainer<DIV>#container WALK
+              BlockContainer<DIV>#container/background/hit-test REUSE
+              BlockContainer<DIV>#container/scroll-metadata RECORD (empty)
+              BlockContainer<DIV>#container/background REUSE
+              BlockContainer<DIV>#container/border SKIP
+              BlockContainer<DIV>#existing/descendants(background-and-borders) REUSE WHOLE CAPTURE
+              BlockContainer<DIV>#inserted/descendants(background-and-borders) WALK
+              BlockContainer<DIV>#existing/descendants(floats) REUSE WHOLE CAPTURE
+              BlockContainer<DIV>#inserted/descendants(floats) WALK
+              BlockContainer<DIV>#existing/descendants(inline-background-and-borders) REUSE WHOLE CAPTURE
+              BlockContainer<DIV>#inserted/descendants(inline-background-and-borders) WALK
+              BlockContainer<DIV>#container/foreground/hit-test REUSE
+              BlockContainer<DIV>#container/foreground REUSE
+              BlockContainer<DIV>#existing/descendants(foreground) REUSE WHOLE CAPTURE
+              BlockContainer<DIV>#inserted/descendants(foreground) WALK
+              BlockContainer<DIV>#container/outline SKIP
+              BlockContainer<DIV>#container/overlay/hit-test REUSE
+              BlockContainer<DIV>#container/overlay SKIP
+            BlockContainer<DIV>#existing REUSE WHOLE CAPTURE
+            BlockContainer<DIV>#inserted WALK
+              BlockContainer<DIV>#inserted/background/hit-test RECORD
+              BlockContainer<DIV>#inserted/scroll-metadata RECORD (empty)
+              BlockContainer<DIV>#inserted/background RECORD
+              BlockContainer<DIV>#inserted/border SKIP
+              BlockContainer<DIV>#inserted/foreground/hit-test RECORD
+              BlockContainer<DIV>#inserted/foreground RECORD
+              BlockContainer<DIV>#inserted/outline SKIP
+              BlockContainer<DIV>#inserted/overlay/hit-test RECORD (empty)
+              BlockContainer<DIV>#inserted/overlay SKIP
+            BlockContainer<DIV>#sibling REUSE WHOLE CAPTURE
+            BlockContainer<HTML>#html/outline SKIP
+          @viewport/outline SKIP
+    `,
+};
+displayListTest({
+    setup: removeBodyWhitespace,
+    steps: [
+        {
+            name: "quiet before abspos insertion",
+            expect: `
+                @canvas RECORD (empty)
+                @viewport REUSE WHOLE CAPTURE
+            `,
+        },
+        insertionStep,
+        {
+            name: "quiet after abspos insertion",
+            expect: `
+                @canvas RECORD (empty)
+                @viewport REUSE WHOLE CAPTURE
+            `,
+        },
+        {
+            name: "abspos removal reuses all remaining paint",
+            mutate: () => { inserted.remove(); },
+            check: equal => {
+                equal(sibling.getBoundingClientRect().top, 100, "sibling position");
+                equal(document.elementFromPoint(170, 30).id, "container", "removed child no longer hit");
+            },
+            expect: `
+                @canvas RECORD (empty)
+                @viewport WALK
+                  @viewport/background/hit-test REUSE
+                  @viewport/scroll-metadata RECORD (empty)
+                  @viewport/background SKIP
+                  @viewport/border SKIP
+                  BlockContainer<HTML>#html/descendants(background-and-borders) WALK
+                  @viewport/foreground/hit-test REUSE
+                  @viewport/foreground REUSE
+                  BlockContainer<HTML>#html/descendants(foreground) WALK
+                  BlockContainer<HTML>#html WALK
+                    BlockContainer<HTML>#html/background/hit-test REUSE
+                    BlockContainer<HTML>#html/scroll-metadata RECORD (empty)
+                    BlockContainer<HTML>#html/background REUSE
+                    BlockContainer<HTML>#html/border SKIP
+                    BlockContainer<BODY>#body/descendants(background-and-borders) WALK
+                      BlockContainer<BODY>#body/background/hit-test REUSE
+                      BlockContainer<BODY>#body/scroll-metadata RECORD (empty)
+                      BlockContainer<BODY>#body/background SKIP
+                      BlockContainer<BODY>#body/border SKIP
+                      BlockContainer<DIV>#container/descendants(background-and-borders) WALK
+                      BlockContainer<DIV>#sibling/descendants(background-and-borders) REUSE WHOLE CAPTURE
+                    BlockContainer<HTML>#html/foreground/hit-test REUSE
+                    BlockContainer<HTML>#html/foreground REUSE
+                    BlockContainer<BODY>#body/descendants(foreground) WALK
+                      BlockContainer<BODY>#body/foreground/hit-test REUSE
+                      BlockContainer<BODY>#body/foreground REUSE
+                      BlockContainer<DIV>#container/descendants(foreground) WALK
+                      BlockContainer<DIV>#sibling/descendants(foreground) REUSE WHOLE CAPTURE
+                      BlockContainer<BODY>#body/outline SKIP
+                      BlockContainer<BODY>#body/overlay/hit-test REUSE
+                      BlockContainer<BODY>#body/overlay SKIP
+                    BlockContainer<DIV>#container WALK
+                      BlockContainer<DIV>#container/background/hit-test REUSE
+                      BlockContainer<DIV>#container/scroll-metadata RECORD (empty)
+                      BlockContainer<DIV>#container/background REUSE
+                      BlockContainer<DIV>#container/border SKIP
+                      BlockContainer<DIV>#existing/descendants(background-and-borders) REUSE WHOLE CAPTURE
+                      BlockContainer<DIV>#existing/descendants(floats) REUSE WHOLE CAPTURE
+                      BlockContainer<DIV>#existing/descendants(inline-background-and-borders) REUSE WHOLE CAPTURE
+                      BlockContainer<DIV>#container/foreground/hit-test REUSE
+                      BlockContainer<DIV>#container/foreground REUSE
+                      BlockContainer<DIV>#existing/descendants(foreground) REUSE WHOLE CAPTURE
+                      BlockContainer<DIV>#container/outline SKIP
+                      BlockContainer<DIV>#container/overlay/hit-test REUSE
+                      BlockContainer<DIV>#container/overlay SKIP
+                    BlockContainer<DIV>#existing REUSE WHOLE CAPTURE
+                    BlockContainer<DIV>#sibling REUSE WHOLE CAPTURE
+                    BlockContainer<HTML>#html/outline SKIP
+                  @viewport/outline SKIP
+            `,
+        },
+        {
+            name: "quiet after abspos removal",
+            expect: `
+                @canvas RECORD (empty)
+                @viewport REUSE WHOLE CAPTURE
+            `,
+        },
+        { ...insertionStep, name: "abspos reinsertion after quiet frame reuses all existing paint" },
+    ],
+});
+</script>

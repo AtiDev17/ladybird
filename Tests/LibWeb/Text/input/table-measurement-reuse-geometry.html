@@ -1,0 +1,54 @@
+<!doctype html>
+<script src="include.js"></script>
+<style>
+    body { margin: 0; }
+    .host { display: flex; width: 160px; height: 120px; align-items: flex-start; }
+    .item { display: flex; flex-direction: column; flex: 1 1 auto; }
+    table { table-layout: fixed; width: 100%; border-spacing: 0; }
+    td { padding: 2px; border: 1px solid; }
+    .content { width: 30px; height: 20px; }
+    .tall { height: 40px; }
+</style>
+<script>
+    test(() => {
+        const output = [];
+        // Intrinsic flex sizing measures the table before its final layout. Cover the
+        // alignment padding reused by the fast path and the percentage cases it rejects.
+        for (const alignment of ["top", "middle", "bottom", "baseline"]) {
+            for (const variant of ["auto", "rowspan", "percentage-cell", "percentage-child", "percentage-min-height"]) {
+                const host = document.createElement("div");
+                host.className = "host";
+                host.innerHTML = `<div class="item"><table><tbody><tr><td><div class="content"></div></td><td><div class="content tall"></div></td></tr><tr><td><div class="content"></div></td><td><div class="content"></div></td></tr></tbody></table></div>`;
+                const table = host.querySelector("table");
+                const cell = host.querySelector("td");
+                const content = cell.firstElementChild;
+                for (const td of host.querySelectorAll("td")) td.style.verticalAlign = alignment;
+                if (variant === "rowspan") {
+                    cell.rowSpan = 2;
+                    table.rows[1].cells[0].remove();
+                } else if (variant === "percentage-cell") {
+                    cell.style.height = "50%";
+                } else if (variant === "percentage-child") {
+                    content.style.height = "50%";
+                } else if (variant === "percentage-min-height") {
+                    cell.style.minHeight = "50%";
+                }
+                document.body.append(host);
+                const snapshot = () => {
+                    const t = table.getBoundingClientRect();
+                    const c = cell.getBoundingClientRect();
+                    const inner = content.getBoundingClientRect();
+                    return [t.width, t.height, c.height, inner.y - c.y, inner.height].join(",");
+                };
+                const before = snapshot();
+                // Change a sibling to invalidate the common intrinsic-sizing ancestors,
+                // then resolve the same cell again from its cached measurement.
+                host.querySelector(".tall").style.height = "60px";
+                const after = snapshot();
+                output.push(`${alignment}/${variant}: ${before} -> ${after}`);
+                host.remove();
+            }
+        }
+        for (const line of output) println(line);
+    });
+</script>

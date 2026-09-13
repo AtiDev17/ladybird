@@ -1,1 +1,1 @@
-hit delta after filter change: 0
+PASS: a filter change invalidates the cached run (work)

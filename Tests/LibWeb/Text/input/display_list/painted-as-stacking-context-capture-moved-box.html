@@ -23,20 +23,20 @@ displayListTest({
             `
         },
         {
-            // Changing top currently relayouts both siblings. The exact trace exposes that scope.
+            // Moving B changes its absolute paint coordinates; A retains its entire capture.
             name: "move B",
             mutate: () => { b.style.top = "20px"; },
             check: equal => { equal(document.elementFromPoint(10, 110).id, "b2", "hit target"); },
             expect: `
                 @canvas RECORD (empty)
                 @viewport WALK
-                  @viewport/background/hit-test RECORD
+                  @viewport/background/hit-test REUSE
                   @viewport/scroll-metadata RECORD (empty)
                   @viewport/background SKIP
                   @viewport/border SKIP
                   BlockContainer<HTML>#html/descendants(background-and-borders) WALK
-                  @viewport/foreground/hit-test RECORD (empty)
-                  @viewport/foreground RECORD (empty)
+                  @viewport/foreground/hit-test REUSE
+                  @viewport/foreground REUSE
                   BlockContainer<HTML>#html/descendants(foreground) WALK
                   BlockContainer<HTML>#html WALK
                     BlockContainer<HTML>#html/background/hit-test RECORD
@@ -48,54 +48,19 @@ displayListTest({
                       BlockContainer<BODY>#body/scroll-metadata RECORD (empty)
                       BlockContainer<BODY>#body/background SKIP
                       BlockContainer<BODY>#body/border SKIP
-                      BlockContainer<DIV>#a/descendants(background-and-borders) WALK
+                      BlockContainer<DIV>#a/descendants(background-and-borders) REUSE WHOLE CAPTURE
                       BlockContainer<DIV>#b/descendants(background-and-borders) WALK
                     BlockContainer<HTML>#html/foreground/hit-test RECORD (empty)
                     BlockContainer<HTML>#html/foreground RECORD (empty)
                     BlockContainer<BODY>#body/descendants(foreground) WALK
                       BlockContainer<BODY>#body/foreground/hit-test RECORD (empty)
                       BlockContainer<BODY>#body/foreground RECORD (empty)
-                      BlockContainer<DIV>#a/descendants(foreground) WALK
+                      BlockContainer<DIV>#a/descendants(foreground) REUSE WHOLE CAPTURE
                       BlockContainer<DIV>#b/descendants(foreground) WALK
                       BlockContainer<BODY>#body/outline SKIP
                       BlockContainer<BODY>#body/overlay/hit-test RECORD (empty)
                       BlockContainer<BODY>#body/overlay SKIP
-                    BlockContainer<DIV>#a WALK
-                      BlockContainer<DIV>#a/background/hit-test RECORD
-                      BlockContainer<DIV>#a/scroll-metadata RECORD (empty)
-                      BlockContainer<DIV>#a/background SKIP
-                      BlockContainer<DIV>#a/border SKIP
-                      BlockContainer<DIV>#a0.row/descendants(background-and-borders) WALK
-                        BlockContainer<DIV>#a0.row/background/hit-test RECORD
-                        BlockContainer<DIV>#a0.row/scroll-metadata RECORD (empty)
-                        BlockContainer<DIV>#a0.row/background SKIP
-                        BlockContainer<DIV>#a0.row/border SKIP
-                      BlockContainer<DIV>#a1.row/descendants(background-and-borders) WALK
-                        BlockContainer<DIV>#a1.row/background/hit-test RECORD
-                        BlockContainer<DIV>#a1.row/scroll-metadata RECORD (empty)
-                        BlockContainer<DIV>#a1.row/background SKIP
-                        BlockContainer<DIV>#a1.row/border SKIP
-                      BlockContainer<DIV>#a0.row/descendants(floats) WALK
-                      BlockContainer<DIV>#a1.row/descendants(floats) WALK
-                      BlockContainer<DIV>#a0.row/descendants(inline-background-and-borders) WALK
-                      BlockContainer<DIV>#a1.row/descendants(inline-background-and-borders) WALK
-                      BlockContainer<DIV>#a/foreground/hit-test RECORD (empty)
-                      BlockContainer<DIV>#a/foreground RECORD (empty)
-                      BlockContainer<DIV>#a0.row/descendants(foreground) WALK
-                        BlockContainer<DIV>#a0.row/foreground/hit-test RECORD
-                        BlockContainer<DIV>#a0.row/foreground RECORD
-                        BlockContainer<DIV>#a0.row/outline SKIP
-                        BlockContainer<DIV>#a0.row/overlay/hit-test RECORD (empty)
-                        BlockContainer<DIV>#a0.row/overlay SKIP
-                      BlockContainer<DIV>#a1.row/descendants(foreground) WALK
-                        BlockContainer<DIV>#a1.row/foreground/hit-test RECORD
-                        BlockContainer<DIV>#a1.row/foreground RECORD
-                        BlockContainer<DIV>#a1.row/outline SKIP
-                        BlockContainer<DIV>#a1.row/overlay/hit-test RECORD (empty)
-                        BlockContainer<DIV>#a1.row/overlay SKIP
-                      BlockContainer<DIV>#a/outline SKIP
-                      BlockContainer<DIV>#a/overlay/hit-test RECORD (empty)
-                      BlockContainer<DIV>#a/overlay SKIP
+                    BlockContainer<DIV>#a REUSE WHOLE CAPTURE
                     BlockContainer<DIV>#b WALK
                       BlockContainer<DIV>#b/background/hit-test RECORD
                       BlockContainer<DIV>#b/scroll-metadata RECORD (empty)

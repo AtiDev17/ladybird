@@ -1,0 +1,2 @@
+PASS: adding an out-of-flow control reuses table cell measurements (work + checks)
+PASS: removing the control preserves table sizing (work + checks)
