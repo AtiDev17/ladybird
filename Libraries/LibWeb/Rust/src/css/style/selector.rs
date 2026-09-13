@@ -41,6 +41,7 @@ use super::index::StyleNodeFacts;
 use super::index::dispatch_bloom_bit;
 use super::instrumentation::Counter;
 use super::instrumentation::Counters;
+use super::shared_vector::{SharedVector, SharedVectorPool};
 use smallvec::SmallVec;
 use std::cell::Cell;
 use std::cell::Ref;
@@ -1118,13 +1119,26 @@ impl SelectorProgramBuilder {
             .entries
             .iter()
             .any(|entry| self.program.subject_leaves_its_scope(entry.root));
+        // Finished programs never append nodes or entries. Release their construction headroom.
+        self.program.nodes.shrink_to_fit();
+        self.program.operands.shrink_to_fit();
+        self.program.text.shrink_to_fit();
+        self.program.entries.shrink_to_fit();
+        self.program.relative_queries.shrink_to_fit();
+        self.program.language_ranges.shrink_to_fit();
         self.program
     }
 }
 
 impl SelectorProgram {
     fn cache_dispatch_metadata(&mut self) {
-        let mut relation_target_blooms = vec![0_u64; self.nodes.len()];
+        // Only ancestor walks consult these blooms; other programs need no per-node array.
+        let target_count = if self.nodes.iter().any(|node| matches!(node, SelectorOp::Ancestor(_))) {
+            self.nodes.len()
+        } else {
+            0
+        };
+        let mut relation_target_blooms = vec![0_u64; target_count];
         for (id, target_bloom) in relation_target_blooms.iter_mut().enumerate() {
             let node = SelectorNodeID(u32::try_from(id).unwrap_or(u32::MAX));
             // Only a feature op standing directly in the compound is a test of the node itself.
@@ -2533,6 +2547,25 @@ struct SharedSelectorProgram {
     _memory: MemoryLease,
 }
 
+/// A strong identity for a process-interned selector. Keeping the payload alive prevents an
+/// address from being recycled while a dispatch sharing key still refers to it.
+#[derive(Clone)]
+pub(super) struct SharedSelectorIdentity(Rc<SharedSelectorProgram>);
+
+impl PartialEq for SharedSelectorIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SharedSelectorIdentity {}
+
+impl Hash for SharedSelectorIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Rc::as_ptr(&self.0).hash(state);
+    }
+}
+
 impl Drop for SharedSelectorProgram {
     fn drop(&mut self) {
         let _ = SHARED_SELECTOR_PROGRAMS.try_with(|shared| {
@@ -2599,9 +2632,32 @@ fn share_selector_program(program: SelectorProgram) -> Rc<SharedSelectorProgram>
     })
 }
 
+#[derive(Clone)]
 enum SelectorProgramStorage {
-    Document(Box<SelectorProgram>),
+    Document(Rc<SelectorProgram>),
     Process(Rc<SharedSelectorProgram>),
+}
+
+impl PartialEq for SelectorProgramStorage {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Document(first), Self::Document(second)) => Rc::ptr_eq(first, second),
+            (Self::Process(first), Self::Process(second)) => Rc::ptr_eq(first, second),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SelectorProgramStorage {}
+
+impl Hash for SelectorProgramStorage {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Document(program) => Rc::as_ptr(program).hash(state),
+            Self::Process(program) => Rc::as_ptr(program).hash(state),
+        }
+    }
 }
 
 impl SelectorProgramStorage {
@@ -2614,7 +2670,9 @@ impl SelectorProgramStorage {
 
     fn document_capacity_bytes(&self) -> u64 {
         match self {
-            Self::Document(program) => size_of::<SelectorProgram>() as u64 + program.capacity_bytes(),
+            Self::Document(program) => {
+                (size_of::<SelectorProgram>() + 2 * size_of::<usize>()) as u64 + program.capacity_bytes()
+            }
             Self::Process(_) => 0,
         }
     }
@@ -2627,19 +2685,84 @@ enum SelectorProgramScope {
     Process,
 }
 
+/// Entry IDs normally form a consecutive run. Keep that run inline, and share an explicit
+/// list only when recycling vacant entries gives a program nonconsecutive identities.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) enum SelectorEntryIDs {
+    Consecutive { first: EntryID, count: u32 },
+    // Keep a thin pointer here: an Rc slice would enlarge every inline consecutive range.
+    Explicit(Rc<Box<[EntryID]>>),
+}
+
+impl SelectorEntryIDs {
+    fn from_entries(entries: Vec<EntryID>) -> Self {
+        if entries
+            .windows(2)
+            .all(|pair| pair[0].0.checked_add(1) == Some(pair[1].0))
+        {
+            Self::Consecutive {
+                first: entries.first().copied().unwrap_or(EntryID(0)),
+                count: u32::try_from(entries.len()).expect("selector program entry space exhausted"),
+            }
+        } else {
+            Self::Explicit(Rc::new(entries.into_boxed_slice()))
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Consecutive { count, .. } => *count as usize,
+            Self::Explicit(entries) => entries.len(),
+        }
+    }
+
+    fn get(&self, index: usize) -> EntryID {
+        assert!(index < self.len());
+        match self {
+            Self::Consecutive { first, .. } => EntryID(first.0 + index as u32),
+            Self::Explicit(entries) => entries[index],
+        }
+    }
+
+    fn iter(&self) -> impl ExactSizeIterator<Item = EntryID> + '_ {
+        (0..self.len()).map(|index| self.get(index))
+    }
+
+    fn capacity_bytes(&self) -> usize {
+        match self {
+            Self::Consecutive { .. } => 0,
+            Self::Explicit(entries) => {
+                size_of_val(entries.as_ref().as_ref()) + size_of_val(entries.as_ref()) + 2 * size_of::<usize>()
+            }
+        }
+    }
+}
+
+thread_local! {
+    static SHARED_ENTRY_ATTACHMENTS: RefCell<SharedVectorPool<Option<SelectorEntryIDs>>> =
+        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
+    static SHARED_PROGRAM_ATTACHMENTS: RefCell<SharedVectorPool<Option<SelectorProgramStorage>>> =
+        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
+    static SHARED_PROGRAM_INDICES: RefCell<SharedVectorPool<Option<NonZeroU32>>> =
+        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
+    static SHARED_ENTRY_LOCATIONS: RefCell<SharedVectorPool<Option<(NonZeroU32, u32)>>> =
+        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
+}
+
 /// One document's attachments to compiled selector programs.
 ///
 /// The immutable program payloads are process-shared on the StyleEngine thread. Entry identities,
 /// attached rules, and every selector-result materialization remain document-local.
 pub struct SelectorPrograms {
-    programs: Vec<Option<SelectorProgramStorage>>,
+    programs: SharedVector<Option<SelectorProgramStorage>>,
     vacant_programs: Vec<SelectorProgramID>,
-    entry_ids_by_program: Vec<Option<Box<[EntryID]>>>,
-    entry_locations: Vec<Option<(SelectorProgramID, u32)>>,
+    entry_ids_by_program: SharedVector<Option<SelectorEntryIDs>>,
+    entry_ids_bytes: usize,
+    entry_locations: SharedVector<Option<(NonZeroU32, u32)>>,
     vacant_entries: Vec<EntryID>,
     /// Open-addressed structural interning table. Reclamation rebuilds it, so lookup never has to
     /// carry tombstones for vacant program identities.
-    program_index: Vec<Option<SelectorProgramID>>,
+    program_index: SharedVector<Option<NonZeroU32>>,
     /// What the programs themselves reserve, accumulated as they arrive. A program is immutable
     /// once compiled, so this is settled by the one place that can move it - which matters because
     /// compiling a rule settles the charge, and deriving it by walking the list would make a sheet
@@ -2652,12 +2775,13 @@ pub struct SelectorPrograms {
 impl Default for SelectorPrograms {
     fn default() -> Self {
         Self {
-            programs: Vec::new(),
+            programs: SharedVector::default(),
             vacant_programs: Vec::new(),
-            entry_ids_by_program: Vec::new(),
-            entry_locations: Vec::new(),
+            entry_ids_by_program: SharedVector::default(),
+            entry_ids_bytes: 0,
+            entry_locations: SharedVector::default(),
             vacant_entries: Vec::new(),
-            program_index: Vec::new(),
+            program_index: SharedVector::default(),
             program_memory: MemoryLease::new(MemoryCategory::RuleProgram),
             memory: MemoryLease::new(MemoryCategory::RuleProgram),
             scope: SelectorProgramScope::Document,
@@ -2706,61 +2830,82 @@ impl SelectorPrograms {
         let mut bucket = Self::program_hash(&program) as usize & (self.program_index.len() - 1);
         loop {
             match self.program_index[bucket] {
-                Some(id) if self.get(id) == &program => return (id, false),
+                Some(id) if self.get(SelectorProgramID(id.get() - 1)) == &program => {
+                    return (SelectorProgramID(id.get() - 1), false);
+                }
                 Some(_) => bucket = (bucket + 1) & (self.program_index.len() - 1),
                 None => break,
             }
         }
 
         let entry_count = program.entries().len();
-        let id = self.vacant_programs.pop().unwrap_or_else(|| {
+        let id = self.vacant_programs.last().copied().unwrap_or_else(|| {
             SelectorProgramID(u32::try_from(self.programs.len()).expect("selector program space exhausted"))
         });
+        let stored_id = Self::stored_program_id(id);
+        self.vacant_programs.pop();
         let program = match self.scope {
-            SelectorProgramScope::Document => SelectorProgramStorage::Document(Box::new(program)),
+            SelectorProgramScope::Document => SelectorProgramStorage::Document(Rc::new(program)),
             SelectorProgramScope::Process => SelectorProgramStorage::Process(share_selector_program(program)),
         };
         self.program_memory.grow_committed(program.document_capacity_bytes());
         if id.0 as usize == self.programs.len() {
-            self.programs.push(Some(program));
+            self.programs.make_mut().push(Some(program));
         } else {
-            self.programs[id.0 as usize] = Some(program);
+            self.programs.make_mut()[id.0 as usize] = Some(program);
         }
         let recycled_count = entry_count.min(self.vacant_entries.len());
-        let mut recycled_entries = self
-            .vacant_entries
-            .split_off(self.vacant_entries.len() - recycled_count);
-        recycled_entries.sort_unstable();
-        let mut recycled_entries = recycled_entries.into_iter();
-        let entries: Box<[EntryID]> = (0..entry_count)
-            .map(|index| {
-                let entry = recycled_entries.next().unwrap_or_else(|| {
-                    EntryID(u32::try_from(self.entry_locations.len()).expect("selector entry space exhausted"))
-                });
-                let location = Some((
-                    id,
-                    u32::try_from(index).expect("selector program entry space exhausted"),
-                ));
-                if entry.0 as usize == self.entry_locations.len() {
-                    self.entry_locations.push(location);
-                } else {
-                    self.entry_locations[entry.0 as usize] = location;
-                }
-                entry
-            })
-            .collect();
+        let entries = if recycled_count == 0 {
+            let first = EntryID(u32::try_from(self.entry_locations.len()).expect("selector entry space exhausted"));
+            let count = u32::try_from(entry_count).expect("selector program entry space exhausted");
+            first.0.checked_add(count).expect("selector entry space exhausted");
+            self.entry_locations
+                .make_mut()
+                .extend((0..count).map(|index| Some((stored_id, index))));
+            SelectorEntryIDs::Consecutive {
+                first: if count == 0 { EntryID(0) } else { first },
+                count,
+            }
+        } else {
+            let mut recycled_entries = self
+                .vacant_entries
+                .split_off(self.vacant_entries.len() - recycled_count);
+            recycled_entries.sort_unstable();
+            let mut recycled_entries = recycled_entries.into_iter();
+            let entries = (0..entry_count)
+                .map(|index| {
+                    let entry = recycled_entries.next().unwrap_or_else(|| {
+                        EntryID(u32::try_from(self.entry_locations.len()).expect("selector entry space exhausted"))
+                    });
+                    let location = Some((
+                        stored_id,
+                        u32::try_from(index).expect("selector program entry space exhausted"),
+                    ));
+                    if entry.0 as usize == self.entry_locations.len() {
+                        self.entry_locations.make_mut().push(location);
+                    } else {
+                        self.entry_locations.make_mut()[entry.0 as usize] = location;
+                    }
+                    entry
+                })
+                .collect();
+            SelectorEntryIDs::from_entries(entries)
+        };
+        self.entry_ids_bytes += entries.capacity_bytes();
         if self.entry_ids_by_program.len() <= id.0 as usize {
-            self.entry_ids_by_program.resize_with(id.0 as usize + 1, || None);
+            self.entry_ids_by_program
+                .make_mut()
+                .resize_with(id.0 as usize + 1, || None);
         }
-        self.entry_ids_by_program[id.0 as usize] = Some(entries);
-        self.program_index[bucket] = Some(id);
+        self.entry_ids_by_program.make_mut()[id.0 as usize] = Some(entries);
+        self.program_index.make_mut()[bucket] = Some(Self::stored_program_id(id));
         (id, true)
     }
 
     fn rebuild_program_index(&mut self) {
         let capacity = ((self.programs.len() + 1) * 4).next_power_of_two().max(16);
         self.program_index.clear();
-        self.program_index.resize(capacity, None);
+        self.program_index.make_mut().resize(capacity, None);
         for (index, program) in self
             .programs
             .iter()
@@ -2772,8 +2917,22 @@ impl SelectorPrograms {
             while self.program_index[bucket].is_some() {
                 bucket = (bucket + 1) & (capacity - 1);
             }
-            self.program_index[bucket] = Some(id);
+            self.program_index.make_mut()[bucket] = Some(Self::stored_program_id(id));
         }
+    }
+
+    fn stored_program_id(id: SelectorProgramID) -> NonZeroU32 {
+        NonZeroU32::new(id.0.checked_add(1).expect("selector program space exhausted")).unwrap()
+    }
+
+    pub(super) fn share_indices(&mut self, memory: &mut MemoryController) {
+        if matches!(self.scope, SelectorProgramScope::Process) {
+            self.programs.share(&SHARED_PROGRAM_ATTACHMENTS);
+        }
+        self.program_index.share(&SHARED_PROGRAM_INDICES);
+        self.entry_locations.share(&SHARED_ENTRY_LOCATIONS);
+        self.entry_ids_by_program.share(&SHARED_ENTRY_ATTACHMENTS);
+        self.settle_memory(memory);
     }
 
     fn program_hash(program: &SelectorProgram) -> u64 {
@@ -2794,12 +2953,28 @@ impl SelectorPrograms {
     pub fn entry_id(&self, program: SelectorProgramID, entry: u32) -> EntryID {
         self.entry_ids_by_program[program.0 as usize]
             .as_ref()
-            .expect("a live selector program must have entry identities")[entry as usize]
+            .expect("a live selector program must have entry identities")
+            .get(entry as usize)
+    }
+
+    pub(super) fn shared_dispatch_identity(
+        &self,
+        program: SelectorProgramID,
+    ) -> Option<(SharedSelectorIdentity, SelectorEntryIDs)> {
+        let SelectorProgramStorage::Process(shared) = self.programs[program.0 as usize].as_ref()? else {
+            return None;
+        };
+        Some((
+            SharedSelectorIdentity(Rc::clone(shared)),
+            self.entry_ids_by_program[program.0 as usize].as_ref()?.clone(),
+        ))
     }
 
     #[must_use]
     pub fn entry_location(&self, entry: EntryID) -> (SelectorProgramID, u32) {
-        self.entry_locations[entry.0 as usize].expect("a referenced selector entry identity must remain live")
+        let (program, index) =
+            self.entry_locations[entry.0 as usize].expect("a referenced selector entry identity must remain live");
+        (SelectorProgramID(program.get() - 1), index)
     }
 
     #[must_use]
@@ -2816,7 +2991,7 @@ impl SelectorPrograms {
 
     pub fn sweep_unreferenced(&mut self, referenced: &[bool]) {
         self.vacant_programs.clear();
-        for (index, slot) in self.programs.iter_mut().enumerate() {
+        for (index, slot) in self.programs.make_mut().iter_mut().enumerate() {
             if referenced.get(index).copied().unwrap_or(false) {
                 assert!(slot.is_some(), "a referenced selector program must remain live");
                 continue;
@@ -2824,9 +2999,10 @@ impl SelectorPrograms {
             if let Some(program) = slot.take() {
                 self.program_memory.shrink_committed(program.document_capacity_bytes());
             }
-            if let Some(entries) = self.entry_ids_by_program[index].take() {
-                for entry in entries {
-                    self.entry_locations[entry.0 as usize] = None;
+            if let Some(entries) = self.entry_ids_by_program.make_mut()[index].take() {
+                self.entry_ids_bytes -= entries.capacity_bytes();
+                for entry in entries.iter() {
+                    self.entry_locations.make_mut()[entry.0 as usize] = None;
                     self.vacant_entries.push(entry);
                 }
             }
@@ -2879,9 +3055,9 @@ impl SelectorPrograms {
                 self.program_index,
             ];
             cached [self.program_memory.bytes()];
-            // Each live entry identity occupies exactly one slot in a boxed program entry list.
-            // Settling after each rule must not walk every program already compiled.
-            nested [(self.entry_locations.len() - self.vacant_entries.len()) * size_of::<EntryID>()];
+            // Consecutive identities live inline; charge only fragmented lists without
+            // walking every program when settling after each rule.
+            nested [self.entry_ids_bytes];
             skip [self.memory];
         }
     }
@@ -3006,42 +3182,116 @@ pub struct TransposeRoute {
     pub anchor: Option<RelativeAnchor>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct RouteRange {
     offset: u32,
     length: u32,
+}
+
+#[derive(PartialEq, Eq)]
+struct FlatRouteDirectoryData {
+    ranges: HashMap<RoutingKey, RouteRange>,
+    routes: Vec<RouteID>,
+}
+
+struct SharedFlatRouteDirectory {
+    data: FlatRouteDirectoryData,
+    hash: u64,
+    _memory: MemoryLease,
+}
+
+struct SharedFlatRouteDirectories {
+    by_hash: HashMap<u64, Vec<Weak<SharedFlatRouteDirectory>>>,
+    memory: MemoryController,
+}
+
+thread_local! {
+    static SHARED_FLAT_ROUTE_DIRECTORIES: RefCell<SharedFlatRouteDirectories> = RefCell::new(SharedFlatRouteDirectories {
+        by_hash: HashMap::default(),
+        memory: MemoryController::new(DeviceClass::ForegroundDesktop),
+    });
+}
+
+impl Drop for SharedFlatRouteDirectory {
+    fn drop(&mut self) {
+        let _ = SHARED_FLAT_ROUTE_DIRECTORIES.try_with(|pool| {
+            let Ok(mut pool) = pool.try_borrow_mut() else { return };
+            if let std::collections::hash_map::Entry::Occupied(mut entry) = pool.by_hash.entry(self.hash) {
+                entry.get_mut().retain(|directory| directory.strong_count() != 0);
+                if entry.get().is_empty() {
+                    entry.remove();
+                }
+            }
+        });
+    }
+}
+
+fn share_flat_route_directory(data: FlatRouteDirectoryData) -> Option<Rc<SharedFlatRouteDirectory>> {
+    if data.ranges.is_empty() {
+        debug_assert!(data.routes.is_empty());
+        return None;
+    }
+    let mut ranges_hash = 0_u64;
+    for (key, range) in &data.ranges {
+        let mut hasher = fast_hasher();
+        key.hash(&mut hasher);
+        range.hash(&mut hasher);
+        ranges_hash ^= hasher.finish();
+    }
+    let mut hasher = fast_hasher();
+    ranges_hash.hash(&mut hasher);
+    data.ranges.len().hash(&mut hasher);
+    data.routes.hash(&mut hasher);
+    let hash = hasher.finish();
+    Some(SHARED_FLAT_ROUTE_DIRECTORIES.with_borrow_mut(|pool| {
+        let bucket = pool.by_hash.entry(hash).or_default();
+        bucket.retain(|directory| directory.strong_count() != 0);
+        if let Some(found) = bucket
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|candidate| candidate.data == data)
+        {
+            return found;
+        }
+        let mut memory = MemoryLease::new(MemoryCategory::RoutingRegistry);
+        memory.resize_required_to(
+            &mut pool.memory,
+            size_of::<SharedFlatRouteDirectory>() as u64
+                + data.ranges.shallow_capacity_bytes()
+                + data.routes.shallow_capacity_bytes(),
+        );
+        let shared = Rc::new(SharedFlatRouteDirectory {
+            data,
+            hash,
+            _memory: memory,
+        });
+        bucket.push(Rc::downgrade(&shared));
+        shared
+    }))
 }
 
 enum RouteDirectory {
     BuildingAfterIdle(HashMap<RoutingKey, Vec<RouteID>>),
     BuildingAfterChange(HashMap<RoutingKey, Vec<RouteID>>),
     BuildingIdleAfterChange(HashMap<RoutingKey, Vec<RouteID>>),
-    FlatAfterIdle {
-        ranges: HashMap<RoutingKey, RouteRange>,
-        routes: Vec<RouteID>,
-    },
-    FlatAfterChange {
-        ranges: HashMap<RoutingKey, RouteRange>,
-        routes: Vec<RouteID>,
-    },
+    FlatAfterIdle { data: Option<Rc<SharedFlatRouteDirectory>> },
+    FlatAfterChange { data: Option<Rc<SharedFlatRouteDirectory>> },
 }
 
 impl Default for RouteDirectory {
     fn default() -> Self {
-        Self::FlatAfterIdle {
-            ranges: HashMap::default(),
-            routes: Vec::new(),
-        }
+        Self::FlatAfterIdle { data: None }
     }
 }
 
 impl RouteDirectory {
-    fn reopen(ranges: HashMap<RoutingKey, RouteRange>, routes: Vec<RouteID>) -> HashMap<RoutingKey, Vec<RouteID>> {
-        let mut building = HashMap::with_capacity_and_hasher(ranges.len(), Default::default());
-        for (key, range) in ranges {
+    fn reopen(data: Option<Rc<SharedFlatRouteDirectory>>) -> HashMap<RoutingKey, Vec<RouteID>> {
+        let Some(data) = data else { return HashMap::default() };
+        let mut building = HashMap::with_capacity_and_hasher(data.data.ranges.len(), Default::default());
+        for (&key, range) in &data.data.ranges {
             building.insert(
                 key,
-                routes[range.offset as usize..(range.offset + range.length) as usize].to_vec(),
+                data.data.routes[range.offset as usize..(range.offset + range.length) as usize].to_vec(),
             );
         }
         building
@@ -3049,11 +3299,11 @@ impl RouteDirectory {
 
     fn push(&mut self, key: RoutingKey, route: RouteID) {
         match std::mem::take(self) {
-            Self::FlatAfterIdle { ranges, routes } => {
-                *self = Self::BuildingAfterIdle(Self::reopen(ranges, routes));
+            Self::FlatAfterIdle { data } => {
+                *self = Self::BuildingAfterIdle(Self::reopen(data));
             }
-            Self::FlatAfterChange { ranges, routes } => {
-                *self = Self::BuildingAfterChange(Self::reopen(ranges, routes));
+            Self::FlatAfterChange { data } => {
+                *self = Self::BuildingAfterChange(Self::reopen(data));
             }
             Self::BuildingIdleAfterChange(building) => {
                 *self = Self::BuildingAfterChange(building);
@@ -3077,11 +3327,11 @@ impl RouteDirectory {
             Self::BuildingAfterIdle(building)
             | Self::BuildingAfterChange(building)
             | Self::BuildingIdleAfterChange(building) => building.get(&key).map_or(&[], Vec::as_slice),
-            Self::FlatAfterIdle { ranges, routes } | Self::FlatAfterChange { ranges, routes } => {
-                ranges.get(&key).map_or(&[], |range| {
-                    &routes[range.offset as usize..(range.offset + range.length) as usize]
+            Self::FlatAfterIdle { data } | Self::FlatAfterChange { data } => data.as_ref().map_or(&[], |data| {
+                data.data.ranges.get(&key).map_or(&[], |range| {
+                    &data.data.routes[range.offset as usize..(range.offset + range.length) as usize]
                 })
-            }
+            }),
         }
     }
 
@@ -3091,14 +3341,16 @@ impl RouteDirectory {
             Self::BuildingAfterIdle(building)
             | Self::BuildingAfterChange(building)
             | Self::BuildingIdleAfterChange(building) => building.len(),
-            Self::FlatAfterIdle { ranges, .. } | Self::FlatAfterChange { ranges, .. } => ranges.len(),
+            Self::FlatAfterIdle { data } | Self::FlatAfterChange { data } => {
+                data.as_ref().map_or(0, |data| data.data.ranges.len())
+            }
         }
     }
 
     fn finish(&mut self) -> bool {
         match std::mem::take(self) {
-            Self::FlatAfterIdle { ranges, routes } | Self::FlatAfterChange { ranges, routes } => {
-                *self = Self::FlatAfterIdle { ranges, routes };
+            Self::FlatAfterIdle { data } | Self::FlatAfterChange { data } => {
+                *self = Self::FlatAfterIdle { data };
                 false
             }
             Self::BuildingAfterChange(building) => {
@@ -3131,16 +3383,14 @@ impl RouteDirectory {
                 },
             );
         }
+        let data = share_flat_route_directory(FlatRouteDirectoryData {
+            ranges,
+            routes: flat_routes,
+        });
         if after_change {
-            Self::FlatAfterChange {
-                ranges,
-                routes: flat_routes,
-            }
+            Self::FlatAfterChange { data }
         } else {
-            Self::FlatAfterIdle {
-                ranges,
-                routes: flat_routes,
-            }
+            Self::FlatAfterIdle { data }
         }
     }
 
@@ -3151,35 +3401,187 @@ impl RouteDirectory {
             | Self::BuildingIdleAfterChange(building) => capacity_bytes! {
                 shallow [building];
                 cached [];
-                nested [building
-                    .values()
-                    .map(|routes| routes.capacity() * size_of::<RouteID>())
-                    .sum::<usize>()];
+                nested [building.values().map(|routes| routes.capacity() * size_of::<RouteID>()).sum::<usize>()];
                 skip [];
             },
-            Self::FlatAfterIdle { ranges, routes } | Self::FlatAfterChange { ranges, routes } => capacity_bytes! {
-                shallow [ranges, routes];
-                cached [];
-                nested [];
-                skip [];
-            },
+            // Immutable directory allocations are charged once to the process ledger.
+            Self::FlatAfterIdle { .. } | Self::FlatAfterChange { .. } => 0,
         }
     }
 }
 
-#[derive(Default)]
-struct RouteColumns {
+#[derive(Clone, Default, PartialEq, Eq)]
+struct RouteColumnData {
     headers: Vec<RouteHeader>,
-    paths: Vec<RouteRange>,
-    origins: Vec<RouteRange>,
-    origin_requirements: Vec<RouteRange>,
-    parents: Vec<RouteRange>,
-    waypoints: Vec<RouteRange>,
+    paths: SharedVector<RouteRange>,
+    origins: SharedVector<RouteRange>,
+    origin_requirements: SharedVector<RouteRange>,
+    parents: SharedVector<RouteRange>,
+    waypoints: SharedVector<RouteRange>,
+    anchors: Vec<RelativeAnchor>,
+    entry_facts: Vec<Option<EntryRouteFacts>>,
+    inverse_steps: Vec<InverseStep>,
+    keys: Vec<DispatchKey>,
+    /// Routes inside relational arguments, needed when departure removes their input facts.
+    relational: Vec<RouteID>,
+    /// Non-relational routes that can leave a departing subtree through a sibling step.
+    sibling_first: Vec<RouteID>,
+    canonical_route_heads: HashMap<(RuleID, EntryID), RouteID>,
+    canonical_next: Vec<Option<RouteID>>,
+}
+
+impl Hash for RouteColumnData {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.headers.hash(state);
+        self.paths.hash(state);
+        self.origins.hash(state);
+        self.origin_requirements.hash(state);
+        self.parents.hash(state);
+        self.waypoints.hash(state);
+        self.anchors.hash(state);
+        self.entry_facts.hash(state);
+        self.inverse_steps.hash(state);
+        self.keys.hash(state);
+        self.relational.hash(state);
+        self.sibling_first.hash(state);
+        self.canonical_next.hash(state);
+        // The canonical heads follow from the ordered headers. Equality still compares the map.
+        self.canonical_route_heads.len().hash(state);
+    }
+}
+
+// Route columns contain immutable selector descriptors and integer identities. Equal contents
+// can be shared even when documents interpret the identities through different selector programs.
+// A later stylesheet edit detaches the columns before appending routes.
+enum RouteColumns {
+    Owned(Box<RouteColumnData>),
+    Shared(Rc<SharedRouteColumns>),
+}
+
+impl Default for RouteColumns {
+    fn default() -> Self {
+        Self::Owned(Box::default())
+    }
+}
+
+impl std::ops::Deref for RouteColumns {
+    type Target = RouteColumnData;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(data) => data,
+            Self::Shared(shared) => &shared.data,
+        }
+    }
+}
+
+struct SharedRouteColumns {
+    data: RouteColumnData,
+    hash: u64,
+    _memory: MemoryLease,
+}
+
+struct SharedRouteColumnTable {
+    by_hash: HashMap<u64, Vec<Weak<SharedRouteColumns>>>,
+    memory: MemoryController,
+}
+
+thread_local! {
+    static SHARED_ROUTE_RANGES: RefCell<SharedVectorPool<RouteRange>> =
+        RefCell::new(SharedVectorPool::new(MemoryCategory::RoutingRegistry));
+    static SHARED_ROUTE_COLUMNS: RefCell<SharedRouteColumnTable> = RefCell::new(SharedRouteColumnTable {
+        by_hash: HashMap::default(),
+        memory: MemoryController::new(DeviceClass::ForegroundDesktop),
+    });
+}
+
+impl Drop for SharedRouteColumns {
+    fn drop(&mut self) {
+        let _ = SHARED_ROUTE_COLUMNS.try_with(|table| {
+            let Ok(mut table) = table.try_borrow_mut() else { return };
+            if let std::collections::hash_map::Entry::Occupied(mut entry) = table.by_hash.entry(self.hash) {
+                entry.get_mut().retain(|candidate| candidate.strong_count() != 0);
+                if entry.get().is_empty() {
+                    entry.remove();
+                }
+            }
+        });
+    }
+}
+
+impl RouteColumns {
+    fn make_mut(&mut self) -> &mut RouteColumnData {
+        if matches!(self, Self::Shared(_)) {
+            let Self::Shared(shared) = std::mem::take(self) else {
+                unreachable!()
+            };
+            let data = match Rc::try_unwrap(shared) {
+                Ok(mut shared) => std::mem::take(&mut shared.data),
+                Err(shared) => shared.data.clone(),
+            };
+            let Self::Owned(owned) = self else { unreachable!() };
+            **owned = data;
+        }
+        let Self::Owned(data) = self else { unreachable!() };
+        data
+    }
+
+    fn push(&mut self, header: RouteHeader, ranges: RouteRanges) {
+        self.make_mut().push(header, ranges);
+    }
+
+    fn capacity_bytes(&self) -> u64 {
+        match self {
+            Self::Owned(data) => size_of::<RouteColumnData>() as u64 + data.capacity_bytes(),
+            // The immutable allocation is charged once to the process ledger.
+            Self::Shared(_) => 0,
+        }
+    }
+
+    fn share(&mut self) {
+        if matches!(self, Self::Shared(_)) || self.is_empty() {
+            return;
+        }
+        let Self::Owned(mut data) = std::mem::take(self) else {
+            unreachable!()
+        };
+        let mut hasher = fast_hasher();
+        data.hash(&mut hasher);
+        let hash = hasher.finish();
+        let shared = SHARED_ROUTE_COLUMNS.with_borrow_mut(|table| {
+            let bucket = table.by_hash.entry(hash).or_default();
+            bucket.retain(|candidate| candidate.strong_count() != 0);
+            if let Some(found) = bucket
+                .iter()
+                .filter_map(Weak::upgrade)
+                .find(|candidate| candidate.data == *data)
+            {
+                return found;
+            }
+            // Offsets and lengths can agree even when route keys or rule bindings differ.
+            // Share each immutable range column independently of the complete registry.
+            data.paths.share(&SHARED_ROUTE_RANGES);
+            data.origins.share(&SHARED_ROUTE_RANGES);
+            data.origin_requirements.share(&SHARED_ROUTE_RANGES);
+            data.parents.share(&SHARED_ROUTE_RANGES);
+            data.waypoints.share(&SHARED_ROUTE_RANGES);
+            let mut memory = MemoryLease::new(MemoryCategory::RoutingRegistry);
+            memory.resize_required_to(&mut table.memory, data.capacity_bytes());
+            let shared = Rc::new(SharedRouteColumns {
+                data: *data,
+                hash,
+                _memory: memory,
+            });
+            table.by_hash.get_mut(&hash).unwrap().push(Rc::downgrade(&shared));
+            shared
+        });
+        *self = Self::Shared(shared);
+    }
 }
 
 const NO_ROUTE_INDEX: u32 = u32::MAX;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct RouteHeader {
     rule: RuleID,
     entry: EntryID,
@@ -3195,14 +3597,14 @@ struct RouteRanges {
     waypoints: RouteRange,
 }
 
-impl RouteColumns {
+impl RouteColumnData {
     fn push(&mut self, header: RouteHeader, ranges: RouteRanges) {
         self.headers.push(header);
-        self.paths.push(ranges.path);
-        self.origins.push(ranges.origin);
-        self.origin_requirements.push(ranges.origin_requirements);
-        self.parents.push(ranges.parent);
-        self.waypoints.push(ranges.waypoints);
+        self.paths.make_mut().push(ranges.path);
+        self.origins.make_mut().push(ranges.origin);
+        self.origin_requirements.make_mut().push(ranges.origin_requirements);
+        self.parents.make_mut().push(ranges.parent);
+        self.waypoints.make_mut().push(ranges.waypoints);
     }
 
     fn len(&self) -> usize {
@@ -3222,6 +3624,14 @@ impl RouteColumns {
                 self.origin_requirements,
                 self.parents,
                 self.waypoints,
+                self.anchors,
+                self.entry_facts,
+                self.inverse_steps,
+                self.keys,
+                self.relational,
+                self.sibling_first,
+                self.canonical_route_heads,
+                self.canonical_next,
             ];
             cached [];
             nested [];
@@ -3231,7 +3641,7 @@ impl RouteColumns {
 }
 
 /// Subject-side facts shared by every transpose route of one selector entry.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct EntryRouteFacts {
     /// Whether prefix matching applies, and whether its compounds read only local facts.
     flags: u8,
@@ -3668,21 +4078,10 @@ fn state_is_published_on_arrival(fact: StateFact) -> bool {
 /// changes which routes run.
 pub struct RoutingRegistry {
     routes: RouteColumns,
-    anchors: Vec<RelativeAnchor>,
-    entry_facts: Vec<Option<EntryRouteFacts>>,
-    /// Every route that sits inside a relational argument. A subtree leaving takes its facts
-    /// with it, so there is no feature left to route from and these have to be asked directly.
-    relational: Vec<RouteID>,
-    /// Every route whose path leaves the element it starts from through a sibling. Those are
-    /// the only paths that can reach outside a departing subtree without being relational, so a
-    /// departure is routed through them and no others.
-    sibling_first: Vec<RouteID>,
     /// Sibling-first routes indexed by a distinguishing feature of their left compound.
     sibling_first_by_origin: HashMap<DispatchKey, Vec<RouteID>>,
     by_input: RouteDirectory,
     arrival_by_input: RouteDirectory,
-    canonical_route_heads: HashMap<(RuleID, EntryID), RouteID>,
-    canonical_next: Vec<Option<RouteID>>,
     route_liveness: RefCell<BitColumn>,
     live_relational_routes: RefCell<Vec<LiveRelationalRoute>>,
     live_sibling_entries: RefCell<Vec<SiblingEntry>>,
@@ -3690,8 +4089,6 @@ pub struct RoutingRegistry {
     live_sequence_entries: RefCell<Vec<SequenceEntry>>,
     live_sequence_index: RefCell<SequenceEntryIndex>,
     route_liveness_version: Cell<Option<u64>>,
-    paths: Vec<InverseStep>,
-    keys: Vec<DispatchKey>,
     memory: MemoryLease,
     nested_memory: MemoryLease,
 }
@@ -3700,15 +4097,9 @@ impl Default for RoutingRegistry {
     fn default() -> Self {
         Self {
             routes: RouteColumns::default(),
-            anchors: Vec::new(),
-            entry_facts: Vec::new(),
-            relational: Vec::new(),
-            sibling_first: Vec::new(),
             sibling_first_by_origin: HashMap::default(),
             by_input: RouteDirectory::default(),
             arrival_by_input: RouteDirectory::default(),
-            canonical_route_heads: HashMap::default(),
-            canonical_next: Vec::new(),
             route_liveness: RefCell::new(BitColumn::default()),
             live_relational_routes: RefCell::new(Vec::new()),
             live_sibling_entries: RefCell::new(Vec::new()),
@@ -3716,8 +4107,6 @@ impl Default for RoutingRegistry {
             live_sequence_entries: RefCell::new(Vec::new()),
             live_sequence_index: RefCell::new(SequenceEntryIndex::default()),
             route_liveness_version: Cell::new(None),
-            paths: Vec::new(),
-            keys: Vec::new(),
             memory: MemoryLease::new(MemoryCategory::RoutingRegistry),
             nested_memory: MemoryLease::new(MemoryCategory::RoutingRegistry),
         }
@@ -3743,14 +4132,14 @@ impl RoutingRegistry {
                 Some(InverseStep::NextSibling | InverseStep::FollowingSiblings)
             );
         let canonical_key = (descriptor.rule, descriptor.entry);
-        let mut candidate = self.canonical_route_heads.get(&canonical_key).copied();
+        let mut candidate = self.routes.canonical_route_heads.get(&canonical_key).copied();
         let mut canonical_route = None;
         while let Some(route) = candidate {
             if self.route_descriptor(route) == descriptor {
                 canonical_route = Some(route);
                 break;
             }
-            candidate = self.canonical_next[route.index()];
+            candidate = self.routes.canonical_next[route.index()];
         }
         let RouteDescriptor {
             rule,
@@ -3765,20 +4154,20 @@ impl RoutingRegistry {
         } = descriptor;
         let route = canonical_route.unwrap_or_else(|| {
             let route = RouteID::from_index(self.routes.len());
-            let path_offset = u32::try_from(self.paths.len()).expect("transpose path space exhausted");
-            self.paths.extend_from_slice(path);
-            let origin_offset = u32::try_from(self.keys.len()).expect("dispatch key space exhausted");
-            self.keys.extend_from_slice(origin_dispatch);
-            let origin_required_offset = u32::try_from(self.keys.len()).expect("dispatch key space exhausted");
-            self.keys.extend_from_slice(origin_required);
-            let parent_offset = u32::try_from(self.keys.len()).expect("dispatch key space exhausted");
-            self.keys.extend_from_slice(parent_dispatch);
-            let waypoint_offset = u32::try_from(self.keys.len()).expect("dispatch key space exhausted");
-            self.keys.extend_from_slice(waypoints);
+            let path_offset = u32::try_from(self.routes.inverse_steps.len()).expect("transpose path space exhausted");
+            self.routes.make_mut().inverse_steps.extend_from_slice(path);
+            let origin_offset = u32::try_from(self.routes.keys.len()).expect("dispatch key space exhausted");
+            self.routes.make_mut().keys.extend_from_slice(origin_dispatch);
+            let origin_required_offset = u32::try_from(self.routes.keys.len()).expect("dispatch key space exhausted");
+            self.routes.make_mut().keys.extend_from_slice(origin_required);
+            let parent_offset = u32::try_from(self.routes.keys.len()).expect("dispatch key space exhausted");
+            self.routes.make_mut().keys.extend_from_slice(parent_dispatch);
+            let waypoint_offset = u32::try_from(self.routes.keys.len()).expect("dispatch key space exhausted");
+            self.routes.make_mut().keys.extend_from_slice(waypoints);
             let anchor_index = anchor.map(|anchor| {
-                let index = u32::try_from(self.anchors.len()).expect("relative anchor space exhausted");
+                let index = u32::try_from(self.routes.anchors.len()).expect("relative anchor space exhausted");
                 assert_ne!(index, NO_ROUTE_INDEX, "relative anchor space exhausted");
-                self.anchors.push(anchor);
+                self.routes.make_mut().anchors.push(anchor);
                 index
             });
             let selector_node = selector_node.map_or(NO_ROUTE_INDEX, |node| {
@@ -3817,10 +4206,10 @@ impl RoutingRegistry {
             );
             self.route_liveness_version.set(None);
             if anchor.is_some() {
-                self.relational.push(route);
+                self.routes.make_mut().relational.push(route);
             }
             if starts_through_a_sibling {
-                self.sibling_first.push(route);
+                self.routes.make_mut().sibling_first.push(route);
                 if origin_dispatch.is_empty() {
                     let routes = self.sibling_first_by_origin.entry(DispatchKey::Universal).or_default();
                     Self::push_route(&mut self.nested_memory, routes, route);
@@ -3831,8 +4220,12 @@ impl RoutingRegistry {
                     }
                 }
             }
-            let previous = self.canonical_route_heads.insert(canonical_key, route);
-            self.canonical_next.push(previous);
+            let previous = self
+                .routes
+                .make_mut()
+                .canonical_route_heads
+                .insert(canonical_key, route);
+            self.routes.make_mut().canonical_next.push(previous);
             route
         });
 
@@ -3861,13 +4254,13 @@ impl RoutingRegistry {
     /// Every route inside a relational argument, in a stable order.
     #[must_use]
     pub fn relational_routes(&self) -> &[RouteID] {
-        &self.relational
+        &self.routes.relational
     }
 
     /// Every route whose path steps to a sibling first, in a stable order.
     #[must_use]
     pub fn sibling_first_routes(&self) -> &[RouteID] {
-        &self.sibling_first
+        &self.routes.sibling_first
     }
 
     /// Sibling-first routes whose left compound can match a node carrying `origin`.
@@ -3896,7 +4289,7 @@ impl RoutingRegistry {
             rule: header.rule,
             entry: header.entry,
             selector_node: (header.selector_node != NO_ROUTE_INDEX).then_some(SelectorNodeID(header.selector_node)),
-            anchor: (header.anchor_index != NO_ROUTE_INDEX).then(|| self.anchors[header.anchor_index as usize]),
+            anchor: (header.anchor_index != NO_ROUTE_INDEX).then(|| self.routes.anchors[header.anchor_index as usize]),
         }
     }
 
@@ -3922,7 +4315,7 @@ impl RoutingRegistry {
         }
         let mut live_relational_routes = self.live_relational_routes.borrow_mut();
         live_relational_routes.clear();
-        live_relational_routes.extend(self.relational.iter().copied().filter_map(|route| {
+        live_relational_routes.extend(self.routes.relational.iter().copied().filter_map(|route| {
             if !liveness.contains(route.index()) {
                 return None;
             }
@@ -3937,7 +4330,8 @@ impl RoutingRegistry {
         let mut live_sibling_entries = self.live_sibling_entries.borrow_mut();
         live_sibling_entries.clear();
         live_sibling_entries.extend(
-            self.sibling_first
+            self.routes
+                .sibling_first
                 .iter()
                 .copied()
                 .filter(|route| liveness.contains(route.index()))
@@ -4030,7 +4424,7 @@ impl RoutingRegistry {
     }
 
     fn entry_facts_of(&self, route: RouteID) -> EntryRouteFacts {
-        self.entry_facts[self.routes.headers[route.index()].entry.0 as usize]
+        self.routes.entry_facts[self.routes.headers[route.index()].entry.0 as usize]
             .expect("a route must reference registered entry facts")
     }
 
@@ -4047,7 +4441,7 @@ impl RoutingRegistry {
     #[must_use]
     pub fn path_of(&self, route: RouteID) -> &[InverseStep] {
         let range = self.routes.paths[route.index()];
-        &self.paths[range.offset as usize..(range.offset + range.length) as usize]
+        &self.routes.inverse_steps[range.offset as usize..(range.offset + range.length) as usize]
     }
 
     /// The features the element an input happened to must carry for this route to be reachable.
@@ -4058,14 +4452,14 @@ impl RoutingRegistry {
     #[must_use]
     pub fn origin_dispatch_of(&self, route: RouteID) -> &[DispatchKey] {
         let range = self.routes.origins[route.index()];
-        &self.keys[range.offset as usize..(range.offset + range.length) as usize]
+        &self.routes.keys[range.offset as usize..(range.offset + range.length) as usize]
     }
 
     /// Independently necessary features of the compound containing the input.
     #[must_use]
     pub fn origin_required_of(&self, route: RouteID) -> &[DispatchKey] {
         let range = self.routes.origin_requirements[route.index()];
-        &self.keys[range.offset as usize..(range.offset + range.length) as usize]
+        &self.routes.keys[range.offset as usize..(range.offset + range.length) as usize]
     }
 
     /// What the parent of the compound an input occurs in must be.
@@ -4076,7 +4470,7 @@ impl RoutingRegistry {
     #[must_use]
     pub fn parent_dispatch_of(&self, route: RouteID) -> &[DispatchKey] {
         let range = self.routes.parents[route.index()];
-        &self.keys[range.offset as usize..(range.offset + range.length) as usize]
+        &self.routes.keys[range.offset as usize..(range.offset + range.length) as usize]
     }
 
     /// How far into a sibling sequence the entry's subjects can be, when a positional test says so.
@@ -4095,14 +4489,14 @@ impl RoutingRegistry {
     #[must_use]
     pub fn subject_dispatch_of(&self, route: RouteID) -> &[DispatchKey] {
         let facts = self.entry_facts_of(route);
-        &self.keys[facts.subject_offset as usize..(facts.subject_offset + facts.subject_length) as usize]
+        &self.routes.keys[facts.subject_offset as usize..(facts.subject_offset + facts.subject_length) as usize]
     }
 
     /// Independently necessary features of the entry's subject compound.
     #[must_use]
     pub fn subject_required_of(&self, route: RouteID) -> &[DispatchKey] {
         let facts = self.entry_facts_of(route);
-        &self.keys[facts.subject_required_offset as usize
+        &self.routes.keys[facts.subject_required_offset as usize
             ..(facts.subject_required_offset + facts.subject_required_length) as usize]
     }
 
@@ -4114,7 +4508,7 @@ impl RoutingRegistry {
     #[must_use]
     pub fn waypoints_of(&self, route: RouteID) -> &[DispatchKey] {
         let range = self.routes.waypoints[route.index()];
-        &self.keys[range.offset as usize..(range.offset + range.length) as usize]
+        &self.routes.keys[range.offset as usize..(range.offset + range.length) as usize]
     }
 
     #[must_use]
@@ -4134,7 +4528,9 @@ impl RoutingRegistry {
     }
 
     pub(super) fn finish_directories(&mut self) -> bool {
-        self.by_input.finish() | self.arrival_by_input.finish()
+        let changed = self.by_input.finish() | self.arrival_by_input.finish();
+        self.routes.share();
+        changed
     }
 
     #[cfg(test)]
@@ -4157,8 +4553,8 @@ impl RoutingRegistry {
         subject_position: SubjectPosition,
     ) {
         let index = entry.0 as usize;
-        if self.entry_facts.len() <= index {
-            self.entry_facts.resize(index + 1, None);
+        if self.routes.entry_facts.len() <= index {
+            self.routes.make_mut().entry_facts.resize(index + 1, None);
         }
         let mut flags = 0;
         if selector_entry.has_prefix_chain() {
@@ -4167,25 +4563,26 @@ impl RoutingRegistry {
         if selector_entry.prefix_chain_has_only_local_facts() {
             flags |= ENTRY_PREFIX_CHAIN_HAS_ONLY_LOCAL_FACTS;
         }
-        if let Some(facts) = self.entry_facts[index] {
+        if let Some(facts) = self.routes.entry_facts[index] {
             debug_assert_eq!(facts.flags, flags);
             debug_assert_eq!(facts.subject_position, subject_position);
             debug_assert_eq!(
-                &self.keys[facts.subject_offset as usize..(facts.subject_offset + facts.subject_length) as usize],
+                &self.routes.keys
+                    [facts.subject_offset as usize..(facts.subject_offset + facts.subject_length) as usize],
                 subject_dispatch
             );
             debug_assert_eq!(
-                &self.keys[facts.subject_required_offset as usize
+                &self.routes.keys[facts.subject_required_offset as usize
                     ..(facts.subject_required_offset + facts.subject_required_length) as usize],
                 subject_required
             );
             return;
         }
-        let subject_offset = u32::try_from(self.keys.len()).expect("dispatch key space exhausted");
-        self.keys.extend_from_slice(subject_dispatch);
-        let subject_required_offset = u32::try_from(self.keys.len()).expect("dispatch key space exhausted");
-        self.keys.extend_from_slice(subject_required);
-        self.entry_facts[index] = Some(EntryRouteFacts {
+        let subject_offset = u32::try_from(self.routes.keys.len()).expect("dispatch key space exhausted");
+        self.routes.make_mut().keys.extend_from_slice(subject_dispatch);
+        let subject_required_offset = u32::try_from(self.routes.keys.len()).expect("dispatch key space exhausted");
+        self.routes.make_mut().keys.extend_from_slice(subject_required);
+        self.routes.make_mut().entry_facts[index] = Some(EntryRouteFacts {
             flags,
             subject_position,
             subject_offset,
@@ -4250,15 +4647,7 @@ impl RoutingRegistry {
     pub fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
             shallow [
-                self.anchors,
-                self.entry_facts,
-                self.relational,
-                self.sibling_first,
                 self.sibling_first_by_origin,
-                self.paths,
-                self.keys,
-                self.canonical_route_heads,
-                self.canonical_next,
             ];
             cached [self.nested_memory.bytes()];
             nested [
@@ -6620,6 +7009,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_route_columns_detach_before_an_edit() {
+        let push = |columns: &mut RouteColumns, rule| {
+            let empty = RouteRange { offset: 0, length: 0 };
+            let route = RouteID::from_index(columns.len());
+            let previous = columns
+                .make_mut()
+                .canonical_route_heads
+                .insert((RuleID(rule), EntryID(0)), route);
+            columns.make_mut().canonical_next.push(previous);
+            columns.make_mut().sibling_first.push(route);
+            columns.push(
+                RouteHeader {
+                    rule: RuleID(rule),
+                    entry: EntryID(0),
+                    selector_node: NO_ROUTE_INDEX,
+                    anchor_index: NO_ROUTE_INDEX,
+                },
+                RouteRanges {
+                    path: empty,
+                    origin: empty,
+                    origin_requirements: empty,
+                    parent: empty,
+                    waypoints: empty,
+                },
+            );
+        };
+        let mut first = RouteColumns::default();
+        let mut second = RouteColumns::default();
+        for rule in 0..128 {
+            push(&mut first, rule);
+            push(&mut second, rule);
+        }
+        first.make_mut().inverse_steps.push(InverseStep::Children);
+        first.make_mut().keys.push(DispatchKey::Universal);
+        second.make_mut().inverse_steps.push(InverseStep::Children);
+        second.make_mut().keys.push(DispatchKey::Universal);
+        first.share();
+        second.share();
+        let (RouteColumns::Shared(a), RouteColumns::Shared(b)) = (&first, &second) else {
+            panic!("columns were not shared")
+        };
+        assert!(Rc::ptr_eq(a, b));
+        second.make_mut().inverse_steps.push(InverseStep::Descendants);
+        second.make_mut().keys.push(DispatchKey::Universal);
+        assert_eq!(first.inverse_steps, [InverseStep::Children]);
+        assert_eq!(first.keys, [DispatchKey::Universal]);
+        push(&mut second, 128);
+        assert_eq!(first.len(), 128);
+        assert_eq!(second.len(), 129);
+        assert_eq!(first.canonical_route_heads.len(), 128);
+        assert_eq!(second.canonical_route_heads.len(), 129);
+        assert_eq!(first.sibling_first.len(), 128);
+        assert_eq!(second.sibling_first.len(), 129);
+        second.share();
+        drop(first);
+        let headers = second.headers.as_ptr();
+        second.make_mut();
+        assert_eq!(
+            second.headers.as_ptr(),
+            headers,
+            "the sole owner can recover its buffers"
+        );
+        assert_eq!(second.headers[128].rule, RuleID(128));
+    }
+
+    #[test]
     fn relation_answers_share_packed_pages_per_compiled_relation() {
         let cache = MatchRelationCache::default();
         let program = SelectorProgramID(7);
@@ -7795,11 +8250,38 @@ mod tests {
         registry.add_rule(rule, program, &programs);
 
         assert_eq!(registry.len(), SELECTOR_ENTRY_COUNT as usize);
-        assert_eq!(registry.canonical_route_heads.len(), SELECTOR_ENTRY_COUNT as usize);
+        assert_eq!(
+            registry.routes.canonical_route_heads.len(),
+            SELECTOR_ENTRY_COUNT as usize
+        );
         assert!(
-            registry.canonical_next.iter().all(Option::is_none),
+            registry.routes.canonical_next.iter().all(Option::is_none),
             "each selector entry should have its own one-route chain"
         );
+    }
+
+    #[test]
+    fn equal_flat_route_directories_share_and_reopen_independently() {
+        let key = RoutingKey::Class(CLASS_ITEM);
+        let mut first = RouteDirectory::default();
+        let mut second = RouteDirectory::default();
+        for directory in [&mut first, &mut second] {
+            directory.push(key, RouteID::from_index(0));
+            directory.finish();
+        }
+        let (RouteDirectory::FlatAfterChange { data: Some(a) }, RouteDirectory::FlatAfterChange { data: Some(b) }) =
+            (&first, &second)
+        else {
+            panic!("directories were not flattened");
+        };
+        assert!(Rc::ptr_eq(a, b));
+        second.push(key, RouteID::from_index(1));
+        assert_eq!(first.get(key), &[RouteID::from_index(0)]);
+        assert_eq!(second.get(key), &[RouteID::from_index(0), RouteID::from_index(1)]);
+        second.finish();
+        second.finish();
+        drop(first);
+        assert_eq!(second.get(key), &[RouteID::from_index(0), RouteID::from_index(1)]);
     }
 
     #[test]
@@ -7912,6 +8394,52 @@ mod tests {
     }
 
     #[test]
+    fn shared_selector_indices_detach_for_reclamation_and_reuse() {
+        let make_program = |atom| single_entry(|builder| builder.push_feature(FeatureTest::Class(StyleAtomID(atom))));
+        let mut first = SelectorPrograms::new();
+        let mut second = SelectorPrograms::new();
+        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        for programs in [&mut first, &mut second] {
+            programs.add(make_program(7));
+            programs.add(make_program(8));
+            programs.share_indices(&mut memory);
+        }
+        assert_eq!(first.program_index.as_ptr(), second.program_index.as_ptr());
+        assert_eq!(first.entry_locations.as_ptr(), second.entry_locations.as_ptr());
+        let entry = first.entry_id(SelectorProgramID(0), 0);
+        second.sweep_unreferenced(&[false, true]);
+        let recycled = second.add(make_program(9));
+        assert_eq!(recycled, SelectorProgramID(0));
+        assert_eq!(first.entry_location(entry), (SelectorProgramID(0), 0));
+        assert!(first.get(SelectorProgramID(0)) == &make_program(7));
+        assert!(second.get(recycled) == &make_program(9));
+        assert_eq!(first.add(make_program(7)), SelectorProgramID(0));
+        assert_eq!(second.add(make_program(9)), recycled);
+        assert_eq!(size_of::<Option<NonZeroU32>>(), 4);
+        assert_eq!(size_of::<Option<(NonZeroU32, u32)>>(), 8);
+    }
+
+    #[test]
+    fn selector_entry_runs_keep_fragmented_recycled_identities() {
+        let consecutive = SelectorEntryIDs::from_entries(vec![EntryID(7), EntryID(8), EntryID(9)]);
+        assert!(matches!(consecutive, SelectorEntryIDs::Consecutive { .. }));
+        assert_eq!(consecutive.capacity_bytes(), 0);
+        assert_eq!(
+            consecutive.iter().collect::<Vec<_>>(),
+            [EntryID(7), EntryID(8), EntryID(9)]
+        );
+
+        let fragmented = SelectorEntryIDs::from_entries(vec![EntryID(1), EntryID(4), EntryID(5)]);
+        let cloned = fragmented.clone();
+        let (SelectorEntryIDs::Explicit(first), SelectorEntryIDs::Explicit(second)) = (&fragmented, &cloned) else {
+            panic!("fragmented entry identities need an explicit list");
+        };
+        assert!(Rc::ptr_eq(first, second));
+        assert_eq!(cloned.iter().collect::<Vec<_>>(), [EntryID(1), EntryID(4), EntryID(5)]);
+        assert_eq!(SelectorEntryIDs::from_entries(Vec::new()).len(), 0);
+    }
+
+    #[test]
     fn live_entry_identities_account_for_program_entry_storage() {
         let make_program = |first: u32, count: u32| {
             let mut builder = SelectorProgramBuilder::new();
@@ -7933,6 +8461,15 @@ mod tests {
                 allocated_entries
             );
             assert_eq!(programs.entry_locations.iter().flatten().count(), allocated_entries);
+            assert_eq!(
+                programs.entry_ids_bytes,
+                programs
+                    .entry_ids_by_program
+                    .iter()
+                    .flatten()
+                    .map(SelectorEntryIDs::capacity_bytes)
+                    .sum::<usize>()
+            );
         };
         for mut programs in [SelectorPrograms::new(), SelectorPrograms::for_replay()] {
             check(&programs);
@@ -8059,7 +8596,7 @@ mod tests {
             registry.rule_of(RouteID::from_index(0)),
             registry.rule_of(RouteID::from_index(1))
         );
-        assert_eq!(registry.entry_facts.iter().flatten().count(), 1);
+        assert_eq!(registry.routes.entry_facts.iter().flatten().count(), 1);
         let first_route = RouteID::from_index(0);
         for index in 1..registry.len() {
             assert_eq!(

@@ -29,6 +29,10 @@ fn declarations(source: &str) -> crate::css::declaration_block::DeclarationBlock
     }
 }
 
+fn first_rule_block(sheet: &ParsedStyleSheet) -> &crate::css::declaration_block::DeclarationBlockData {
+    sheet.rules[0].declaration_block.as_ref().unwrap()
+}
+
 fn first_value(block: &crate::css::declaration_block::DeclarationBlock) -> Vec<u16> {
     serialize_style_value_to_utf16(&block.data().properties[0].value).unwrap()
 }
@@ -378,7 +382,7 @@ fn worker_block_merging_and_shorthand_expansion_need_no_host_callbacks() {
         assert_eq!(margin.properties.len(), 1);
         assert!(margin.properties[0].important);
         let sheet = parse(&utf16("a { margin: var(--gap) }"), &super::tests::parse_context());
-        assert_eq!(sheet.declarations.len(), 1);
+        assert!(sheet.declarations.is_empty());
         let expanded = sheet.rules[0].declaration_block.clone().unwrap();
         drop(sheet);
         assert_eq!(expanded.properties.len(), 5);
@@ -399,12 +403,20 @@ fn value_graphs_are_shared_and_destroyed_without_worker_callbacks() {
     let sheet = parse_shared_on_worker(
         "a { grid-template-columns: repeat(2, [é] minmax(10px, 1fr)); width: calc(1em + 2px); --custom: var(--é, [nested tokens]); content: '😀'; background-image: url(image.png); filter: url(image.png) }",
     );
-    assert_eq!(sheet.declarations.len(), 6);
-    let values: Vec<_> = sheet
-        .declarations
+    assert!(sheet.declarations.is_empty());
+    let block = first_rule_block(&sheet);
+    let values: Vec<_> = block
+        .properties
         .iter()
-        .map(|declaration| declaration.parsed_value.clone().unwrap())
+        .map(|property| property.value.clone())
+        .chain(
+            block
+                .custom_properties
+                .iter()
+                .map(|property| property.declaration.value.clone()),
+        )
         .collect();
+    assert_eq!(values.len(), 6);
     drop(sheet);
     let copies = [values.clone(), values.clone()];
     drop(values);
@@ -427,14 +439,9 @@ fn value_graphs_are_shared_and_destroyed_without_worker_callbacks() {
     let sheet = parse_shared_on_worker(
         "a { position-anchor: --shared-name; color: ReD; grid-template-columns: [shared-name] 1fr; content: 'text' }",
     );
-    assert_eq!(sheet.declarations.len(), 4);
-    assert!(
-        sheet
-            .declarations
-            .iter()
-            .all(|declaration| declaration.parsed_value.is_some())
-    );
-    let value = sheet.declarations[0].parsed_value.clone().unwrap();
+    assert!(sheet.declarations.is_empty());
+    assert_eq!(first_rule_block(&sheet).properties.len(), 4);
+    let value = first_rule_block(&sheet).properties[0].value.clone();
     drop(sheet);
     let StyleValueData::CustomIdent { custom_ident } = &*value else {
         panic!()
@@ -444,8 +451,8 @@ fn value_graphs_are_shared_and_destroyed_without_worker_callbacks() {
         &utf16("b { position-anchor: --shared-name }"),
         &super::tests::parse_context(),
     );
-    assert_eq!(second.declarations.len(), 1);
-    let other = second.declarations[0].parsed_value.as_ref().unwrap();
+    assert!(second.declarations.is_empty());
+    let other = &first_rule_block(&second).properties[0].value;
     assert!(unsafe { rust_style_value_equals(Arc::as_ptr(&value), Arc::as_ptr(other)) });
 }
 
@@ -660,6 +667,55 @@ fn namespace_rules_own_native_names_after_the_sheet_is_dropped() {
 }
 
 #[test]
+fn cached_sheets_share_across_urls_only_when_parsing_does_not_read_the_base() {
+    let mut first_context = super::tests::parse_context();
+    let first_url = b"https://first.example/path/";
+    first_context.document_url = first_url.as_ptr();
+    first_context.document_url_length = first_url.len();
+    first_context.document_base_url = first_url.as_ptr();
+    first_context.document_base_url_length = first_url.len();
+    let mut second_context = first_context;
+    let second_url = b"https://second.example/other/";
+    second_context.document_url = second_url.as_ptr();
+    second_context.document_url_length = second_url.len();
+    second_context.document_base_url = second_url.as_ptr();
+    second_context.document_base_url_length = second_url.len();
+
+    let source = utf16(".shared-without-images { display: none !important; --image: url(later.png) }");
+    let first = parse(&source, &first_context);
+    let second = parse(&source, &second_context);
+    assert!(Arc::ptr_eq(&first, &second));
+
+    for declaration in [
+        "background-image: url(image.png)",
+        "background-image: image-set(\"image.png\" 1x)",
+    ] {
+        let source = utf16(&format!(".base-dependent {{ {declaration} }}"));
+        let first = parse(&source, &first_context);
+        let second = parse(&source, &second_context);
+        assert!(!Arc::ptr_eq(&first, &second));
+        let repeated = parse(&source, &first_context);
+        assert!(Arc::ptr_eq(&first, &repeated));
+    }
+}
+
+#[test]
+fn cached_calculated_descriptors_keep_their_length_resolution_context() {
+    let source =
+        utf16("@counter-style contextual { system: numeric; symbols: 'a' 'b'; pad: calc(sign(1em - 1px) + 1) '0'; }");
+    let mut context = super::tests::parse_context();
+    let mut lengths: crate::css::style_compute::FfiLengthResolutionContext = unsafe { std::mem::zeroed() };
+    context.length_resolution_context = (&raw const lengths).cast();
+    let first = parse(&source, &context);
+    lengths.font_metrics.font_size = 16.0;
+    context.length_resolution_context = (&raw const lengths).cast();
+    let second = parse(&source, &context);
+    assert!(!Arc::ptr_eq(&first, &second));
+    let repeated = parse(&source, &context);
+    assert!(Arc::ptr_eq(&second, &repeated));
+}
+
+#[test]
 fn cache_keys_include_parsing_context_and_replay_side_effects() {
     let source = utf16(".é😀 { width: 13px; background-image: url(image.png) }");
     let mut context = super::tests::parse_context();
@@ -684,7 +740,8 @@ fn cache_keys_include_parsing_context_and_replay_side_effects() {
     lengths.viewport_width = 800.0;
     context.length_resolution_context = (&raw const lengths).cast();
     let resized = parse(&source, &context);
-    assert!(!Arc::ptr_eq(&with_lengths, &resized));
+    assert!(Arc::ptr_eq(&first, &with_lengths));
+    assert!(Arc::ptr_eq(&with_lengths, &resized));
     let mut resolved_viewport_length = false;
     lengths.resolved_viewport_relative_length = &raw mut resolved_viewport_length;
     context.length_resolution_context = (&raw const lengths).cast();
@@ -714,42 +771,38 @@ fn cache_shares_ascii_and_utf16_sources() {
 
 #[test]
 fn retained_values_do_not_keep_the_sheet_in_the_cache() {
-    let source = utf16(".weak-cache-owner { width: 13px }");
+    let source = utf16(".weak-cache-owner { width: 13.25px }");
     let context = super::tests::parse_context();
     let first = parse(&source, &context);
-    assert_eq!(first.declarations.len(), 1);
-    let retained = first.declarations[0].parsed_value.clone().unwrap();
+    assert!(first.declarations.is_empty());
+    let retained = first_rule_block(&first).properties[0].value.clone();
     let second_reference = retained.clone();
     let weak = Arc::downgrade(&first);
     drop(first);
     assert!(weak.upgrade().is_none());
     let second = parse(&source, &context);
-    assert_eq!(second.declarations.len(), 1);
-    assert!(!Arc::ptr_eq(
-        &retained,
-        second.declarations[0].parsed_value.as_ref().unwrap()
-    ));
-    assert_eq!(serialize_style_value_to_utf16(&retained).unwrap(), utf16("13px"));
+    assert!(second.declarations.is_empty());
+    assert!(!Arc::ptr_eq(&retained, &first_rule_block(&second).properties[0].value));
+    assert_eq!(serialize_style_value_to_utf16(&retained).unwrap(), utf16("13.25px"));
     drop(retained);
     assert_eq!(
         serialize_style_value_to_utf16(&second_reference).unwrap(),
-        utf16("13px")
+        utf16("13.25px")
     );
 }
 
 #[test]
-fn published_sheet_owns_non_ascii_declaration_metadata() {
+fn published_sheet_owns_non_ascii_declarations() {
     let sheet = parse_shared_on_worker(".é😀 { width: 13px; --é😀: value }");
     assert_eq!(sheet.rules.len(), 1);
-    assert_eq!(sheet.declarations.len(), 2);
+    assert!(sheet.declarations.is_empty());
     assert!(sheet.rules[0].selector_list.is_some());
-    let declaration = &sheet.declarations[1];
     assert_eq!(
-        &sheet.values[declaration.name_offset..declaration.name_offset + declaration.name_length],
+        first_rule_block(&sheet).custom_properties[0].name.units(),
         utf16("--é😀")
     );
     assert_eq!(
-        serialize_style_value_to_utf16(sheet.declarations[0].parsed_value.as_ref().unwrap()).unwrap(),
+        serialize_style_value_to_utf16(&first_rule_block(&sheet).properties[0].value).unwrap(),
         utf16("13px")
     );
 }
@@ -760,14 +813,14 @@ fn independent_workers_read_the_same_immutable_graph() {
     let sheet = parse_shared_on_worker(
         ".é😀 { width: 13px } @supports (display: grid) { a { height: 7px } } @property --size { syntax: '<length>'; inherits: false; initial-value: 3px } @page :left { margin: 2px }",
     );
-    let expected_value = sheet.declarations[0].parsed_value.clone().unwrap();
+    let expected_value = first_rule_block(&sheet).properties[0].value.clone();
     let copies = [sheet.clone(), sheet.clone()];
     drop(sheet);
     let threads = copies.map(|sheet| {
         let expected_value = expected_value.clone();
         std::thread::spawn(move || {
             assert!(Arc::ptr_eq(
-                sheet.declarations[0].parsed_value.as_ref().unwrap(),
+                &first_rule_block(&sheet).properties[0].value,
                 &expected_value
             ));
             assert_eq!(serialize_style_value_to_utf16(&expected_value).unwrap(), utf16("13px"));

@@ -23,6 +23,11 @@
 //! and a group rule detached from a sheet takes its subtree with it while shared descendants stay
 //! alive if something else still references them.
 
+mod rule_records;
+mod rule_versions;
+use rule_records::RuleRecordTable;
+use rule_versions::RuleVersionTable;
+
 pub use crate::css::cascaded_properties::CascadeOrigin;
 
 use super::capacity::ShallowCapacityBytes;
@@ -34,13 +39,19 @@ use super::column::Column;
 use super::fast_hash::FastMap as HashMap;
 use super::fast_hash::FastSet as HashSet;
 use super::index::StyleAtomID;
+use super::memory::DeviceClass;
 use super::memory::MemoryCategory;
 use super::memory::MemoryController;
+use super::memory::MemoryLease;
 use super::order::OrderMaintenance;
 use super::order::OrderToken;
 use super::transaction::ProgramVersion;
 use super::tree::TreeScopeID;
 use crate::css::style_value::RetainedStyleValueData;
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroU32;
+use std::rc::{Rc, Weak};
 
 define_id! {
     /// Identity of a CSSOM `CSSStyleSheet` wrapper object. Assigned by C++, which owns the wrapper.
@@ -147,7 +158,7 @@ impl RuleKind {
 ///
 /// The sheet order token is deliberately absent: rules reference their sheet, and the sheet holds
 /// the token. Moving a sheet therefore updates one token instead of rewriting every rule in it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RuleVersion {
     pub rule: RuleID,
     pub kind: RuleKind,
@@ -204,6 +215,7 @@ struct Sheet {
     live: bool,
 }
 
+#[derive(Clone)]
 struct Rule {
     sheet: SheetID,
     /// Whether the conditions of the groups this rule sits inside currently hold. A rule behind an
@@ -214,11 +226,65 @@ struct Rule {
     /// in layers, so a rule outside every layer cannot change hands when that order moves.
     in_a_layer: bool,
     parent: Option<RuleID>,
-    children: Vec<RuleID>,
+    children_slot: Option<NonZeroU32>,
     version_slot: u32,
     nested_order: OrderToken,
     live: bool,
     gated_by_container_query: bool,
+    declarations: Rc<SharedRuleDeclarations>,
+    declarations_are_complete: bool,
+    semantic_declaration: SemanticDeclarationID,
+}
+
+impl Rule {
+    fn sharing_key(&self) -> impl Eq + Hash + '_ {
+        let Self {
+            sheet,
+            conditions_hold,
+            in_a_layer,
+            parent,
+            children_slot,
+            version_slot,
+            nested_order,
+            live,
+            gated_by_container_query,
+            declarations,
+            declarations_are_complete,
+            semantic_declaration,
+        } = self;
+        (
+            sheet,
+            conditions_hold,
+            in_a_layer,
+            parent,
+            children_slot,
+            version_slot,
+            nested_order,
+            live,
+            gated_by_container_query,
+            Rc::as_ptr(declarations),
+            declarations_are_complete,
+            semantic_declaration,
+        )
+    }
+}
+
+impl PartialEq for Rule {
+    fn eq(&self, other: &Self) -> bool {
+        self.sharing_key() == other.sharing_key()
+    }
+}
+
+impl Eq for Rule {}
+
+impl Hash for Rule {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.sharing_key().hash(state);
+    }
+}
+
+#[derive(Clone, Default, PartialEq)]
+struct RuleDeclarationData {
     declared_properties: Vec<DeclaredProperty>,
     /// The value each declaration was written with, parallel to `declared_properties`, when the
     /// rule arrived with them. A consumer computing a value needs the written spelling, which the
@@ -228,8 +294,95 @@ struct Rule {
     /// written with, parallel to them: a custom property resolves from its written spelling.
     custom_declarations: Vec<CustomDeclaration>,
     custom_written_values: Vec<RetainedStyleValueData>,
-    declarations_are_complete: bool,
-    semantic_declaration: SemanticDeclarationID,
+}
+
+impl RuleDeclarationData {
+    fn capacity_bytes(&self) -> u64 {
+        (self.declared_properties.capacity() * size_of::<DeclaredProperty>()
+            + self.written_values.capacity() * size_of::<RetainedStyleValueData>()
+            + self.custom_declarations.capacity() * size_of::<CustomDeclaration>()
+            + self.custom_written_values.capacity() * size_of::<RetainedStyleValueData>()) as u64
+    }
+}
+
+struct SharedRuleDeclarations {
+    data: RuleDeclarationData,
+    hash: u64,
+    _memory: MemoryLease,
+}
+
+impl std::ops::Deref for Rule {
+    type Target = RuleDeclarationData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.declarations.data
+    }
+}
+
+struct SharedRuleDeclarationTable {
+    by_hash: HashMap<u64, Vec<Weak<SharedRuleDeclarations>>>,
+    memory: MemoryController,
+}
+
+thread_local! {
+    static SHARED_RULE_DECLARATIONS: RefCell<SharedRuleDeclarationTable> = RefCell::new(SharedRuleDeclarationTable {
+        by_hash: HashMap::default(),
+        memory: MemoryController::new(DeviceClass::ForegroundDesktop),
+    });
+}
+
+impl Drop for SharedRuleDeclarations {
+    fn drop(&mut self) {
+        let _ = SHARED_RULE_DECLARATIONS.try_with(|table| {
+            let Ok(mut table) = table.try_borrow_mut() else { return };
+            if let std::collections::hash_map::Entry::Occupied(mut entry) = table.by_hash.entry(self.hash) {
+                entry.get_mut().retain(|candidate| candidate.strong_count() != 0);
+                if entry.get().is_empty() {
+                    entry.remove();
+                }
+            }
+        });
+    }
+}
+
+fn share_rule_declarations(data: RuleDeclarationData) -> Rc<SharedRuleDeclarations> {
+    // Canonical IDs are document-local, so equal numeric declarations alone are insufficient:
+    // compare the authored values as well before sharing their immutable storage.
+    let mut hasher = super::fast_hash::fast_hasher();
+    data.declared_properties.hash(&mut hasher);
+    data.custom_declarations.hash(&mut hasher);
+    for values in [&data.written_values, &data.custom_written_values] {
+        values.len().hash(&mut hasher);
+        for value in values {
+            // SAFETY: The handle retains a live value or a registered replay token.
+            let hash = unsafe { crate::css::style_value::style_value_content_hash(value.pointer()) };
+            hash.hash(&mut hasher);
+        }
+    }
+    let hash = hasher.finish();
+    SHARED_RULE_DECLARATIONS.with_borrow_mut(|table| {
+        let bucket = table.by_hash.entry(hash).or_default();
+        bucket.retain(|candidate| candidate.strong_count() != 0);
+        if let Some(found) = bucket
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|candidate| candidate.data == data)
+        {
+            return found;
+        }
+        let mut memory = MemoryLease::new(MemoryCategory::RuleProgram);
+        memory.resize_required_to(
+            &mut table.memory,
+            size_of::<SharedRuleDeclarations>() as u64 + data.capacity_bytes(),
+        );
+        let declarations = Rc::new(SharedRuleDeclarations {
+            data,
+            hash,
+            _memory: memory,
+        });
+        table.by_hash.get_mut(&hash).unwrap().push(Rc::downgrade(&declarations));
+        declarations
+    })
 }
 
 struct SemanticDeclarationEntry {
@@ -239,12 +392,14 @@ struct SemanticDeclarationEntry {
 
 /// The document's stylesheet program: identities, versions, order, and attachment.
 pub struct StyleSheetProgram {
+    empty_declarations: Rc<SharedRuleDeclarations>,
     sheets: Vec<Sheet>,
-    rules: Vec<Rule>,
+    rules: RuleRecordTable,
+    rule_children: Vec<Vec<RuleID>>,
     /// How many rules declare a custom property. A document without any resolves no environment
     /// of its own, and a cascade need not look.
     rules_declaring_custom_properties: usize,
-    rule_versions: Vec<RuleVersion>,
+    rule_versions: RuleVersionTable,
     semantic_declarations: HashMap<u64, Vec<SemanticDeclarationEntry>>,
     next_semantic_declaration_id: u32,
 
@@ -270,7 +425,7 @@ pub struct StyleSheetProgram {
 impl StyleSheetProgram {
     pub(super) fn collect_atoms(&self, atoms: &mut HashSet<StyleAtomID>) -> u64 {
         let mut visited = 0_u64;
-        for rule in &self.rules {
+        for rule in self.rules.iter() {
             if !rule.live {
                 continue;
             }
@@ -302,10 +457,12 @@ impl StyleSheetProgram {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            empty_declarations: share_rule_declarations(RuleDeclarationData::default()),
             sheets: Vec::new(),
-            rules: Vec::new(),
+            rules: RuleRecordTable::default(),
+            rule_children: Vec::new(),
             rules_declaring_custom_properties: 0,
-            rule_versions: Vec::new(),
+            rule_versions: RuleVersionTable::default(),
             semantic_declarations: HashMap::default(),
             next_semantic_declaration_id: 1,
             sheet_order: Column::default(),
@@ -719,31 +876,28 @@ impl StyleSheetProgram {
     ) -> RuleID {
         let id = RuleID(u32::try_from(self.rules.len()).expect("rule identity space exhausted"));
         let version_slot = self.allocate_rule_version(RuleVersion::new(id, kind));
-        let previous_rule_capacity = (self.rules.capacity() * size_of::<Rule>()) as u64;
+        let previous_rule_capacity = self.rules.shallow_capacity_bytes();
         self.rules.push(Rule {
             sheet,
             conditions_hold: true,
             in_a_layer: false,
             parent,
-            children: Vec::new(),
+            children_slot: None,
             version_slot,
             nested_order: order,
             live,
             gated_by_container_query: false,
-            declared_properties: Vec::new(),
-            written_values: Vec::new(),
-            custom_declarations: Vec::new(),
-            custom_written_values: Vec::new(),
+            declarations: Rc::clone(&self.empty_declarations),
             declarations_are_complete: false,
             semantic_declaration: SemanticDeclarationID::default(),
         });
-        self.record_capacity_change(
-            previous_rule_capacity,
-            (self.rules.capacity() * size_of::<Rule>()) as u64,
-        );
+        self.record_capacity_change(previous_rule_capacity, self.rules.shallow_capacity_bytes());
 
         let siblings = match parent {
-            Some(parent) => &mut self.rules[parent.0 as usize].children,
+            Some(parent) => {
+                let slot = self.ensure_rule_children_slot(parent);
+                &mut self.rule_children[slot]
+            }
             None => &mut self.sheets[sheet.0 as usize].rules,
         };
         let previous_sibling_capacity = (siblings.capacity() * size_of::<RuleID>()) as u64;
@@ -768,9 +922,29 @@ impl StyleSheetProgram {
     }
 
     #[must_use]
-    #[cfg(test)]
-    pub fn rule_children(&self, rule: RuleID) -> &[RuleID] {
-        &self.rules[rule.0 as usize].children
+    pub(super) fn rule_children(&self, rule: RuleID) -> &[RuleID] {
+        self.rules[rule.0 as usize]
+            .children_slot
+            .map_or(&[], |slot| self.rule_children[(slot.get() - 1) as usize].as_slice())
+    }
+
+    fn ensure_rule_children_slot(&mut self, rule: RuleID) -> usize {
+        if let Some(slot) = self.rules[rule.0 as usize].children_slot {
+            return (slot.get() - 1) as usize;
+        }
+        let index = self.rule_children.len();
+        let slot = NonZeroU32::new(
+            u32::try_from(index)
+                .expect("rule children space exhausted")
+                .checked_add(1)
+                .expect("rule children space exhausted"),
+        )
+        .unwrap();
+        let previous_capacity = self.rule_children.shallow_capacity_bytes();
+        self.rule_children.push(Vec::new());
+        self.record_capacity_change(previous_capacity, self.rule_children.shallow_capacity_bytes());
+        self.rules[rule.0 as usize].children_slot = Some(slot);
+        index
     }
 
     #[must_use]
@@ -815,7 +989,7 @@ impl StyleSheetProgram {
         assert_eq!(contents.rule, rule, "a rule version must name its own rule");
         let slot = self.rules[rule.0 as usize].version_slot;
         let selector_changed = self.rule_versions[slot as usize].selector_program != contents.selector_program;
-        self.rule_versions[slot as usize] = contents;
+        self.rule_versions.set(slot as usize, contents);
         self.bump_rule_sheet_dispatch_version(rule);
         if selector_changed {
             self.bump_routing_liveness_version();
@@ -826,7 +1000,7 @@ impl StyleSheetProgram {
     pub(crate) fn replace_reserved_rule_version(&mut self, rule: RuleID, contents: RuleVersion) {
         assert_eq!(contents.rule, rule, "a rule version must name its own rule");
         let slot = self.rules[rule.0 as usize].version_slot;
-        self.rule_versions[slot as usize] = contents;
+        self.rule_versions.set(slot as usize, contents);
         self.bump_rule_sheet_dispatch_version(rule);
     }
 
@@ -864,10 +1038,10 @@ impl StyleSheetProgram {
     }
 
     fn set_rule_live(&mut self, rule: RuleID, live: bool) -> bool {
-        let entry = &mut self.rules[rule.0 as usize];
-        if entry.live == live {
+        if self.rules[rule.0 as usize].live == live {
             return false;
         }
+        let entry = &mut self.rules[rule.0 as usize];
         if !entry.custom_declarations.is_empty() {
             if live {
                 self.rules_declaring_custom_properties += 1;
@@ -895,7 +1069,12 @@ impl StyleSheetProgram {
         let sheet = self.rules[rule.0 as usize].sheet;
         let parent = self.rules[rule.0 as usize].parent;
         let siblings = match parent {
-            Some(parent) => &mut self.rules[parent.0 as usize].children,
+            Some(parent) => {
+                let slot = self.rules[parent.0 as usize]
+                    .children_slot
+                    .expect("a parent has a child list");
+                &mut self.rule_children[(slot.get() - 1) as usize]
+            }
             None => &mut self.sheets[sheet.0 as usize].rules,
         };
         if let Some(position) = siblings.iter().position(|sibling| *sibling == rule) {
@@ -918,7 +1097,7 @@ impl StyleSheetProgram {
 
     fn collect_subtree(&self, rule: RuleID, out: &mut Vec<RuleID>) {
         out.push(rule);
-        for &child in &self.rules[rule.0 as usize].children {
+        for &child in self.rule_children(rule) {
             self.collect_subtree(child, out);
         }
     }
@@ -953,10 +1132,7 @@ impl StyleSheetProgram {
     #[must_use]
     pub fn rules_in_sheet(&self, sheet: SheetID) -> Vec<RuleID> {
         let top_level_rules = &self.sheets[sheet.0 as usize].rules;
-        if top_level_rules
-            .iter()
-            .all(|rule| self.rules[rule.0 as usize].children.is_empty())
-        {
+        if top_level_rules.iter().all(|rule| self.rule_children(*rule).is_empty()) {
             return top_level_rules
                 .iter()
                 .copied()
@@ -981,7 +1157,7 @@ impl StyleSheetProgram {
             return;
         }
         out.push(rule);
-        for &child in &self.rules[rule.0 as usize].children {
+        for &child in self.rule_children(rule) {
             self.collect_live_subtree(child, out);
         }
     }
@@ -1128,11 +1304,13 @@ impl StyleSheetProgram {
             self.invalidate_semantic_declarations();
         }
         let entry = &mut self.rules[rule.0 as usize];
-        let previous_capacity = Self::rule_declaration_capacity_bytes(entry);
         let declared_custom_properties_before = entry.live && !entry.custom_declarations.is_empty();
-        entry.declared_properties = declared;
-        entry.written_values = written_values;
-        entry.custom_declarations = custom_declarations;
+        entry.declarations = share_rule_declarations(RuleDeclarationData {
+            declared_properties: declared,
+            written_values,
+            custom_declarations,
+            custom_written_values,
+        });
         match (
             declared_custom_properties_before,
             entry.live && !entry.custom_declarations.is_empty(),
@@ -1141,10 +1319,7 @@ impl StyleSheetProgram {
             (true, false) => self.rules_declaring_custom_properties -= 1,
             _ => {}
         }
-        entry.custom_written_values = custom_written_values;
-        let current_capacity = Self::rule_declaration_capacity_bytes(entry);
         entry.declarations_are_complete = declarations_are_complete;
-        self.record_capacity_change(previous_capacity, current_capacity);
         self.bump_rule_sheet_dispatch_version(rule);
     }
 
@@ -1159,8 +1334,10 @@ impl StyleSheetProgram {
             .sum::<u64>();
         self.semantic_declarations.clear();
         self.record_capacity_change(previous_payload_capacity, 0);
-        for rule in &mut self.rules {
-            rule.semantic_declaration = SemanticDeclarationID::default();
+        for index in 0..self.rules.len() {
+            if self.rules[index].semantic_declaration != SemanticDeclarationID::default() {
+                self.rules[index].semantic_declaration = SemanticDeclarationID::default();
+            }
         }
     }
 
@@ -1217,13 +1394,6 @@ impl StyleSheetProgram {
         let entry = &mut self.rules[rule.0 as usize];
         entry.semantic_declaration = id;
         id
-    }
-
-    fn rule_declaration_capacity_bytes(entry: &Rule) -> u64 {
-        (entry.declared_properties.capacity() * size_of::<DeclaredProperty>()
-            + entry.written_values.capacity() * size_of::<RetainedStyleValueData>()
-            + entry.custom_declarations.capacity() * size_of::<CustomDeclaration>()
-            + entry.custom_written_values.capacity() * size_of::<RetainedStyleValueData>()) as u64
     }
 
     #[must_use]
@@ -1347,14 +1517,16 @@ impl StyleSheetProgram {
 
     // -- Accounting --------------------------------------------------------------------------
 
+    pub(super) fn share_rule_storage(&mut self) {
+        self.rule_versions.share();
+        self.rules.share();
+    }
+
     fn allocate_rule_version(&mut self, contents: RuleVersion) -> u32 {
         let slot = u32::try_from(self.rule_versions.len()).expect("rule version space exhausted");
-        let previous_capacity = (self.rule_versions.capacity() * size_of::<RuleVersion>()) as u64;
+        let previous_capacity = self.rule_versions.shallow_capacity_bytes();
         self.rule_versions.push(contents);
-        self.record_capacity_change(
-            previous_capacity,
-            (self.rule_versions.capacity() * size_of::<RuleVersion>()) as u64,
-        );
+        self.record_capacity_change(previous_capacity, self.rule_versions.shallow_capacity_bytes());
         slot
     }
 
@@ -1367,6 +1539,8 @@ impl StyleSheetProgram {
             skip [
                 self.sheets,
                 self.rules,
+                self.rule_children,
+                self.empty_declarations,
                 self.rule_versions,
                 self.semantic_declarations,
                 self.next_semantic_declaration_id,
@@ -1390,15 +1564,9 @@ impl StyleSheetProgram {
             })
             .sum();
         let rule_payload: usize = self
-            .rules
+            .rule_children
             .iter()
-            .map(|rule| {
-                rule.children.capacity() * size_of::<RuleID>()
-                    + rule.declared_properties.capacity() * size_of::<DeclaredProperty>()
-                    + rule.written_values.capacity() * size_of::<RetainedStyleValueData>()
-                    + rule.custom_declarations.capacity() * size_of::<CustomDeclaration>()
-                    + rule.custom_written_values.capacity() * size_of::<RetainedStyleValueData>()
-            })
+            .map(|children| children.capacity() * size_of::<RuleID>())
             .sum();
         let orders: u64 = self
             .sheet_order
@@ -1428,7 +1596,7 @@ impl StyleSheetProgram {
             .map(semantic_declaration_bucket_capacity_bytes)
             .sum::<u64>();
         capacity_bytes! {
-            shallow [self.sheets, self.rules, self.rule_versions, self.semantic_declarations, self.sheet_order, self.sheets_by_scope, self.layer_ranks];
+            shallow [self.sheets, self.rules, self.rule_children, self.rule_versions, self.semantic_declarations, self.sheet_order, self.sheets_by_scope, self.layer_ranks];
             cached [];
             nested [
                 self.scopes_using_document_sheets.capacity_bytes(),
@@ -1470,6 +1638,51 @@ impl Default for StyleSheetProgram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_declarations_compare_authored_values_and_isolate_edits() {
+        let (mut first, first_sheet) = program_with_sheet();
+        let (mut second, second_sheet) = program_with_sheet();
+        let first_rule = first.append_rule(first_sheet, None, RuleKind::Style);
+        let second_rule = second.append_rule(second_sheet, None, RuleKind::Style);
+        let set = |program: &mut StyleSheetProgram, rule, keyword| {
+            program.set_rule_declared_properties(
+                rule,
+                vec![DeclaredProperty {
+                    property: 1,
+                    important: false,
+                    operator: CascadeOperator::Initial,
+                    value: SpecifiedValueID(1),
+                }],
+                vec![RetainedStyleValueData::from_owned(
+                    crate::css::style_value::StyleValueData::Keyword { keyword },
+                )],
+                Vec::new(),
+                Vec::new(),
+                true,
+            );
+        };
+        set(&mut first, first_rule, 1);
+        set(&mut second, second_rule, 1);
+        assert!(Rc::ptr_eq(
+            &first.rules[first_rule.0 as usize].declarations,
+            &second.rules[second_rule.0 as usize].declarations
+        ));
+        set(&mut second, second_rule, 2);
+        assert!(!Rc::ptr_eq(
+            &first.rules[first_rule.0 as usize].declarations,
+            &second.rules[second_rule.0 as usize].declarations
+        ));
+        assert!(matches!(
+            first.written_values_of(first_rule)[0].data(),
+            crate::css::style_value::StyleValueData::Keyword { keyword: 1 }
+        ));
+        drop(first);
+        assert!(matches!(
+            second.written_values_of(second_rule)[0].data(),
+            crate::css::style_value::StyleValueData::Keyword { keyword: 2 }
+        ));
+    }
 
     fn program_with_sheet() -> (StyleSheetProgram, SheetID) {
         let mut program = StyleSheetProgram::new();

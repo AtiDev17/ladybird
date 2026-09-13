@@ -152,12 +152,10 @@ void ApplyHistoryStep::get_changing_and_nonchanging_navigables()
 
         // 3. If targetEntry's document is not navigable's active document, then queue a global task on the navigation
         //    and traversal task source of navigable's active window to run these steps:
-        // AD-HOC: This implements https://github.com/whatwg/html/pull/12838.
         if (!navigable->active_document_is(*target_entry))
             m_jobs.queue_navigation_api_state_clear_task(navigable_id);
 
         // 4. Set navigable's ongoing navigation to "traversal".
-        // AD-HOC: This implements https://github.com/whatwg/html/pull/12838.
         if (set_ongoing_navigation_to_traversal(*navigable, *target_entry))
             m_navigables_superseded_by_newer_navigation.set(navigable_id);
     }

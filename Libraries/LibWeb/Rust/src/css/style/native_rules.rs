@@ -6,33 +6,85 @@
 
 use super::capacity::ShallowCapacityBytes;
 use super::memory::{MemoryCategory, MemoryController, MemoryLease};
-use super::{HashMap, RuleID, StyleEngine};
+use super::{RuleID, StyleEngine};
 use crate::css::container_conditions::ContainerConditionsData;
 use crate::css::declaration_block::DeclarationBlockData;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
+mod identities;
+mod targets;
+use identities::NativeRuleIdentities;
+use targets::NativeRuleTargets;
+
+#[derive(Clone)]
 pub(super) struct NativeRuleTarget {
-    pub identity: u64,
+    pub identity: NonZeroU64,
     pub declarations: Option<Arc<DeclarationBlockData>>,
     pub source_identity: u64,
-    pub layer_name: Box<[u16]>,
-    pub containers: Vec<Arc<ContainerConditionsData>>,
+    conditions: Option<Box<NativeRuleConditions>>,
+}
+
+#[derive(Clone)]
+struct NativeRuleConditions {
+    layer_name: Box<[u16]>,
+    containers: Vec<Arc<ContainerConditionsData>>,
 }
 
 pub(super) struct NativeRuleRegistry {
-    pub targets: HashMap<RuleID, NativeRuleTarget>,
-    pub identities: HashMap<u64, RuleID>,
-    owned_bytes: u64,
+    pub targets: NativeRuleTargets,
+    pub identities: NativeRuleIdentities,
     memory: MemoryLease,
 }
 
 impl Default for NativeRuleRegistry {
     fn default() -> Self {
         Self {
-            targets: HashMap::default(),
-            identities: HashMap::default(),
-            owned_bytes: 0,
+            targets: NativeRuleTargets::default(),
+            identities: NativeRuleIdentities::default(),
             memory: MemoryLease::new(MemoryCategory::RuleProgram),
+        }
+    }
+}
+
+impl PartialEq for NativeRuleTarget {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            identity,
+            declarations,
+            source_identity,
+            conditions: _,
+        } = self;
+        *identity == other.identity
+            && *source_identity == other.source_identity
+            && declarations.as_ref().map(Arc::as_ptr) == other.declarations.as_ref().map(Arc::as_ptr)
+            && self.layer_name() == other.layer_name()
+            && self.containers().len() == other.containers().len()
+            && self
+                .containers()
+                .iter()
+                .zip(other.containers())
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+    }
+}
+
+impl Eq for NativeRuleTarget {}
+
+impl Hash for NativeRuleTarget {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        let Self {
+            identity,
+            declarations,
+            source_identity,
+            conditions: _,
+        } = self;
+        identity.hash(hasher);
+        declarations.as_ref().map(Arc::as_ptr).hash(hasher);
+        source_identity.hash(hasher);
+        self.layer_name().hash(hasher);
+        for container in self.containers() {
+            Arc::as_ptr(container).hash(hasher);
         }
     }
 }
@@ -40,16 +92,31 @@ impl Default for NativeRuleRegistry {
 impl NativeRuleTarget {
     fn owned_bytes(&self) -> u64 {
         // The parsed graph is authoritative input. Charge only this owner's additional storage.
-        self.layer_name.shallow_capacity_bytes() + self.containers.shallow_capacity_bytes()
+        self.conditions.as_ref().map_or(0, |conditions| {
+            size_of::<NativeRuleConditions>() as u64
+                + conditions.layer_name.shallow_capacity_bytes()
+                + conditions.containers.shallow_capacity_bytes()
+        })
+    }
+
+    pub fn layer_name(&self) -> &[u16] {
+        self.conditions
+            .as_ref()
+            .map_or(&[], |conditions| &conditions.layer_name)
+    }
+
+    pub fn containers(&self) -> &[Arc<ContainerConditionsData>] {
+        self.conditions
+            .as_ref()
+            .map_or(&[], |conditions| &conditions.containers)
     }
 }
 
 impl NativeRuleRegistry {
     pub fn remove(&mut self, id: RuleID, memory: &mut MemoryController) {
         if let Some(target) = self.targets.remove(&id) {
-            self.owned_bytes -= target.owned_bytes();
-            let identity = target.identity;
-            if self.identities.get(&identity) == Some(&id) {
+            let identity = target.identity.get();
+            if self.identities.get(&identity) == Some(id) {
                 self.identities.remove(&identity);
             }
         }
@@ -59,14 +126,14 @@ impl NativeRuleRegistry {
     fn reconcile_memory(&mut self, memory: &mut MemoryController) {
         self.memory.resize_required_to(
             memory,
-            self.owned_bytes + self.targets.shallow_capacity_bytes() + self.identities.shallow_capacity_bytes(),
+            self.targets.shallow_capacity_bytes() + self.identities.shallow_capacity_bytes(),
         );
     }
 }
 
 impl StyleEngine {
     pub(crate) fn native_rule_id(&self, identity: u64) -> Option<RuleID> {
-        self.native_rules.identities.get(&identity).copied()
+        self.native_rules.identities.get(&identity)
     }
 
     /// Register immutable cascade inputs independently of document-local rule owners.
@@ -88,21 +155,24 @@ impl StyleEngine {
         self.native_rules.remove(id, &mut self.memory);
         let target = unsafe {
             NativeRuleTarget {
-                identity,
+                identity: NonZeroU64::new(identity).expect("native rule identities are nonzero"),
                 declarations,
                 source_identity,
-                layer_name: layer_name.into(),
-                containers: containers
-                    .iter()
-                    .rev()
-                    .map(|&container| {
-                        Arc::increment_strong_count(container);
-                        Arc::from_raw(container)
+                conditions: (!layer_name.is_empty() || !containers.is_empty()).then(|| {
+                    Box::new(NativeRuleConditions {
+                        layer_name: layer_name.into(),
+                        containers: containers
+                            .iter()
+                            .rev()
+                            .map(|&container| {
+                                Arc::increment_strong_count(container);
+                                Arc::from_raw(container)
+                            })
+                            .collect(),
                     })
-                    .collect(),
+                }),
             }
         };
-        self.native_rules.owned_bytes += target.owned_bytes();
         self.native_rules.identities.insert(identity, id);
         self.native_rules.targets.insert(id, target);
         self.native_rules.reconcile_memory(&mut self.memory);
@@ -160,7 +230,10 @@ mod tests {
                 id.0 + 1
             );
             ids.push(id);
-            assert_eq!(engine.native_rules.targets[&id].source_identity, source_identity);
+            assert_eq!(
+                engine.native_rules.targets.get(&id).unwrap().source_identity,
+                source_identity
+            );
         }
         assert_ne!(ids[0], ids[1]);
         drop(rule);
@@ -170,14 +243,14 @@ mod tests {
         let replacement = self::source();
         assert_ne!(replacement.identity(), source_identity);
         assert_eq!(
-            engines[1].native_rules.targets[&ids[1]].source_identity,
+            engines[1].native_rules.targets.get(&ids[1]).unwrap().source_identity,
             source_identity
         );
         engines[0].remove_style_rule(ids[0]);
         assert!(engines[0].native_rules.identities.is_empty());
         assert!(rule_weak.upgrade().is_none());
         assert!(source_weak.upgrade().is_none());
-        assert_eq!(engines[1].native_rules.identities.get(&identity), Some(&ids[1]));
+        assert_eq!(engines[1].native_rules.identities.get(&identity), Some(ids[1]));
         engines[1].remove_style_rule(ids[1]);
         assert!(engines[1].native_rules.identities.is_empty());
         assert!(rule_weak.upgrade().is_none());
@@ -281,7 +354,7 @@ mod tests {
         );
         assert_eq!(
             engine.native_rules.identities.get(&rust_rule_identity(new_rule)),
-            Some(&id)
+            Some(id)
         );
         assert_eq!(engine.native_rules.targets.len(), 1);
     }

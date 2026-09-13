@@ -1176,12 +1176,8 @@ void Window::close()
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-closed
 bool Window::closed() const
 {
-    // The closed getter steps are to return true if this's browsing context is null or its is closing is true;
-    // otherwise false.
-    if (!browsing_context())
-        return true;
-
-    // FIXME: The spec seems a bit out of date. The `is closing` flag is on the navigable, not the browsing context.
+    // The closed getter steps are to return true if this's navigable is null or its is closing is true; otherwise
+    // false.
     if (auto navigable = this->navigable(); !navigable || navigable->is_closing())
         return true;
 

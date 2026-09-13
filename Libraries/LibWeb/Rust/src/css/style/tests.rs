@@ -188,7 +188,7 @@ fn native_declaration_publication_reuses_values_and_observes_live_mutation() {
 #[test]
 fn environment_memo_retains_its_written_value_keys() {
     let mut environments = custom_property_environments::CustomPropertyEnvironments::default();
-    let written = RetainedStyleValueData::from_owned(StyleValueData::Keyword { keyword: 1 });
+    let written = RetainedStyleValueData::from_owned(StyleValueData::Number { value: 1.25 });
     let written_pointer = written.pointer();
     let inputs = custom_property_environments::EnvironmentInputs {
         parent: 0,
@@ -211,7 +211,7 @@ fn environment_memo_retains_its_written_value_keys() {
 #[test]
 fn substitution_memo_retains_its_written_value_key() {
     let mut environments = custom_property_environments::CustomPropertyEnvironments::default();
-    let written = RetainedStyleValueData::from_owned(StyleValueData::Keyword { keyword: 1 });
+    let written = RetainedStyleValueData::from_owned(StyleValueData::Number { value: 1.25 });
     let written_pointer = written.pointer();
     let value = RetainedStyleValueData::from_owned(StyleValueData::Keyword { keyword: 2 });
     environments.remember_substitution(&written, 1, 0, value);
@@ -9352,6 +9352,48 @@ fn identical_sheet_sets_share_a_scope_program() {
 }
 
 #[test]
+fn equivalent_documents_share_only_semantically_identical_dispatch_topology() {
+    let make_engine = |atom| {
+        let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+        engine.programs = selector::SelectorPrograms::for_replay();
+        let program = engine
+            .programs
+            .add(test_selector_program(".target", &[("target", atom)]));
+        let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::User);
+        engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
+        let rule = engine.append_rule(sheet, None, RuleKind::Style);
+        let mut version = engine.program.rule_version(rule);
+        version.selector_program = Some(program);
+        engine.replace_rule_version(rule, version);
+        discard_transaction(&mut engine);
+        engine
+    };
+    let mut first_engine = make_engine(StyleAtomID(200));
+    let mut second_engine = make_engine(StyleAtomID(200));
+    let mut different_engine = make_engine(StyleAtomID(201));
+    let (_, first) = first_engine.ranked_scope_program(TreeScopeID::DOCUMENT);
+    let (_, second) = second_engine.ranked_scope_program(TreeScopeID::DOCUMENT);
+    let (_, different) = different_engine.ranked_scope_program(TreeScopeID::DOCUMENT);
+    assert!(first.shares_topology_with(&second));
+    assert!(first.shares_entries_with(&second));
+    assert!(!first.shares_topology_with(&different));
+
+    // The last scope to publish a template can die while an earlier scope still owns its data.
+    drop(second);
+    drop(second_engine);
+    let mut second_engine = make_engine(StyleAtomID(200));
+    let (_, second) = second_engine.ranked_scope_program(TreeScopeID::DOCUMENT);
+    assert!(first.shares_topology_with(&second));
+
+    drop(first);
+    drop(first_engine);
+    second_engine.invalidate_scope_programs();
+    let (_, rebuilt) = second_engine.ranked_scope_program(TreeScopeID::DOCUMENT);
+    assert!(second.shares_topology_with(&rebuilt));
+    assert_eq!(rebuilt.entry_at(0).program, second.entry_at(0).program);
+}
+
+#[test]
 fn equivalent_sheet_programs_share_dispatch_topology() {
     let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
     let selector_program = engine
@@ -9400,6 +9442,41 @@ fn equivalent_sheet_programs_share_dispatch_topology() {
             .keys()
             .all(|shape| shape.0.iter().all(|&(program, _)| program != selector_program))
     );
+}
+
+#[test]
+fn extending_a_scope_dispatch_skips_empty_selector_programs() {
+    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let base = engine
+        .programs
+        .add(test_selector_program(".base", &[("base", StyleAtomID(200))]));
+    let suffix = engine
+        .programs
+        .add(test_selector_program(".suffix", &[("suffix", StyleAtomID(201))]));
+    let empty = engine.programs.add(selector::SelectorProgramBuilder::new().finish());
+    let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
+    engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
+    let base_rule = engine.append_rule(sheet, None, RuleKind::Style);
+    let mut version = engine.program.rule_version(base_rule);
+    version.selector_program = Some(base);
+    engine.replace_rule_version(base_rule, version);
+    discard_transaction(&mut engine);
+    let (_, template) = engine.ranked_scope_program(TreeScopeID::DOCUMENT);
+    assert_eq!(template.entry_count(), 1);
+
+    let mut suffix_rules = Vec::new();
+    for program in [suffix, empty] {
+        let rule = engine.append_rule(sheet, None, RuleKind::Style);
+        let mut version = engine.program.rule_version(rule);
+        version.selector_program = Some(program);
+        engine.replace_rule_version(rule, version);
+        suffix_rules.push(rule);
+    }
+    discard_transaction(&mut engine);
+    let (_, extended) = engine.ranked_scope_program(TreeScopeID::DOCUMENT);
+    assert_eq!(extended.entry_count(), 2);
+    assert_eq!(extended.entry_at(0).rule, base_rule);
+    assert_eq!(extended.entry_at(1).rule, suffix_rules[0]);
 }
 
 #[test]

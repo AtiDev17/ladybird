@@ -58,14 +58,22 @@ fn lowercase(value: &[u16]) -> SelectorString {
         .iter()
         .map(|&unit| ascii_lowercase(unit))
         .collect::<Vec<_>>()
-        .into_boxed_slice()
+        .into()
+}
+
+fn lowercase_shared(value: &SelectorString) -> SelectorString {
+    if value.iter().all(|&unit| ascii_lowercase(unit) == unit) {
+        value.clone()
+    } else {
+        lowercase(value)
+    }
 }
 
 fn selector_name(value: &[u16]) -> NameSelector {
     NameSelector {
         name: value.into(),
-        interned_name: None,
-        interned_lowercase_name: None,
+        interned_name: (),
+        interned_lowercase_name: (),
     }
 }
 
@@ -77,8 +85,8 @@ fn pseudo_class_selector(pseudo_class: PseudoClassType) -> PseudoClassSelector {
         languages: Box::new([]),
         direction: None,
         identifier: None,
-        identifier_identity: None,
-        identifier_lowercase_identity: None,
+        identifier_identity: (),
+        identifier_lowercase_identity: (),
         levels: Box::new([]),
         is_forgiving: false,
     }
@@ -365,8 +373,7 @@ impl<'a> SelectorParser<'a> {
                                 Combinator::Descendant
                             },
                             is_implicit_universal_anchor: false,
-                            simple_selectors: vec![SimpleSelector::Invalid(source.into_boxed_slice())]
-                                .into_boxed_slice(),
+                            simple_selectors: vec![SimpleSelector::Invalid(source.into())].into_boxed_slice(),
                         }]
                         .into_boxed_slice(),
                     ));
@@ -454,7 +461,7 @@ impl<'a> SelectorParser<'a> {
     fn parse_qualified_name(&self, stream: &mut Stream<'_>, allow_wildcard: bool) -> Option<QualifiedName> {
         fn name(value: &ComponentValue) -> Option<SelectorString> {
             if value.is_delim(b'*') {
-                return Some(Box::new([b'*' as u16]));
+                return Some(vec![b'*' as u16].into());
             }
             value.ident().map(Into::into)
         }
@@ -469,12 +476,12 @@ impl<'a> SelectorParser<'a> {
             }
             return Some(QualifiedName {
                 namespace_type: NamespaceType::None,
-                namespace: Box::new([]),
-                lowercase_name: lowercase(&parsed_name),
+                namespace: SelectorString::default(),
+                lowercase_name: lowercase_shared(&parsed_name),
                 name: parsed_name,
-                interned_name: None,
-                interned_lowercase_name: None,
-                interned_namespace: None,
+                interned_name: (),
+                interned_lowercase_name: (),
+                interned_namespace: (),
             });
         }
 
@@ -511,11 +518,11 @@ impl<'a> SelectorParser<'a> {
             return Some(QualifiedName {
                 namespace_type,
                 namespace: first_name,
-                lowercase_name: lowercase(&parsed_name),
+                lowercase_name: lowercase_shared(&parsed_name),
                 name: parsed_name,
-                interned_name: None,
-                interned_lowercase_name: None,
-                interned_namespace: None,
+                interned_name: (),
+                interned_lowercase_name: (),
+                interned_namespace: (),
             });
         }
         if !allow_wildcard && first_name.as_ref() == [b'*' as u16] {
@@ -524,12 +531,12 @@ impl<'a> SelectorParser<'a> {
         }
         Some(QualifiedName {
             namespace_type: NamespaceType::Default,
-            namespace: Box::new([]),
-            lowercase_name: lowercase(&first_name),
+            namespace: SelectorString::default(),
+            lowercase_name: lowercase_shared(&first_name),
             name: first_name,
-            interned_name: None,
-            interned_lowercase_name: None,
-            interned_namespace: None,
+            interned_name: (),
+            interned_lowercase_name: (),
+            interned_namespace: (),
         })
     }
 
@@ -565,9 +572,9 @@ impl<'a> SelectorParser<'a> {
         let original = stream.position;
         if let Some(qualified_name) = self.parse_qualified_name(stream, true) {
             return Ok(Some(if qualified_name.name.as_ref() == [b'*' as u16] {
-                SimpleSelector::Universal(qualified_name)
+                SimpleSelector::Universal(Box::new(qualified_name))
             } else {
-                SimpleSelector::TagName(qualified_name)
+                SimpleSelector::TagName(Box::new(qualified_name))
             }));
         }
         stream.position = original;
@@ -607,13 +614,13 @@ impl<'a> SelectorParser<'a> {
         let qualified_name = self.parse_qualified_name(&mut stream, false).ok_or(())?;
         stream.discard_whitespace();
         if stream.is_empty() {
-            return Ok(SimpleSelector::Attribute(AttributeSelector {
+            return Ok(SimpleSelector::Attribute(Box::new(AttributeSelector {
                 match_type: AttributeMatchType::HasAttribute,
                 qualified_name,
-                value: Box::new([]),
-                value_identity: None,
+                value: SelectorString::default(),
+                value_identity: (),
                 case_type: AttributeCaseType::Default,
-            }));
+            })));
         }
 
         let first = stream.next().ok_or(())?;
@@ -655,13 +662,13 @@ impl<'a> SelectorParser<'a> {
         if !stream.is_empty() {
             return Err(());
         }
-        Ok(SimpleSelector::Attribute(AttributeSelector {
+        Ok(SimpleSelector::Attribute(Box::new(AttributeSelector {
             match_type,
             qualified_name,
             value,
-            value_identity: None,
+            value_identity: (),
             case_type,
-        }))
+        })))
     }
 
     fn parse_pseudo_class(&mut self, stream: &mut Stream<'_>) -> Result<SimpleSelector, ()> {
@@ -674,7 +681,9 @@ impl<'a> SelectorParser<'a> {
             if !pseudo_class.metadata().is_valid_as_identifier {
                 return Err(());
             }
-            return Ok(SimpleSelector::PseudoClass(pseudo_class_selector(pseudo_class)));
+            return Ok(SimpleSelector::PseudoClass(Box::new(pseudo_class_selector(
+                pseudo_class,
+            ))));
         }
 
         let (name, function_values) = value.function().ok_or(())?;
@@ -694,7 +703,7 @@ impl<'a> SelectorParser<'a> {
         self.pseudo_class_context.push(pseudo_class);
         let result = self.parse_pseudo_class_function(pseudo_class, metadata.parameter_type, function_values);
         self.pseudo_class_context.pop();
-        result.map(SimpleSelector::PseudoClass)
+        result.map(|selector| SimpleSelector::PseudoClass(Box::new(selector)))
     }
 
     fn parse_pseudo_class_function(
@@ -776,10 +785,10 @@ impl<'a> SelectorParser<'a> {
                     stream.discard_whitespace();
                     let (value, is_string) = match &stream.next().ok_or(())?.kind {
                         ComponentKind::Token(ParserTokenKind::Ident(value)) => {
-                            (value.to_vec().into_boxed_slice(), false)
+                            (SelectorString::from_utf16(value), false)
                         }
                         ComponentKind::Token(ParserTokenKind::String(value)) => {
-                            (value.to_vec().into_boxed_slice(), true)
+                            (SelectorString::from_utf16(value), true)
                         }
                         _ => return Err(()),
                     };
@@ -855,12 +864,12 @@ impl<'a> SelectorParser<'a> {
 
         let Some((pseudo_element, alias)) = PseudoElementType::from_name(name) else {
             if function_values.is_none() && ascii_starts_with(name, "-webkit-") && !self.inside_has() {
-                return Ok(SimpleSelector::PseudoElement(PseudoElementSelector {
+                return Ok(SimpleSelector::PseudoElement(Box::new(PseudoElementSelector {
                     pseudo_element: PseudoElementType::UnknownWebKit,
                     serialized_name: Some(lowercase(name)),
                     value: PseudoElementValue::None,
                     identifier_identities: Box::new([]),
-                }));
+                })));
             }
             return Err(());
         };
@@ -879,12 +888,12 @@ impl<'a> SelectorParser<'a> {
             {
                 return Err(());
             }
-            return Ok(SimpleSelector::PseudoElement(PseudoElementSelector {
+            return Ok(SimpleSelector::PseudoElement(Box::new(PseudoElementSelector {
                 pseudo_element,
-                serialized_name: alias.map(|alias| alias.encode_utf16().collect::<Vec<_>>().into_boxed_slice()),
+                serialized_name: alias.map(|alias| alias.encode_utf16().collect::<Vec<_>>().into()),
                 value: PseudoElementValue::None,
                 identifier_identities: Box::new([]),
-            }));
+            })));
         }
 
         let metadata = pseudo_element.metadata();
@@ -894,12 +903,12 @@ impl<'a> SelectorParser<'a> {
             None => PseudoElementValue::None,
             Some(values) => self.parse_pseudo_element_function(metadata.parameter_type, values)?,
         };
-        Ok(SimpleSelector::PseudoElement(PseudoElementSelector {
+        Ok(SimpleSelector::PseudoElement(Box::new(PseudoElementSelector {
             pseudo_element,
-            serialized_name: alias.map(|alias| alias.encode_utf16().collect::<Vec<_>>().into_boxed_slice()),
+            serialized_name: alias.map(|alias| alias.encode_utf16().collect::<Vec<_>>().into()),
             value,
             identifier_identities: Box::new([]),
-        }))
+        })))
     }
 
     fn inside_has(&self) -> bool {
@@ -945,7 +954,7 @@ impl<'a> SelectorParser<'a> {
             PseudoElementParameterType::PTNameSelector => {
                 let (is_universal, value) = if stream.peek().is_some_and(|value| value.is_delim(b'*')) {
                     stream.position += 1;
-                    (true, Box::new([]) as SelectorString)
+                    (true, SelectorString::default())
                 } else {
                     let ident = stream.next().and_then(ComponentValue::ident).ok_or(())?;
                     if is_css_wide_keyword(ident) || ascii_eq(ident, "default") {
@@ -1028,15 +1037,15 @@ fn normalize_pseudo_element_transitions(compounds: Vec<CompoundSelector>) -> Vec
                     normalized.push(CompoundSelector {
                         combinator,
                         is_implicit_universal_anchor: true,
-                        simple_selectors: vec![SimpleSelector::Universal(QualifiedName {
+                        simple_selectors: vec![SimpleSelector::Universal(Box::new(QualifiedName {
                             namespace_type: NamespaceType::Any,
-                            namespace: Box::new([]),
-                            name: Box::new([b'*' as u16]),
-                            lowercase_name: Box::new([b'*' as u16]),
-                            interned_name: None,
-                            interned_lowercase_name: None,
-                            interned_namespace: None,
-                        })]
+                            namespace: SelectorString::default(),
+                            name: vec![b'*' as u16].into(),
+                            lowercase_name: vec![b'*' as u16].into(),
+                            interned_name: (),
+                            interned_lowercase_name: (),
+                            interned_namespace: (),
+                        }))]
                         .into_boxed_slice(),
                     });
                 } else {
@@ -1110,9 +1119,9 @@ fn parse_pseudo_element_selector(input: TokenizerInput<'_>) -> Result<(Arc<Compi
     ))
 }
 
-fn append_unique(names: &mut Vec<SelectorString>, name: &[u16]) {
-    if !names.iter().any(|existing| existing.as_ref() == name) {
-        names.push(name.into());
+fn append_unique(names: &mut Vec<SelectorString>, name: &SelectorString) {
+    if !names.iter().any(|existing| existing == name) {
+        names.push(name.clone());
     }
 }
 
@@ -1133,7 +1142,7 @@ fn collect_interned_names_from_selector(names: &mut Vec<SelectorString>, selecto
                 }
                 SimpleSelector::Id(name) | SimpleSelector::Class(name) => {
                     append_unique(names, &name.name);
-                    append_unique(names, &lowercase(&name.name));
+                    append_unique(names, &lowercase_shared(&name.name));
                 }
                 SimpleSelector::Attribute(attribute) => {
                     collect_qualified_name(names, &attribute.qualified_name);
@@ -1142,7 +1151,7 @@ fn collect_interned_names_from_selector(names: &mut Vec<SelectorString>, selecto
                 SimpleSelector::PseudoClass(pseudo_class) => {
                     if let Some(identifier) = &pseudo_class.identifier {
                         append_unique(names, identifier);
-                        append_unique(names, &lowercase(identifier));
+                        append_unique(names, &lowercase_shared(identifier));
                     }
                     for selector in &pseudo_class.argument_selector_list {
                         collect_interned_names_from_selector(names, selector);
@@ -1184,11 +1193,14 @@ fn bind_qualified_name(
         namespace: qualified_name.namespace.clone(),
         name: qualified_name.name.clone(),
         lowercase_name: qualified_name.lowercase_name.clone(),
-        interned_name: identity_for(names, identities, &qualified_name.name),
-        interned_lowercase_name: identity_for(names, identities, &qualified_name.lowercase_name),
+        interned_name: identity_for(names, identities, &qualified_name.name)
+            .unwrap_or_else(RetainedUtf16FlyString::none),
+        interned_lowercase_name: identity_for(names, identities, &qualified_name.lowercase_name)
+            .unwrap_or_else(RetainedUtf16FlyString::none),
         interned_namespace: (qualified_name.namespace_type == NamespaceType::Named)
             .then(|| identity_for(names, identities, &qualified_name.namespace))
-            .flatten(),
+            .flatten()
+            .unwrap_or_else(RetainedUtf16FlyString::none),
     }
 }
 
@@ -1209,16 +1221,18 @@ fn bind_interned_names_in_selector(
                 .map(|simple| {
                     match simple {
                         SimpleSelector::Universal(name) => {
-                            bound::SimpleSelector::Universal(bind_qualified_name(name, names, identities))
+                            bound::SimpleSelector::Universal(Box::new(bind_qualified_name(name, names, identities)))
                         }
                         SimpleSelector::TagName(name) => {
-                            bound::SimpleSelector::TagName(bind_qualified_name(name, names, identities))
+                            bound::SimpleSelector::TagName(Box::new(bind_qualified_name(name, names, identities)))
                         }
                         SimpleSelector::Id(name) | SimpleSelector::Class(name) => {
                             let name = bound::NameSelector {
                                 name: name.name.clone(),
-                                interned_name: identity_for(names, identities, &name.name),
-                                interned_lowercase_name: identity_for(names, identities, &lowercase(&name.name)),
+                                interned_name: identity_for(names, identities, &name.name)
+                                    .unwrap_or_else(RetainedUtf16FlyString::none),
+                                interned_lowercase_name: identity_for(names, identities, &lowercase_shared(&name.name))
+                                    .unwrap_or_else(RetainedUtf16FlyString::none),
                             };
                             if matches!(simple, SimpleSelector::Id(_)) {
                                 bound::SimpleSelector::Id(name)
@@ -1227,16 +1241,17 @@ fn bind_interned_names_in_selector(
                             }
                         }
                         SimpleSelector::Attribute(attribute) => {
-                            bound::SimpleSelector::Attribute(bound::AttributeSelector {
+                            bound::SimpleSelector::Attribute(Box::new(bound::AttributeSelector {
                                 match_type: attribute.match_type,
                                 qualified_name: bind_qualified_name(&attribute.qualified_name, names, identities),
                                 value: attribute.value.clone(),
-                                value_identity: identity_for(names, identities, &attribute.value),
+                                value_identity: identity_for(names, identities, &attribute.value)
+                                    .unwrap_or_else(RetainedUtf16FlyString::none),
                                 case_type: attribute.case_type,
-                            })
+                            }))
                         }
                         SimpleSelector::PseudoClass(pseudo_class) => {
-                            bound::SimpleSelector::PseudoClass(bound::PseudoClassSelector {
+                            bound::SimpleSelector::PseudoClass(Box::new(bound::PseudoClassSelector {
                                 pseudo_class: pseudo_class.pseudo_class,
                                 an_plus_b_pattern: pseudo_class.an_plus_b_pattern,
                                 argument_selector_list: pseudo_class
@@ -1250,14 +1265,18 @@ fn bind_interned_names_in_selector(
                                 identifier_identity: pseudo_class
                                     .identifier
                                     .as_ref()
-                                    .and_then(|identifier| identity_for(names, identities, identifier)),
+                                    .and_then(|identifier| identity_for(names, identities, identifier))
+                                    .unwrap_or_else(RetainedUtf16FlyString::none),
                                 identifier_lowercase_identity: pseudo_class
                                     .identifier
                                     .as_ref()
-                                    .and_then(|identifier| identity_for(names, identities, &lowercase(identifier))),
+                                    .and_then(|identifier| {
+                                        identity_for(names, identities, &lowercase_shared(identifier))
+                                    })
+                                    .unwrap_or_else(RetainedUtf16FlyString::none),
                                 levels: pseudo_class.levels.clone(),
                                 is_forgiving: pseudo_class.is_forgiving,
-                            })
+                            }))
                         }
                         SimpleSelector::PseudoElement(pseudo_element) => {
                             let mut identifier_identities = Box::default();
@@ -1285,12 +1304,12 @@ fn bind_interned_names_in_selector(
                                     }
                                 }
                             };
-                            bound::SimpleSelector::PseudoElement(bound::PseudoElementSelector {
+                            bound::SimpleSelector::PseudoElement(Box::new(bound::PseudoElementSelector {
                                 pseudo_element: pseudo_element.pseudo_element,
                                 serialized_name: pseudo_element.serialized_name.clone(),
                                 value,
                                 identifier_identities,
-                            })
+                            }))
                         }
                         SimpleSelector::Nesting => bound::SimpleSelector::Nesting,
                         SimpleSelector::Invalid(source) => bound::SimpleSelector::Invalid(source.clone()),

@@ -1245,7 +1245,8 @@ void LocalNavigable::update_nonchanging_navigable_history_step_state(HistoryObje
     }));
 }
 
-// AD-HOC: This implements https://github.com/whatwg/html/pull/12838.
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#apply-the-history-step
+// The steps queued for a navigable of changingNavigables whose targetEntry's document is not its active document.
 void LocalNavigable::queue_navigation_api_state_clear_task()
 {
     if (has_been_destroyed() || !active_window())
@@ -3067,12 +3068,7 @@ void LocalNavigable::create_navigation_params_for_navigation(NavigationPopulatio
         received_navigation_params);
 }
 
-WebIDL::ExceptionOr<void> LocalNavigable::continue_navigation_in_active_document_agent(
-    NavigateParams params,
-    ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type,
-    GC::Ref<SourceSnapshotParams> source_snapshot_params,
-    URL::Origin initiator_origin_snapshot,
-    URL::URL initiator_base_url_snapshot)
+WebIDL::ExceptionOr<void> LocalNavigable::continue_navigation_in_active_document_agent(PreparedNavigation navigation)
 {
     // NB: A WebContent process has one main-thread similar-origin window agent, so a local navigable's active
     //     document always shares the surrounding agent and step 8 continues here. A navigation the UI process
@@ -3081,14 +3077,6 @@ WebIDL::ExceptionOr<void> LocalNavigable::continue_navigation_in_active_document
     // AD-HOC: Not in the spec but subsequent steps will fail if the navigable doesn't have an active window.
     if (!active_window())
         return {};
-
-    PreparedNavigation navigation {
-        .params = move(params),
-        .csp_navigation_type = csp_navigation_type,
-        .source_snapshot_params = source_snapshot_params,
-        .initiator_origin_snapshot = move(initiator_origin_snapshot),
-        .initiator_base_url_snapshot = move(initiator_base_url_snapshot),
-    };
 
     // AD-HOC: A child navigable's session history entry exists canonically only once the UI process has admitted
     //         the creation operation, so navigations that arrive before that acknowledgment queue until it lands.
@@ -3118,7 +3106,6 @@ WebIDL::ExceptionOr<void> LocalNavigable::continue_navigation_in_active_document
 
 void LocalNavigable::continue_navigation_after_population_dispatch(PreparedNavigation navigation, NavigationPopulationRequest population_request)
 {
-    auto& params = navigation.params;
     auto source_snapshot_params = navigation.source_snapshot_params;
     auto navigation_id = population_request.navigation_id;
 
@@ -3143,14 +3130,15 @@ void LocalNavigable::continue_navigation_after_population_dispatch(PreparedNavig
     NavigationParamsVariant navigation_params = LocalNavigable::NullOrError {};
 
     // 8. If response is non-null:
-    if (params.response) {
-        auto response_url = params.response->url();
+    if (navigation.response) {
+        auto response_url = navigation.response->url();
         VERIFY(response_url.has_value());
 
         // 1. Let sourcePolicyContainer be a clone of the sourceDocument's policy container, if
         //    sourceDocument is not null; otherwise null.
+        // NB: sourceDocument is null exactly for a "browser UI" user involvement, by steps 5 and 6.
         GC::Ptr<PolicyContainer> source_policy_container;
-        if (params.source_document)
+        if (navigation.user_involvement != UserNavigationInvolvement::BrowserUI)
             source_policy_container = source_snapshot_params->source_policy_container;
 
         // 2. Let policyContainer be the result of determining navigation params policy container given
@@ -3209,7 +3197,7 @@ void LocalNavigable::continue_navigation_after_population_dispatch(PreparedNavig
             navigation_id,
             this,
             nullptr,
-            params.response,
+            navigation.response,
             nullptr,
             nullptr,
             move(coop_enforcement_result),
@@ -3221,7 +3209,7 @@ void LocalNavigable::continue_navigation_after_population_dispatch(PreparedNavig
             response_coop,
             Bindings::NavigationTimingType::Navigate,
             population_request.history_entry.document_state.about_base_url,
-            params.user_involvement);
+            navigation.user_involvement);
     }
 
     // 9. Attempt to populate the history entry's document for historyEntry, given navigable, "navigate",
@@ -3246,17 +3234,16 @@ void LocalNavigable::begin_navigation(PreparedNavigation navigation)
     if (!active_window())
         return;
 
-    auto& params = navigation.params;
-    auto url = params.url;
-    auto source_document = params.source_document;
-    auto document_resource = params.document_resource;
-    auto response = params.response;
-    auto history_handling = params.history_handling;
-    auto navigation_api_state = params.navigation_api_state;
-    auto referrer_policy = params.referrer_policy;
-    auto user_involvement = params.user_involvement;
-    auto source_element = params.source_element;
-    auto initial_insertion = params.initial_insertion;
+    auto url = navigation.url;
+    auto document_resource = navigation.document_resource;
+    auto response = navigation.response;
+    auto history_handling = navigation.history_handling;
+    auto navigation_api_state = navigation.navigation_api_state;
+    auto form_data_entry_list = navigation.form_data_entry_list;
+    auto referrer_policy = navigation.referrer_policy;
+    auto user_involvement = navigation.user_involvement;
+    auto source_element = navigation.source_element;
+    auto initial_insertion = navigation.initial_insertion;
     auto& active_document = *this->active_document();
     auto& vm = this->vm();
     auto csp_navigation_type = navigation.csp_navigation_type;
@@ -3264,9 +3251,8 @@ void LocalNavigable::begin_navigation(PreparedNavigation navigation)
     auto initiator_origin_snapshot = navigation.initiator_origin_snapshot;
     auto initiator_base_url_snapshot = navigation.initiator_base_url_snapshot;
 
-    VERIFY(params.navigation_id.has_value());
     // Keep the ID in the prepared navigation in case step 18 queues it behind an ongoing traversal.
-    auto navigation_id = *params.navigation_id;
+    auto navigation_id = navigation.navigation_id;
 
     // 9. If navigable's active document's unload counter is greater than 0,
     //    then invoke WebDriver BiDi navigation failed with navigable and a WebDriver BiDi navigation status whose id
@@ -3292,12 +3278,11 @@ void LocalNavigable::begin_navigation(PreparedNavigation navigation)
 
     // 12. If historyHandling is "auto", then:
     if (history_handling == Bindings::NavigationHistoryBehavior::Auto) {
-        // 1. If url equals navigable's active document's URL, and initiatorOriginSnapshot is same origin with
-        //    navigable's active document's origin, then set historyHandling to "replace".
-        // AD-HOC: Also replace same-URL navigations when sourceDocument is null.
-        //         See https://github.com/whatwg/html/issues/12803.
+        // 1. If url equals navigable's active document's URL, and either userInvolvement is "browser UI" or
+        //    initiatorOriginSnapshot is same origin with navigable's active document's origin, then set
+        //    historyHandling to "replace".
         if (url == active_document.url()
-            && (!source_document || initiator_origin_snapshot.is_same_origin(active_document.origin()))) {
+            && (user_involvement == UserNavigationInvolvement::BrowserUI || initiator_origin_snapshot.is_same_origin(active_document.origin()))) {
             history_handling = Bindings::NavigationHistoryBehavior::Replace;
         }
 
@@ -3378,7 +3363,8 @@ void LocalNavigable::begin_navigation(PreparedNavigation navigation)
     //     - navigable's active document's is initial about:blank is false; and
     //     - url's scheme is a fetch scheme
     //     then:
-    if (source_document && active_document.origin().is_same_origin_domain(source_document->origin()) && !active_document.is_initial_about_blank() && Fetch::Infrastructure::is_fetch_scheme(url.scheme())) {
+    // NB: initiatorOriginSnapshot is sourceDocument's origin, which step 6 took in this same task.
+    if (user_involvement != UserNavigationInvolvement::BrowserUI && active_document.origin().is_same_origin_domain(initiator_origin_snapshot) && !active_document.is_initial_about_blank() && Fetch::Infrastructure::is_fetch_scheme(url.scheme())) {
         // 1. Let navigation be navigable's active window's navigation API.
         VERIFY(active_window());
         auto navigation = active_window()->navigation();
@@ -3386,7 +3372,7 @@ void LocalNavigable::begin_navigation(PreparedNavigation navigation)
         // 2. Let entryListForFiring be formDataEntryList if documentResource is a POST resource; otherwise, null.
         auto entry_list_for_firing = [&]() -> Optional<GC::ConservativeVector<XHR::FormDataEntry>> {
             if (document_resource.has<POSTResource>())
-                return GC::ConservativeVector { params.form_data_entry_list.value() };
+                return GC::ConservativeVector { form_data_entry_list.value() };
             return {};
         }();
 
@@ -6179,6 +6165,13 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
     document->update_paint_and_hit_testing_properties_if_needed();
     document->update_compositor_animations();
 
+    // Hit testing can publish a display list before the next frame. Give both paths the same canvas fill so that
+    // switching between them does not force another recording. Screenshots can supply their own fill rectangle.
+    if (is_local_root() && !paint_config.canvas_fill_rect.has_value()) {
+        auto viewport_size = page().css_to_device_rect(viewport_rect()).size().to_type<int>();
+        paint_config.canvas_fill_rect = Gfx::IntRect { {}, viewport_size };
+    }
+
     auto should_record_display_list = m_needs_to_record_display_list
         || !m_compositor_display_list_paint_config.has_value()
         || !(m_compositor_display_list_paint_config.value() == paint_config);
@@ -6252,11 +6245,8 @@ void LocalNavigable::paint_next_frame()
         return;
     }
 
-    auto viewport_rect = page().css_to_device_rect(this->viewport_rect()).to_type<int>();
     PaintConfig paint_config { .paint_overlay = true, .should_show_caret_hit_test_debug_overlay = m_should_show_caret_hit_test_debug_overlay };
-    if (is_local_root()) {
-        paint_config.canvas_fill_rect = Gfx::IntRect { {}, viewport_rect.size() };
-    } else {
+    if (!is_local_root()) {
         // Nested navigables paint transparent bitmaps for their parent compositor context.
         auto parent = this->parent();
         if (!parent || !as<LocalNavigable>(*parent).has_compositor_context())
@@ -6267,7 +6257,7 @@ void LocalNavigable::paint_next_frame()
 
     if (!record_display_list_and_scroll_state(paint_config))
         return;
-    viewport_rect = page().css_to_device_rect(this->viewport_rect()).to_type<int>();
+    auto viewport_rect = page().css_to_device_rect(this->viewport_rect()).to_type<int>();
     compositor_context().present_frame(viewport_rect);
 }
 

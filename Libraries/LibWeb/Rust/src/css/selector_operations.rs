@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use super::css_tokenizer::{ParserTokenKind, tokenize_for_parser};
+use super::retained_fly_string::RetainedUtf16FlyString;
 use super::selector::{
     Combinator, CompiledSelector, CompoundSelector, PseudoClassSelector, PseudoClassType, PseudoElementType,
     PseudoElementValue, RustSelector, SelectorList, SimpleSelector, pseudo_class_from_ffi,
@@ -16,18 +17,18 @@ use super::selector::{
 use super::selector_parser::StyleNestingParent;
 
 fn pseudo_class(pseudo_class: PseudoClassType, arguments: SelectorList) -> SimpleSelector {
-    SimpleSelector::PseudoClass(PseudoClassSelector {
+    SimpleSelector::PseudoClass(Box::new(PseudoClassSelector {
         pseudo_class,
         an_plus_b_pattern: Default::default(),
         argument_selector_list: arguments,
         languages: Box::new([]),
         direction: None,
         identifier: None,
-        identifier_identity: None,
-        identifier_lowercase_identity: None,
+        identifier_identity: RetainedUtf16FlyString::none(),
+        identifier_lowercase_identity: RetainedUtf16FlyString::none(),
         levels: Box::new([]),
         is_forgiving: false,
-    })
+    }))
 }
 
 fn scope_selector() -> Arc<CompiledSelector> {

@@ -25,4 +25,17 @@ void NavigateParams::visit_edges(GC::Cell::Visitor& visitor)
     }
 }
 
+void PreparedNavigation::visit_edges(GC::Cell::Visitor& visitor)
+{
+    visitor.visit(response);
+    visitor.visit(source_element);
+    visitor.visit(source_snapshot_params);
+    if (form_data_entry_list.has_value()) {
+        for (auto& entry : form_data_entry_list.value()) {
+            entry.value.visit([&](GC::Ref<FileAPI::File> const& file) { visitor.visit(file); },
+                [&](auto const&) {});
+        }
+    }
+}
+
 }

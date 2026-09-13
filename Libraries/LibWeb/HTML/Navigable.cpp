@@ -134,12 +134,24 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
     // 8. If the surrounding agent is equal to navigable's active document's relevant agent, then continue these
     //    steps. Otherwise, queue a global task on the navigation and traversal task source given navigable's active
     //    window to continue these steps.
-    return continue_navigation_in_active_document_agent(
-        move(params),
-        csp_navigation_type,
-        source_snapshot_params,
-        move(initiator_origin_snapshot),
-        move(initiator_base_url_snapshot));
+    // NB: Steps 1 to 7 took everything the remaining steps need from sourceDocument, so they carry no reference to it.
+    return continue_navigation_in_active_document_agent({
+        .url = move(params.url),
+        .document_resource = move(params.document_resource),
+        .response = params.response,
+        .history_handling = params.history_handling,
+        .navigation_api_state = move(params.navigation_api_state),
+        .form_data_entry_list = move(params.form_data_entry_list),
+        .referrer_policy = params.referrer_policy,
+        .user_involvement = params.user_involvement,
+        .navigation_id = params.navigation_id.release_value(),
+        .source_element = params.source_element,
+        .initial_insertion = params.initial_insertion,
+        .csp_navigation_type = csp_navigation_type,
+        .source_snapshot_params = source_snapshot_params,
+        .initiator_origin_snapshot = move(initiator_origin_snapshot),
+        .initiator_base_url_snapshot = move(initiator_base_url_snapshot),
+    });
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#allowed-to-navigate

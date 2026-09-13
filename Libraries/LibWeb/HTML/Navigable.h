@@ -62,13 +62,7 @@ protected:
     void set_id(CrossProcessId id) { m_id = id; }
     void set_parent(GC::Ptr<Navigable> parent) { m_parent = parent; }
 
-    virtual WebIDL::ExceptionOr<void> continue_navigation_in_active_document_agent(
-        NavigateParams,
-        ContentSecurityPolicy::Directives::Directive::NavigationType,
-        GC::Ref<SourceSnapshotParams>,
-        URL::Origin initiator_origin_snapshot,
-        URL::URL initiator_base_url_snapshot)
-        = 0;
+    virtual WebIDL::ExceptionOr<void> continue_navigation_in_active_document_agent(PreparedNavigation) = 0;
 
     virtual void visit_edges(Cell::Visitor&) override;
 

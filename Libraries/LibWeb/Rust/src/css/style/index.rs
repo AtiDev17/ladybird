@@ -32,9 +32,12 @@ use super::column::RemovablePagedColumnPage;
 use super::column::advance_epoch;
 use super::fast_hash::FastMap as HashMap;
 use super::fast_hash::FastSet as HashSet;
+use super::shared_vector::{SharedVector, SharedVectorPool};
 use crate::css::style_value::RetainedStyleValueData;
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::cmp::Reverse;
+use std::num::NonZeroU32;
 use std::rc::Rc;
 
 use super::memory::MemoryCategory;
@@ -2040,9 +2043,10 @@ struct DispatchEntryMetadata {
     required_subject_bloom: u64,
     prefix_matched: bool,
     multi_key: bool,
+    next_for_identity: Option<NonZeroU32>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct DispatchEntryBinding {
     rule: RuleID,
     cascade_order_index: u32,
@@ -2050,6 +2054,9 @@ struct DispatchEntryBinding {
 
 struct RuleDispatchEntries {
     rows: Vec<DispatchEntryMetadata>,
+    entry_heads: Vec<Option<NonZeroU32>>,
+    // Only construction appends to these chains. Rebuild their tails when extending a template.
+    entry_tails: Vec<Option<NonZeroU32>>,
     residency: MemoryLease,
 }
 
@@ -2057,6 +2064,8 @@ impl Clone for RuleDispatchEntries {
     fn clone(&self) -> Self {
         Self {
             rows: self.rows.clone(),
+            entry_heads: self.entry_heads.clone(),
+            entry_tails: self.entry_tails.clone(),
             residency: MemoryLease::new(MemoryCategory::RuleProgram),
         }
     }
@@ -2066,15 +2075,31 @@ impl Default for RuleDispatchEntries {
     fn default() -> Self {
         Self {
             rows: Vec::new(),
+            entry_heads: Vec::new(),
+            entry_tails: Vec::new(),
             residency: MemoryLease::new(MemoryCategory::RuleProgram),
         }
     }
 }
 
 impl RuleDispatchEntries {
+    fn prepare_entry_tails(&mut self) {
+        if !self.entry_tails.is_empty() || self.rows.is_empty() {
+            return;
+        }
+        self.entry_tails.resize(self.entry_heads.len(), None);
+        for (index, row) in self.rows.iter().enumerate() {
+            if row.next_for_identity.is_none() {
+                let index = u32::try_from(index).expect("dispatch row space exhausted");
+                self.entry_tails[row.identity.0 as usize] =
+                    NonZeroU32::new(index.checked_add(1).expect("dispatch row space exhausted"));
+            }
+        }
+    }
+
     fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
-            shallow [self.rows];
+            shallow [self.rows, self.entry_heads, self.entry_tails];
             cached [];
             nested [];
             skip [self.residency];
@@ -2098,7 +2123,7 @@ impl DispatchRow {
 }
 
 /// Direct cascade projection metadata indexed by an entry's dense cascade order.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 struct CascadeEntryData {
     property_start: u32,
     property_count: u16,
@@ -2363,7 +2388,7 @@ fn dispatch_atom_bucket_key(kind: usize, atom: usize) -> DispatchKey {
 /// full of `.item` elements never considers a rule whose subject compound requires `#header`. This
 /// is program-derived dispatch rather than acceleration over elements: it is Tier 2, it is rebuilt
 /// with the program, and it is never evicted independently of it.
-struct AncestorDispatchTopology {
+pub(super) struct AncestorDispatchTopology {
     key_indices: HashMap<DispatchKey, u32>,
     residency: MemoryLease,
 }
@@ -2431,32 +2456,80 @@ impl Default for RuleDispatchTopology {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct AncestorDispatchTopologyID(*const AncestorDispatchTopology);
 
+thread_local! {
+    static SHARED_CASCADE_RULE_PAGES: RefCell<SharedVectorPool<CascadeOrderRule>> =
+        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
+    static SHARED_DISPATCH_BINDINGS: RefCell<SharedVectorPool<DispatchEntryBinding>> =
+        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
+    static SHARED_CASCADE_ORDERS: RefCell<SharedVectorPool<u32>> =
+        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
+    static SHARED_CASCADE_PROPERTIES: RefCell<SharedVectorPool<u16>> =
+        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
+    static SHARED_CASCADE_ENTRIES: RefCell<SharedVectorPool<CascadeEntryData>> =
+        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
+}
+
 pub struct RuleDispatch {
     entries: Rc<RuleDispatchEntries>,
-    entry_bindings: Vec<DispatchEntryBinding>,
-    entry_rows: Vec<Vec<DispatchRow>>,
+    entry_bindings: SharedVector<DispatchEntryBinding>,
     /// Direct cascade-order projection for every rule represented in this dispatch. Rule
     /// identities are program indices, so retained answers can restore an entry's order without
     /// searching the dispatch's much larger candidate table. Sparse pages keep a scope containing
     /// one late-created rule from allocating rows for every preceding rule in the document.
-    cascade_order_rule_pages: Vec<Option<Box<[CascadeOrderRule; CASCADE_ORDER_RULE_PAGE_SIZE]>>>,
-    cascade_orders_by_rule_entry: Vec<u32>,
-    cascade_properties: Vec<u16>,
-    cascade_entries: Vec<CascadeEntryData>,
+    cascade_order_rule_pages: Vec<Option<SharedVector<CascadeOrderRule>>>,
+    cascade_orders_by_rule_entry: SharedVector<u32>,
+    cascade_properties: SharedVector<u16>,
+    cascade_entries: SharedVector<CascadeEntryData>,
     topology: Rc<RuleDispatchTopology>,
     residency: MemoryLease,
+}
+
+impl Drop for RuleDispatchEntries {
+    fn drop(&mut self) {
+        super::matching::forget_dead_shared_dispatches();
+    }
+}
+
+/// Weak references to the actual shared storage, independent of a particular scope wrapper.
+pub(super) struct WeakRuleDispatch {
+    entries: std::rc::Weak<RuleDispatchEntries>,
+    topology: std::rc::Weak<RuleDispatchTopology>,
+}
+
+impl WeakRuleDispatch {
+    pub(super) fn is_alive(&self) -> bool {
+        self.entries.strong_count() != 0 && self.topology.strong_count() != 0
+    }
+
+    pub(super) fn upgrade(&self) -> Option<RuleDispatch> {
+        Some(RuleDispatch {
+            entries: self.entries.upgrade()?,
+            topology: self.topology.upgrade()?,
+            entry_bindings: SharedVector::default(),
+            cascade_order_rule_pages: Vec::new(),
+            cascade_orders_by_rule_entry: SharedVector::default(),
+            cascade_properties: SharedVector::default(),
+            cascade_entries: SharedVector::default(),
+            residency: MemoryLease::new(MemoryCategory::RuleProgram),
+        })
+    }
+}
+
+impl Drop for RuleDispatchTopology {
+    fn drop(&mut self) {
+        super::matching::forget_dead_shared_dispatches();
+    }
 }
 
 impl Default for RuleDispatch {
     fn default() -> Self {
         Self {
             entries: Rc::new(RuleDispatchEntries::default()),
-            entry_bindings: Vec::new(),
-            entry_rows: Vec::new(),
+            entry_bindings: SharedVector::default(),
             cascade_order_rule_pages: Vec::new(),
-            cascade_orders_by_rule_entry: Vec::new(),
-            cascade_properties: Vec::new(),
-            cascade_entries: Vec::new(),
+            cascade_orders_by_rule_entry: SharedVector::default(),
+            cascade_properties: SharedVector::default(),
+            cascade_entries: SharedVector::default(),
             topology: Rc::new(RuleDispatchTopology::default()),
             residency: MemoryLease::new(MemoryCategory::RuleProgram),
         }
@@ -2465,7 +2538,7 @@ impl Default for RuleDispatch {
 
 const CASCADE_ORDER_RULE_PAGE_SIZE: usize = 256;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct CascadeOrderRule {
     program: SelectorProgramID,
     entry_start: u32,
@@ -2483,6 +2556,13 @@ impl Default for CascadeOrderRule {
 }
 
 impl RuleDispatch {
+    pub(super) fn downgrade(&self) -> WeakRuleDispatch {
+        WeakRuleDispatch {
+            entries: Rc::downgrade(&self.entries),
+            topology: Rc::downgrade(&self.topology),
+        }
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -2532,11 +2612,10 @@ impl RuleDispatch {
                     cascade_order_index: u32::MAX,
                 })
                 .collect(),
-            entry_rows: template.entry_rows.clone(),
             cascade_order_rule_pages: Vec::new(),
-            cascade_orders_by_rule_entry: Vec::new(),
-            cascade_properties: Vec::new(),
-            cascade_entries: Vec::new(),
+            cascade_orders_by_rule_entry: SharedVector::default(),
+            cascade_properties: SharedVector::default(),
+            cascade_entries: SharedVector::default(),
             topology: Rc::clone(&template.topology),
             residency: MemoryLease::new(MemoryCategory::RuleProgram),
         }
@@ -2581,10 +2660,6 @@ impl RuleDispatch {
         Rc::ptr_eq(&self.entries, &other.entries)
     }
 
-    pub(super) fn shares_ancestor_topology_with(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.topology.ancestors, &other.topology.ancestors)
-    }
-
     pub(super) fn ancestor_topology_id(&self) -> AncestorDispatchTopologyID {
         AncestorDispatchTopologyID(Rc::as_ptr(&self.topology.ancestors))
     }
@@ -2598,15 +2673,16 @@ impl RuleDispatch {
         AncestorDispatchShape(keys)
     }
 
-    pub(super) fn share_ancestor_topology_with(&mut self, template: &Self) {
-        if self.shares_ancestor_topology_with(template) {
+    pub(super) fn ancestor_topology(&self) -> Rc<AncestorDispatchTopology> {
+        Rc::clone(&self.topology.ancestors)
+    }
+
+    pub(super) fn share_ancestor_topology_with(&mut self, template: &Rc<AncestorDispatchTopology>) {
+        if Rc::ptr_eq(&self.topology.ancestors, template) {
             return;
         }
-        debug_assert_eq!(
-            self.topology.ancestors.key_indices,
-            template.topology.ancestors.key_indices
-        );
-        self.topology_mut().ancestors = Rc::clone(&template.topology.ancestors);
+        debug_assert_eq!(self.topology.ancestors.key_indices, template.key_indices);
+        self.topology_mut().ancestors = Rc::clone(template);
     }
 
     pub(super) fn insert(&mut self, key: DispatchKey, mut entry: DispatchEntry) -> DispatchRow {
@@ -2621,6 +2697,7 @@ impl RuleDispatch {
             *ancestors.key_indices.entry(required).or_insert(next)
         });
         let id = DispatchRow::from_index(self.entries.rows.len());
+        Rc::make_mut(&mut self.entries).prepare_entry_tails();
         self.entries_mut().push(DispatchEntryMetadata {
             identity: entry.identity,
             program: entry.program,
@@ -2632,15 +2709,23 @@ impl RuleDispatch {
             required_subject_bloom: entry.required_subject_bloom,
             prefix_matched: entry.prefix_matched,
             multi_key: entry.multi_key,
+            next_for_identity: None,
         });
-        self.entry_bindings.push(DispatchEntryBinding {
+        self.entry_bindings.make_mut().push(DispatchEntryBinding {
             rule: entry.rule,
             cascade_order_index: u32::MAX,
         });
-        if self.entry_rows.len() <= entry.identity.0 as usize {
-            self.entry_rows.resize_with(entry.identity.0 as usize + 1, Vec::new);
+        let entries = Rc::make_mut(&mut self.entries);
+        if entries.entry_heads.len() <= entry.identity.0 as usize {
+            entries.entry_heads.resize(entry.identity.0 as usize + 1, None);
+            entries.entry_tails.resize(entry.identity.0 as usize + 1, None);
         }
-        self.entry_rows[entry.identity.0 as usize].push(id);
+        let row = NonZeroU32::new(id.0.checked_add(1).expect("dispatch row space exhausted")).unwrap();
+        if let Some(previous) = entries.entry_tails[entry.identity.0 as usize].replace(row) {
+            entries.rows[(previous.get() - 1) as usize].next_for_identity = Some(row);
+        } else {
+            entries.entry_heads[entry.identity.0 as usize] = Some(row);
+        }
         self.topology_mut().buckets.entry(key).or_default().push(id);
         if key == DispatchKey::Universal {
             self.index_universal_entry(id);
@@ -2671,6 +2756,18 @@ impl RuleDispatch {
 
     pub(super) fn finish_prefixes(&mut self) {
         debug_assert!(!self.topology.finalized, "a dispatch can only be finalized once");
+        // Finished templates are cloned before extension, so their spare builder capacity
+        // does not contribute to subsequent edits.
+        if self.entries.rows.capacity() != self.entries.rows.len()
+            || self.entries.entry_heads.capacity() != self.entries.entry_heads.len()
+            || self.entries.entry_tails.capacity() != 0
+        {
+            let entries = Rc::make_mut(&mut self.entries);
+            entries.rows.shrink_to_fit();
+            entries.entry_heads.shrink_to_fit();
+            entries.entry_tails = Vec::new();
+        }
+        self.entry_bindings.make_mut().shrink_to_fit();
         self.topology_mut().prefixes.finish();
         self.finalize_bucket_directories();
         self.rebuild_universal_with_parent_filter();
@@ -2683,11 +2780,11 @@ impl RuleDispatch {
     }
 
     pub(super) fn entries_for_identity(&self, entry: EntryID) -> impl Iterator<Item = DispatchEntry> + '_ {
-        self.entry_rows
-            .get(entry.0 as usize)
-            .into_iter()
-            .flatten()
-            .map(|&row| self.entry(row))
+        let first = self.entries.entry_heads.get(entry.0 as usize).copied().flatten();
+        std::iter::successors(first, |row| {
+            self.entries.rows[(row.get() - 1) as usize].next_for_identity
+        })
+        .map(|row| self.entry(DispatchRow(row.get() - 1)))
     }
 
     #[must_use]
@@ -2789,14 +2886,25 @@ impl RuleDispatch {
 
     pub(super) fn reuse_cascade_order(&mut self, template: &Self) {
         assert_eq!(self.entry_count(), template.entry_count());
-        let mut cascade_orders_by_row = Vec::with_capacity(self.entry_count());
+        let mut same_bindings = true;
         for index in 0..self.entry_count() {
-            let entry = self.entry(DispatchRow::from_index(index));
-            let template_entry = template.entry(DispatchRow::from_index(index));
+            let entry = self.entries.rows[index];
+            let template_entry = template.entries.rows[index];
             assert_eq!(entry.program, template_entry.program);
             assert_eq!(entry.entry, template_entry.entry);
-            cascade_orders_by_row.push(template_entry.cascade_order);
+            same_bindings &= self.entry_bindings[index].rule == template.entry_bindings[index].rule;
         }
+        if same_bindings {
+            // The cache already proves the cascade priorities agree. With the same rule
+            // bindings, its direct lookup tables need no document-local reconstruction.
+            self.entry_bindings = template.entry_bindings.clone();
+            self.cascade_order_rule_pages = template.cascade_order_rule_pages.clone();
+            self.cascade_orders_by_rule_entry = template.cascade_orders_by_rule_entry.clone();
+            return;
+        }
+        let cascade_orders_by_row: Vec<_> = (0..self.entry_count())
+            .map(|index| template.entry(DispatchRow::from_index(index)).cascade_order)
+            .collect();
         self.rebuild_cascade_order_projection(&cascade_orders_by_row);
     }
 
@@ -2813,7 +2921,9 @@ impl RuleDispatch {
         });
         self.cascade_order_rule_pages.clear();
         self.cascade_orders_by_rule_entry.clear();
-        self.cascade_orders_by_rule_entry.reserve(entries_by_identity.len());
+        self.cascade_orders_by_rule_entry
+            .make_mut()
+            .reserve(entries_by_identity.len());
         for id in entries_by_identity {
             let metadata = self.entries.rows[id.index()];
             let binding = self.entry_bindings[id.index()];
@@ -2822,9 +2932,12 @@ impl RuleDispatch {
             if self.cascade_order_rule_pages.len() <= page_index {
                 self.cascade_order_rule_pages.resize_with(page_index + 1, || None);
             }
-            let page = self.cascade_order_rule_pages[page_index]
-                .get_or_insert_with(|| Box::new([CascadeOrderRule::default(); CASCADE_ORDER_RULE_PAGE_SIZE]));
-            let rule = &mut page[rule_index % CASCADE_ORDER_RULE_PAGE_SIZE];
+            let page = self.cascade_order_rule_pages[page_index].get_or_insert_with(|| {
+                (0..CASCADE_ORDER_RULE_PAGE_SIZE)
+                    .map(|_| CascadeOrderRule::default())
+                    .collect()
+            });
+            let rule = &mut page.make_mut()[rule_index % CASCADE_ORDER_RULE_PAGE_SIZE];
             if rule.entry_count == 0 {
                 rule.program = metadata.program;
                 rule.entry_start =
@@ -2840,9 +2953,10 @@ impl RuleDispatch {
             );
             rule.entry_count = rule.entry_count.checked_add(1).expect("selector entry space exhausted");
             self.cascade_orders_by_rule_entry
+                .make_mut()
                 .push(cascade_orders_by_row[id.index()]);
         }
-        for (row, binding) in self.entry_bindings.iter_mut().enumerate() {
+        for (row, binding) in self.entry_bindings.make_mut().iter_mut().enumerate() {
             let metadata = self.entries.rows[row];
             let rule_index = binding.rule.0 as usize;
             let page = self.cascade_order_rule_pages[rule_index / CASCADE_ORDER_RULE_PAGE_SIZE]
@@ -2885,8 +2999,10 @@ impl RuleDispatch {
     ) {
         self.cascade_properties.clear();
         self.cascade_entries.clear();
+        let entry_count = self.entry_count();
         self.cascade_entries
-            .resize(self.entry_count(), CascadeEntryData::default());
+            .make_mut()
+            .resize(entry_count, CascadeEntryData::default());
         let mut configured = vec![false; self.entry_count()];
         for index in 0..self.entry_count() {
             let entry = self.entry(DispatchRow::from_index(index));
@@ -2895,7 +3011,7 @@ impl RuleDispatch {
                 continue;
             }
             configured[order] = true;
-            let data = &mut self.cascade_entries[order];
+            let data = &mut self.cascade_entries.make_mut()[order];
             data.pruning_blocker = blocks_pruning(entry);
             data.property_start =
                 u32::try_from(self.cascade_properties.len()).expect("cascade property space exhausted");
@@ -2904,9 +3020,18 @@ impl RuleDispatch {
             };
             data.property_count =
                 u16::try_from(properties.len()).expect("a rule cannot declare more than u16::MAX longhands");
-            self.cascade_properties.extend(properties);
+            self.cascade_properties.make_mut().extend(properties);
             data.prunable = true;
         }
+        // These complete projections retain only numeric identities and declaration inventories.
+        // Equal bindings can share across scopes while their mutable match results stay separate.
+        for page in self.cascade_order_rule_pages.iter_mut().flatten() {
+            page.share(&SHARED_CASCADE_RULE_PAGES);
+        }
+        self.entry_bindings.share(&SHARED_DISPATCH_BINDINGS);
+        self.cascade_orders_by_rule_entry.share(&SHARED_CASCADE_ORDERS);
+        self.cascade_properties.share(&SHARED_CASCADE_PROPERTIES);
+        self.cascade_entries.share(&SHARED_CASCADE_ENTRIES);
     }
 
     #[must_use]
@@ -3098,7 +3223,6 @@ impl RuleDispatch {
         capacity_bytes! {
             shallow [
                 self.entry_bindings,
-                self.entry_rows,
                 self.cascade_order_rule_pages,
                 self.cascade_orders_by_rule_entry,
                 self.cascade_properties,
@@ -3110,13 +3234,8 @@ impl RuleDispatch {
                     .cascade_order_rule_pages
                     .iter()
                     .flatten()
-                    .map(|page| size_of_val(page.as_ref()))
-                    .sum::<usize>(),
-                self
-                    .entry_rows
-                    .iter()
-                    .map(|rows| rows.capacity() * size_of::<DispatchRow>())
-                    .sum::<usize>(),
+                    .map(ShallowCapacityBytes::shallow_capacity_bytes)
+                    .sum::<u64>(),
             ];
             skip [self.entries, self.residency];
         }
@@ -3165,6 +3284,10 @@ impl RuleDispatch {
 
     pub(super) fn settle_memory(&mut self, memory: &mut MemoryController) {
         self.residency.resize_required_to(memory, self.scope_capacity_bytes());
+        self.settle_topology_memory(memory);
+    }
+
+    pub(super) fn settle_topology_memory(&mut self, memory: &mut MemoryController) {
         if let Some(entries) = Rc::get_mut(&mut self.entries) {
             entries.residency.resize_required_to(memory, entries.capacity_bytes());
         }

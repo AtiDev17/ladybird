@@ -264,8 +264,8 @@ use crate::css::color_resolution::{
 use crate::css::css_enums::keyword;
 use crate::css::style_compute::{FfiLengthResolutionContext, absolutize_length, keyword_is_color};
 use crate::css::style_value::{
-    ColorBase, CssString, RetainedGridTrackEntryList, RetainedStyleValueData, RetainedStyleValueDataList,
-    StyleValueData, value_depends_on_current_color,
+    BasicShapeData, ColorBase, CssString, OwnedBasicShapeData, RetainedGridTrackEntryList, RetainedStyleValueData,
+    RetainedStyleValueDataList, StyleValueData, value_depends_on_current_color,
 };
 
 pub(crate) struct AbsolutizationContext<'a> {
@@ -450,10 +450,10 @@ fn rgb_color_function(r: f64, g: f64, b: f64, alpha: f64, color_syntax: u8) -> S
             color_type: crate::css::color_conversion::RGB,
             color_syntax,
         },
-        channel_0: retain_new(StyleValueData::Number { value: r }),
-        channel_1: retain_new(StyleValueData::Number { value: g }),
-        channel_2: retain_new(StyleValueData::Number { value: b }),
-        alpha: retain_new(StyleValueData::Number { value: alpha }),
+        channel_0: RetainedStyleValueData::from_owned(StyleValueData::Number { value: r }),
+        channel_1: RetainedStyleValueData::from_owned(StyleValueData::Number { value: g }),
+        channel_2: RetainedStyleValueData::from_owned(StyleValueData::Number { value: b }),
+        alpha: RetainedStyleValueData::from_owned(StyleValueData::Number { value: alpha }),
         has_name: false,
         name: CssString::none(),
         origin_color: retained_null(),
@@ -1018,7 +1018,7 @@ fn absolutize_basic_shape(
     value: &StyleValueData,
     resolve: &mut impl FnMut(&RetainedStyleValueData, &mut bool) -> Option<RetainedStyleValueData>,
 ) -> Option<Absolutized> {
-    let StyleValueData::BasicShape {
+    let BasicShapeData {
         kind,
         v0,
         v1,
@@ -1028,10 +1028,7 @@ fn absolutize_basic_shape(
         fill_rule,
         points,
         path,
-    } = value
-    else {
-        return None;
-    };
+    } = value.basic_shape()?;
     // Absolutizes a freshly built 100%-minus calculation for the inset lowering.
     let flipped = |values: &[&StyleValueData],
                    changed: &mut bool,
@@ -1066,15 +1063,17 @@ fn absolutize_basic_shape(
                 return Some(Absolutized::Unchanged);
             }
             Some(Absolutized::Changed(retain_new(StyleValueData::BasicShape {
-                kind: 0,
-                v0: top,
-                v1: right,
-                v2: bottom,
-                v3: left,
-                v4: border_radius,
-                fill_rule: *fill_rule,
-                points: points.clone(),
-                path: path.clone(),
+                shape: OwnedBasicShapeData::new(BasicShapeData {
+                    kind: 0,
+                    v0: top,
+                    v1: right,
+                    v2: bottom,
+                    v3: left,
+                    v4: border_radius,
+                    fill_rule: *fill_rule,
+                    points: points.clone(),
+                    path: path.clone(),
+                }),
             })))
         }
         1 | 2 => {
@@ -1110,15 +1109,17 @@ fn absolutize_basic_shape(
             let border_radius = resolve(v4, &mut radius_changed)?;
             let _ = changed;
             Some(Absolutized::Changed(retain_new(StyleValueData::BasicShape {
-                kind: 0,
-                v0: top,
-                v1: right,
-                v2: bottom,
-                v3: left,
-                v4: border_radius,
-                fill_rule: *fill_rule,
-                points: points.clone(),
-                path: path.clone(),
+                shape: OwnedBasicShapeData::new(BasicShapeData {
+                    kind: 0,
+                    v0: top,
+                    v1: right,
+                    v2: bottom,
+                    v3: left,
+                    v4: border_radius,
+                    fill_rule: *fill_rule,
+                    points: points.clone(),
+                    path: path.clone(),
+                }),
             })))
         }
         3 | 4 => {
@@ -1129,15 +1130,17 @@ fn absolutize_basic_shape(
                 return Some(Absolutized::Unchanged);
             }
             Some(Absolutized::Changed(retain_new(StyleValueData::BasicShape {
-                kind: *kind,
-                v0: radius,
-                v1: position,
-                v2: v2.clone_retained(),
-                v3: v3.clone_retained(),
-                v4: v4.clone_retained(),
-                fill_rule: *fill_rule,
-                points: points.clone(),
-                path: path.clone(),
+                shape: OwnedBasicShapeData::new(BasicShapeData {
+                    kind: *kind,
+                    v0: radius,
+                    v1: position,
+                    v2: v2.clone_retained(),
+                    v3: v3.clone_retained(),
+                    v4: v4.clone_retained(),
+                    fill_rule: *fill_rule,
+                    points: points.clone(),
+                    path: path.clone(),
+                }),
             })))
         }
         5 => {
@@ -1153,15 +1156,17 @@ fn absolutize_basic_shape(
                 return Some(Absolutized::Unchanged);
             }
             Some(Absolutized::Changed(retain_new(StyleValueData::BasicShape {
-                kind: 5,
-                v0: v0.clone_retained(),
-                v1: v1.clone_retained(),
-                v2: v2.clone_retained(),
-                v3: v3.clone_retained(),
-                v4: v4.clone_retained(),
-                fill_rule: *fill_rule,
-                points: crate::css::style_value::RetainedShapePointList::from_retained_points(absolutized_points),
-                path: path.clone(),
+                shape: OwnedBasicShapeData::new(BasicShapeData {
+                    kind: 5,
+                    v0: v0.clone_retained(),
+                    v1: v1.clone_retained(),
+                    v2: v2.clone_retained(),
+                    v3: v3.clone_retained(),
+                    v4: v4.clone_retained(),
+                    fill_rule: *fill_rule,
+                    points: crate::css::style_value::RetainedShapePointList::from_retained_points(absolutized_points),
+                    path: path.clone(),
+                }),
             })))
         }
         _ => Some(Absolutized::Unchanged),
@@ -1564,7 +1569,7 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
         }
         StyleValueData::OpenTypeTagged {
             mode,
-            tag,
+            tag_name: tag,
             packed_tag,
             value,
         } => {
@@ -1574,7 +1579,7 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
                 changed,
                 StyleValueData::OpenTypeTagged {
                     mode: *mode,
-                    tag: tag.clone(),
+                    tag_name: tag.clone(),
                     packed_tag: *packed_tag,
                     value,
                 }
@@ -2152,5 +2157,30 @@ pub unsafe extern "C" fn rust_style_value_absolutize(
             kind: ABSOLUTIZED_DECLINED,
             data: core::ptr::null(),
         },
+    }
+}
+
+#[cfg(test)]
+mod color_channel_tests {
+    use super::*;
+
+    #[test]
+    fn integral_color_channels_share_without_rounding_other_numbers() {
+        for channel in 0..=255_u16 {
+            let first = RetainedStyleValueData::from_owned(StyleValueData::Number {
+                value: f64::from(channel),
+            });
+            let second = RetainedStyleValueData::from_owned(StyleValueData::Number {
+                value: f64::from(channel),
+            });
+            assert_eq!(first.pointer(), second.pointer());
+        }
+        for value in [-0.0, -1.0, 0.5, 255.5, 256.0, f64::INFINITY, f64::NAN] {
+            let channel = RetainedStyleValueData::from_owned(StyleValueData::Number { value });
+            let StyleValueData::Number { value: actual } = channel.data() else {
+                panic!("a channel must remain a number");
+            };
+            assert_eq!(actual.to_bits(), value.to_bits());
+        }
     }
 }

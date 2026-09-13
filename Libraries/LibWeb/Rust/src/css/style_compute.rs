@@ -34,7 +34,9 @@ use crate::css::property_metadata::longhands_for_shorthand;
 use crate::css::property_metadata::property_id;
 use crate::css::property_metadata::property_is_inherited;
 use crate::css::property_metadata::property_is_shorthand;
-use crate::css::style_value::{GridTrackEntryKind, RetainedStyleValueData, RetainedStyleValueDataList, StyleValueData};
+use crate::css::style_value::{
+    BasicShapeData, GridTrackEntryKind, RetainedStyleValueData, RetainedStyleValueDataList, StyleValueData,
+};
 
 pub use crate::css::css_enums::*;
 
@@ -1130,15 +1132,16 @@ pub(crate) fn value_is_computationally_independent(value: &StyleValueData) -> Op
         // unused generic fields and point list of the other kinds are absent, so
         // one null-tolerant conjunction covers inset, xywh, rect, circle,
         // ellipse, polygon and path exactly.
-        StyleValueData::BasicShape {
-            v0,
-            v1,
-            v2,
-            v3,
-            v4,
-            points,
-            ..
-        } => {
+        StyleValueData::BasicShape { shape } => {
+            let BasicShapeData {
+                v0,
+                v1,
+                v2,
+                v3,
+                v4,
+                points,
+                ..
+            } = shape.as_ref();
             let mut independent = true;
             for value in [v0, v1, v2, v3, v4] {
                 if let Some(value) = value.optional_data() {
@@ -1490,15 +1493,16 @@ fn collect_external_value_dependencies(value: &StyleValueData) -> ExternalValueD
             StyleValueData::RadialSize { value_0, value_1, .. } => {
                 collect_values(&[value_0, value_1], dependencies);
             }
-            StyleValueData::BasicShape {
-                v0,
-                v1,
-                v2,
-                v3,
-                v4,
-                points,
-                ..
-            } => {
+            StyleValueData::BasicShape { shape } => {
+                let BasicShapeData {
+                    v0,
+                    v1,
+                    v2,
+                    v3,
+                    v4,
+                    points,
+                    ..
+                } = shape.as_ref();
                 collect_values(&[v0, v1, v2, v3, v4], dependencies);
                 for point in points.as_slice() {
                     for value in point.values() {
@@ -1733,15 +1737,16 @@ pub(crate) fn collect_unfixed_random_sharings_in_value(
         } => collect_values(&[top, right, bottom, left], sharings),
         StyleValueData::Content { content, alt_text } => collect_values(&[content, alt_text], sharings),
         StyleValueData::RadialSize { value_0, value_1, .. } => collect_values(&[value_0, value_1], sharings),
-        StyleValueData::BasicShape {
-            v0,
-            v1,
-            v2,
-            v3,
-            v4,
-            points,
-            ..
-        } => {
+        StyleValueData::BasicShape { shape } => {
+            let BasicShapeData {
+                v0,
+                v1,
+                v2,
+                v3,
+                v4,
+                points,
+                ..
+            } = shape.as_ref();
             collect_values(&[v0, v1, v2, v3, v4], sharings);
             for point in points.as_slice() {
                 collect_values(&point.values(), sharings);
@@ -3262,12 +3267,39 @@ fn retained_new(value: StyleValueData) -> RetainedStyleValueData {
     unsafe { RetainedStyleValueData::from_retained_pointer(Arc::into_raw(Arc::new(value))) }
 }
 
+fn needs_computed_style_sheet_context(value: *const StyleValueData) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    #[cfg(any(test, feature = "style-replay"))]
+    if crate::css::style_value::replay_style_value_token(value).is_some() {
+        return true;
+    }
+    // NB: Keep this traversal aligned with StyleValue::set_style_sheet(). Only image
+    //     wrappers consume the context; container wrappers forward it to their children.
+    match unsafe { &*value } {
+        StyleValueData::Image { .. } | StyleValueData::ImageSet { .. } => true,
+        StyleValueData::Content { content, alt_text } => {
+            needs_computed_style_sheet_context(content.pointer())
+                || needs_computed_style_sheet_context(alt_text.pointer())
+        }
+        StyleValueData::Shorthand { values, .. } | StyleValueData::ValueList { values, .. } => values
+            .as_slice()
+            .iter()
+            .any(|value| needs_computed_style_sheet_context(value.pointer())),
+        _ => false,
+    }
+}
+
 fn store_computed_value(longhand_table: &mut ComputedLonghandTable, entry: &ComputedStoreEntry) {
     let specified_value = entry.inheritance_dependent.then(|| unsafe {
         RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(entry.data.cast()))
     });
     longhand_table.set_drive_inheritance_dependent_value(entry.property_id, specified_value);
-    let source_slot = if entry.has_style_sheet_context && entry.computed_kind == COMPUTED_KIND_UNCHANGED {
+    let source_slot = if entry.has_style_sheet_context
+        && entry.computed_kind == COMPUTED_KIND_UNCHANGED
+        && needs_computed_style_sheet_context(entry.data.cast())
+    {
         entry.source_slot
     } else {
         -1

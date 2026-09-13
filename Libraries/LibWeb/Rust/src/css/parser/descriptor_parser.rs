@@ -57,13 +57,6 @@ fn is_css_wide_keyword(value: &StyleValueData) -> bool {
     )
 }
 
-fn into_owned(value: Arc<StyleValueData>) -> Option<StyleValueData> {
-    if let StyleValueData::Keyword { keyword } = &*value {
-        return Some(StyleValueData::Keyword { keyword: *keyword });
-    }
-    Arc::into_inner(value)
-}
-
 fn parse_keyword(values: &[ComponentValue], expected: &str) -> Option<StyleValueData> {
     let identifier = single_non_whitespace(values)?.ident()?;
     let parsed = keyword_from_ascii_case_insensitive(identifier)?;
@@ -120,14 +113,19 @@ fn parse_integer_component(
         // NB: This matches CalculatedStyleValue::resolve_integer() at
         //     Libraries/LibWeb/CSS/StyleValues/CalculatedStyleValue.cpp, before descriptor
         //     integer resolution moved to Rust.
-        StyleValueData::Calculated { .. } => unsafe {
-            context
-                .length_resolution_context
-                .cast::<FfiLengthResolutionContext>()
-                .as_ref()
+        StyleValueData::Calculated { .. } => {
+            super::stylesheet_cache::record_length_resolution_dependency();
+            unsafe {
+                context
+                    .length_resolution_context
+                    .cast::<FfiLengthResolutionContext>()
+                    .as_ref()
+            }
+            .and_then(|length_context| {
+                crate::css::calc::resolve_calculated_integer_with_context(&parsed, length_context)
+            })
+            .or_else(|| crate::css::calc::resolve_calculated_integer_without_context(&parsed))?
         }
-        .and_then(|length_context| crate::css::calc::resolve_calculated_integer_with_context(&parsed, length_context))
-        .or_else(|| crate::css::calc::resolve_calculated_integer_without_context(&parsed))?,
         _ => return None,
     };
     Some((resolved, parsed))
@@ -303,19 +301,19 @@ fn parse_value_type(
     match value_type {
         DescriptorValueType::FamilyName => {
             match parse_font_descriptor(context, FontDescriptorKind::FamilyName, values) {
-                ParseOutcome::Parsed(value) => into_owned(value),
+                ParseOutcome::Parsed(value) => Some(Arc::unwrap_or_clone(value)),
                 _ => None,
             }
         }
         DescriptorValueType::FontSrcList => {
             match parse_font_descriptor(context, FontDescriptorKind::SourceList, values) {
-                ParseOutcome::Parsed(value) => into_owned(value),
+                ParseOutcome::Parsed(value) => Some(Arc::unwrap_or_clone(value)),
                 _ => None,
             }
         }
         DescriptorValueType::UnicodeRangeTokens => {
             match parse_font_descriptor(context, FontDescriptorKind::UnicodeRangeList, values) {
-                ParseOutcome::Parsed(value) => into_owned(value),
+                ParseOutcome::Parsed(value) => Some(Arc::unwrap_or_clone(value)),
                 _ => None,
             }
         }
@@ -421,7 +419,7 @@ fn parse_value_type(
                                     }
                                 ) =>
                         {
-                            into_owned(value)
+                            Some(Arc::unwrap_or_clone(value))
                         }
                         _ => None,
                     },
@@ -450,7 +448,7 @@ fn parse_with_metadata(
             DescriptorSyntax::Keyword(keyword) => parse_keyword(values, keyword),
             DescriptorSyntax::Property(property) => match parse_css_value(context, *property, values) {
                 ParseOutcome::Parsed(value) if metadata.allow_css_wide_keywords || !is_css_wide_keyword(&value) => {
-                    into_owned(value)
+                    Some(Arc::unwrap_or_clone(value))
                 }
                 _ => None,
             },

@@ -11,11 +11,14 @@
 #include <AK/Vector.h>
 #include <LibGC/Cell.h>
 #include <LibGC/Ptr.h>
+#include <LibURL/Origin.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Bindings/Navigation.h>
+#include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/InitialInsertion.h>
 #include <LibWeb/HTML/POSTResource.h>
+#include <LibWeb/HTML/SourceSnapshotParams.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
 #include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
@@ -40,6 +43,26 @@ struct NavigateParams {
     Optional<Utf16String> navigation_id = {};
     GC::Ptr<DOM::Element> source_element = nullptr;
     InitialInsertion initial_insertion = InitialInsertion::No;
+
+    void visit_edges(GC::Cell::Visitor&);
+};
+
+struct PreparedNavigation {
+    URL::URL url;
+    DocumentResource document_resource;
+    GC::Ptr<Fetch::Infrastructure::Response> response;
+    Bindings::NavigationHistoryBehavior history_handling;
+    Optional<StorageSerializationRecord> navigation_api_state;
+    Optional<Vector<XHR::FormDataEntry>> form_data_entry_list;
+    ReferrerPolicy::ReferrerPolicy referrer_policy;
+    UserNavigationInvolvement user_involvement;
+    Utf16String navigation_id;
+    GC::Ptr<DOM::Element> source_element;
+    InitialInsertion initial_insertion;
+    ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type;
+    GC::Ref<SourceSnapshotParams> source_snapshot_params;
+    URL::Origin initiator_origin_snapshot;
+    URL::URL initiator_base_url_snapshot;
 
     void visit_edges(GC::Cell::Visitor&);
 };

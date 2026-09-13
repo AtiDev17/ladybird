@@ -385,22 +385,6 @@ private:
         Replace
     };
 
-    // Values produced by steps 1-7 of the navigate algorithm. Keep these when navigation is parked so resumption
-    // continues at step 8 instead of snapshotting a different document state.
-    struct PreparedNavigation {
-        NavigateParams params;
-        ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type;
-        GC::Ref<SourceSnapshotParams> source_snapshot_params;
-        URL::Origin initiator_origin_snapshot;
-        URL::URL initiator_base_url_snapshot;
-
-        void visit_edges(Cell::Visitor& visitor)
-        {
-            params.visit_edges(visitor);
-            visitor.visit(source_snapshot_params);
-        }
-    };
-
     struct PendingNavigation {
         Optional<PreparedNavigation> navigation;
         Optional<Utf16String> population_navigation_id;
@@ -408,12 +392,7 @@ private:
     };
 
     void begin_navigation(PreparedNavigation);
-    virtual WebIDL::ExceptionOr<void> continue_navigation_in_active_document_agent(
-        NavigateParams,
-        ContentSecurityPolicy::Directives::Directive::NavigationType,
-        GC::Ref<SourceSnapshotParams>,
-        URL::Origin initiator_origin_snapshot,
-        URL::URL initiator_base_url_snapshot) override;
+    virtual WebIDL::ExceptionOr<void> continue_navigation_in_active_document_agent(PreparedNavigation) override;
     void continue_navigation_after_population_dispatch(PreparedNavigation, NavigationPopulationRequest);
     void queue_pending_navigation(PreparedNavigation, PendingNavigationBehavior);
     void park_navigation_for_population(Utf16String navigation_id, Optional<PreparedNavigation>, GC::Ref<GC::Function<void(Optional<PreparedNavigation>, Optional<NavigationPopulationRequest>)>> continue_steps);
