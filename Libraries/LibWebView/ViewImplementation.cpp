@@ -37,6 +37,7 @@
 #include <LibWebView/URL.h>
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/ViewImplementation.h>
+#include <LibWebView/WebContentTestClient.h>
 
 namespace WebView {
 
@@ -781,6 +782,22 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
         mouse_event->wheel_delta_y /= zoom_level();
     }
 
+    if (key_event && Web::is_keyboard_scroll_key(key_event->key, Web::UIEvents::Mod_None)) {
+        bool preceding_input_may_change_target = false;
+        m_pending_input_events.for_each([&](Web::InputEvent const& pending) {
+            auto const* key = pending.get_pointer<Web::KeyEvent>();
+            if (!key || key->type != Web::KeyEvent::Type::KeyDown || !key->async_scroll_performed_default_action)
+                preceding_input_may_change_target = true;
+        });
+        // Always deliver key release to the compositor, even if it could no longer accept a new scroll.
+        if (key_event->type == Web::KeyEvent::Type::KeyUp
+            || (Application::web_content_options().enable_async_scrolling == EnableAsyncScrolling::Yes
+                && m_client_state.has_usable_bitmap && !preceding_input_may_change_target)) {
+            auto handled = client().handle_key_event_in_compositor(m_client_state.page_index, *key_event);
+            key_event->async_scroll_performed_default_action = handled && key_event->type == Web::KeyEvent::Type::KeyDown;
+        }
+    }
+
     if (Application::web_content_options().enable_async_scrolling == EnableAsyncScrolling::Yes
         && m_client_state.has_usable_bitmap
         && mouse_event) {
@@ -825,7 +842,7 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
 
     m_pending_input_events.tail().visit(
         [this](Web::KeyEvent const& event) {
-            client().async_key_event(m_client_state.page_index, event.clone_without_browser_data());
+            client().dispatch_key_event_to_web_content(m_client_state.page_index, event);
         },
         [this](Web::MouseEvent const& event) {
             client().dispatch_mouse_event_to_web_content(m_client_state.page_index, event);
@@ -2844,7 +2861,10 @@ NonnullRefPtr<Core::Promise<Empty>> ViewImplementation::reset_session_history_fo
     // entry so canonical history is reset before anything queued behind the reset runs.
     m_top_level_traversable.append_history_queue_steps([this](NonnullRefPtr<Core::Promise<Empty>> promise) {
         m_pending_session_history_reset_queue_promise = move(promise);
-        client().async_reset_session_history_for_testing(page_id());
+        if (auto* test_connection = client().test_connection()) {
+            client().transport().flush();
+            test_connection->async_reset_session_history_for_testing(page_id());
+        }
     });
     return *m_pending_session_history_reset_for_testing;
 }

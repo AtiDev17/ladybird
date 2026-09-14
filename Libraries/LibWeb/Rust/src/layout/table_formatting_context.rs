@@ -758,8 +758,6 @@ pub(crate) fn calculate_table_grid<T: TableTree>(tree: &T, table: Node, missing_
     let mut rows = Vec::new();
     let mut occupancy = HashSet::default();
     let mut column_count = 0usize;
-    let mut row_count = 0usize;
-    let mut current_row = 0usize;
 
     for child in matching_children(tree, table, |display| {
         display.is_table_column_group() || display.is_table_column()
@@ -781,12 +779,8 @@ pub(crate) fn calculate_table_grid<T: TableTree>(tree: &T, table: Node, missing_
                        cells: &mut Vec<TableCell>,
                        rows: &mut Vec<Row>,
                        occupancy: &mut HashSet<(usize, usize)>,
-                       column_count: &mut usize,
-                       row_count: &mut usize,
-                       current_row: &mut usize| {
-        if *row_count == *current_row {
-            *row_count += 1;
-        }
+                       column_count: &mut usize| {
+        let current_row = rows.len();
         let mut current_column = 0usize;
         for cell_box in matching_children(tree, row, |display| display.is_table_cell()) {
             if missing_cells == MissingTableCells::Exclude
@@ -794,7 +788,7 @@ pub(crate) fn calculate_table_grid<T: TableTree>(tree: &T, table: Node, missing_
             {
                 continue;
             }
-            while current_column < *column_count && occupancy.contains(&(current_column, *current_row)) {
+            while current_column < *column_count && occupancy.contains(&(current_column, current_row)) {
                 current_column += 1;
             }
             if current_column == *column_count {
@@ -808,8 +802,7 @@ pub(crate) fn calculate_table_grid<T: TableTree>(tree: &T, table: Node, missing_
                 row_span = 1;
             }
             *column_count = (*column_count).max(current_column + column_span);
-            *row_count = (*row_count).max(*current_row + row_span);
-            for row_index in *current_row..*current_row + row_span {
+            for row_index in current_row..current_row + row_span {
                 for column_index in current_column..current_column + column_span {
                     occupancy.insert((column_index, row_index));
                 }
@@ -817,7 +810,7 @@ pub(crate) fn calculate_table_grid<T: TableTree>(tree: &T, table: Node, missing_
             cells.push(TableCell {
                 box_: cell_box,
                 column_index: current_column,
-                row_index: *current_row,
+                row_index: current_row,
                 column_span,
                 row_span,
                 baseline: CssPixels::default(),
@@ -831,7 +824,6 @@ pub(crate) fn calculate_table_grid<T: TableTree>(tree: &T, table: Node, missing_
         }
 
         rows.push(Row::new(row, tree.row_is_collapsed(row, row_group)));
-        *current_row += 1;
     };
 
     for child in row_containers_in_layout_order(tree, table) {
@@ -844,8 +836,6 @@ pub(crate) fn calculate_table_grid<T: TableTree>(tree: &T, table: Node, missing_
                 &mut rows,
                 &mut occupancy,
                 &mut column_count,
-                &mut row_count,
-                &mut current_row,
             );
         } else {
             for row in matching_children(tree, child, |display| display.is_table_row()) {
@@ -857,8 +847,6 @@ pub(crate) fn calculate_table_grid<T: TableTree>(tree: &T, table: Node, missing_
                     &mut rows,
                     &mut occupancy,
                     &mut column_count,
-                    &mut row_count,
-                    &mut current_row,
                 );
             }
         }
@@ -1994,7 +1982,7 @@ impl<'pass> TableFormattingContext<'pass> {
             // Implement the following parts of the specification, accounting for fixed layout mode:
             // https://www.w3.org/TR/css-tables-3/#min-content-width-of-a-column-based-on-cells-of-span-up-to-1
             // https://www.w3.org/TR/css-tables-3/#max-content-width-of-a-column-based-on-cells-of-span-up-to-1
-            for cell in self.cells.clone() {
+            for &cell in &self.cells {
                 if cell.column_span == 1 && self.cell_is_measured(cell, axis) {
                     let column = &mut self.columns[cell.column_index];
                     column.min_size = column.min_size.max(cell.outer_min_inline_size);
@@ -2020,14 +2008,18 @@ impl<'pass> TableFormattingContext<'pass> {
         let track_count = self.track_count(axis);
         for current_span in 2..=max_span {
             // https://www.w3.org/TR/css-tables-3/#min-content-width-of-a-column-based-on-cells-of-span-up-to-n-n--1
-            let mut min_contributions = vec![Vec::new(); track_count];
+            let mut min_contributions = (0..track_count)
+                .map(|index| self.track_min(axis, index))
+                .collect::<Vec<_>>();
             // https://www.w3.org/TR/css-tables-3/#max-content-width-of-a-column-based-on-cells-of-span-up-to-n-n--1
-            let mut max_contributions = vec![Vec::new(); track_count];
+            let mut max_contributions = (0..track_count)
+                .map(|index| self.track_max(axis, index))
+                .collect::<Vec<_>>();
             let track_spacing = match axis {
                 TrackAxis::Row => self.border_spacing_block(),
                 TrackAxis::Column => self.border_spacing_inline(),
             };
-            for cell in self.cells.clone() {
+            for &cell in &self.cells {
                 if Self::cell_span(cell, axis) != current_span || !self.cell_is_measured(cell, axis) {
                     continue;
                 }
@@ -2096,27 +2088,19 @@ impl<'pass> TableFormattingContext<'pass> {
                         max_contribution +=
                             (Self::cell_max(cell, axis) - spacing).max(CssPixels::default()) / current_span;
                     }
-                    min_contributions[index].push(min_contribution);
-                    max_contributions[index].push(max_contribution);
+                    min_contributions[index] = min_contributions[index].max(min_contribution);
+                    max_contributions[index] = max_contributions[index].max(max_contribution);
                 }
             }
             for index in 0..track_count {
                 // min-content size of a row / column based on cells of span up to N (N > 1) is
                 // the largest of the min-content size of the row / column based on cells of span up to N-1 and
                 // the contributions of the cells in the row / column whose rowSpan / colSpan is N
-                let mut min_size = self.track_min(axis, index);
-                for contribution in &min_contributions[index] {
-                    min_size = min_size.max(*contribution);
-                }
-                self.set_track_min(axis, index, min_size);
+                self.set_track_min(axis, index, min_contributions[index]);
                 // max-content size of a row / column based on cells of span up to N (N > 1) is
                 // the largest of the max-content size based on cells of span up to N-1 and the contributions of
                 // the cells in the row / column whose rowSpan / colSpan is N
-                let mut max_size = self.track_max(axis, index);
-                for contribution in &max_contributions[index] {
-                    max_size = max_size.max(*contribution);
-                }
-                self.set_track_max(axis, index, max_size);
+                self.set_track_max(axis, index, max_contributions[index]);
             }
         }
     }
@@ -2907,18 +2891,15 @@ impl<'pass> TableFormattingContext<'pass> {
         let inline_spacing = self.border_spacing_inline();
         let inline_offset = table_used.border_box_left(table_used.uses_collapsing_borders_model.get()) + inline_spacing;
         let mut row_block_offset = self.table_box_content_block_offset_in_wrapper + block_spacing;
-        let mut row_block_offsets = Vec::with_capacity(self.rows.len());
-        for row_index in 0..self.rows.len() {
-            let row = &self.rows[row_index];
-            row_block_offsets.push(row_block_offset);
-            let inline_size = self
-                .columns
-                .iter()
-                .fold(CssPixels::default(), |sum, column| sum + column.used_inline_size)
-                + inline_spacing * self.visible_column_count().saturating_sub(1);
+        let row_inline_size = self
+            .columns
+            .iter()
+            .fold(CssPixels::default(), |sum, column| sum + column.used_inline_size)
+            + inline_spacing * self.visible_column_count().saturating_sub(1);
+        for row in &self.rows {
             let used = self.used_values(row.box_);
             used.set_content_block_size(row.final_block_size);
-            used.set_content_inline_size(inline_size);
+            used.set_content_inline_size(row_inline_size);
             self.place_child(row.box_, inline_offset, row_block_offset);
             if !row.is_collapsed {
                 row_block_offset += row.final_block_size + block_spacing;
@@ -2935,16 +2916,16 @@ impl<'pass> TableFormattingContext<'pass> {
             let mut block_end = group_block_offset;
             let mut inline_size = CssPixels::default();
             let mut has_rows = false;
-            for (row_index, row) in self.rows.iter().enumerate() {
+            for row in &self.rows {
                 if self.parent(row.box_) != group {
                     continue;
                 }
                 let used = self.used_values(row.box_);
                 if !has_rows {
-                    block_start = row_block_offsets[row_index];
+                    block_start = used.content_offset.get().y;
                     has_rows = true;
                 }
-                block_end = row_block_offsets[row_index] + used.border_box_block_size(false);
+                block_end = used.content_offset.get().y + used.border_box_block_size(false);
                 inline_size = inline_size.max(used.border_box_inline_size(false));
             }
             let used = self.used_values(group);

@@ -222,33 +222,21 @@ impl Item {
         }
         let (split_glyph_index, split_code_units) = split?;
 
-        let glyph_data = self.glyphs.as_mut().unwrap();
-        let split_x = glyph_data.glyphs[split_glyph_index].x;
-        let font = glyph_data.font.clone();
-        let text_type = glyph_data.text_type;
-        let remainder_glyphs = glyph_data.glyphs.split_off(split_glyph_index);
-        let prefix_glyphs = std::mem::replace(&mut glyph_data.glyphs, remainder_glyphs);
-        for glyph in &mut glyph_data.glyphs {
+        let mut prefix = self.glyphs.take().unwrap();
+        let split_x = prefix.glyphs[split_glyph_index].x;
+        let mut remainder_glyphs = prefix.glyphs.split_off(split_glyph_index);
+        for glyph in &mut remainder_glyphs {
             glyph.x -= split_x;
         }
-        let remainder_width = glyph_data.width - split_x;
-        let remainder_glyphs = std::mem::take(&mut glyph_data.glyphs);
+        let remainder = line_box_fragment::GlyphData {
+            glyphs: remainder_glyphs,
+            font: prefix.font.clone(),
+            text_type: prefix.text_type,
+            width: prefix.width - split_x,
+        };
+        prefix.width = split_x;
 
-        Some(self.take_prefix_before(
-            self.offset_in_node + split_code_units,
-            line_box_fragment::GlyphData {
-                glyphs: prefix_glyphs,
-                font: font.clone(),
-                text_type,
-                width: split_x,
-            },
-            line_box_fragment::GlyphData {
-                glyphs: remainder_glyphs,
-                font,
-                text_type,
-                width: remainder_width,
-            },
-        ))
+        Some(self.take_prefix_before(self.offset_in_node + split_code_units, prefix, remainder))
     }
 
     fn split_by_reshaping(
@@ -338,7 +326,6 @@ struct InlineLevelIteratorGenerator<'iterator, 'context> {
     box_model_node_stack: Vec<Node>,
     visited_fragmented_inlines: Vec<Node>,
     items: Vec<Item>,
-    next_item_index: usize,
     accumulated_inline_size_for_tabs: CssPixels,
     previous_chunk_can_break_after: bool,
 }
@@ -362,7 +349,6 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
             box_model_node_stack: Vec::new(),
             visited_fragmented_inlines: Vec::new(),
             items: Vec::new(),
-            next_item_index: 0,
             accumulated_inline_size_for_tabs: CssPixels::default(),
             previous_chunk_can_break_after: false,
         };
@@ -371,8 +357,7 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
         iterator.generate_all_items();
         Some(InlineLevelIterator {
             visited_fragmented_inlines: iterator.visited_fragmented_inlines,
-            items: iterator.items,
-            next_item_index: iterator.next_item_index,
+            items: iterator.items.into_iter(),
         })
     }
 
@@ -869,8 +854,7 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
 
 pub(crate) struct InlineLevelIterator {
     visited_fragmented_inlines: Vec<Node>,
-    items: Vec<Item>,
-    next_item_index: usize,
+    items: std::vec::IntoIter<Item>,
 }
 
 impl InlineLevelIterator {
@@ -886,24 +870,16 @@ impl InlineLevelIterator {
     }
 
     pub(crate) fn next(&mut self) -> Option<Item> {
-        let index = self.next_item_index;
-        if index >= self.items.len() {
-            return None;
-        }
-        self.next_item_index += 1;
-        Some(std::mem::replace(
-            &mut self.items[index],
-            Item::new(ItemType::ForcedBreak, NodeSlotId::INVALID),
-        ))
+        self.items.next()
     }
 
     pub(crate) fn items(&self) -> &[Item] {
-        &self.items
+        self.items.as_slice()
     }
 
     pub(crate) fn skip_items(&mut self, count: usize) {
-        assert!(self.next_item_index + count <= self.items.len());
-        self.next_item_index += count;
+        assert!(count <= self.items.len());
+        self.items.by_ref().take(count).for_each(drop);
     }
 
     pub(crate) fn next_inline_run_size(
@@ -926,7 +902,7 @@ impl InlineLevelIterator {
         stop_at_overflow_breakable_text: bool,
     ) -> Option<CssPixels> {
         let mut size = CssPixels::default();
-        for item in &self.items[self.next_item_index..] {
+        for item in self.items.as_slice() {
             match item.type_ {
                 ItemType::ForcedBreak => return Some(CssPixels::default()),
                 ItemType::BlockLevelBox => break,
@@ -954,7 +930,8 @@ impl InlineLevelIterator {
         context: &inline_formatting_context::InlineFormattingContext<'_>,
     ) -> bool {
         self.items
-            .get(self.next_item_index)
+            .as_slice()
+            .first()
             .is_some_and(|item| item.allows_overflow_break(context))
     }
 

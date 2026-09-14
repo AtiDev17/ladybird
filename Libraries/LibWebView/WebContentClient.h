@@ -65,6 +65,8 @@ class WEBVIEW_API WebContentClient final
     , public WebContentClientEndpoint {
     C_OBJECT_ABSTRACT(WebContentClient);
 
+    friend class WebContentTestClient;
+
 public:
     using InitTransport = Messages::WebContentServer::InitTransport;
 
@@ -91,6 +93,10 @@ public:
     BrowsingSession& session() const { return *m_session; }
     void remove_blob_url_entries();
 
+    void connect_test_endpoint(NonnullOwnPtr<IPC::Transport>);
+    // Null outside test mode: the test endpoint is only connected when the UI process runs tests.
+    WebContentTestClient* test_connection() { return m_test_connection; }
+
     void assign_view(Badge<Application>, ViewImplementation&);
     void set_initial_top_level_history_entry(Badge<Application>, Web::HTML::SessionHistoryEntryDescriptor entry) { m_initial_top_level_history_entry = move(entry); }
     void register_view(u64 page_id, ViewImplementation&);
@@ -111,6 +117,9 @@ public:
     // False once the page can no longer host work: the page is unregistered or the process is gone. A page
     // awaiting a detached close remains open; it still coordinates its own close.
     bool is_page_open(u64 page_id) const;
+    // True while the connection may still act for the page: a spare process's unassigned initial page, an
+    // open page, or a detached page awaiting its close acknowledgement.
+    bool owns_page(u64 page_id) const;
     Optional<CanonicalNavigable&> hosted_navigable(Web::HTML::CrossProcessId navigable_id);
     Optional<CanonicalNavigable&> hosted_navigable_for_page(u64 page_id, Web::HTML::CrossProcessId navigable_id);
     Optional<CanonicalNavigable&> population_worker_navigable_for_page(u64 page_id, Web::HTML::CrossProcessId navigable_id);
@@ -132,6 +141,8 @@ public:
     Optional<u64> page_id_for_compositor_context_id(Web::Compositor::CompositorContextId) const;
     bool send_async_scroll_to_compositor(u64 page_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Web::WheelDeltaPrecision, Web::ScrollGesturePhase);
     bool handle_mouse_event_in_compositor(u64 page_id, Web::MouseEvent const&);
+    bool handle_key_event_in_compositor(u64 page_id, Web::KeyEvent const&);
+    void dispatch_key_event_to_web_content(u64 page_id, Web::KeyEvent const&);
     bool handle_pinch_event_in_compositor(u64 page_id, Web::PinchEvent const&);
     void dispatch_mouse_event_to_web_content(u64 page_id, Web::MouseEvent const&);
     void notify_presented_bitmap_ready_to_paint(u64 page_id, i32 bitmap_id);
@@ -152,9 +163,25 @@ private:
     StorageJar* storage_jar_for_page(u64 page_id, Web::StorageAPI::StorageEndpointType);
     void cancel_navigation_transactions();
     bool continue_navigation_population_in_selected_process(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id);
-    void report_unexpected_debugger_response();
+
+    void did_misbehave(StringView message_name, StringView reason);
 
     virtual void die() override;
+
+    // Test-only handlers, reached over the separate test transport (see WebContentTestClient).
+    void did_finish_test(u64 page_id, String text);
+    void did_set_test_timeout(u64 page_id, double milliseconds);
+    void did_receive_reference_test_metadata(u64 page_id, JsonValue);
+    void did_expire_cookies_with_time_offset(AK::Duration);
+    void did_simulate_worker_request_server_connection_loss(u64 page_id);
+    String did_request_ui_process_session_history_for_testing(u64 page_id);
+    String did_request_site_isolation_process_tree_for_testing(u64 page_id);
+    void did_request_crash_of_remote_frame_processes_for_testing(u64 page_id);
+    void did_reset_session_history_for_testing(u64 page_id, Web::HTML::SessionHistoryEntryDescriptor);
+    bool did_request_capture_session_history_snapshot_for_testing(u64 page_id);
+    bool did_request_restore_session_history_snapshot_for_testing(u64 page_id);
+    bool did_request_register_session_store_tab_for_testing(u64 page_id);
+    String did_request_session_store_tab_state_for_testing(u64 page_id);
 
     virtual Messages::WebContentClient::AllocateCompositorContextIdResponse allocate_compositor_context_id(u64 page_id, Web::Compositor::PagePresentationRegistration) override;
     virtual void did_destroy_compositor_context(Web::Compositor::CompositorContextId) override;
@@ -167,7 +194,7 @@ private:
     virtual void did_create_child_frame(u64 page_id, Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::ReplicatedNavigableState replicated_state) override;
     virtual void did_update_child_frame_viewport(u64 page_id, Web::HTML::CrossProcessId frame_id, Web::DevicePixelRect viewport_rect, double device_pixel_ratio) override;
     virtual void did_destroy_child_frame(u64 page_id, Web::HTML::CrossProcessId frame_id) override;
-    virtual void did_finish_loading(u64 page_id, Optional<Utf16String>, URL::URL) override;
+    virtual void did_finish_loading(u64 page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String>) override;
     virtual void did_request_refresh(u64 page_id) override;
     virtual void did_request_cursor_change(u64 page_id, Gfx::Cursor) override;
     virtual void did_change_title(u64 page_id, Utf16String) override;
@@ -243,12 +270,10 @@ private:
     virtual Messages::WebContentClient::DidRequestCookieResponse did_request_cookie(u64 page_id, URL::URL, HTTP::Cookie::Source) override;
     virtual void did_set_cookie(URL::URL, HTTP::Cookie::ParsedCookie, HTTP::Cookie::Source) override;
     virtual void did_update_cookie(HTTP::Cookie::Cookie) override;
-    virtual void did_expire_cookies_with_time_offset(AK::Duration) override;
     virtual void did_request_delete_all_cookies(u64 page_id, u64 request_id, URL::URL) override;
     virtual void did_store_hsts_policy(String, HTTP::HSTS::ParsedHSTSPolicy) override;
     virtual Messages::WebContentClient::DidIsKnownHstsHostResponse did_is_known_hsts_host(String) override;
     virtual Messages::WebContentClient::DidLoseRequestServerConnectionResponse did_lose_request_server_connection() override;
-    virtual void did_simulate_worker_request_server_connection_loss(u64 page_id) override;
     virtual Messages::WebContentClient::DidRequestStorageItemResponse did_request_storage_item(u64 page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key) override;
     virtual Messages::WebContentClient::DidSetStorageItemResponse did_set_storage_item(u64 page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key, Utf16String value) override;
     virtual void did_remove_storage_item(u64 page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key) override;
@@ -282,9 +307,6 @@ private:
     virtual void did_request_select_dropdown(u64 page_id, Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) override;
     virtual void did_finish_handling_input_event(u64 page_id, Web::EventResult event_result) override;
     virtual void did_update_input_method_state(u64 page_id, Optional<Web::DevicePixelRect> caret_rect, bool is_enabled, i32 cursor_position, i32 anchor_position, Utf16String text_before_cursor, Utf16String text_after_cursor) override;
-    virtual void did_finish_test(u64 page_id, String text) override;
-    virtual void did_set_test_timeout(u64 page_id, double milliseconds) override;
-    virtual void did_receive_reference_test_metadata(u64 page_id, JsonValue) override;
     virtual void did_set_browser_zoom(u64 page_id, double factor) override;
     virtual void did_find_in_page(u64 page_id, size_t current_match_index, Optional<size_t> total_match_count) override;
     virtual void did_change_theme_color(u64 page_id, Gfx::Color color) override;
@@ -300,9 +322,6 @@ private:
     virtual void did_update_session_history_entry_document_state_navigable_target_name(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Utf16String navigable_target_name) override;
     virtual void did_set_session_history_entry_document_state_reload_pending(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, bool reload_pending) override;
     virtual void did_request_set_system_visibility_state(u64 page_id, Web::HTML::VisibilityState) override;
-    virtual Messages::WebContentClient::DidRequestUiProcessSessionHistoryForTestingResponse did_request_ui_process_session_history_for_testing(u64 page_id) override;
-    virtual Messages::WebContentClient::DidRequestSiteIsolationProcessTreeForTestingResponse did_request_site_isolation_process_tree_for_testing(u64 page_id) override;
-    virtual void did_request_crash_of_remote_frame_processes_for_testing(u64 page_id) override;
     virtual void request_history_operation(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters) override;
     virtual void history_operation_ready(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationReadyResult) override;
     virtual void history_step_unload_cancelation_result(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) override;
@@ -313,11 +332,6 @@ private:
     virtual void request_child_navigable_unload(u64 page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void changing_navigable_continuation_applied(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::ReplicatedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) override;
     virtual void nonchanging_navigable_history_state_updated(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) override;
-    virtual void did_reset_session_history_for_testing(u64 page_id, Web::HTML::SessionHistoryEntryDescriptor) override;
-    virtual Messages::WebContentClient::DidRequestCaptureSessionHistorySnapshotForTestingResponse did_request_capture_session_history_snapshot_for_testing(u64 page_id) override;
-    virtual Messages::WebContentClient::DidRequestRestoreSessionHistorySnapshotForTestingResponse did_request_restore_session_history_snapshot_for_testing(u64 page_id) override;
-    virtual Messages::WebContentClient::DidRequestRegisterSessionStoreTabForTestingResponse did_request_register_session_store_tab_for_testing(u64 page_id) override;
-    virtual Messages::WebContentClient::DidRequestSessionStoreTabStateForTestingResponse did_request_session_store_tab_state_for_testing(u64 page_id) override;
     virtual Messages::WebContentClient::StartWorkerAgentResponse start_worker_agent(u64 page_id, Web::HTML::WorkerAgentStartRequest request) override;
     virtual void close_worker_agent(u64 page_id, Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) override;
 
@@ -329,9 +343,12 @@ private:
     void forget_renderer_owned_download(u64 download_id);
     void fail_renderer_owned_downloads();
 
+    RefPtr<WebContentTestClient> m_test_connection;
+
     IsPrivate m_is_private { IsPrivate::No };
     RefPtr<BrowsingSession> m_session;
     bool m_process_lost { false };
+    bool m_rejected_ipc { false };
 
     HashMap<u64, NonnullRawPtr<ViewImplementation>> m_views;
     HashMap<u64, WeakPtr<CanonicalNavigable>> m_embedded_pages;
@@ -340,7 +357,7 @@ private:
     HashMap<u64, u64> m_renderer_owned_downloads;
     HashMap<u64, String> m_history_recorded_urls_for_current_load;
     Optional<i32> m_compositor_connection_id;
-    u64 m_initial_page_id { 0 };
+    Optional<u64> m_unassigned_initial_page_id;
     Web::HTML::CrossProcessId m_root_navigable_id;
     Optional<Web::HTML::SessionHistoryEntryDescriptor> m_initial_top_level_history_entry;
 

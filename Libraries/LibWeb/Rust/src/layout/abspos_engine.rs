@@ -234,7 +234,7 @@ impl<'pass> AbsposEngine<'pass> {
     fn base_containing_block_info(
         &self,
         node: Node,
-        inline_containing_block_rect: Option<formatting_context::PhysicalRect>,
+        inline_containing_block_rect: Option<CssPixelRect>,
         entry_containing_block_geometry: &ContainingBlockGeometry,
         resolved_anchor_insets: Option<&formatting_context::ResolvedAnchorInsets>,
     ) -> abspos_inputs::AbsposContainingBlockInfo {
@@ -395,7 +395,7 @@ impl AbsposEngine<'_> {
         containing_block: Node,
         entry_containing_block_geometry: Option<&ContainingBlockGeometry>,
         entry_coordinate_space_box: Node,
-    ) -> formatting_context::PhysicalRect {
+    ) -> CssPixelRect {
         let (rect, coordinate_space_box) = self
             .fragments
             .as_deref()
@@ -405,7 +405,7 @@ impl AbsposEngine<'_> {
             Some(geometry) => {
                 let fold_into_entry_space =
                     self.translation_between_payload_resting_spaces(coordinate_space_box, entry_coordinate_space_box);
-                formatting_context::PhysicalRect {
+                CssPixelRect {
                     x: rect.x + fold_into_entry_space.x - geometry.content_origin_in_entry_space.x
                         + geometry.padding_left,
                     y: rect.y + fold_into_entry_space.y - geometry.content_origin_in_entry_space.y
@@ -416,7 +416,7 @@ impl AbsposEngine<'_> {
             }
             None => {
                 let containing_block_used = self.used(containing_block);
-                formatting_context::PhysicalRect {
+                CssPixelRect {
                     x: rect.x + containing_block_used.padding_left.get(),
                     y: rect.y + containing_block_used.padding_top.get(),
                     width: rect.width,
@@ -429,7 +429,7 @@ impl AbsposEngine<'_> {
     fn anchor_side(
         &self,
         side: AnchorSide,
-        rect: formatting_context::PhysicalRect,
+        rect: CssPixelRect,
         positioned_box: Node,
         containing_block: Node,
         is_from_end: bool,
@@ -568,11 +568,15 @@ impl AbsposEngine<'_> {
             .set_default_scroll_shift(node, NodeSlotId::INVALID, false, false);
 
         let style = self.style(node);
-        let top_contains_anchor = style.inset_top().contains_anchor_function();
-        let right_contains_anchor = style.inset_right().contains_anchor_function();
-        let bottom_contains_anchor = style.inset_bottom().contains_anchor_function();
-        let left_contains_anchor = style.inset_left().contains_anchor_function();
-        if !top_contains_anchor && !right_contains_anchor && !bottom_contains_anchor && !left_contains_anchor {
+        if ![
+            style.inset_top(),
+            style.inset_right(),
+            style.inset_bottom(),
+            style.inset_left(),
+        ]
+        .into_iter()
+        .any(style_values::InsetValue::contains_anchor_function)
+        {
             return None;
         }
 
@@ -597,80 +601,57 @@ impl AbsposEngine<'_> {
             compensates_for_horizontal_scroll: false,
             compensates_for_vertical_scroll: false,
         };
-        let mut resolved = formatting_context::ResolvedAnchorInsets::default();
-
-        if top_contains_anchor {
-            let value = self.resolve_anchor_value(
+        let mut resolve_inset = |inset: style_values::InsetValue<'_>, axis: AnchorValueAxis| {
+            inset.contains_anchor_function().then(|| {
+                self.resolve_anchor_value(
+                    inset,
+                    node,
+                    containing_block,
+                    entry_containing_block_geometry.copied(),
+                    entry_coordinate_space_box,
+                    axis,
+                    &mut resolution_state,
+                )
+                .map_or(
+                    style_values::ResolvedInsetOverride::Auto,
+                    style_values::ResolvedInsetOverride::Pixels,
+                )
+            })
+        };
+        let resolved = formatting_context::ResolvedAnchorInsets {
+            top: resolve_inset(
                 style.inset_top(),
-                node,
-                containing_block,
-                entry_containing_block_geometry.copied(),
-                entry_coordinate_space_box,
                 AnchorValueAxis {
                     is_from_end: false,
                     is_horizontal: false,
                     containing_block_extent: containing_block_geometry.padding_box_block_size(),
                 },
-                &mut resolution_state,
-            );
-            resolved.resolves_top = true;
-            resolved.top_is_auto = value.is_none();
-            resolved.top = value.unwrap_or_default();
-        }
-        if right_contains_anchor {
-            let value = self.resolve_anchor_value(
+            ),
+            right: resolve_inset(
                 style.inset_right(),
-                node,
-                containing_block,
-                entry_containing_block_geometry.copied(),
-                entry_coordinate_space_box,
                 AnchorValueAxis {
                     is_from_end: true,
                     is_horizontal: true,
                     containing_block_extent: containing_block_geometry.padding_box_inline_size(),
                 },
-                &mut resolution_state,
-            );
-            resolved.resolves_right = true;
-            resolved.right_is_auto = value.is_none();
-            resolved.right = value.unwrap_or_default();
-        }
-        if bottom_contains_anchor {
-            let value = self.resolve_anchor_value(
+            ),
+            bottom: resolve_inset(
                 style.inset_bottom(),
-                node,
-                containing_block,
-                entry_containing_block_geometry.copied(),
-                entry_coordinate_space_box,
                 AnchorValueAxis {
                     is_from_end: true,
                     is_horizontal: false,
                     containing_block_extent: containing_block_geometry.padding_box_block_size(),
                 },
-                &mut resolution_state,
-            );
-            resolved.resolves_bottom = true;
-            resolved.bottom_is_auto = value.is_none();
-            resolved.bottom = value.unwrap_or_default();
-        }
-        if left_contains_anchor {
-            let value = self.resolve_anchor_value(
+            ),
+            left: resolve_inset(
                 style.inset_left(),
-                node,
-                containing_block,
-                entry_containing_block_geometry.copied(),
-                entry_coordinate_space_box,
                 AnchorValueAxis {
                     is_from_end: false,
                     is_horizontal: true,
                     containing_block_extent: containing_block_geometry.padding_box_inline_size(),
                 },
-                &mut resolution_state,
-            );
-            resolved.resolves_left = true;
-            resolved.left_is_auto = value.is_none();
-            resolved.left = value.unwrap_or_default();
-        }
+            ),
+        };
 
         if resolution_state.compensates_for_horizontal_scroll || resolution_state.compensates_for_vertical_scroll {
             self.callbacks.arena().set_default_scroll_shift(
@@ -1992,7 +1973,7 @@ impl<'pass> AbsposEngine<'pass> {
         &self,
         child: &abspos_inputs::PendingAbsposChild,
         containing_block_geometry: &ContainingBlockGeometry,
-    ) -> Option<formatting_context::PhysicalRect> {
+    ) -> Option<CssPixelRect> {
         if child.inline_containing_block.is_invalid() {
             return None;
         }
@@ -2000,7 +1981,7 @@ impl<'pass> AbsposEngine<'pass> {
         let (rect, payload_space) = fragments.find_inline_containing_block_rect(child.inline_containing_block)?;
         let fold_into_entry_space =
             self.translation_between_payload_resting_spaces(payload_space, child.coordinate_space_box);
-        Some(formatting_context::PhysicalRect {
+        Some(CssPixelRect {
             x: rect.x + fold_into_entry_space.x - containing_block_geometry.content_origin_in_entry_space.x,
             y: rect.y + fold_into_entry_space.y - containing_block_geometry.content_origin_in_entry_space.y,
             width: rect.width,

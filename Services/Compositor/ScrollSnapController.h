@@ -44,13 +44,15 @@ public:
         Web::Compositor::ScrollAnimationKind animation_kind { Web::Compositor::ScrollAnimationKind::SmoothScroll };
     };
 
-    // A wheel delta that selected the snap position the scrolling box already rests at, or is already scrolling to,
-    // is consumed without disturbing where the box is going.
-    struct StepConsumed { };
+    // A step that selected the snap position the scrolling box already rests at, or is already scrolling to, is
+    // consumed without disturbing where the box is going. Keys can still advance the input for that scroll.
+    struct StepConsumed {
+        Optional<Web::Compositor::StartedUserScroll> updated_scroll;
+    };
 
-    // What a wheel delta over a snap container does with the snap position it selected; a delta that selects none
+    // What a scroll step over a snap container does with the snap position it selected; a step that selects none
     // scrolls the box by itself.
-    using WheelStepDecision = Variant<StepConsumed, SnapScrollStart>;
+    using StepDecision = Variant<StepConsumed, SnapScrollStart>;
 
     struct GestureEndSnap {
         Web::Compositor::AsyncScrollNodeID node_id;
@@ -62,6 +64,7 @@ public:
     void did_start_snap_scroll(Web::Compositor::AsyncScrollNodeStableID, Web::Compositor::AsyncScrollOperationID, Web::CSSPixelPoint destination);
     void did_end_snap_scroll(Web::Compositor::AsyncScrollNodeStableID, Web::Compositor::AsyncScrollOperationID, Optional<Web::CSSPixelPoint> scroll_offset);
     bool is_snap_scroll(Web::Compositor::AsyncScrollNodeStableID, Web::Compositor::AsyncScrollOperationID) const;
+    Optional<Web::CSSPixelPoint> unsnapped_destination_for_snap_scroll(Web::Compositor::AsyncScrollNodeStableID, Web::Compositor::AsyncScrollOperationID) const;
 
     // Input that scrolls with a gesture reports its phases; the momentum of a flick and the end of a gesture snap
     // from what the gesture has done so far.
@@ -70,10 +73,14 @@ public:
 
     // https://drafts.csswg.org/css-scroll-snap-1/#scroll-types
     // A discrete wheel step is a relative scroll with only an intended direction.
-    Optional<WheelStepDecision> decide_discrete_step(Web::Compositor::AsyncScrollTree const&, Web::Painting::ScrollStateSnapshot const&, Web::Compositor::AsyncScrollNodeID, Web::CSSPixelPoint delta, MonotonicTime now);
+    Optional<StepDecision> decide_discrete_step(Web::Compositor::AsyncScrollTree const&, Web::Painting::ScrollStateSnapshot const&, Web::Compositor::AsyncScrollNodeID, Web::CSSPixelPoint delta, MonotonicTime now);
     // The momentum of a flick is a relative scroll with an intended direction and, once its decay tells where it is
     // headed, an intended end position.
-    Optional<WheelStepDecision> decide_momentum_delta(Web::Compositor::AsyncScrollTree const&, Web::Painting::ScrollStateSnapshot const&, Web::Compositor::AsyncScrollNodeID, Web::CSSPixelPoint delta);
+    Optional<StepDecision> decide_momentum_delta(Web::Compositor::AsyncScrollTree const&, Web::Painting::ScrollStateSnapshot const&, Web::Compositor::AsyncScrollNodeID, Web::CSSPixelPoint delta);
+    // A scroll key is a command of its own rather than a step of a gesture: while a scroll is in flight it travels on
+    // from the offset the steps before it asked for, otherwise from the scrolling box itself. An arrow key has only
+    // an intended direction; a paging key has an intended end position as well.
+    Optional<StepDecision> decide_key_step(Web::Compositor::AsyncScrollTree const&, Web::Painting::ScrollStateSnapshot const&, Web::Compositor::AsyncScrollNodeID, Web::CSSPixelPoint delta, Web::Compositor::SnapSelectionStrategy::Type, Optional<Web::CSSPixelPoint> scroll_in_flight_destination, MonotonicTime now);
     // The end of a gesture snaps each scrolling box it panned to the snap position nearest where it was released,
     // and ends the gesture.
     Vector<GestureEndSnap> decide_gesture_end(Web::Compositor::AsyncScrollTree const&, Web::Painting::ScrollStateSnapshot const&);

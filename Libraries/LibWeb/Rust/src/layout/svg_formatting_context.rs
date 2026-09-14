@@ -191,99 +191,48 @@ impl From<FfiAffineTransform> for libgfx_rust::AffineTransform {
     }
 }
 
-impl FfiAffineTransform {
-    fn is_identity(self) -> bool {
-        self.a == 1.0 && self.b == 0.0 && self.c == 0.0 && self.d == 1.0 && self.e == 0.0 && self.f == 0.0
-    }
-
-    fn is_identity_or_translation(self) -> bool {
-        self.a == 1.0 && self.b == 0.0 && self.c == 0.0 && self.d == 1.0
-    }
-
-    pub(crate) fn translated(mut self, x: f32, y: f32) -> Self {
-        if self.is_identity_or_translation() {
-            self.e += x;
-            self.f += y;
-            return self;
-        }
-        self.e += x * self.a + y * self.c;
-        self.f += x * self.b + y * self.d;
-        self
-    }
-
-    pub(crate) fn scaled(mut self, x: f32, y: f32) -> Self {
-        self.a *= x;
-        self.b *= x;
-        self.c *= y;
-        self.d *= y;
-        self
-    }
-
-    fn map_point(self, point: FfiFloatPoint) -> FfiFloatPoint {
-        FfiFloatPoint {
-            x: self.a * point.x + self.c * point.y + self.e,
-            y: self.b * point.x + self.d * point.y + self.f,
-        }
-    }
-
-    pub(crate) fn map_rect(self, rect: FfiFloatRect) -> FfiFloatRect {
-        if self.is_identity() {
-            return rect;
-        }
-        if self.is_identity_or_translation() {
-            return FfiFloatRect {
-                x: rect.x + self.e,
-                y: rect.y + self.f,
-                ..rect
-            };
-        }
-
-        let top_left = self.map_point(FfiFloatPoint { x: rect.x, y: rect.y });
-        let top_right = self.map_point(FfiFloatPoint {
-            x: rect.x + rect.width,
-            y: rect.y,
-        });
-        let bottom_right = self.map_point(FfiFloatPoint {
-            x: rect.x + rect.width,
-            y: rect.y + rect.height,
-        });
-        let bottom_left = self.map_point(FfiFloatPoint {
-            x: rect.x,
-            y: rect.y + rect.height,
-        });
-        let left = top_left.x.min(top_right.x).min(bottom_right.x.min(bottom_left.x));
-        let top = top_left.y.min(top_right.y).min(bottom_right.y.min(bottom_left.y));
-        let right = top_left.x.max(top_right.x).max(bottom_right.x.max(bottom_left.x));
-        let bottom = top_left.y.max(top_right.y).max(bottom_right.y.max(bottom_left.y));
-        FfiFloatRect {
-            x: left,
-            y: top,
-            width: right - left,
-            height: bottom - top,
-        }
+impl From<libgfx_rust::AffineTransform> for FfiAffineTransform {
+    fn from(transform: libgfx_rust::AffineTransform) -> Self {
+        let [a, b, c, d, e, f] = transform.values;
+        Self { a, b, c, d, e, f }
     }
 }
 
-fn css_pixels_from_f32(value: f32) -> CssPixels {
-    if value.is_nan() {
-        return CssPixels::default();
+impl FfiAffineTransform {
+    fn is_identity(self) -> bool {
+        libgfx_rust::AffineTransform::from(self).is_identity()
     }
-    let scaled = value * 64.0;
-    if scaled >= i32::MAX as f32 {
-        return CssPixels::from_raw(i32::MAX);
+
+    pub(crate) fn translated(self, x: f32, y: f32) -> Self {
+        libgfx_rust::AffineTransform::from(self).translated(x, y).into()
     }
-    if scaled <= i32::MIN as f32 {
-        return CssPixels::from_raw(i32::MIN);
+
+    pub(crate) fn scaled(self, x: f32, y: f32) -> Self {
+        libgfx_rust::AffineTransform::from(self).scaled(x, y).into()
     }
-    CssPixels::from_raw(scaled.round_ties_even() as i32)
+
+    pub(crate) fn map_rect(self, rect: FfiFloatRect) -> FfiFloatRect {
+        let rect = libgfx_rust::AffineTransform::from(self).map_rect(libgfx_rust::FloatRect::new(
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+        ));
+        FfiFloatRect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        }
+    }
 }
 
 fn float_rect_to_css_pixels(rect: FfiFloatRect) -> SvgCssPixelRect {
     SvgCssPixelRect {
-        x: css_pixels_from_f32(rect.x),
-        y: css_pixels_from_f32(rect.y),
-        width: css_pixels_from_f32(rect.width),
-        height: css_pixels_from_f32(rect.height),
+        x: CssPixels::nearest_value_for_f32(rect.x),
+        y: CssPixels::nearest_value_for_f32(rect.y),
+        width: CssPixels::nearest_value_for_f32(rect.width),
+        height: CssPixels::nearest_value_for_f32(rect.height),
     }
 }
 
@@ -838,7 +787,7 @@ impl<'pass> SvgFormattingContext<'pass> {
 
         let mut bounding_box = float_rect_to_css_pixels(result.bounding_box);
         // Stroke increases the path's size by stroke_width/2 per side.
-        let stroke_width = css_pixels_from_f32(facts.visible_stroke_width);
+        let stroke_width = CssPixels::nearest_value_for_f32(facts.visible_stroke_width);
         bounding_box.inflate(stroke_width, stroke_width);
 
         let used_pointer = self.used_values(graphics_box);
@@ -893,8 +842,8 @@ impl<'pass> SvgFormattingContext<'pass> {
                     facts.pattern_height.value
                 };
                 let used = &used_pointer;
-                used.set_content_inline_size(css_pixels_from_f32(width));
-                used.set_content_block_size(css_pixels_from_f32(height));
+                used.set_content_inline_size(CssPixels::nearest_value_for_f32(width));
+                used.set_content_block_size(CssPixels::nearest_value_for_f32(height));
             } else {
                 let parent = self.parent(resource);
                 assert!(!parent.is_invalid());
@@ -954,10 +903,10 @@ impl<'pass> SvgFormattingContext<'pass> {
                     width: child_used.content_inline_size.get().raw_value() as f32 / 64.0,
                     height: child_used.content_block_size.get().raw_value() as f32 / 64.0,
                 });
-                let left = css_pixels_from_f32(mapped_child_rect.x);
-                let top = css_pixels_from_f32(mapped_child_rect.y);
-                let right = left + css_pixels_from_f32(mapped_child_rect.width);
-                let bottom = top + css_pixels_from_f32(mapped_child_rect.height);
+                let left = CssPixels::nearest_value_for_f32(mapped_child_rect.x);
+                let top = CssPixels::nearest_value_for_f32(mapped_child_rect.y);
+                let right = left + CssPixels::nearest_value_for_f32(mapped_child_rect.width);
+                let bottom = top + CssPixels::nearest_value_for_f32(mapped_child_rect.height);
                 if has_points {
                     min_x = min_x.min(left);
                     min_y = min_y.min(top);

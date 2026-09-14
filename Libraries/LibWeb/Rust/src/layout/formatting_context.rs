@@ -25,55 +25,20 @@ pub(crate) enum LayoutMode {
 /// unresolved and read from style.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResolvedAnchorInsets {
-    pub(crate) resolves_top: bool,
-    pub(crate) top_is_auto: bool,
-    pub(crate) top: CssPixels,
-    pub(crate) resolves_right: bool,
-    pub(crate) right_is_auto: bool,
-    pub(crate) right: CssPixels,
-    pub(crate) resolves_bottom: bool,
-    pub(crate) bottom_is_auto: bool,
-    pub(crate) bottom: CssPixels,
-    pub(crate) resolves_left: bool,
-    pub(crate) left_is_auto: bool,
-    pub(crate) left: CssPixels,
+    pub(crate) top: Option<style_values::ResolvedInsetOverride>,
+    pub(crate) right: Option<style_values::ResolvedInsetOverride>,
+    pub(crate) bottom: Option<style_values::ResolvedInsetOverride>,
+    pub(crate) left: Option<style_values::ResolvedInsetOverride>,
 }
 
 impl ResolvedAnchorInsets {
     pub(crate) fn override_for(&self, field: style_values::InsetField) -> Option<style_values::ResolvedInsetOverride> {
-        let (resolves, is_auto, px) = match field {
-            style_values::InsetField::Top => (self.resolves_top, self.top_is_auto, self.top),
-            style_values::InsetField::Right => (self.resolves_right, self.right_is_auto, self.right),
-            style_values::InsetField::Bottom => (self.resolves_bottom, self.bottom_is_auto, self.bottom),
-            style_values::InsetField::Left => (self.resolves_left, self.left_is_auto, self.left),
-        };
-        resolves.then_some(style_values::ResolvedInsetOverride { is_auto, px })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PhysicalRect {
-    pub(crate) x: CssPixels,
-    pub(crate) y: CssPixels,
-    pub(crate) width: CssPixels,
-    pub(crate) height: CssPixels,
-}
-
-impl PhysicalRect {
-    pub(super) fn left(self) -> CssPixels {
-        self.x
-    }
-
-    pub(super) fn top(self) -> CssPixels {
-        self.y
-    }
-
-    pub(super) fn right(self) -> CssPixels {
-        self.x + self.width
-    }
-
-    pub(super) fn bottom(self) -> CssPixels {
-        self.y + self.height
+        match field {
+            style_values::InsetField::Top => self.top,
+            style_values::InsetField::Right => self.right,
+            style_values::InsetField::Bottom => self.bottom,
+            style_values::InsetField::Left => self.left,
+        }
     }
 }
 
@@ -384,7 +349,7 @@ pub(crate) fn place_child(
         let node_facts = NodeFacts::new(callbacks, node);
         let own_anchor_candidate_border_box_rect = (node_facts.is_box() && node_facts.has_anchor_names()).then(|| {
             let collapsed = used.uses_collapsing_borders_model.get();
-            PhysicalRect {
+            CssPixelRect {
                 x: used.content_offset.get().x - used.border_box_left(collapsed),
                 y: used.content_offset.get().y - used.border_box_top(collapsed),
                 width: used.border_box_inline_size(collapsed),
@@ -690,16 +655,16 @@ pub(crate) fn derive_baselines(
     let container_skips_anonymous_whitespace_runs =
         container_display.is_flex_inside() || container_display.is_grid_inside();
     let baseline_from_children = |baseline_set: BaselineSet| -> Option<CssPixels> {
-        let mut children = Vec::new();
-        let mut child = callbacks.first_child(box_);
-        while !child.is_invalid() {
-            children.push(child);
-            child = callbacks.next_sibling(child);
-        }
-        if baseline_set == BaselineSet::Last {
-            children.reverse();
-        }
-        for child in children {
+        let mut next_child = match baseline_set {
+            BaselineSet::First => callbacks.first_child(box_),
+            BaselineSet::Last => callbacks.last_child(box_),
+        };
+        while !next_child.is_invalid() {
+            let child = next_child;
+            next_child = match baseline_set {
+                BaselineSet::First => callbacks.next_sibling(child),
+                BaselineSet::Last => callbacks.previous_sibling(child),
+            };
             let child_facts = NodeFacts::new(callbacks, child);
             if !child_facts.is_flow_layout_participant() || (!inhibits_floating && child_facts.is_floating()) {
                 continue;
@@ -821,14 +786,6 @@ pub(crate) enum SizingProperty {
     FlexBasis,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct FlexLayoutItemRect {
-    pub(crate) x: CssPixels,
-    pub(crate) y: CssPixels,
-    pub(crate) width: CssPixels,
-    pub(crate) height: CssPixels,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FlexLayoutClampState {
     Unclamped,
@@ -845,7 +802,7 @@ pub(crate) enum FlexLayoutGrowthState {
 #[derive(Debug, PartialEq)]
 pub(crate) struct FlexLayoutItem {
     pub(crate) node_id: Option<i64>,
-    pub(crate) rect: FlexLayoutItemRect,
+    pub(crate) rect: CssPixelRect,
     pub(crate) main_base_size: CssPixels,
     pub(crate) main_delta_size: CssPixels,
     pub(crate) main_min_size: CssPixels,

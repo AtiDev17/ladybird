@@ -157,7 +157,7 @@ public:
     EventResult handle_drag_and_drop_event(DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files);
     EventResult handle_pinch_event(DevicePixelPoint point, unsigned modifiers, double scale);
 
-    EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text);
+    EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action = false);
     EventResult handle_keyup(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat);
 
     void handle_sdl_input_events();
@@ -186,6 +186,12 @@ public:
     void set_async_scrolling_enabled(bool b) { m_async_scrolling_enabled = b; }
     u64 wheel_event_listener_state_generation() const { return m_wheel_event_listener_state_generation; }
     void invalidate_compositor_wheel_event_listener_state();
+    void invalidate_compositor_keyboard_scroll_state();
+    void invalidate_compositor_keyboard_scroll_state_for_document(DOM::Document const&);
+    void keyboard_scroll_event_path_changed(DOM::EventTarget const&);
+    void keyboard_scroll_dom_tree_changed(DOM::Node const&);
+    void keyboard_scroll_editability_changed(DOM::Document&);
+    Compositor::KeyboardScrollState take_keyboard_scroll_state_for_compositor(u64 visual_context_tree_structural_epoch);
     bool needs_beforeunload_check() const { return m_needs_beforeunload_check; }
     void update_needs_beforeunload_check();
 
@@ -397,6 +403,12 @@ private:
     bool m_enable_primary_paste { true };
     bool m_async_scrolling_enabled { false };
     u64 m_wheel_event_listener_state_generation { 0 };
+    u64 m_keyboard_scroll_state_generation { 0 };
+    bool m_keyboard_scroll_state_is_current { false };
+    bool m_keyboard_scroll_state_is_scrollable { false };
+    bool m_keyboard_scroll_focus_is_editable { false };
+    Vector<GC::Weak<DOM::EventTarget>> m_keyboard_scroll_event_path;
+    GC::Weak<DOM::Node> m_keyboard_scroll_dom_target;
     bool m_needs_beforeunload_check { true };
 
     // https://w3c.github.io/webdriver/#dfn-webdriver-active-flag
@@ -511,6 +523,7 @@ public:
     virtual Optional<Compositor::CompositorContextId> compositor_context_id_for_remote_child_frame(HTML::CrossProcessId) const { return {}; }
     virtual String dump_site_isolation_process_tree_for_testing() { return {}; }
     virtual void crash_remote_frame_processes_for_testing() { }
+    virtual void send_bad_ipc_message_for_testing([[maybe_unused]] StringView kind, [[maybe_unused]] URL::URL const& active_document_url) { }
     virtual Gfx::Palette palette() const = 0;
     virtual DevicePixelRect screen_rect() const = 0;
     virtual double zoom_level() const = 0;
@@ -554,7 +567,7 @@ public:
     virtual void page_did_request_exit_fullscreen() { }
     virtual void page_did_create_new_document(Web::DOM::Document&) { }
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) { }
-    virtual void page_did_finish_loading(Optional<Utf16String> const&, URL::URL const&) { }
+    virtual void page_did_finish_loading(HTML::CrossProcessId, Optional<Utf16String> const&) { }
     virtual Optional<u64> page_did_start_download(HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data)
     {
         (void)navigable_id;

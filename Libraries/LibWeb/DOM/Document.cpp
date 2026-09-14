@@ -3794,6 +3794,7 @@ void Document::set_focused_area(GC::Ptr<Node> node, InvalidateFocusPseudoClasses
     if (m_focused_area == node)
         return;
 
+    page().invalidate_compositor_keyboard_scroll_state_for_document(*this);
     GC::Ptr old_focused_area = m_focused_area;
 
     if (auto* old_focused_element = as_if<Element>(old_focused_area.ptr()))
@@ -4403,7 +4404,7 @@ void Document::update_readiness(HTML::DocumentReadyState readiness_value)
             if (!is_decoded_svg()) {
                 HTML::HTMLLinkElement::load_fallback_favicon_if_needed(*this);
             }
-            navigable->page().client().page_did_finish_loading(m_navigation_id, url());
+            navigable->page().client().page_did_finish_loading(navigable->id(), m_navigation_id);
         } else {
             m_needs_to_call_page_did_load = true;
         }
@@ -6206,7 +6207,7 @@ void Document::make_active()
     HTML::relevant_settings_object(window).execution_ready = true;
 
     if (m_needs_to_call_page_did_load) {
-        navigable()->page().client().page_did_finish_loading(m_navigation_id, url());
+        navigable()->page().client().page_did_finish_loading(navigable()->id(), m_navigation_id);
         m_needs_to_call_page_did_load = false;
     }
 

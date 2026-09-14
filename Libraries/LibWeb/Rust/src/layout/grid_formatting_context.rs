@@ -5,6 +5,7 @@
  */
 
 use super::*;
+use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Alignment {
@@ -1027,7 +1028,9 @@ impl<'pass> GridFormattingContext<'pass> {
             records: run.records,
             grid_container,
             derived_baselines_of_root_box: DerivedBaselines::default(),
-            parent_grid: parent_grid.map(|parent| ParentGridData::for_child_container(parent, grid_container)),
+            parent_grid: parent_grid
+                .filter(|_| grid_template_declares_a_subgrid_axis(&run.callbacks, grid_container))
+                .map(|parent| ParentGridData::for_child_container(parent, grid_container)),
             layout_mode: run.layout_mode,
             callbacks: run.callbacks,
             should_collect_devtools_layout_data: run.should_collect_devtools_layout_data,
@@ -1423,20 +1426,11 @@ impl<'pass> GridFormattingContext<'pass> {
         if self.is_subgridded(axis, grid_style) {
             let parent_item = self.parent_grid_placement().unwrap();
             let track_count = parent_item.span(axis);
-            let inherited = self
-                .parent_grid()
-                .map(|parent| {
-                    let lines = axis.select(&parent.column_lines, &parent.row_lines);
-                    let start = parent_item.position(axis).max(0) as usize;
-                    lines
-                        .iter()
-                        .skip(start)
-                        .take(track_count.saturating_add(1))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            return expand_subgrid(source, list, track_count, &inherited);
+            let parent = self.parent_grid().unwrap();
+            let lines = axis.select(&parent.column_lines, &parent.row_lines);
+            let start = (parent_item.position(axis).max(0) as usize).min(lines.len());
+            let end = start.saturating_add(track_count.saturating_add(1)).min(lines.len());
+            return expand_subgrid(source, list, track_count, &lines[start..end]);
         }
         expand_standalone(source, list, |_index, entry| {
             self.automatic_repeat_count(source, list, entry, axis)
@@ -1446,7 +1440,7 @@ impl<'pass> GridFormattingContext<'pass> {
     fn initialize_lines(
         &mut self,
         grid_style: &'pass GridValues,
-    ) -> (ExpandedTrackList<'pass>, ExpandedTrackList<'pass>) {
+    ) -> (Vec<TrackDefinition<'pass>>, Vec<TrackDefinition<'pass>>) {
         let mut columns = self.expand_axis(Axis::Column, grid_style);
         let mut rows = self.expand_axis(Axis::Row, grid_style);
         self.project_parent_grid_areas(
@@ -1463,9 +1457,9 @@ impl<'pass> GridFormattingContext<'pass> {
         );
         self.explicit_column_line_count = columns.lines.len();
         self.explicit_row_line_count = rows.lines.len();
-        self.column_lines.clone_from(&columns.lines);
-        self.row_lines.clone_from(&rows.lines);
-        (columns, rows)
+        self.column_lines = columns.lines;
+        self.row_lines = rows.lines;
+        (columns.tracks, rows.tracks)
     }
 
     fn axis_placements(
@@ -1647,7 +1641,7 @@ impl<'pass> GridFormattingContext<'pass> {
         &self,
         axis: Axis,
         grid_style: &'pass GridValues,
-        explicit: &ExpandedTrackList<'pass>,
+        explicit: &[TrackDefinition<'pass>],
         total_count: usize,
         explicit_start: usize,
     ) -> Vec<Track<'pass>> {
@@ -1704,7 +1698,7 @@ impl<'pass> GridFormattingContext<'pass> {
                 Track::from_definition(definition)
             });
         }
-        tracks.extend(explicit.tracks.iter().copied().map(Track::from_definition));
+        tracks.extend(explicit.iter().copied().map(Track::from_definition));
         // NOTE: If there are implicit tracks created by items with negative indexes they should prepend explicitly defined tracks
         while tracks.len() < total_count {
             tracks.push(if automatic.is_empty() {
@@ -1771,8 +1765,8 @@ impl<'pass> GridFormattingContext<'pass> {
     fn initialize_tracks(
         &mut self,
         grid_style: &'pass GridValues,
-        columns: &ExpandedTrackList<'pass>,
-        rows: &ExpandedTrackList<'pass>,
+        columns: &[TrackDefinition<'pass>],
+        rows: &[TrackDefinition<'pass>],
     ) {
         self.columns = self.initialize_tracks_for_axis(
             Axis::Column,
@@ -1872,17 +1866,13 @@ impl<'pass> GridFormattingContext<'pass> {
         }
     }
 
-    fn spanned_interleaved_indices(item: GridItem, axis: Axis, track_count: usize) -> Vec<usize> {
+    fn spanned_interleaved_range(item: GridItem, axis: Axis, track_count: usize) -> Range<usize> {
         let start = item.position(axis).max(0) as usize;
         let end = start.saturating_add(item.span(axis)).min(track_count);
-        let mut indices = Vec::new();
-        for track in start..end {
-            indices.push(Self::interleaved_index_of_track(track));
-            if track + 1 < end {
-                indices.push(Self::interleaved_index_of_gap_after_track(track));
-            }
+        if start >= end {
+            return 0..0;
         }
-        indices
+        Self::interleaved_index_of_track(start)..Self::interleaved_index_of_track(end) - 1
     }
 
     fn containing_block_size(&self, item: GridItem, axis: Axis) -> CssPixels {
@@ -2356,7 +2346,7 @@ impl<'pass> GridFormattingContext<'pass> {
     }
 
     fn item_contribution(&self, item: GridItem, axis: Axis, combined_track_count: usize) -> ItemContribution {
-        let spanned_tracks = Self::spanned_interleaved_indices(item, axis, combined_track_count);
+        let spanned_tracks = Self::spanned_interleaved_range(item, axis, combined_track_count);
         let is_scroll_container = self.facts(item.box_).is_scroll_container();
         if !self.item_contributes_to_track_sizing(item, axis) {
             return ItemContribution {
@@ -2498,9 +2488,8 @@ impl<'pass> GridFormattingContext<'pass> {
             let interleaved_index_offset_in_parent =
                 Self::interleaved_index_of_track(subgrid.position(axis).max(0) as usize);
             for contribution in &mut contributions {
-                for index in &mut contribution.spanned_tracks {
-                    *index += interleaved_index_offset_in_parent;
-                }
+                contribution.spanned_tracks.start += interleaved_index_offset_in_parent;
+                contribution.spanned_tracks.end += interleaved_index_offset_in_parent;
             }
             contributions
         })
@@ -3581,8 +3570,8 @@ pub(crate) enum SpaceDistributionPhase {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ItemContribution {
-    /// Indices into the axis's interleaved track-and-gap array, in span order.
-    pub(crate) spanned_tracks: Vec<usize>,
+    /// Range in the axis's interleaved track-and-gap array, excluding the trailing gap.
+    pub(crate) spanned_tracks: Range<usize>,
     pub(crate) span: usize,
     pub(crate) minimum: CssPixels,
     pub(crate) min_content: CssPixels,
@@ -3610,22 +3599,21 @@ fn distribute_base_sizes_for_span_group(
     for item in group {
         let spanned = &item.spanned_tracks;
         let affected = spanned
-            .iter()
-            .copied()
+            .clone()
             .filter(|&index| matcher(&tracks[index]))
             .collect::<Vec<_>>();
         if affected.is_empty() {
             continue;
         }
-        for &index in spanned {
+        for index in spanned.clone() {
             incurred[index] = CssPixels::default();
             frozen[index] = false;
         }
         // 1. Find the space to distribute: subtract the base size of every spanned track from the
         //    item's size contribution to find the item's remaining size contribution.
         let spanned_size = spanned
-            .iter()
-            .fold(CssPixels::default(), |sum, &index| sum + tracks[index].base_size);
+            .clone()
+            .fold(CssPixels::default(), |sum, index| sum + tracks[index].base_size);
         let mut space = CssPixels::default().max(contribution_of(item) - spanned_size);
         // 2. Distribute space up to limits: for base sizes, a limit of the growth limit, capped by
         //    the fit-content() argument for fit-content() tracks.
@@ -3718,8 +3706,7 @@ fn distribute_growth_limits_for_span_group(
     for item in group {
         let spanned = &item.spanned_tracks;
         let affected = spanned
-            .iter()
-            .copied()
+            .clone()
             .filter(|&index| matcher(&tracks[index]))
             .collect::<Vec<_>>();
         if affected.is_empty() {
@@ -3731,7 +3718,7 @@ fn distribute_growth_limits_for_span_group(
         }
         // 1. Find the space to distribute: for growth limits, the corresponding size of a spanned
         //    track is its growth limit, or its base size while the growth limit is still infinite.
-        let accounted = spanned.iter().fold(CssPixels::default(), |sum, &index| {
+        let accounted = spanned.clone().fold(CssPixels::default(), |sum, index| {
             sum + tracks[index].growth_limit.unwrap_or(tracks[index].base_size)
         });
         let mut space = CssPixels::default().max(contribution_of(item) - accounted);
@@ -3845,9 +3832,9 @@ pub(crate) fn resolve_intrinsic_track_sizes(
                 item.span == span
                     && !item
                         .spanned_tracks
-                        .iter()
-                        .any(|&index| tracks[index].max_sizing.flex_factor().is_some())
-                    && item.spanned_tracks.iter().any(|&index| {
+                        .clone()
+                        .any(|index| tracks[index].max_sizing.flex_factor().is_some())
+                    && item.spanned_tracks.clone().any(|index| {
                         tracks[index].min_sizing.is_intrinsic(available)
                             || tracks[index].max_sizing.is_intrinsic(available)
                     })
@@ -3996,7 +3983,7 @@ pub(crate) fn resolve_intrinsic_track_sizes(
             let mut total_flex = 0.0;
             let mut flexible_count = 0usize;
             let mut non_flexible_space = CssPixels::default();
-            for &index in &item.spanned_tracks {
+            for index in item.spanned_tracks.clone() {
                 if let Some(factor) = tracks[index].max_sizing.flex_factor()
                     && dominated(&tracks[index])
                 {
@@ -4045,7 +4032,7 @@ pub(crate) fn resolve_intrinsic_track_sizes(
             // - If the sum is less than one, distributing that proportion of space according to the ratios of their
             //   flexible sizing functions and the rest equally.
             // FIXME: Handle 0 < total_flex < 1 case separately per spec.
-            for &index in &item.spanned_tracks {
+            for index in item.spanned_tracks.clone() {
                 let Some(factor) = tracks[index].max_sizing.flex_factor() else {
                     continue;
                 };
@@ -4149,17 +4136,12 @@ pub(crate) fn expand_flexible_tracks_indefinite(tracks: &mut [Track<'_>], items:
     for item in items {
         if !item
             .spanned_tracks
-            .iter()
-            .any(|index| tracks[*index].flex_factor.is_some())
+            .clone()
+            .any(|index| tracks[index].flex_factor.is_some())
         {
             continue;
         }
-        let local = item
-            .spanned_tracks
-            .iter()
-            .map(|index| tracks[*index])
-            .collect::<Vec<_>>();
-        flex_fraction = flex_fraction.max(find_fr_size(&local, item.max_content));
+        flex_fraction = flex_fraction.max(find_fr_size(&tracks[item.spanned_tracks.clone()], item.max_content));
     }
     for track in tracks {
         if let Some(factor) = track.flex_factor {

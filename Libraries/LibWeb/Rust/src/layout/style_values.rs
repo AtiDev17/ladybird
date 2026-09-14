@@ -18,10 +18,10 @@ pub(crate) enum InsetField {
 /// A resolved px-or-auto inset produced by anchor resolution. It takes
 /// precedence over every style read and reports
 /// contains_anchor_function() == false.
-#[derive(Clone, Copy)]
-pub(crate) struct ResolvedInsetOverride {
-    pub(crate) is_auto: bool,
-    pub(crate) px: CssPixels,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedInsetOverride {
+    Auto,
+    Pixels(CssPixels),
 }
 
 #[derive(Clone, Copy)]
@@ -33,17 +33,14 @@ pub(crate) enum InsetValue<'a> {
 
 impl InsetValue<'_> {
     pub(crate) fn auto_value() -> Self {
-        Self::Resolved(ResolvedInsetOverride {
-            is_auto: true,
-            px: CssPixels::default(),
-        })
+        Self::Resolved(ResolvedInsetOverride::Auto)
     }
 
     pub(crate) fn is_auto(self) -> bool {
         match self {
             Self::FromStyle(value) => value.is_auto(),
             Self::BareAnchor(_) => false,
-            Self::Resolved(resolved) => resolved.is_auto,
+            Self::Resolved(resolved) => matches!(resolved, ResolvedInsetOverride::Auto),
         }
     }
 
@@ -51,8 +48,8 @@ impl InsetValue<'_> {
         match self {
             Self::FromStyle(value) => value.to_px(reference),
             Self::BareAnchor(wrapper) => resolve_calc_to_px(std::ptr::from_ref(wrapper).cast(), reference),
-            Self::Resolved(resolved) if resolved.is_auto => CssPixels::default(),
-            Self::Resolved(resolved) => resolved.px,
+            Self::Resolved(ResolvedInsetOverride::Auto) => CssPixels::default(),
+            Self::Resolved(ResolvedInsetOverride::Pixels(px)) => px,
         }
     }
 
@@ -96,7 +93,7 @@ impl InsetValue<'_> {
 pub(crate) struct StyleValues<'a> {
     style: ComputedValuesView<'a>,
     resolved_anchor_insets: Option<&'a formatting_context::ResolvedAnchorInsets>,
-    vertical_align_override: u16,
+    vertical_align_override: Option<u8>,
 }
 
 impl<'a> std::ops::Deref for StyleValues<'a> {
@@ -113,7 +110,7 @@ impl<'a> StyleValues<'a> {
         Self {
             style: ComputedValuesView::new(&payloads.groups),
             resolved_anchor_insets: None,
-            vertical_align_override: u16::MAX,
+            vertical_align_override: None,
         }
     }
 
@@ -184,20 +181,17 @@ impl<'a> StyleValues<'a> {
     }
 
     pub(crate) fn with_vertical_align_keyword(mut self, keyword: u8) -> Self {
-        self.vertical_align_override = keyword as u16;
+        self.vertical_align_override = Some(keyword);
         self
     }
 
     pub(crate) fn vertical_align_is_keyword(self) -> bool {
-        self.vertical_align_override != u16::MAX || self.style.box_values().vertical_align.is_keyword
+        self.vertical_align_override.is_some() || self.style.box_values().vertical_align.is_keyword
     }
 
     pub(crate) fn vertical_align_keyword(self) -> u8 {
-        if self.vertical_align_override != u16::MAX {
-            self.vertical_align_override as u8
-        } else {
-            self.style.box_values().vertical_align.keyword
-        }
+        self.vertical_align_override
+            .unwrap_or_else(|| self.style.box_values().vertical_align.keyword)
     }
 }
 

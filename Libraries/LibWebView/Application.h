@@ -61,6 +61,7 @@
 
 namespace Web {
 
+struct KeyEvent;
 struct MouseEvent;
 struct PinchEvent;
 
@@ -101,6 +102,7 @@ public:
     virtual Optional<String> ui_font_family() const { return {}; }
 
     static Requests::RequestClient& request_server_client(IsPrivate = IsPrivate::No);
+    static Requests::RequestControlClient& request_server_control_client() { return *the().m_request_server_control_client; }
     static ImageDecoderClient::Client& image_decoder_client() { return *the().m_image_decoder_client; }
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     static WasmCompilerClient::Client& wasm_compiler_client() { return *the().m_wasm_compiler_client; }
@@ -195,6 +197,8 @@ public:
     void update_compositor_context_visibility(Web::Compositor::CompositorContextId, Web::HTML::VisibilityState);
     bool send_async_scroll_to_compositor(Web::Compositor::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Web::WheelDeltaPrecision, Web::ScrollGesturePhase);
     bool handle_mouse_event_in_compositor(Web::Compositor::CompositorContextId, Web::MouseEvent const&);
+    bool handle_key_event_in_compositor(Web::Compositor::CompositorContextId, Web::KeyEvent const&);
+    bool dispatch_key_event_to_web_content(Web::Compositor::CompositorContextId, Web::KeyEvent const&);
     bool handle_pinch_event_in_compositor(Web::Compositor::CompositorContextId, Web::PinchEvent const&);
     bool dispatch_mouse_event_to_web_content(Web::Compositor::CompositorContextId, Web::MouseEvent const&);
     void notify_compositor_presented_bitmap_ready_to_paint(Web::Compositor::CompositorContextId, i32 bitmap_id);
@@ -533,6 +537,7 @@ private:
     bool m_webdriver_browser_connection_failed { false };
     WebDriverSessionConfig m_webdriver_session_config;
 
+    RefPtr<Requests::RequestControlClient> m_request_server_control_client;
     RefPtr<Requests::RequestClient> m_request_server_client;
     RefPtr<Requests::RequestClient> m_private_request_server_client;
     RefPtr<ImageDecoderClient::Client> m_image_decoder_client;

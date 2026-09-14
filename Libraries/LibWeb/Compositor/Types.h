@@ -52,16 +52,28 @@ enum class AsyncScrollUpdateFreshness : u8 {
     FromCompositor,
 };
 
-// A snap scroll the compositor started for wheel input of its own: the main thread registers it as a user scroll
-// in flight. A scroll started for a step of a gesture is owed the scrollend event by that gesture, which continues
-// from the offset its steps have asked for; a scroll started for the end of a gesture settles the gesture.
-struct StartedSnapScroll {
+// A scroll the compositor started for user input of its own: the main thread registers it as a user scroll in
+// flight. A scroll started for a step of a gesture is owed the scrollend event by that gesture, which continues
+// from the offset its steps have asked for; a scroll started for the end of a gesture settles the gesture. The
+// selection of a scroll that snapped along no axis carries only the destination. Repeated reports for the same
+// operation update its accumulated input without starting another animation.
+struct StartedUserScroll {
     AsyncScrollNodeStableID stable_node_id;
     AsyncScrollOperationID operation_id { 0 };
     CSSPixelPoint initial_scroll_offset;
     CSSPixelPoint unsnapped_scroll_destination;
     SnapDestination selection;
     bool settles_gesture { false };
+};
+
+// Published with a display list or an incremental scroll-state snapshot. An absent target keeps keyboard default
+// actions on WebContent. The epoch also binds incremental updates to the tree whose target they describe.
+struct KeyboardScrollState {
+    u64 generation { 0 };
+    u64 visual_context_tree_structural_epoch { 0 };
+    Optional<AsyncScrollNodeStableID> target;
+    float page_scroll_distance { 0 };
+    float arrow_scroll_distance { 0 };
 };
 
 struct PendingAsyncScrollUpdates {
@@ -71,7 +83,7 @@ struct PendingAsyncScrollUpdates {
     Vector<AsyncScrollOffset> scroll_offsets;
     Vector<AsyncScrollOperationID> completed_operation_ids;
     Vector<AsyncScrollOperationID> operation_ids_taken_over_by_user_input;
-    Vector<StartedSnapScroll> started_snap_scrolls;
+    Vector<StartedUserScroll> started_user_scrolls;
     bool user_scroll_gesture_in_progress { false };
     bool user_scroll_gesture_ended { false };
 };
@@ -106,6 +118,11 @@ template<>
 WEB_API ErrorOr<Web::Compositor::AsyncScrollNodeStableID> decode(Decoder&);
 
 template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::Compositor::KeyboardScrollState const&);
+template<>
+WEB_API ErrorOr<Web::Compositor::KeyboardScrollState> decode(Decoder&);
+
+template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::Compositor::AsyncScrollOffset const&);
 template<>
 WEB_API ErrorOr<Web::Compositor::AsyncScrollOffset> decode(Decoder&);
@@ -121,9 +138,9 @@ template<>
 WEB_API ErrorOr<Web::Compositor::SnapDestination> decode(Decoder&);
 
 template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::Compositor::StartedSnapScroll const&);
+WEB_API ErrorOr<void> encode(Encoder&, Web::Compositor::StartedUserScroll const&);
 template<>
-WEB_API ErrorOr<Web::Compositor::StartedSnapScroll> decode(Decoder&);
+WEB_API ErrorOr<Web::Compositor::StartedUserScroll> decode(Decoder&);
 
 template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::Compositor::PendingAsyncScrollUpdates const&);

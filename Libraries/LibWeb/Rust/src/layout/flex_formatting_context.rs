@@ -142,13 +142,11 @@ impl FlexItem<'_> {
     }
 }
 
-#[derive(Clone)]
 struct FlexLine {
     items: Vec<usize>,
     cross_size: CssPixels,
     has_baseline_aligned_items: bool,
     remaining_free_space: Option<CssPixels>,
-    chosen_flex_fraction: f64,
     growth_state: formatting_context::FlexLayoutGrowthState,
 }
 
@@ -159,7 +157,6 @@ impl Default for FlexLine {
             cross_size: CssPixels::default(),
             has_baseline_aligned_items: false,
             remaining_free_space: None,
-            chosen_flex_fraction: 0.0,
             growth_state: formatting_context::FlexLayoutGrowthState::Growing,
         }
     }
@@ -1273,10 +1270,11 @@ impl<'pass> FlexFormattingContext<'pass> {
 
     // https://www.w3.org/TR/css-flexbox-1/#algo-line-break
     fn collect_flex_items_into_flex_lines(&mut self) {
+        let reverse = self.is_direction_reverse();
         // If the flex container is single-line, collect all the flex items into a single flex line.
         if self.is_single_line() {
             let mut items: Vec<_> = (0..self.flex_items.len()).collect();
-            if self.is_direction_reverse() {
+            if reverse {
                 items.reverse();
             }
             self.flex_lines.push(FlexLine {
@@ -1306,18 +1304,20 @@ impl<'pass> FlexFormattingContext<'pass> {
                     .main
                     .pixels_greater_than(line_main_size + outer)
             {
+                if reverse {
+                    line.items.reverse();
+                }
                 self.flex_lines.push(line);
                 line = FlexLine::default();
                 line_main_size = CssPixels::default();
             }
-            if self.is_direction_reverse() {
-                line.items.insert(0, index);
-            } else {
-                line.items.push(index);
-            }
+            line.items.push(index);
             line_main_size += outer;
             // CSS-FLEXBOX-2: Account for gap between flex items.
             line_main_size += self.main_gap();
+        }
+        if reverse {
+            line.items.reverse();
         }
         self.flex_lines.push(line);
     }
@@ -2544,7 +2544,7 @@ impl<'pass> FlexFormattingContext<'pass> {
                 let writing_mode = self.style(self.flex_container).writing_mode();
                 let (x, y) = geometry::to_physical(writing_mode, logical_inline_offset, logical_block_offset);
                 let (width, height) = geometry::to_physical(writing_mode, logical_inline_size, logical_block_size);
-                let rect = formatting_context::FlexLayoutItemRect { x, y, width, height };
+                let rect = CssPixelRect { x, y, width, height };
                 let node = item.box_;
                 let style = self.style(node);
                 let main_size_property = self.select_main(style.width(), style.height());
@@ -2637,6 +2637,15 @@ impl<'pass> FlexFormattingContext<'pass> {
         //     the aspect ratio.
         let node = self.flex_items[index].box_;
         if !self.cross_axis_is_horizontal() || !self.has_definite_main_size(index) {
+            return None;
+        }
+        // https://www.w3.org/TR/CSS2/visudet.html#inline-replaced-width
+        // If 'height' and 'width' both have computed values of 'auto' [...] then that intrinsic width
+        // is the used value of 'width'.
+        // NB: A replaced element with a natural inline size contributes that size. Its post-flexing
+        //     block size must not replace the natural inline size through the aspect ratio. Explicit
+        //     computed heights are handled by the intrinsic inline size calculation instead.
+        if self.facts(node).is_replaced_box() && self.facts(node).has_auto_content_width() {
             return None;
         }
         let ratio = self.facts(node).preferred_aspect_ratio()?;
@@ -2761,9 +2770,7 @@ impl<'pass> FlexFormattingContext<'pass> {
     fn determine_intrinsic_size_of_flex_container(&mut self) {
         let available_space = self.available_space_for_items.unwrap();
         if available_space.main.is_intrinsic_sizing_constraint() {
-            let flex_lines = self.flex_lines.clone();
             let size = self.calculate_intrinsic_main_size_of_flex_container();
-            self.flex_lines = flex_lines;
             self.set_container_main_size(size);
         }
         if available_space.cross.is_intrinsic_sizing_constraint() {
@@ -2800,10 +2807,7 @@ impl<'pass> FlexFormattingContext<'pass> {
         let automatic_block_size = if self.main_axis_is_horizontal() {
             self.automatic_block_size_from_line_cross_sizes()
         } else {
-            let flex_lines = self.flex_lines.clone();
-            let size = self.calculate_intrinsic_main_size_of_flex_container();
-            self.flex_lines = flex_lines;
-            size
+            self.calculate_intrinsic_main_size_of_flex_container()
         };
         self.resolve_own_auto_block_size(automatic_block_size, resolution_space);
     }
@@ -2831,7 +2835,6 @@ impl<'pass> FlexFormattingContext<'pass> {
             self.determine_flex_base_size(index);
         }
         let max_content_main_size = self.calculate_intrinsic_main_size_of_flex_container();
-        self.flex_lines.clear();
         self.determine_available_space_for_items(real_space_for_items);
         self.resolve_own_auto_block_size(max_content_main_size, resolution_space);
     }
@@ -2919,75 +2922,62 @@ impl<'pass> FlexFormattingContext<'pass> {
             self.flex_items[index].desired_flex_fraction = adjusted.to_double();
         }
 
-        // 2. Place all flex items into lines of infinite length.
-        self.flex_lines.clear();
-        if !self.flex_items.is_empty() {
-            // FIXME: Honor breaking requests.
-            self.flex_lines.push(FlexLine {
-                items: (0..self.flex_items.len()).collect(),
-                ..Default::default()
-            });
+        // 2. Place all flex items into a line of infinite length and find its greatest desired flex fraction.
+        // FIXME: Honor breaking requests.
+        let mut greatest = 0.0f32;
+        let mut grow_sum = 0.0f32;
+        let mut shrink_sum = 0.0f32;
+        for item in &self.flex_items {
+            greatest = greatest.max(item.desired_flex_fraction as f32);
+            grow_sum += self.style(item.box_).flex_grow() as f32;
+            shrink_sum += self.flex_shrink_factor(item.box_) as f32;
         }
-        //    Within each line, find the greatest (most positive) desired flex fraction among all the flex items.
-        //    This is the line’s chosen flex fraction.
-        for line_index in 0..self.flex_lines.len() {
-            let mut greatest = 0.0f32;
-            let mut grow_sum = 0.0f32;
-            let mut shrink_sum = 0.0f32;
-            for index in self.flex_lines[line_index].items.iter().copied() {
-                greatest = greatest.max(self.flex_items[index].desired_flex_fraction as f32);
-                let node = self.flex_items[index].box_;
-                grow_sum += self.style(node).flex_grow() as f32;
-                shrink_sum += self.flex_shrink_factor(node) as f32;
-            }
-            let mut chosen = greatest;
-            // 3. If the chosen flex fraction is positive, and the sum of the line’s flex grow factors is less than 1,
-            //    divide the chosen flex fraction by that sum.
-            if chosen > 0.0 && grow_sum < 1.0 {
-                chosen /= grow_sum;
-            }
-            // If the chosen flex fraction is negative, and the sum of the line’s flex shrink factors is less than 1,
-            // multiply the chosen flex fraction by that sum.
-            if chosen < 0.0 && shrink_sum < 1.0 {
-                chosen *= shrink_sum;
-            }
-            self.flex_lines[line_index].chosen_flex_fraction = chosen as f64;
+        let mut chosen = greatest;
+        // 3. If the chosen flex fraction is positive, and the sum of the line's flex grow factors is less than 1,
+        //    divide the chosen flex fraction by that sum.
+        if chosen > 0.0 && grow_sum < 1.0 {
+            chosen /= grow_sum;
         }
+        // If the chosen flex fraction is negative, and the sum of the line's flex shrink factors is less than 1,
+        // multiply the chosen flex fraction by that sum.
+        if chosen < 0.0 && shrink_sum < 1.0 {
+            chosen *= shrink_sum;
+        }
+        let chosen = f64::from(chosen);
 
-        let mut largest_sum = CssPixels::default();
-        for line_index in 0..self.flex_lines.len() {
-            // 4. Add each item’s flex base size to the product of its flex grow factor (scaled flex shrink factor, if shrinking)
-            //    and the chosen flex fraction, then clamp that result by the max main size floored by the min main size.
-            let mut sum = CssPixels::default();
-            for index in self.flex_lines[line_index].items.iter().copied() {
-                let desired = self.flex_items[index].desired_flex_fraction;
-                let style = self.style(self.flex_items[index].box_);
-                let product = if desired > 0.0 {
-                    self.flex_lines[line_index].chosen_flex_fraction * style.flex_grow()
-                } else if desired < 0.0 {
-                    self.flex_lines[line_index].chosen_flex_fraction * self.flex_items[index].scaled_flex_shrink_factor
-                } else {
-                    0.0
-                };
-                let result = self.flex_items[index].flex_base_size + CssPixels::nearest_value_for(product);
-                let min = self.computed_main_min_size(self.flex_items[index].box_).0;
-                let clamp_min = if !min.is_auto() && !min.contains_percentage() {
-                    self.specified_main_min_size(index)
-                } else {
-                    self.automatic_minimum_size(index)
-                };
-                let clamp_max = self.specified_main_max_size_for_intrinsic_contribution(
-                    index,
-                    self.available_space_for_items.unwrap().main,
-                );
-                // NOTE: The spec doesn't mention anything about the *outer* size here, but if we don't add the margin box,
-                //       flex items with non-zero padding/border/margin in the main axis end up overflowing the container.
-                sum += self.flex_items[index].add_main_margin_box_sizes(css_clamp(result, clamp_min, clamp_max));
-            }
-            // CSS-FLEXBOX-2: Account for gap between flex items.
-            sum += self.main_gap() * self.flex_lines[line_index].items.len().wrapping_sub(1);
-            largest_sum = largest_sum.max(sum);
+        // 4. Add each item's flex base size to the product of its flex grow factor (scaled flex shrink factor, if shrinking)
+        //    and the chosen flex fraction, then clamp that result by the max main size floored by the min main size.
+        let mut sum = CssPixels::default();
+        for index in 0..self.flex_items.len() {
+            let desired = self.flex_items[index].desired_flex_fraction;
+            let style = self.style(self.flex_items[index].box_);
+            let product = if desired > 0.0 {
+                chosen * style.flex_grow()
+            } else if desired < 0.0 {
+                chosen * self.flex_items[index].scaled_flex_shrink_factor
+            } else {
+                0.0
+            };
+            let result = self.flex_items[index].flex_base_size + CssPixels::nearest_value_for(product);
+            let min = self.computed_main_min_size(self.flex_items[index].box_).0;
+            let clamp_min = if !min.is_auto() && !min.contains_percentage() {
+                self.specified_main_min_size(index)
+            } else {
+                self.automatic_minimum_size(index)
+            };
+            let clamp_max = self.specified_main_max_size_for_intrinsic_contribution(
+                index,
+                self.available_space_for_items.unwrap().main,
+            );
+            // NOTE: The spec doesn't mention anything about the *outer* size here, but if we don't add the margin box,
+            //       flex items with non-zero padding/border/margin in the main axis end up overflowing the container.
+            sum += self.flex_items[index].add_main_margin_box_sizes(css_clamp(result, clamp_min, clamp_max));
         }
+        // CSS-FLEXBOX-2: Account for gap between flex items.
+        if !self.flex_items.is_empty() {
+            sum += self.main_gap() * (self.flex_items.len() - 1);
+        }
+        let largest_sum = sum.max(CssPixels::default());
         // 5. The flex container’s max-content size is the largest sum (among all the lines) of the afore-calculated sizes of all items within a single line.
         self.set_container_main_size(largest_sum);
         largest_sum

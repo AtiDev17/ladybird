@@ -381,6 +381,26 @@ WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Painting::Acc
     return hit_test_result_for_scroll_node(*viewport_node_id, delta);
 }
 
+Optional<AsyncScrollNodeID> AsyncScrollTree::scroll_node_for_keyboard_scroll(AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint delta, Painting::ScrollStateSnapshot const& scroll_state_snapshot) const
+{
+    auto const* node = scroll_node_for_stable_id(stable_node_id);
+    if (!node)
+        return {};
+
+    // Keyboard routing does not depend on pointer or wheel-listener regions.
+    if (can_scroll_node_by_delta(*node, scroll_state_snapshot, delta))
+        return node->node_id;
+    return scrollable_ancestor_for_node(node->node_id, scroll_state_snapshot, delta);
+}
+
+Gfx::FloatPoint AsyncScrollTree::clamped_scroll_offset_for_node(AsyncScrollNodeID node_id, Gfx::FloatPoint scroll_offset) const
+{
+    auto const* node = scroll_node_for_id(node_id);
+    if (!node)
+        return scroll_offset;
+    return clamp_scroll_offset_to_node(*node, scroll_offset);
+}
+
 bool AsyncScrollTree::scroll_node_is_viewport(AsyncScrollNodeID node_id) const
 {
     auto const* node = scroll_node_for_id(node_id);
