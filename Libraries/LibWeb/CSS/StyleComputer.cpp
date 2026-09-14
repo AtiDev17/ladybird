@@ -1916,6 +1916,45 @@ Vector<GC::Ref<Animations::KeyframeEffect>> StyleComputer::start_needed_transiti
     return newly_started_transition_effects;
 }
 
+bool StyleComputer::has_provisional_transition_states(DOM::AbstractElement abstract_element) const
+{
+    auto& element = abstract_element.element();
+    auto pseudo_element = abstract_element.pseudo_element();
+    if (auto style_node_id = element.style_node_id(); style_node_id != 0) {
+        auto transition_target_key = (static_cast<u64>(style_node_id.value()) << 8) | pseudo_element_to_ffi(pseudo_element);
+        return m_provisional_transition_state_indices_by_target.contains(transition_target_key);
+    }
+    return any_of(m_provisional_transition_states, [&](auto const& state) {
+        return state.element == GC::Ptr { element } && state.pseudo_element == pseudo_element;
+    });
+}
+
+RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions_on_shared_style(DOM::AbstractElement abstract_element, ComputedValues const& shared_values) const
+{
+    auto& element = abstract_element.element();
+    auto pseudo_element = abstract_element.pseudo_element();
+    if (element.property_ids_with_matching_transition_property_entry(pseudo_element).is_empty()
+        && element.property_ids_with_existing_transitions(pseudo_element).is_empty()
+        && !has_provisional_transition_states(abstract_element))
+        return {};
+    auto previous_style = abstract_element.computed_style();
+    if (!previous_style || previous_style->in_display_none_subtree())
+        return {};
+    if (auto parent = abstract_element.element_to_inherit_style_from(); parent.has_value()) {
+        if (auto parent_style = parent->computed_style(); parent_style && parent_style->in_display_none_subtree())
+            return {};
+    }
+    begin_style_update();
+    ScopeGuard end_style_update = [&] { this->end_style_update(); };
+    auto style = reconstruct_computed_properties(shared_values);
+    start_needed_transitions(*style, abstract_element);
+    clear_computation_context_caches();
+    auto animated_properties = style->animated_properties_snapshot();
+    if (!animated_properties || animated_properties->is_empty())
+        return {};
+    return style;
+}
+
 // The encapsulation contexts that decide for an element, outermost first.
 //
 // https://drafts.csswg.org/css-cascade-5/#cascade-context
@@ -3725,11 +3764,6 @@ StyleEngine::StyleRecordDelta StyleComputer::record_computed_style_inputs(Option
 NonnullRefPtr<ComputedValues const> StyleComputer::materialize_style_record(DOM::AbstractElement abstract_element, Optional<bool&> did_change_custom_properties, StyleEngineMatchResult* reusable_matches, Optional<StyleEngine::StyleRecordDelta&> style_record_delta, StyleSharingMode style_sharing_mode) const
 {
     m_last_materialization_kept_pseudo_element_styles = false;
-    auto was_materializing_for_targeted_style_update = m_materializing_for_targeted_style_update;
-    m_materializing_for_targeted_style_update = true;
-    ScopeGuard restore_materialization_mode = [&] {
-        m_materializing_for_targeted_style_update = was_materializing_for_targeted_style_update;
-    };
     StyleSharingCandidate sharing;
     sharing.may_reuse_or_publish_shared_style = style_sharing_mode == StyleSharingMode::Enabled;
     auto publish_computed_groups = [&](NonnullRefPtr<ComputedValues const> values) {
@@ -3750,15 +3784,33 @@ NonnullRefPtr<ComputedValues const> StyleComputer::materialize_style_record(DOM:
     };
 
     auto& style_scope = abstract_element.style_scope();
+    auto const custom_property_data_before = abstract_element.custom_property_data();
     auto computed_properties = compute_style_impl(abstract_element, ComputeStyleMode::Normal, did_change_custom_properties, style_scope, IncludeInlineStyle::Yes, reusable_matches, &sharing);
-    if (sharing.reused_values)
-        return publish_computed_groups(sharing.reused_values.release_nonnull());
+    if (sharing.reused_values) {
+        // Only a publication tells the engine that the custom property environment moved.
+        VERIFY(!sharing.new_style_sharing_entry_hash.has_value());
+        if (abstract_element.custom_property_data().ptr() != custom_property_data_before.ptr())
+            return publish_computed_groups(sharing.reused_values.release_nonnull());
+        auto publication = const_cast<StyleComputer&>(*this).style_engine().reaffirm_style_record(
+            abstract_element.element().style_node_id(),
+            pseudo_element_to_ffi(abstract_element.pseudo_element()));
+        if (!publication.has_value())
+            return publish_computed_groups(sharing.reused_values.release_nonnull());
+        if (style_record_delta.has_value())
+            *style_record_delta = *publication;
+        return sharing.reused_values.release_nonnull();
+    }
     if (sharing.shared_values && sharing.shared_style_record_identity.has_value()) {
         auto& values = *sharing.shared_values;
+        // An inherited-group swap does not run the transition step, so an element with transitions
+        // to decide over is not eligible for one.
+        auto& element = abstract_element.element();
         bool const inherited_group_swap_eligible = !abstract_element.pseudo_element().has_value()
-            && abstract_element.element().style_input_record()
+            && element.style_input_record()
             && values.property_inheritance_is_standard()
-            && !values.display().is_list_item();
+            && !values.display().is_list_item()
+            && element.property_ids_with_existing_transitions({}).is_empty()
+            && element.property_ids_with_matching_transition_property_entry({}).is_empty();
         auto publication = const_cast<StyleComputer&>(*this).style_engine().assign_shared_style_record(
             abstract_element.element().style_node_id(),
             pseudo_element_to_ffi(abstract_element.pseudo_element()),
@@ -3787,7 +3839,7 @@ NonnullRefPtr<ComputedValues const> StyleComputer::materialize_style_record(DOM:
 static constexpr size_t style_input_record_parent_custom_properties_index = ComputedValues::inherited_style_group_count;
 static constexpr size_t style_sharing_style_scope_index = ComputedValues::inherited_style_group_count + 2;
 static constexpr size_t style_input_record_element_index = style_input_record_parent_custom_properties_index + 1;
-static constexpr size_t style_input_record_block_index = style_input_record_element_index + 6;
+static constexpr size_t style_input_record_block_index = style_input_record_element_index + 7;
 
 NonnullRefPtr<ComputedValues const> StyleComputer::build_and_share_computed_values(NonnullRefPtr<ComputedStyleWorkingSet> computed_properties, DOM::AbstractElement abstract_element, StyleScope const& style_scope, StyleSharingCandidate& sharing) const
 {
@@ -3856,13 +3908,6 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_and_share_computed_valu
             && !computed_values->has_animated_values();
         if (computation_read_only_the_key) {
             auto key_hash = sharing.key.hash();
-            Vector<u64> style_input_declaration_words;
-            Vector<NonnullRefPtr<StyleValue const>> pinned_style_input_values;
-            if (!abstract_element.pseudo_element().has_value()) {
-                auto declaration_words = element.style_input_record()->words.span().slice(style_input_record_block_index);
-                style_input_declaration_words.append(declaration_words.data(), declaration_words.size());
-                pinned_style_input_values = element.style_input_record()->pinned_values;
-            }
             if (sharing.explicitly_inherited_non_inherited_style_groups != 0 && !!sharing.parent_style_record_identity)
                 pin_style_record(sharing.parent_style_record_identity);
             if (!sharing.key.pinned_values.is_empty()
@@ -3882,8 +3927,6 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_and_share_computed_valu
                 .values = computed_values,
                 .custom_property_data = abstract_element.custom_property_data(),
                 .style_record_identity = {},
-                .style_input_declaration_words = move(style_input_declaration_words),
-                .pinned_style_input_values = move(pinned_style_input_values),
                 .read_beyond_the_record = !computation_read_only_the_record,
                 .style_reads_resource_context = sharing.computation_reads_resource_context,
                 .style_uses_var_css_function = element.style_uses_var_css_function(),
@@ -4401,8 +4444,8 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
     // context, the element's own shape, and what it reads of the style it is replacing. Ordinary
     // property computation reads that style's writing mode. Custom property computation can use
     // the whole style as its fallback context, so an input that needs it is bound to that identity
-    // below. Transitions read the before-change style too, but their per-element state excludes
-    // them from sharing before a key is built.
+    // below. Transitions read the before-change style too, and are decided once the values are
+    // known.
     auto const inheritance_parent = abstract_element.element_to_inherit_style_from();
     auto const inheritance_parent_style_record_identity = inheritance_parent.has_value() ? inheritance_parent->style_record_identity() : StyleRecordID {};
     auto const inheritance_parent_style_record = m_style_engine.style_record_view(inheritance_parent_style_record_identity);
@@ -4411,14 +4454,10 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
     auto const previous_style_record = m_style_engine.style_record_view(previous_style_record_identity);
     if (sharing) {
         auto& element = abstract_element.element();
-        // A registered or running transition is decided per element from the style it is replacing,
-        // and starting one is not something the values carry.
         sharing->is_candidate = inheritance_parent_style_record.present && !element.is_document_element()
             && !inheritance_parent_style_record.animated_overlay
             && !element.has_relevant_animations()
-            && !element.has_css_defined_animations()
-            && element.property_ids_with_existing_transitions(abstract_element.pseudo_element()).is_empty()
-            && element.property_ids_with_matching_transition_property_entry(abstract_element.pseudo_element()).is_empty();
+            && !element.has_css_defined_animations();
     }
     Optional<Array<void const*, ComputedValues::inherited_style_group_count>> inherited_style_group_identities;
     auto get_inherited_style_group_identities = [&]() -> auto const& {
@@ -4519,13 +4558,13 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             .style_reads_resource_context = previous.style_reads_resource_context,
         };
     };
-    auto record_style_input = [&](StyleSharingEntry const* shared_entry = nullptr) {
+    auto record_style_input = [&]() {
         if (!sharing || abstract_element.pseudo_element().has_value() || !inheritance_parent_style_record.present)
             return;
         auto& element = abstract_element.element();
         auto& counters = document().style_invalidation_counters();
 
-        if (!shared_entry && !collected_presentational_hints) {
+        if (!collected_presentational_hints) {
             presentational_hint_properties = collect_presentational_hint_properties(abstract_element);
             collected_presentational_hints = true;
         }
@@ -4561,10 +4600,11 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         record->words.append(cascade_input.matching_pseudo_element_styles);
         append_element_shape_key(record->words);
         // The environment names what reaches an element by no route the blocks describe, such as
-        // the viewport moving or a counter style changing. It sits with the element's own words rather
+        // the viewport moving or the root font metrics moving. It sits with the element's own words rather
         // than with the blocks, so that a version that moved is never reported as a change of
         // declarations - a reuse admitted on the declarations alone must not be admitted by it.
         record->words.append(document().style_environment_version());
+        record->words.append(document().custom_property_registration_generation());
         record->viewport_environment_version = m_viewport_environment_version;
         record->custom_property_reads.clear_with_capacity();
         record->custom_property_reads_are_complete = true;
@@ -4623,17 +4663,11 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         record->custom_property_reads.shrink(unique_reads);
         VERIFY(record->words.size() == style_input_record_block_index);
 
-        if (shared_entry) {
-            record->words.append(shared_entry->style_input_declaration_words.data(), shared_entry->style_input_declaration_words.size());
-            record->pinned_values = shared_entry->pinned_style_input_values;
-            record->cascade_reads_custom_properties = sharing->cascade_reads_custom_properties;
-        } else {
-            auto const inline_style = include_inline_style == IncludeInlineStyle::Yes && cascade_input.inline_style_context_index.has_value()
-                ? abstract_element.inline_style()
-                : GC::Ptr<CSSStyleProperties const> {};
-            auto const dependencies = append_cascade_blocks_to_key(record->words, record->pinned_values, cascade_input, presentational_hint_properties, inline_style, CascadeBlockKeyValueComparison::ByValue);
-            record->cascade_reads_custom_properties = dependencies.reads_custom_properties;
-        }
+        auto const inline_style = include_inline_style == IncludeInlineStyle::Yes && cascade_input.inline_style_context_index.has_value()
+            ? abstract_element.inline_style()
+            : GC::Ptr<CSSStyleProperties const> {};
+        auto const dependencies = append_cascade_blocks_to_key(record->words, record->pinned_values, cascade_input, presentational_hint_properties, inline_style, CascadeBlockKeyValueComparison::ByValue);
+        record->cascade_reads_custom_properties = dependencies.reads_custom_properties;
         if (record->cascade_reads_custom_properties && inheritance_parent.has_value()) {
             record->pinned_parent_custom_property_data = inheritance_parent->custom_property_data();
             record->words[style_input_record_parent_custom_properties_index] = bit_cast<FlatPtr>(record->pinned_parent_custom_property_data.ptr());
@@ -4664,7 +4698,10 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             };
             auto difference = compare_style_input_records(*previous, *record);
             // A computation that read a viewport metric read what the viewport environment names.
-            auto const viewport_environment_moved = previous->style_depends_on_viewport_metrics
+            auto const viewport_dependency_flags = to_underlying(StyleRecordDependencyFlag::DependsOnViewportMetrics) | to_underlying(StyleRecordDependencyFlag::FontMetricsDependOnViewportMetrics);
+            auto const style_depends_on_viewport_metrics = previous->style_depends_on_viewport_metrics
+                || (previous_style_record.present && (m_style_engine.style_record_dependency_flags(previous_style_record_identity) & viewport_dependency_flags) != 0);
+            auto const viewport_environment_moved = style_depends_on_viewport_metrics
                 && previous->viewport_environment_version != record->viewport_environment_version;
             if (difference == StyleInputRecord::Difference::None && viewport_environment_moved)
                 difference = StyleInputRecord::Difference::Element;
@@ -4731,10 +4768,10 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
                 break;
             }
             // A cascade that reads no custom property names no environment in its record, yet the
-            // element holds the one it inherits, and its pseudo-elements may read it. A derived
-            // reaction that moved that environment has the element take the moved one, provided no
+            // element holds the one it inherits, and its pseudo-elements may read it. A recompute
+            // that moved that environment has the element take the moved one, provided no
             // pseudo-element cascade reads a name that moved.
-            if (style_input_is_unchanged && m_materializing_for_derived_reaction && !parent_custom_property_environment_moved
+            if (style_input_is_unchanged && !parent_custom_property_environment_moved
                 && !record->cascade_reads_custom_properties && inheritance_parent.has_value()) {
                 auto existing_data = abstract_element.custom_property_data();
                 auto new_parent_data = inheritable_custom_property_data(*inheritance_parent);
@@ -4780,17 +4817,11 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             || previous_style_record.animated_overlay
             || previous_style_record.animation_overlay_identity != 0)
             return false;
-        // What the record does not name is everything that reaches the element some other way: a
-        // font finishing loading or a registration arriving. An environment or targeted update may
-        // include one of those inputs, so only descendant propagation and a reaction the engine
-        // derived from an ancestor's application can reuse the record's parent half here.
-        if (m_materializing_for_targeted_style_update && !m_materializing_for_derived_reaction)
+        // A recompute can carry the parent's non-inherited half moving, which the record names for
+        // no computation that read it through `inherit`.
+        if (new_style_input_record->explicitly_inherited_non_inherited_style_groups != 0 || new_style_input_record->style_uses_inherit_css_function)
             return false;
         if (m_materializing_for_derived_reaction) {
-            // A derived reaction can carry the parent's non-inherited half moving, which the record
-            // names for no computation that read it through `inherit`.
-            if (new_style_input_record->explicitly_inherited_non_inherited_style_groups != 0 || new_style_input_record->style_uses_inherit_css_function)
-                return false;
             // The winner state the last cascade bound has to be the one the engine holds for the
             // element now; a reused style carries it into the next publication.
             auto node = abstract_element.element().style_node_id();
@@ -4898,6 +4929,8 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             return false;
         if (!style_input_is_unchanged || new_style_input_record->read_beyond_the_record || !last_style_still_stands())
             return false;
+        if (new_style_input_record->explicitly_inherited_non_inherited_style_groups != 0)
+            return false;
         if (auto data = abstract_element.custom_property_data(); data && data->is_animation_overlay())
             return false;
         if (parent_custom_property_environment_moved && !install_moved_custom_property_environment())
@@ -4928,8 +4961,6 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             // for an element inheriting from that very style.
             if (entry.explicitly_inherited_non_inherited_style_groups != 0 && entry.parent_style_record_identity != inheritance_parent->style_record_identity())
                 continue;
-            if (!new_style_input_record)
-                record_style_input(&entry);
             sharing->shared_values = entry.values;
             // The custom properties the computation resolved are the other element's only when the
             // key named the environment they resolved against. An element that reads none keeps the
@@ -4952,6 +4983,10 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
                     parent->add_children_explicitly_inherited_non_inherited_style_groups(entry.explicitly_inherited_non_inherited_style_groups);
             }
             compute_transitioned_properties(*sharing->shared_values, abstract_element);
+            // A style built from the shared values when a transition starts on them records these.
+            sharing->computation_reads_unkeyed_context = entry.read_beyond_the_record;
+            sharing->computation_reads_resource_context = entry.style_reads_resource_context;
+            sharing->explicitly_inherited_non_inherited_style_groups = entry.explicitly_inherited_non_inherited_style_groups;
             // The declaration key can distinguish resource contexts that retained cascade winners
             // cannot. Preserve that restriction for the winner records retained from this element.
             if (!abstract_element.pseudo_element().has_value()) {
@@ -4969,53 +5004,70 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         return false;
     };
 
-    if (!m_materializing_for_targeted_style_update || m_materializing_for_derived_reaction)
-        record_style_input();
+    auto take_shared_style = [&]() -> RefPtr<ComputedStyleWorkingSet> {
+        auto transitioned_style = start_needed_transitions_on_shared_style(abstract_element, *sharing->shared_values);
+        if (!transitioned_style)
+            return {};
+        sharing->shared_values = nullptr;
+        sharing->shared_style_record_identity = {};
+        sharing->computed_groups_to_rebuild = {};
+        sharing->donor_values = nullptr;
+        return transitioned_style;
+    };
+
+    record_style_input();
 
     // The element's own last answer comes before another element's: it needs no lookup, and it is
     // the one whose marks are already on the element.
+    // The mechanism is exactly the kind that can be wrong for a year: right everywhere the record
+    // is complete, and silently wrong where it is not. Under verification every reuse derives the
+    // style anyway and every longhand of the two is compared.
+    auto verify_reused_style = [&](auto&& derive_style) {
+        static bool const verify_reuse = getenv("LIBWEB_VERIFY_STYLE_INPUT_REUSE") != nullptr;
+        if (!verify_reuse)
+            return;
+        auto& counters = document().style_invalidation_counters();
+        auto const counters_before_verification = counters;
+        auto reused = sharing->reused_values.release_nonnull();
+        auto custom_property_data = abstract_element.custom_property_data();
+        auto derived = derive_style();
+        abstract_element.set_custom_property_data(move(custom_property_data));
+        counters = counters_before_verification;
+        auto reused_properties = reconstruct_computed_properties(*reused);
+        for (auto i = to_underlying(first_longhand_property_id); i <= to_underlying(last_longhand_property_id); ++i) {
+            auto property_id = static_cast<PropertyID>(i);
+            // A logical alias is answered through the writing mode rather than stored, so the
+            // two sides spell it differently without disagreeing about anything.
+            if (property_is_logical_alias(property_id))
+                continue;
+            auto const& reused_value = reused_properties->property(property_id);
+            auto const& derived_value = derived->property(property_id);
+            if (reused_value.equals(derived_value))
+                continue;
+            // The reused side is reconstructed from computed values and the derived side comes
+            // straight out of the cascade, so the two can spell the same value differently.
+            if (reused_value.to_string(SerializationMode::ResolvedValue) == derived_value.to_string(SerializationMode::ResolvedValue))
+                continue;
+            dbgln("StyleEngine: a reused style differs on {}: reused {}, derived {}",
+                string_from_property_id(property_id), reused_value.to_string(SerializationMode::Normal), derived_value.to_string(SerializationMode::Normal));
+            // A reconstructed colour is spelled in the legacy form and a cascaded one in the
+            // space it was written in, so the two disagree about the text and not the colour.
+            // The line above still reports it; only the two colours are not made fatal.
+            if (reused_value.is_color() && derived_value.is_color())
+                continue;
+            VERIFY_NOT_REACHED();
+        }
+        sharing->reused_values = move(reused);
+    };
+
     if (reuse_computed_style()) {
         auto& counters = document().style_invalidation_counters();
         counters.element_style_input_reused++;
-        // The mechanism is exactly the kind that can be wrong for a year: right everywhere the
-        // record is complete, and silently wrong where it is not. Under verification every reuse
-        // derives the style anyway and every longhand of the two is compared.
-        static bool const verify_reuse = getenv("LIBWEB_VERIFY_STYLE_INPUT_REUSE") != nullptr;
-        if (verify_reuse) {
-            auto const counters_before_verification = counters;
-            auto reused = sharing->reused_values.release_nonnull();
-            auto custom_property_data = abstract_element.custom_property_data();
+        verify_reused_style([&] {
             auto cascaded = compute_cascaded_values(abstract_element, cascade_input, include_inline_style, nullptr,
                 collected_presentational_hints ? &presentational_hint_properties : nullptr);
-            auto derived = compute_properties(abstract_element, cascaded, cascade_input.matching_pseudo_element_styles, nullptr);
-            abstract_element.set_custom_property_data(move(custom_property_data));
-            counters = counters_before_verification;
-            auto reused_properties = reconstruct_computed_properties(*reused);
-            for (auto i = to_underlying(first_longhand_property_id); i <= to_underlying(last_longhand_property_id); ++i) {
-                auto property_id = static_cast<PropertyID>(i);
-                // A logical alias is answered through the writing mode rather than stored, so the
-                // two sides spell it differently without disagreeing about anything.
-                if (property_is_logical_alias(property_id))
-                    continue;
-                auto const& reused_value = reused_properties->property(property_id);
-                auto const& derived_value = derived->property(property_id);
-                if (reused_value.equals(derived_value))
-                    continue;
-                // The reused side is reconstructed from computed values and the derived side comes
-                // straight out of the cascade, so the two can spell the same value differently.
-                if (reused_value.to_string(SerializationMode::ResolvedValue) == derived_value.to_string(SerializationMode::ResolvedValue))
-                    continue;
-                dbgln("StyleEngine: a reused style differs on {}: reused {}, derived {}",
-                    string_from_property_id(property_id), reused_value.to_string(SerializationMode::Normal), derived_value.to_string(SerializationMode::Normal));
-                // A reconstructed colour is spelled in the legacy form and a cascaded one in the
-                // space it was written in, so the two disagree about the text and not the colour.
-                // The line above still reports it; only the two colours are not made fatal.
-                if (reused_value.is_color() && derived_value.is_color())
-                    continue;
-                VERIFY_NOT_REACHED();
-            }
-            sharing->reused_values = move(reused);
-        }
+            return compute_properties(abstract_element, cascaded, cascade_input.matching_pseudo_element_styles, nullptr);
+        });
         // The style is the one the last cascade produced from these same inputs, so the winner
         // state that cascade bound still stands behind the publication about to reuse it.
         if (auto node = abstract_element.element().style_node_id(); node != 0 && !abstract_element.pseudo_element().has_value())
@@ -5059,12 +5111,9 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
                 new_style_input_record->bind_next_published_style = true;
             }
             document().style_invalidation_counters().element_style_shared_computations++;
-            return {};
+            return take_shared_style();
         }
     }
-
-    if (!new_style_input_record)
-        record_style_input();
 
     auto cascade_started_at = MonotonicTime::now();
     auto cascaded_properties = compute_cascaded_values(
@@ -5166,11 +5215,6 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         // non-inherited property, read what the record does not name, so an unchanged cascade does
         // not mean an unchanged answer.
         && previous_computation->explicitly_inherited_non_inherited_style_groups == 0
-        // A transition starts by comparing the style that was to the style that is, and a
-        // computation skipped here never makes that comparison. The element that starts none is the
-        // one this asks about, which is the same question the transition step itself asks first.
-        && abstract_element.element().property_ids_with_matching_transition_property_entry(abstract_element.pseudo_element()).is_empty()
-        && abstract_element.element().property_ids_with_existing_transitions(abstract_element.pseudo_element()).is_empty()
         // The steps this skips after the cascade are about the element's custom properties: they are
         // resolved against the style, compared against the environment this computation replaced,
         // and any change reported to the caller. An element whose cascade declared none keeps the
@@ -5192,6 +5236,9 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         new_style_input_record->style_reads_resource_context = previous_computation->style_reads_resource_context;
         new_style_input_record->explicitly_inherited_non_inherited_style_groups = previous_computation->explicitly_inherited_non_inherited_style_groups;
         reuse_last_computed_style();
+        verify_reused_style([&] {
+            return compute_properties(abstract_element, cascaded_properties, cascade_input.matching_pseudo_element_styles, nullptr);
+        });
         return {};
     }
 
@@ -5199,10 +5246,9 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
     // element owns rather than something the values carry, so an element declaring one derives its
     // own style. A declared transition is not like that. What it registers is decided by the
     // computed values, and it is registered again by every computation before anything reads it, so
-    // an element that takes another's answer this pass registers the same thing the pass it needs
-    // it - which is the pass a transitioned property changes, and that pass changes the blocks the
-    // key names, so it cannot be answered from here. An element that does start a transition holds
-    // animated values and is refused at the publish.
+    // an element that takes another's answer this pass registers the same thing. Whether a
+    // transition starts is decided from that answer against the element's own previous style, and
+    // an element that starts one takes a copy of its own.
     if (sharing && sharing->is_candidate) {
         auto animation_name = cascaded_properties->property(PropertyID::AnimationName);
         auto declares_animation = animation_name
@@ -5229,7 +5275,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
                     pseudo_element_to_ffi(abstract_element.pseudo_element()));
             }
             document().style_invalidation_counters().element_style_shared_computations++;
-            return {};
+            return take_shared_style();
         }
     }
 
