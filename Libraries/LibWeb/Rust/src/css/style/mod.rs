@@ -60,6 +60,7 @@ mod child_reactions;
 mod column;
 pub mod compiler;
 mod computed;
+mod counter_context;
 mod custom_property_cascade;
 mod custom_property_environments;
 #[cfg(test)]
@@ -181,6 +182,8 @@ use instrumentation::Counters;
 use exact_matcher::ExactMatchContext;
 use exact_matcher::ExactMatcher;
 
+pub use counter_context::StyleEngine;
+
 use batch_matcher::AncestorRequirements;
 use batch_matcher::AncestorRequirementsCache;
 use batch_matcher::BatchMatchState;
@@ -243,7 +246,6 @@ use prefix::PrefixEnteringDeltas;
 use prefix::PrefixEvaluation;
 use prefix::PrefixMatchSetID;
 use prefix::PrefixProducer;
-use prefix::PrefixProducerCache;
 use prefix::PrefixStateCache;
 use prefix::PrefixStates;
 use prefix::PrefixTransitionLookup;
@@ -335,9 +337,10 @@ const RETAINED_WITNESS_SIBLING_STEPS: usize = 64;
 const INITIAL_SIBLING_FACT_WINDOW: usize = 8;
 
 mod verification {
+    use super::Counters;
     use super::MatchAnswerID;
     use super::RuleMatch;
-    use super::StyleEngine;
+    use super::StyleEngineState;
     use super::StyleNodeID;
     #[cfg(test)]
     use std::cell::Cell;
@@ -360,14 +363,15 @@ mod verification {
     }
 
     pub(super) struct StyleAnswerVerifier<'a> {
-        engine: &'a mut StyleEngine,
+        engine: &'a mut StyleEngineState,
+        counters: &'a mut Counters,
     }
 
     impl StyleAnswerVerifier<'_> {
         pub(super) fn verify_match_answer(&mut self, answer: &[RuleMatch], node: StyleNodeID, description: &str) {
             let cold = self
                 .engine
-                .exact_match_answer_for_verification(node)
+                .exact_match_answer_for_verification(node, self.counters)
                 .expect("cold matching must answer wherever a retained answer did");
             assert_eq!(answer, cold, "{description} differs from cold matching for {node:?}");
         }
@@ -375,21 +379,26 @@ mod verification {
         pub(super) fn verify_cascade_answer(&mut self, answer: &[RuleMatch], node: StyleNodeID, description: &str) {
             let (cold, _) = self
                 .engine
-                .exact_cascade_answer_for_verification(node)
+                .exact_cascade_answer_for_verification(node, self.counters)
                 .expect("cold matching must answer wherever a retained answer did");
             assert_eq!(answer, cold, "{description} differs from cold matching for {node:?}");
         }
 
         pub(super) fn verify_retained_cascade_input(&mut self, node: StyleNodeID, cascade_input: MatchAnswerID) {
-            self.engine.verify_retained_cascade_input(node, cascade_input);
+            self.engine
+                .verify_retained_cascade_input(node, cascade_input, self.counters);
         }
     }
 
     /// Re-derive every patched or reused retained answer cold and compare it. The callback receives
     /// only the verifier capability, so it cannot publish through or otherwise mutate the engine.
-    pub(super) fn style_answer_patch(engine: &mut StyleEngine, check: impl FnOnce(&mut StyleAnswerVerifier<'_>)) {
+    pub(super) fn style_answer_patch(
+        engine: &mut StyleEngineState,
+        counters: &mut Counters,
+        check: impl FnOnce(&mut StyleAnswerVerifier<'_>),
+    ) {
         if enabled(&STYLE_ANSWER_PATCH, "LIBWEB_VERIFY_STYLE_ANSWER_PATCH") {
-            check(&mut StyleAnswerVerifier { engine });
+            check(&mut StyleAnswerVerifier { engine, counters });
         }
     }
 
@@ -429,21 +438,21 @@ mod verification {
     }
 
     /// Compare complete retained cascade winners with the legacy cascade output.
-    pub(super) fn cascade_winners(engine: &StyleEngine, check: impl FnOnce(&StyleEngine)) {
+    pub(super) fn cascade_winners(engine: &StyleEngineState, check: impl FnOnce(&StyleEngineState)) {
         if enabled(&CASCADE_WINNERS, "LIBWEB_VERIFY_CASCADE_WINNERS") {
             check(engine);
         }
     }
 
     /// Require every scoped style transaction output to name semantic provenance.
-    pub(super) fn style_plan_provenance(engine: &StyleEngine, check: impl FnOnce(&StyleEngine)) {
+    pub(super) fn style_plan_provenance(engine: &StyleEngineState, check: impl FnOnce(&StyleEngineState)) {
         if enabled(&STYLE_PLAN_PROVENANCE, "LIBWEB_VERIFY_STYLE_PLAN_PROVENANCE") {
             check(engine);
         }
     }
 
     /// Require a published style transaction to complete without another selector query.
-    pub(super) fn published_style_transaction(engine: &StyleEngine, check: impl FnOnce(&StyleEngine)) {
+    pub(super) fn published_style_transaction(engine: &StyleEngineState, check: impl FnOnce(&StyleEngineState)) {
         if enabled(
             &PUBLISHED_STYLE_TRANSACTION,
             "LIBWEB_VERIFY_PUBLISHED_STYLE_TRANSACTION",
@@ -758,12 +767,12 @@ struct QuerySortedCandidatesStamp {
     keys: Vec<DispatchKey>,
 }
 
-pub struct StyleEngine {
+/// Mutable engine state; operations borrow their instrumentation from the boundary.
+pub struct StyleEngineState {
     /// The capture-local document identity, absent when record-replay is disabled.
     #[cfg(feature = "style-recording")]
     recording_id: Option<u64>,
     memory: MemoryController,
-    counters: Counters,
     /// The instrumentation state to restore after C++ materializes a record for verification.
     computed_record_verification_counters: Option<Box<Counters>>,
     computed_record_verification_pins: Vec<u64>,
@@ -885,8 +894,6 @@ pub struct StyleEngine {
     engine_pseudo_record_cache: HashMap<publication::PseudoCohortKey, computed::FinalStyleRecordID>,
     engine_cold_record_cache: HashMap<publication::ColdRecordKey, publication::ColdRecord>,
     engine_cold_record_donors: HashMap<publication::ColdRecordDonorKey, Vec<publication::ColdRecordDonor>>,
-    /// Which winner states the engine can compute records from, decided once per state.
-    engine_computable_states: HashMap<(u64, CascadeStateID, u64, u64), bool>,
     computed_group_set_memory: MemoryLease,
     custom_property_environment_memory: MemoryLease,
     computed_fixed_metadata_memory: MemoryLease,
@@ -910,14 +917,9 @@ pub struct StyleEngine {
     /// Read-through facts shared by one synchronous style traversal. This is Tier-4 scratch, not
     /// retained matching state. A broad traversal begins with a complete batch; a selective one
     /// promotes only after repeated local packing clears its rebuild-cost hysteresis.
-    /// Boxed because every per-element ask takes it out of this slot and puts it back, and moving
-    /// the struct moves the fact batch's two dozen vector headers with it.
+    /// The transaction or host-call adapter owns the box while matching borrows its scratch.
+    /// Moving the box at those boundaries leaves the fact batch's vector headers in place.
     batch_matching_traversal: Option<Box<BatchMatchingTraversal>>,
-    /// While a published-answer completion is running, cold matching skips cascade winner-pruning
-    /// so the produced answer is exact and can enter the retained match relation. A pruned answer
-    /// costs less once but cannot be retained, which forces the same region back to cold matching
-    /// on every subsequent flush.
-    complete_answers_exactly: bool,
     /// Distinct retained cascade states per dispatch-key posting, shared by every route-pruning
     /// proof in one routing pass. Keyed by the winner-group generation so any winner mutation
     /// invalidates naturally; cleared per transaction so the map cannot grow across flushes. A
@@ -927,7 +929,7 @@ pub struct StyleEngine {
     /// Once Tier-3 pressure closes retained-answer admission, the rest of the completion batch
     /// stops asking for exact answers: an exact answer costs more to evaluate, and paying that
     /// premium for an answer the controller cannot retain buys nothing on any later flush.
-    completion_exactness_exhausted: bool,
+    completion_exactness: CompletionExactness,
     /// Prefix transitions and their canonical answers have one document-lifetime owner. Matching
     /// traversals and answer patches borrow it synchronously and change its cache-owned lifecycle
     /// between scratch and retained residency without moving the payload.
@@ -993,9 +995,6 @@ pub struct StyleEngine {
     /// while a depth change replaces only this scope's identity. It uses the same direct tree-scope
     /// index as the root column.
     scope_program_by_scope: Column<Option<(u32, ScopeProgramID)>>,
-    /// The last scope lookup. A style traversal nearly always asks consecutive elements in one
-    /// scope, so the common path compares two integers and never hashes its ordered sheet set.
-    held_scope_program: Option<(TreeScopeID, u32, ScopeProgramID)>,
     /// Maps names and qualified names to process-global atoms. Selector names and DOM facts use
     /// the same owner, so a class in a stylesheet and a class on an element compare as one integer.
     ///

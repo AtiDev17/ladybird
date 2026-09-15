@@ -1722,7 +1722,6 @@ impl FeaturePostings {
         if growth != 0 {
             self.residency
                 .reconcile_committed(memory, self.residency.bytes() + growth);
-            memory.finish_committed_acceleration_growth(MemoryCategory::FeaturePosting);
         }
         if key.has_selector_posting() && posting_length > 4096 {
             self.remember_grown_selector_posting(key);
@@ -3327,6 +3326,7 @@ struct ElementDeclarationRow {
     /// The value each declaration was written with, parallel to `by_kind`, when the block's
     /// publication carried them; a consumer computing from the declarations reads the spelling.
     written_by_kind: [Option<Box<[RetainedStyleValueData]>>; ElementDeclarationKind::COUNT],
+    written_checks_by_kind: [Box<[super::publication::WrittenValueChecks]>; ElementDeclarationKind::COUNT],
     complete: [bool; ElementDeclarationKind::COUNT],
     /// The custom properties the inline style declares, in declaration order. Only the `style`
     /// attribute declares custom properties.
@@ -3340,6 +3340,7 @@ impl Default for ElementDeclarationRow {
         Self {
             by_kind: Default::default(),
             written_by_kind: Default::default(),
+            written_checks_by_kind: Default::default(),
             complete: [true; ElementDeclarationKind::COUNT],
             custom_declarations: None,
             custom_written_values: None,
@@ -3350,6 +3351,11 @@ impl Default for ElementDeclarationRow {
 impl ElementDeclarationRow {
     fn storage_bytes(&self) -> u64 {
         (size_of::<Self>()
+            + self
+                .written_checks_by_kind
+                .iter()
+                .map(|checks| size_of_val(checks.as_ref()))
+                .sum::<usize>()
             + self
                 .by_kind
                 .iter()
@@ -3446,6 +3452,11 @@ impl ElementDeclarationRows {
         let row = self.rows.entry(index);
         let before = row.as_ref().map_or(0, |row| row.storage_bytes());
         let row = row.get_or_insert_with(Box::default);
+        row.written_checks_by_kind[kind.index()] = declared
+            .iter()
+            .zip(&written_values)
+            .map(|(declared, value)| super::publication::WrittenValueChecks::prepare(declared.property, value))
+            .collect();
         row.written_by_kind[kind.index()] =
             (!declared.is_empty() && written_values.len() == declared.len()).then(|| written_values.into_boxed_slice());
         row.by_kind[kind.index()] = (!declared.is_empty()).then(|| declared.into_boxed_slice());
@@ -3529,6 +3540,7 @@ impl ElementDeclarationRows {
         let before = row.storage_bytes();
         row.by_kind[kind.index()] = None;
         row.written_by_kind[kind.index()] = None;
+        row.written_checks_by_kind[kind.index()] = Box::default();
         row.complete[kind.index()] = true;
         if kind == ElementDeclarationKind::InlineStyle {
             if row.custom_declarations.take().is_some() {
@@ -4020,7 +4032,7 @@ impl ElementFactStore {
         self.staging.is_empty()
     }
 
-    fn sync_attribute_catalogs(&mut self) {
+    fn prepare_attribute_catalogs(&mut self) {
         if Rc::ptr_eq(&self.rows.attribute_catalogs, &self.attribute_catalogs) {
             return;
         }
@@ -4358,7 +4370,7 @@ impl ElementFactStore {
             !self.has_dirty_staging(),
             "cannot evaluate facts while fact staging is unapplied"
         );
-        self.sync_attribute_catalogs();
+        self.prepare_attribute_catalogs();
         MatchingFactBatch::primary_view(Rc::clone(&self.rows))
     }
 
@@ -5054,6 +5066,18 @@ impl ElementFactStore {
         self.element_declared_properties.complete_but_for_custom(node, kind)
     }
 
+    pub(super) fn element_written_value_checks(
+        &self,
+        node: StyleNodeID,
+        kind: ElementDeclarationKind,
+        index: usize,
+    ) -> super::publication::WrittenValueChecks {
+        let row = self.element_declared_properties.rows[node.element_index().unwrap() as usize]
+            .as_ref()
+            .unwrap();
+        row.written_checks_by_kind[kind.index()][index]
+    }
+
     /// The values one kind of the node's element declarations were written with, parallel to
     /// `element_declared_properties`, or nothing when their publication carried none.
     #[must_use]
@@ -5334,7 +5358,7 @@ impl ElementFactStore {
 
     pub fn sweep_auxiliary_catalogs(&mut self) {
         self.sweep_auxiliary_catalogs_without_sync();
-        self.sync_attribute_catalogs();
+        self.prepare_attribute_catalogs();
     }
 
     /// Remove every derived row keyed by an identity before that identity can be reused.
@@ -5369,7 +5393,7 @@ impl ElementFactStore {
             );
         }
         self.postings.forget_atoms(&atoms);
-        self.sync_attribute_catalogs();
+        self.prepare_attribute_catalogs();
     }
 
     #[must_use]
@@ -5386,8 +5410,9 @@ impl ElementFactStore {
     /// Every column an operator can read is filled, not only the ones a compound tests: a row whose
     /// parameters were left at their defaults answers `:dir()` and `:state()` as though the element
     /// held neither, which is a wrong answer rather than a missing one.
-    pub fn materialize(&mut self, nodes: impl Iterator<Item = StyleNodeID>, batch: &mut StyleNodeFacts) {
-        self.sync_attribute_catalogs();
+    // NB: Commit prepares the resident catalogs. A packed batch takes the current catalog
+    //     owner directly and never needs to mutate the shared primary rows.
+    pub fn materialize(&self, nodes: impl Iterator<Item = StyleNodeID>, batch: &mut StyleNodeFacts) {
         batch.clear();
         batch.attribute_catalogs = Rc::clone(&self.attribute_catalogs);
         for node in nodes {
@@ -5400,8 +5425,7 @@ impl ElementFactStore {
     /// One shared batch can serve a whole pass this way: consecutive asks overwhelmingly share
     /// their ancestor chains, and each row is packed at most once per pass instead of once per
     /// ask.
-    pub fn materialize_missing(&mut self, nodes: impl Iterator<Item = StyleNodeID>, batch: &mut StyleNodeFacts) {
-        self.sync_attribute_catalogs();
+    pub fn materialize_missing(&self, nodes: impl Iterator<Item = StyleNodeID>, batch: &mut StyleNodeFacts) {
         batch.attribute_catalogs = Rc::clone(&self.attribute_catalogs);
         for node in nodes {
             if batch.row_of(node).is_some() {
@@ -5519,7 +5543,7 @@ impl ElementFactStore {
             self.rebuild_missing_postings(memory);
             return;
         }
-        self.sync_attribute_catalogs();
+        self.prepare_attribute_catalogs();
         let mut staging = std::mem::take(&mut self.staging);
         for (node, facts) in staging.dirty_rows() {
             let previous = self.rows.row_of(node);
@@ -5571,7 +5595,7 @@ impl ElementFactStore {
     /// Snapshot the committed rows which staged local facts will replace at the barrier.
     #[must_use]
     pub fn staged_before_facts(&mut self) -> StyleNodeFacts {
-        self.sync_attribute_catalogs();
+        self.prepare_attribute_catalogs();
         let mut nodes = Vec::with_capacity(self.staging.len());
         for node in self.staging.keys() {
             nodes.push(node);
@@ -6124,6 +6148,8 @@ mod tests {
         }
 
         assert_eq!(known_posting(&postings, key).length, 511);
+        assert!(memory.is_tier3_admitting(MemoryCategory::FeaturePosting));
+        memory.finish_evaluation_loop();
         assert!(!postings.insert(missing_key, StyleNodeID::element(1), &mut memory));
         assert!(matches!(postings.lookup(missing_key), Lookup::Missing(gap) if gap == missing_key));
     }
@@ -6213,6 +6239,7 @@ mod tests {
         memory.set_tier3_limit_for_test(0);
         let mut other_postings = FeaturePostings::new();
         other_postings.insert(key, node, &mut memory);
+        memory.finish_evaluation_loop();
         assert!(!memory.is_tier3_admitting(MemoryCategory::FeaturePosting));
 
         for _ in 0..3 {
@@ -6251,6 +6278,9 @@ mod tests {
         let new_class_key = SelectorPostingKey::Class(new_class);
         let new_animation_key = DependencyPostingKey::AnimationName(new_animation);
         assert_eq!(known_posting(facts.postings(), new_class_key).length, 1);
+        assert_eq!(known_posting(facts.postings(), new_animation_key).length, 1);
+        memory.finish_evaluation_loop();
+        facts.postings_mut().evict(new_animation_key);
         assert!(matches!(facts.postings().lookup(new_animation_key), Lookup::Missing(gap) if gap == new_animation_key));
         assert_eq!(facts.posting_rebuild_closed_at_headroom, None);
 

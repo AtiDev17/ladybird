@@ -45,6 +45,7 @@ use crate::css::computed_values::replaying_style_groups;
 use crate::css::computed_values::retain_group_payload;
 use crate::css::computed_values::retained_group_payload_bytes;
 use crate::css::computed_values::style_group_payloads_equal;
+use crate::css::computed_values::style_group_payloads_hash;
 use crate::css::computed_values::style_group_payloads_hold_image_values;
 use crate::css::style_value::RetainedStyleValueData;
 use crate::css::style_value::retained_value_depends_on_color_scheme;
@@ -317,6 +318,10 @@ pub(super) struct IdentityMints {
 struct ComputedGroup {
     index: usize,
     payload: *const c_void,
+    /// The payload's content hash, the key it is interned under, and `None` for a group the
+    /// interner deliberately left out of the content index. Kept with the group so a retirement
+    /// can find its index entry again without hashing the payload a second time.
+    content_hash: Option<u64>,
 }
 
 struct ComputedGroupSet {
@@ -649,6 +654,16 @@ pub struct ComputedGroupSets {
     /// counters credit an order while these count the partition.
     identity_mints: IdentityMints,
     groups: InternTable<ComputedGroupID, ComputedGroup>,
+    /// The same groups indexed by payload *content*, so that two equal payloads built by
+    /// different records are one identity. `groups` stays indexed by payload address, which is
+    /// the fast path: a payload that is already interned keeps its identity without hashing its
+    /// content again.
+    groups_by_content: InternTable<ComputedGroupID, ()>,
+    /// Whether interning is to ignore the content index, for the span of a C++ verification
+    /// pass. Such a pass interns a second copy of the very record it is checking; letting the
+    /// copy take or hand out a content identity would let a verification decide identities -
+    /// and through them the work of later transactions - that production never asked for.
+    content_identities_suspended: bool,
     sets: InternTable<ComputedGroupSetID, ComputedGroupSet>,
     inherited_sets: InternTable<InheritedGroupSetID, Box<[ComputedGroupID]>>,
     custom_property_environments: InternTable<CustomPropertyEnvironmentID, u64>,
@@ -701,6 +716,7 @@ pub(super) struct SharedStyleRecordKey {
     pub inherited_groups: InheritedGroupSetID,
     pub environment: u64,
     pub font_environment_generation: u64,
+    pub(super) root_font_inputs: super::publication::RootFontInputs,
     pub shape: [u64; 4],
 }
 
@@ -709,6 +725,8 @@ impl Default for ComputedGroupSets {
         Self {
             identity_mints: IdentityMints::default(),
             groups: InternTable::default(),
+            groups_by_content: InternTable::default(),
+            content_identities_suspended: false,
             sets: InternTable::default(),
             inherited_sets: InternTable::default(),
             custom_property_environments: InternTable::default(),
@@ -931,18 +949,50 @@ impl ComputedGroupSets {
         nodes
     }
 
+    /// Suspends and resumes deciding group identity by payload content, for the span of a C++
+    /// verification pass. While suspended, interning is the address-keyed interning it was
+    /// before content decided identity, so a verification leaves production's identities alone.
+    pub(super) fn set_content_identities_suspended(&mut self, suspended: bool) {
+        self.content_identities_suspended = suspended;
+    }
+
     fn intern_group(&mut self, index: usize, payload: *const c_void) -> (ComputedGroupID, bool) {
-        let hash = content_hash((index, payload as usize));
-        if let Some(identity) = self.groups.find(hash, |_identity, group| {
+        let address_hash = content_hash((index, payload as usize));
+        if let Some(identity) = self.groups.find(address_hash, |_identity, group| {
             group.index == index && group.payload == payload
         }) {
             return (identity, false);
+        }
+        // A payload nobody has interned yet is asked for its content, which is what decides its
+        // identity: an equal payload built by another record is the same group, however the two
+        // builds were ordered.
+        let payload_content_hash =
+            (!self.content_identities_suspended).then(|| style_group_payloads_hash(index, payload));
+        if let Some(hash) = payload_content_hash {
+            let groups = &self.groups;
+            if let Some(identity) = self.groups_by_content.find(hash, |identity, ()| {
+                let group = &groups[identity];
+                group.index == index && style_group_payloads_equal(index, group.payload, payload)
+            }) {
+                return (identity, false);
+            }
         }
         retain_group_payload(index, payload);
         let identity = self.groups.take_free_identity().unwrap_or_else(|| {
             ComputedGroupID(u32::try_from(self.groups.len()).expect("computed group identity space exhausted"))
         });
-        self.groups.insert(hash, identity, ComputedGroup { index, payload });
+        self.groups.insert(
+            address_hash,
+            identity,
+            ComputedGroup {
+                index,
+                payload,
+                content_hash: payload_content_hash,
+            },
+        );
+        if let Some(hash) = payload_content_hash {
+            self.groups_by_content.insert_identity(hash, identity);
+        }
         self.identity_mints.groups += 1;
         self.group_set_nested_memory
             .grow_committed(retained_group_payload_bytes(index, payload) as u64);
@@ -1903,11 +1953,17 @@ impl ComputedGroupSets {
                     None => {
                         assert_eq!(raw_identity as usize, self.groups.len());
                         let identity = ComputedGroupID(raw_identity);
+                        let payload_content_hash = style_group_payloads_hash(index, payload);
                         self.groups.insert(
                             content_hash((index, payload as usize)),
                             identity,
-                            ComputedGroup { index, payload },
+                            ComputedGroup {
+                                index,
+                                payload,
+                                content_hash: Some(payload_content_hash),
+                            },
                         );
+                        self.groups_by_content.insert_identity(payload_content_hash, identity);
                         self.identity_mints.groups += 1;
                         self.group_set_nested_memory
                             .grow_committed(retained_group_payload_bytes(index, payload) as u64);
@@ -2794,6 +2850,7 @@ impl ComputedGroupSets {
         capacity_bytes! {
             shallow [
                 self.groups,
+                self.groups_by_content,
                 self.sets,
                 self.columns.groups,
                 self.inherited_sets,
@@ -3072,8 +3129,12 @@ impl ComputedGroupSets {
                 ComputedGroup {
                     index: usize::MAX,
                     payload: std::ptr::null(),
+                    content_hash: None,
                 },
             );
+            if let Some(hash) = group.content_hash {
+                self.groups_by_content.remove_identity(hash, identity);
+            }
             self.groups
                 .retire_identity(content_hash((group.index, group.payload as usize)), identity);
             self.group_set_nested_memory
@@ -3856,6 +3917,7 @@ mod tests {
             inherited_groups: sets.inherited_groups_for_shared_style(record).unwrap(),
             environment: 1,
             font_environment_generation: 1,
+            root_font_inputs: super::super::publication::RootFontInputs::from_document(&Default::default()),
             shape: [0; 4],
         };
         sets.remember_shared_style_record(node, key, record);

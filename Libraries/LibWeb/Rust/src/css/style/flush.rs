@@ -68,16 +68,18 @@ impl PassTimer {
     }
 }
 
-impl StyleEngine {
+impl StyleEngineState {
     pub fn take_style_transaction(
         &mut self,
         root: StyleNodeID,
         emit: impl FnMut(StyleTransactionVersion, ProgramVersion, &[PublishedStyleDeltaRecord]),
+        counters: &mut Counters,
     ) -> bool {
         let mut clock = TransactionClock::new();
-        let scoped = self.take_style_transaction_with_clock(root, emit, &mut clock);
+        let scoped = self.take_style_transaction_with_clock(root, emit, &mut clock, counters);
+        self.finish_memory_evaluation_loop();
         // Include transaction-local destruction on both ordinary and early-return paths.
-        clock.finish(&mut self.counters);
+        clock.finish(counters);
         scoped
     }
 
@@ -86,17 +88,18 @@ impl StyleEngine {
         root: StyleNodeID,
         mut emit: impl FnMut(StyleTransactionVersion, ProgramVersion, &[PublishedStyleDeltaRecord]),
         clock: &mut TransactionClock,
+        counters: &mut Counters,
     ) -> bool {
         // The previous transaction's uninstalled records can no longer be consumed. Revert
         // them before this transaction publishes anything: a later C++ computation can install
         // the same record, which must not then be mistaken for an unconsumed derivation.
-        self.discard_engine_computed_records();
-        self.reclaim_computed_memory_if_needed();
-        self.sync_tier3_benefit_observations();
+        self.discard_engine_computed_records(counters);
+        self.reclaim_computed_memory_if_needed(counters);
+        self.sync_tier3_benefit_observations(counters);
         let tier3_evictions = self.memory.finish_tier3_quota_period();
         for &category in &TIER3_REFUSAL_CATEGORIES {
             if tier3_evictions[category as usize] && self.evict_tier3_category(category) {
-                self.counters.bump(Counter::Tier3BenefitEvictions);
+                counters.bump(Counter::Tier3BenefitEvictions);
             }
         }
         self.memory.begin_tier3_quota_period();
@@ -111,7 +114,7 @@ impl StyleEngine {
             capture.scoped = true;
         }
         self.discard_prepared_batch_matching_traversal();
-        self.discard_published_match_answers();
+        self.discard_published_match_answers(counters);
         // A transaction made of derived child reactions alone continues the style change whose
         // reactions C++ applied last, one tree generation further.
         self.last_transaction_only_derived_child_reactions = self.deferred_element_style_inputs_are_pending
@@ -122,7 +125,7 @@ impl StyleEngine {
             && !self.program_staging.is_dirty()
             && self.sheet_rule_replacement.is_none();
         for input in std::mem::take(&mut self.deferred_element_style_inputs) {
-            self.record_input(input.key, input.old, input.new);
+            self.record_input(input.key, input.old, input.new, counters);
         }
         self.deferred_element_style_inputs_are_pending = false;
         self.externally_recorded_style_input_nodes.clear();
@@ -143,19 +146,19 @@ impl StyleEngine {
         self.match_workspace = MatchEvaluationWorkspace::default();
         self.memory
             .release(MemoryCategory::BatchScratch, stale_match_workspace_bytes);
-        let mut transaction = self.drain_transaction();
-        self.apply_staged_transaction(&mut transaction);
+        let mut transaction = self.drain_transaction(counters);
+        self.apply_staged_transaction(&mut transaction, counters);
         self.program.share_rule_storage();
         self.native_rules.targets.share();
         self.programs.share_indices(&mut self.memory);
         if transaction.is_empty() {
-            self.release_transaction_and_sweep_atoms(transaction);
-            clock.enter(Counter::TransactionRemainderMicroseconds, &mut self.counters);
+            self.release_transaction_and_sweep_atoms(transaction, counters);
+            clock.enter(Counter::TransactionRemainderMicroseconds, counters);
             return true;
         }
         // Routing invokes exact planning and prefix matching inline; separating those clocks
         // would require per-node timers or moving work.
-        clock.enter(Counter::RoutingPlanningMicroseconds, &mut self.counters);
+        clock.enter(Counter::RoutingPlanningMicroseconds, counters);
         let routing_setup_timer = PassTimer::start();
         let preserves_selector_incidence = !transaction.has_coarsened_markers()
             && transaction.inputs.iter().all(|input| {
@@ -295,9 +298,9 @@ impl StyleEngine {
         {
             self.discard_retained_prefix_caches();
             self.retained_match_answers.evict(&mut self.match_answers);
-            self.release_transaction_and_sweep_atoms(transaction);
-            routing_setup_timer.stop(Counter::RoutingSetupMicroseconds, &mut self.counters);
-            clock.enter(Counter::TransactionRemainderMicroseconds, &mut self.counters);
+            self.release_transaction_and_sweep_atoms(transaction, counters);
+            routing_setup_timer.stop(Counter::RoutingSetupMicroseconds, counters);
+            clock.enter(Counter::TransactionRemainderMicroseconds, counters);
             return false;
         }
 
@@ -499,7 +502,7 @@ impl StyleEngine {
                     .flat_map(|input| transaction.program_joins_for(input.key))
                     .filter_map(|delta| delta.before_program)
                     .collect();
-                self.retain_selector_incidences(&programs, root);
+                self.retain_selector_incidences(&programs, root, counters);
             }
             // Only program routing joins against the resident nodes, and a transaction of pure
             // DOM inputs has no program joins at all. Walking every element of the document to
@@ -532,13 +535,13 @@ impl StyleEngine {
                 transaction_inputs: &transaction.inputs,
             };
             let routing_for_siblings = Rc::clone(&self.routing);
-            let sibling_entries = routing_for_siblings.live_sibling_entries(&self.program, &self.programs);
-            let mut sibling_candidates = routing_for_siblings.live_sibling_workspace(&self.program, &self.programs);
+            routing_for_siblings.prepare_route_liveness(&self.program, &self.programs);
+            let sibling_entries = routing_for_siblings.live_sibling_entries(&self.program);
+            let mut sibling_candidates = routing_for_siblings.live_sibling_workspace(&self.program);
             let mut pending_routes = PendingRoutes::new();
             let mut pending_sibling_routes = PendingSiblingRoutes::new();
             let mut pending_prefix_producers = Vec::new();
             let collect_pending_prefix_producers = self.prefix_caches.borrow().states.is_retained();
-            let mut prefix_producer_cache = PrefixProducerCache::default();
             let mut prefix_producer_seen = Vec::new();
 
             // Program and cascade-topology inputs can establish the transaction's outer envelope
@@ -572,7 +575,7 @@ impl StyleEngine {
                 scopes.dedup();
             }
             let mut removed_rules_requiring_refresh = Vec::new();
-            routing_setup_timer.stop(Counter::RoutingSetupMicroseconds, &mut self.counters);
+            routing_setup_timer.stop(Counter::RoutingSetupMicroseconds, counters);
             let routing_inputs_timer = PassTimer::start();
             for input in transaction
                 .inputs
@@ -592,6 +595,7 @@ impl StyleEngine {
                         removed_rules_requiring_refresh: &mut removed_rules_requiring_refresh,
                     },
                     &mut regions,
+                    counters,
                 );
                 if regions.covers_document() {
                     break;
@@ -613,6 +617,7 @@ impl StyleEngine {
                             removed_rules_requiring_refresh: &mut removed_rules_requiring_refresh,
                         },
                         &mut regions,
+                        counters,
                     );
                     if regions.covers_document() {
                         break;
@@ -630,7 +635,7 @@ impl StyleEngine {
                 );
             }
             let prefix_producer_admission = if !regions.covers_document() && collect_pending_prefix_producers {
-                Some(self.ranked_scope_program(TreeScopeID::DOCUMENT))
+                Some(self.prepare_scope_program(TreeScopeID::DOCUMENT))
             } else {
                 None
             };
@@ -671,23 +676,22 @@ impl StyleEngine {
                         &mut pending_routes,
                         &mut pending_prefix_producers,
                         prefix_producer_admission.as_ref(),
-                        &mut prefix_producer_cache,
                         &mut prefix_producer_seen,
                         &mut sequences,
                         &mut regions,
+                        counters,
                     );
                     if regions.covers_document() {
                         break;
                     }
                 }
             }
-            routing_inputs_timer.stop(Counter::RoutingInputsMicroseconds, &mut self.counters);
+            routing_inputs_timer.stop(Counter::RoutingInputsMicroseconds, counters);
             pending_routes.finish();
             pending_sibling_routes.finish();
             let pending_table_scratch_bytes = (pending_routes.capacity_bytes()
                 + pending_sibling_routes.capacity_bytes()
                 + pending_prefix_producers.capacity() * size_of::<PendingPrefixProducer>()
-                + prefix_producer_cache.capacity_bytes()
                 + prefix_producer_seen.capacity() * size_of::<u32>())
                 as u64;
             self.memory
@@ -706,12 +710,13 @@ impl StyleEngine {
                     tree_routing,
                     &mut regions,
                     &mut planning_workspace,
+                    counters,
                 );
             }
             if !regions.covers_document() {
-                self.route_relational_sequence_changes(&sequences, &mut regions);
+                self.route_relational_sequence_changes(&sequences, &mut regions, counters);
             }
-            sequence_routing_timer.stop(Counter::SequenceRoutingMicroseconds, &mut self.counters);
+            sequence_routing_timer.stop(Counter::SequenceRoutingMicroseconds, counters);
             let mut prefix_convergence = PrefixConvergenceOutcome::default();
             let pending_route_flush_timer = PassTimer::start();
             if !regions.covers_document() {
@@ -723,6 +728,7 @@ impl StyleEngine {
                     &transaction,
                     &sequences,
                     &pending_prefix_producers,
+                    counters,
                 );
             }
             self.flush_deferred_sequence_routes(
@@ -731,6 +737,7 @@ impl StyleEngine {
                 &sequences,
                 &mut regions,
                 &mut planning_workspace,
+                counters,
             );
             if !regions.covers_document() {
                 self.flush_pending_sibling_routes(
@@ -739,10 +746,11 @@ impl StyleEngine {
                     &mut regions,
                     &mut planning_workspace,
                     prefix_convergence.sibling_routes_are_covered,
+                    counters,
                 );
             }
             drop(planning_workspace);
-            pending_route_flush_timer.stop(Counter::PendingRouteFlushMicroseconds, &mut self.counters);
+            pending_route_flush_timer.stop(Counter::PendingRouteFlushMicroseconds, counters);
             let pending_route_scratch_bytes = pending_routes
                 .values()
                 .map(|routes| (routes.capacity() * size_of::<ImpactRegion>()) as u64)
@@ -773,7 +781,7 @@ impl StyleEngine {
                 self.prepared_batch_matching_traversal = Some(prepared);
             }
         } else {
-            routing_setup_timer.stop(Counter::RoutingSetupMicroseconds, &mut self.counters);
+            routing_setup_timer.stop(Counter::RoutingSetupMicroseconds, counters);
         }
         // An element whose own declaration block moved in this transaction has C++ publish the
         // block's properties while it computes the style, so its winner state is not yet what the
@@ -820,7 +828,7 @@ impl StyleEngine {
             // A complete-scope action or coarsened journal proves no narrower output region, so the
             // plan is the document. An environment action still preserves the exact selector state
             // maintained above because it changed no selector input.
-            regions.widen_to_document(&mut self.counters);
+            regions.widen_to_document(counters);
         }
         if !self.prefix_caches.borrow().states.is_current() {
             self.discard_retained_prefix_caches();
@@ -834,8 +842,8 @@ impl StyleEngine {
         let patch_cover = retained_answer_patch_selection
             .as_ref()
             .map(|_| regions.compile_patch_cover(&self.tree, Some(root)));
-        self.resolve_already_planned_selector_truth(&regions, patch_cover.as_ref().map(|cover| &cover.full));
-        batch_compilation_timer.stop(Counter::BatchCompilationMicroseconds, &mut self.counters);
+        self.resolve_already_planned_selector_truth(&regions, patch_cover.as_ref().map(|cover| &cover.full), counters);
+        batch_compilation_timer.stop(Counter::BatchCompilationMicroseconds, counters);
         let program_base_version = transaction.program_base_version;
         // A scoped plan consumes retained match answers or packs its missing rows adaptively. Do
         // not walk and snapshot the complete required fact store merely to prepare for that bounded
@@ -856,11 +864,10 @@ impl StyleEngine {
                 inspected += 1;
                 is_complete &= facts.row_of(node).is_some();
             });
-            self.counters
-                .add(Counter::PreparedMatchingBatchCompletenessRowsInspected, inspected);
+            counters.add(Counter::PreparedMatchingBatchCompletenessRowsInspected, inspected);
             is_complete
         };
-        completeness_timer.stop(Counter::BatchCompilationMicroseconds, &mut self.counters);
+        completeness_timer.stop(Counter::BatchCompilationMicroseconds, counters);
         let fact_view_bytes = self
             .transaction_fact_view
             .as_ref()
@@ -925,15 +932,14 @@ impl StyleEngine {
         let style_input_reaction_bytes = (style_input_reactions.capacity() * size_of::<(StyleNodeID, u8, u8)>()) as u64;
         self.memory
             .reserve_required(MemoryCategory::BatchScratch, style_input_reaction_bytes);
-        self.release_transaction_and_sweep_atoms(transaction);
+        self.release_transaction_and_sweep_atoms(transaction, counters);
         // Releasing staging can compact primary payloads. Take the shared view afterwards so that
         // compaction does not need to copy the complete primary arrangement away from its view.
         if prepared_matching_batch_is_complete {
             let batch = self.facts.primary_view();
             // NB: This externally visible counter predates shared primary views. It now counts the
             //     rows made available to the prepared batch without implying a physical copy.
-            self.counters
-                .add(Counter::PreparedMatchingBatchRowsCloned, batch.live_row_count() as u64);
+            counters.add(Counter::PreparedMatchingBatchRowsCloned, batch.live_row_count() as u64);
             match &mut self.prepared_batch_matching_traversal {
                 Some(prepared) => prepared.batch = Some(batch),
                 None => {
@@ -951,7 +957,7 @@ impl StyleEngine {
         let patch_preparation_timer = PassTimer::start();
         let mut retained_answer_patch =
             retained_answer_patch_selection.map(|selection| self.prepare_retained_answer_patch(selection));
-        patch_preparation_timer.stop(Counter::RetainedAnswerPatchLoopMicroseconds, &mut self.counters);
+        patch_preparation_timer.stop(Counter::RetainedAnswerPatchLoopMicroseconds, counters);
         let retained_answer_patch_scratch_bytes = retained_answer_patch
             .as_ref()
             .map_or(0, RetainedAnswerPatch::capacity_bytes);
@@ -964,7 +970,7 @@ impl StyleEngine {
         };
         let compile_union_timer = PassTimer::start();
         let compiled_regions = regions.compile_union(regions.regions(), &self.tree, Some(root));
-        compile_union_timer.stop(Counter::BatchCompilationMicroseconds, &mut self.counters);
+        compile_union_timer.stop(Counter::BatchCompilationMicroseconds, counters);
         let winner_version_timer = PassTimer::start();
         if let Some(base_version) = program_base_version {
             let current_version = self.program.version();
@@ -977,16 +983,27 @@ impl StyleEngine {
                     });
             }
         }
-        winner_version_timer.stop(Counter::WinnerVersionAdvanceMicroseconds, &mut self.counters);
+        winner_version_timer.stop(Counter::WinnerVersionAdvanceMicroseconds, counters);
 
-        clock.enter(Counter::MatchingCascadeMicroseconds, &mut self.counters);
+        clock.enter(Counter::PrepareMicroseconds, counters);
+        if self.tree.has_tree_scopes() || !self.scope_roots.is_empty() {
+            let mut nodes = Vec::new();
+            regions.for_each_batch(&compiled_regions, |node| nodes.push(node));
+            let bytes = (nodes.capacity() * size_of::<StyleNodeID>()) as u64;
+            self.memory.reserve_required(MemoryCategory::BatchScratch, bytes);
+            self.prepare_scope_programs_for_nodes(nodes);
+            self.memory.release(MemoryCategory::BatchScratch, bytes);
+        } else {
+            self.prepare_scope_program(TreeScopeID::DOCUMENT);
+        }
+        clock.enter(Counter::MatchingCascadeMicroseconds, counters);
         let mut node_count = 0;
         let mut unattributed_node_count = 0;
         let mut published_match_answers = PublishedMatchAnswers::default();
         // A node inside any coarse region was planned without exact selector provenance. Exact
         // node routes consume their signed changes directly; only incomplete routes refresh.
         let mut selector_truth_changes = std::mem::take(&mut self.selector_truth_changes);
-        selector_truth_changes.consolidate(&mut self.counters);
+        selector_truth_changes.consolidate(counters);
         let selector_truth_change_bytes = selector_truth_changes.capacity_bytes();
         self.memory
             .reserve_required(MemoryCategory::BatchScratch, selector_truth_change_bytes);
@@ -1019,7 +1036,7 @@ impl StyleEngine {
         let mut attribution_sweep = AttributionSweep::default();
         let patch_loop_timer = PassTimer::start();
         regions.for_each_batch(&compiled_regions, |node| {
-            self.counters.bump(Counter::ReachedStyleNodes);
+            counters.bump(Counter::ReachedStyleNodes);
             #[cfg(test)]
             if let Some(capture) = &mut self.diagnostic_plan_capture {
                 capture.nodes.push(node.raw());
@@ -1067,14 +1084,14 @@ impl StyleEngine {
                     let node_deltas = selector_truth_changes.deltas_for(node);
                     let refreshes = selector_truth_changes.refreshes_for(node);
                     let truth_patch = if node_is_coarse_covered {
-                        self.counters.bump(Counter::RetainedPatchesCoarseCovered);
+                        counters.bump(Counter::RetainedPatchesCoarseCovered);
                         has_upquery = true;
                         SelectorTruthPatch::Full
                     } else if !attribution_known {
                         has_upquery = true;
                         SelectorTruthPatch::Full
                     } else if refreshes.iter().any(|refresh| refresh.rule.is_none()) {
-                        self.counters.bump(Counter::RetainedPatchesPoisoned);
+                        counters.bump(Counter::RetainedPatchesPoisoned);
                         has_upquery = true;
                         SelectorTruthPatch::Full
                     } else if !attribution_scratch.is_empty() {
@@ -1101,7 +1118,7 @@ impl StyleEngine {
                     {
                         SelectorTruthPatch::Direct(node_deltas)
                     } else {
-                        self.counters.bump(Counter::RetainedPatchesUnattributed);
+                        counters.bump(Counter::RetainedPatchesUnattributed);
                         has_upquery = true;
                         SelectorTruthPatch::Full
                     };
@@ -1139,7 +1156,7 @@ impl StyleEngine {
                         && node_has_safe_exact_cascade_provenance
                         && self.match_answer_is_comparable_across_elements(node);
                     can_stop_at_exact_cascade = transaction_supports_global_exact_cascade_stops;
-                    match self.patch_retained_match_answer(node, patch, truth_patch) {
+                    match self.patch_retained_match_answer(node, patch, truth_patch, counters) {
                         Some(outcome) => {
                             if outcome.emit
                                 && !has_direct_action
@@ -1162,7 +1179,7 @@ impl StyleEngine {
                                         .chain(current)
                                         .all(|entry| patch.cascade_update_rules.binary_search(&entry.rule).is_err())
                                 {
-                                    self.counters.bump(Counter::RetainedMatchAnswerPatchStops);
+                                    counters.bump(Counter::RetainedMatchAnswerPatchStops);
                                     return;
                                 }
                             }
@@ -1179,7 +1196,7 @@ impl StyleEngine {
                             outcome.emit
                         }
                         None => {
-                            self.counters.bump(Counter::RetainedMatchAnswerPatchMisses);
+                            counters.bump(Counter::RetainedMatchAnswerPatchMisses);
                             repair_match_identity = match_identity_is_complete_output
                                 && !patch.always_emit_for(node)
                                 && !patch.orders_shifted
@@ -1213,19 +1230,19 @@ impl StyleEngine {
                 identity_repair_nodes.push(node);
             }
             if has_direct_action {
-                self.counters.bump(Counter::PlannedNodesWithDirectAction);
+                counters.bump(Counter::PlannedNodesWithDirectAction);
             }
             if has_signed_delta {
-                self.counters.bump(Counter::PlannedNodesWithSignedDelta);
+                counters.bump(Counter::PlannedNodesWithSignedDelta);
             }
             if has_output_change {
-                self.counters.bump(Counter::PlannedNodesWithOutputChange);
+                counters.bump(Counter::PlannedNodesWithOutputChange);
             }
             if has_upquery {
-                self.counters.bump(Counter::PlannedNodesWithUpquery);
+                counters.bump(Counter::PlannedNodesWithUpquery);
             }
             if !has_direct_action && !has_signed_delta && !has_output_change && !has_upquery {
-                self.counters.bump(Counter::PlannedNodesUnattributed);
+                counters.bump(Counter::PlannedNodesUnattributed);
                 unattributed_node_count += 1;
             }
             node_count += 1;
@@ -1238,7 +1255,7 @@ impl StyleEngine {
                 exact_cascade_confirmation_nodes.push(node);
             }
         });
-        patch_loop_timer.stop(Counter::RetainedAnswerPatchLoopMicroseconds, &mut self.counters);
+        patch_loop_timer.stop(Counter::RetainedAnswerPatchLoopMicroseconds, counters);
         exact_cascade_stop_nodes.consolidate();
         exact_cascade_confirmation_nodes.consolidate();
         let exact_cascade_stop_node_bytes = exact_cascade_stop_nodes.capacity_bytes();
@@ -1251,12 +1268,12 @@ impl StyleEngine {
         if self.diagnostic_plan_capture.is_some() {
             // Plan-only fixtures deliberately omit unrelated fact rows. Complete those fixtures
             // after routing, as the browser has before it consumes the already-computed plan.
-            let counters = self.counters.clone();
+            let saved_counters = counters.clone();
             for node in self.elements_under(root) {
                 self.facts.ensure_row(node);
             }
             self.facts.apply_staged(&mut self.memory);
-            self.counters = counters;
+            *counters = saved_counters;
         }
         let publish_style_answers = true;
         {
@@ -1278,11 +1295,18 @@ impl StyleEngine {
                     published_nodes.len().saturating_mul(16) > self.tree.connected_element_count() as usize;
                 let reuse_active_batch_matching_traversal =
                     transaction_reaches_no_selector && self.batch_matching_traversal.is_some();
+                clock.enter(Counter::PrepareMicroseconds, counters);
                 if !reuse_active_batch_matching_traversal {
                     let completion_begin_timer = PassTimer::start();
-                    self.begin_published_match_answer_completion_batch(root, prefer_complete_batch);
-                    completion_begin_timer.stop(Counter::CompletionBatchBeginMicroseconds, &mut self.counters);
+                    self.begin_published_match_answer_completion_batch(root, prefer_complete_batch, counters);
+                    completion_begin_timer.stop(Counter::CompletionBatchBeginMicroseconds, counters);
+                } else if let Some(traversal) = self.batch_matching_traversal.take() {
+                    if let Some(batch) = traversal.batch.as_ref() {
+                        self.prepare_prefix_rows_for_batch(batch);
+                    }
+                    self.batch_matching_traversal = Some(traversal);
                 }
+                clock.enter(Counter::MatchingCascadeMicroseconds, counters);
                 let retained_answer_dispatch = retained_answer_patch
                     .as_ref()
                     .map(|patch| patch.dispatch.as_ref())
@@ -1304,6 +1328,7 @@ impl StyleEngine {
                 let mut completed_retained_answer_bytes = 0_u64;
                 let share_cascade_completions = published_nodes.len() >= MIN_SHARED_CASCADE_COMPLETION_BATCH;
                 let completion_pass_timer = PassTimer::start();
+                let mut traversal = self.batch_matching_traversal.take();
                 for index in 0..published_nodes.len() {
                     let node = published_nodes[index];
                     let previous_exact_cascade_input = previous_cascade_inputs[index];
@@ -1328,7 +1353,7 @@ impl StyleEngine {
                         .ok()
                         .map(|answer_index| {
                             let answer = &mut incremental_cascade_answers[answer_index];
-                            self.counters.bump(Counter::RetainedMatchAnswerReuses);
+                            counters.bump(Counter::RetainedMatchAnswerReuses);
                             PublishedMatchAnswer {
                                 node,
                                 cascade_input: Some(answer.cascade_input),
@@ -1339,7 +1364,7 @@ impl StyleEngine {
                         })
                         .or_else(|| {
                             if self.last_transaction_only_derived_child_reactions {
-                                self.reuse_published_match_answer(node)
+                                self.reuse_published_match_answer(node, counters)
                             } else {
                                 None
                             }
@@ -1356,11 +1381,17 @@ impl StyleEngine {
                                 source,
                                 cascade_input,
                                 cascade_winners_are_complete,
+                                counters,
                             )
                         })
                         .unwrap_or_else(|| {
-                            self.complete_published_match_answer(node, retained_answer_dispatch)
-                                .expect("a connected style reaction must have complete selector facts")
+                            self.complete_published_match_answer_in_traversal(
+                                node,
+                                traversal.as_deref_mut(),
+                                retained_answer_dispatch,
+                                counters,
+                            )
+                            .expect("a connected style reaction must have complete selector facts")
                         });
                     if let Some(identity) = retained_answer_identity
                         && let Some(cascade_input) = published_answer.cascade_input
@@ -1382,10 +1413,9 @@ impl StyleEngine {
                     if let Some(retained_cascade_input) = retained_cascade_input
                         && let Some(published_cascade_input) = published_answer.cascade_input
                     {
-                        self.counters
-                            .bump(Counter::PublishedMatchAnswerRetainedIdentityComparisons);
+                        counters.bump(Counter::PublishedMatchAnswerRetainedIdentityComparisons);
                         if retained_cascade_input == published_cascade_input {
-                            self.counters.bump(Counter::PublishedMatchAnswerRetainedIdentityMatches);
+                            counters.bump(Counter::PublishedMatchAnswerRetainedIdentityMatches);
                         }
                     }
                     // A confirmation may stop a reaction only when its proof is strictly cheaper
@@ -1439,11 +1469,12 @@ impl StyleEngine {
                                                 node,
                                                 previous_cascade_input,
                                                 current_cascade_input,
+                                                counters,
                                             )
                                     })
                             });
                     if confirmed_exact_cascade && let Some(current_cascade_input) = published_answer.cascade_input {
-                        verify_style_answer_patch(self, |verifier| {
+                        verify_style_answer_patch(self, counters, |verifier| {
                             verifier.verify_retained_cascade_input(node, current_cascade_input);
                         });
                     }
@@ -1452,12 +1483,12 @@ impl StyleEngine {
                             if previous_cascade_input.is_some()
                                 && published_answer.cascade_input == previous_cascade_input =>
                         {
-                            self.counters.bump(Counter::PublishedMatchAnswerIdentityRepairs);
-                            self.counters.bump(Counter::PublishedMatchAnswerIdentityRepairStops);
+                            counters.bump(Counter::PublishedMatchAnswerIdentityRepairs);
+                            counters.bump(Counter::PublishedMatchAnswerIdentityRepairStops);
                             node_count -= 1;
                         }
                         _ if confirmed_exact_cascade => {
-                            self.counters.bump(Counter::PublishedExactCascadeStops);
+                            counters.bump(Counter::PublishedExactCascadeStops);
                             node_count -= 1;
                         }
                         _ if exact_cascade_stop_nodes.as_slice().binary_search(&node).is_ok()
@@ -1465,23 +1496,24 @@ impl StyleEngine {
                             && self.exact_cascade_output_is_unchanged(node)
                             && self.pseudo_cascade_states_are_unchanged(node) =>
                         {
-                            self.counters.bump(Counter::PublishedExactCascadeStops);
+                            counters.bump(Counter::PublishedExactCascadeStops);
                             node_count -= 1;
                         }
                         published_answer => {
                             if previous_cascade_input.is_some() {
-                                self.counters.bump(Counter::PublishedMatchAnswerIdentityRepairs);
-                                self.counters.bump(Counter::MatchAnswerChanges);
-                                self.counters.bump(Counter::PlannedNodesWithOutputChange);
+                                counters.bump(Counter::PublishedMatchAnswerIdentityRepairs);
+                                counters.bump(Counter::MatchAnswerChanges);
+                                counters.bump(Counter::PlannedNodesWithOutputChange);
                             }
                             published_nodes[accepted_node_count] = node;
                             previous_cascade_inputs[accepted_node_count] = previous_exact_cascade_input;
                             accepted_node_count += 1;
-                            published_match_answers.push(published_answer, &mut self.memory, &mut self.counters);
+                            published_match_answers.push(published_answer, &mut self.memory, counters);
                         }
                     }
                 }
-                completion_pass_timer.stop(Counter::CompletionPassMicroseconds, &mut self.counters);
+                self.batch_matching_traversal = traversal;
+                completion_pass_timer.stop(Counter::CompletionPassMicroseconds, counters);
                 self.memory
                     .release(MemoryCategory::BatchScratch, completed_retained_answer_bytes);
                 published_nodes.truncate(accepted_node_count);
@@ -1537,12 +1569,13 @@ impl StyleEngine {
             .release(MemoryCategory::BatchScratch, direct_action_node_bytes);
         published_match_answers.sort();
         // Record computation interns and installs immediately in the current evaluator.
-        clock.enter(Counter::ComputationPublicationMicroseconds, &mut self.counters);
+        clock.enter(Counter::ComputationPublicationMicroseconds, counters);
         {
+            let mut style_delta_memory = MemoryLease::new(MemoryCategory::BridgeBuffer);
+            let mut computation_scratch_memory = MemoryLease::new(MemoryCategory::BatchScratch);
             let mut style_deltas = Vec::with_capacity(published_nodes.len());
             let style_delta_bytes = (style_deltas.capacity() * size_of::<PublishedStyleDeltaRecord>()) as u64;
-            self.memory
-                .reserve_required(MemoryCategory::BridgeBuffer, style_delta_bytes);
+            style_delta_memory.resize_required_to(&mut self.memory, style_delta_bytes);
             let mut unresolved_inheritance_sources = BitColumn::default();
             let mut unresolved_inheritance_source_bytes = 0;
             let mut engine_computed_record_scratch = publication::EngineComputedRecordScratch::default();
@@ -1552,318 +1585,455 @@ impl StyleEngine {
             // anything the descendant inherits.
             let mut confined_ancestors: HashMap<StyleNodeID, bool> = HashMap::default();
             let computation_loop_timer = PassTimer::start();
-            for (published_index, node) in published_nodes.iter().copied().enumerate() {
-                let pseudo_inputs_may_have_changed = pseudo_inputs_may_have_changed
-                    || !selector_truth_changes.refreshes_for(node).is_empty()
-                    || selector_truth_changes
-                        .deltas_for(node)
-                        .iter()
-                        .any(|delta| self.programs.entry(delta.entry).1.pseudo_element.is_some());
-                let answer = published_match_answers
-                    .lookup(node)
-                    .expect("each accepted style reaction has a published match answer");
-                let style_input_reaction_index = style_input_reactions
-                    .binary_search_by_key(&node, |&(style_node, _, _)| style_node)
-                    .ok();
-                let (reaction, inherited_style_groups) = style_input_reaction_index
-                    .map_or((transaction::STYLE_REACTION_PUBLISHED_STYLE, 0), |index| {
-                        (style_input_reactions[index].1, style_input_reactions[index].2)
+            engine_computed_record_scratch
+                .settled_nodes
+                .reserve(published_nodes.len());
+            confined_ancestors.reserve(published_nodes.len());
+            computation_scratch_memory.resize_required_to(
+                &mut self.memory,
+                engine_computed_record_scratch.capacity_bytes()
+                    + capacity::ShallowCapacityBytes::shallow_capacity_bytes(&confined_ancestors),
+            );
+            if let Some(resolver) = &mut self.font_resolver
+                && let Some(inputs) = self.document_style_computation_inputs
+            {
+                resolver.prepare(inputs.font_environment_generation);
+            }
+            // NB: This input crosses fixed-font intermediaries independently of inheritance.
+            //     Incremental roots use the current retained document inputs already submitted.
+            if let Some((root_index, root)) = published_nodes.iter().copied().enumerate().find(|(_, node)| {
+                self.computed_group_sets.adjustment_facts(*node) & bridge::element_adjustment_fact::IS_DOCUMENT_ELEMENT
+                    != 0
+            }) {
+                let answer = published_match_answers.lookup(root).unwrap();
+                let old_record = self.computed_group_sets.assigned_style_record(root);
+                let reaction = style_input_reactions
+                    .binary_search_by_key(&root, |&(node, _, _)| node)
+                    .map_or(transaction::STYLE_REACTION_PUBLISHED_STYLE, |index| {
+                        style_input_reactions[index].1
                     });
-                let pseudo_inputs_may_have_changed =
-                    pseudo_inputs_may_have_changed || style_input_reaction_index.is_some();
-                let old_style_record = self
-                    .computed_group_sets
-                    .assigned_style_record(node)
-                    .map_or(0, |style_record| style_record.raw());
-                // A record computed from an answer declaring past its winners (custom properties,
-                // `all`) is no function of a winner state: the engine derives nothing from it.
-                let previous_answer_was_incomplete = self.computed_group_sets.node_answer_is_incomplete(node);
-                // Custom properties alone leave an answer complete enough: the engine computes
-                // the environment they decide.
-                let answer_is_incomplete = !answer.cascade_winners_are_complete
-                    && !self.cascade_winners_are_complete_but_for_custom_properties(node);
-                self.computed_group_sets
-                    .set_node_answer_incomplete(node, answer_is_incomplete);
-                let direct_inherited_delta = (reaction == transaction::STYLE_REACTION_INHERITED_STYLE)
-                    .then(|| self.tree.flat_tree_parent(node))
-                    .flatten()
-                    .filter(|parent| {
-                        parent
-                            .element_index()
-                            .is_none_or(|index| !unresolved_inheritance_sources.contains(index as usize))
-                    })
-                    .and_then(|parent| {
-                        self.computed_group_sets.replace_engine_resolvable_inherited_groups(
-                            node,
-                            parent,
-                            inherited_style_groups,
-                        )
-                    });
-                // A regular style reaction whose moved winners the engine can compute itself
-                // publishes its new record here, so C++ applies a record instead of running a
-                // style computation. A reaction that also carries a style input, or that may have
-                // moved a pseudo-element's inputs, still materializes in C++. An ancestor this
-                // flush already settled holds the record the node inherits from.
-                // The answer says whether the node relied on a settled ancestor, whose record it
-                // then inherits from in full. C++ closes its batch over the nodes between a
-                // published descendant and its published ancestor, and folds what the ancestor's
-                // application derives into each of them before the descendant, so the node's
-                // parent holds what it inherits from only when every node up to the settled
-                // ancestor is settled as well.
-                let ancestors_are_confined = |engine: &Self,
-                                              confined_ancestors: &mut HashMap<StyleNodeID, bool>,
-                                              settled_nodes: &HashSet<StyleNodeID>|
-                 -> Option<bool> {
-                    let mut relied_on_settled_ancestor = false;
-                    let mut unsettled_between = false;
-                    let mut ancestor = engine.tree.flat_tree_parent(node);
-                    while let Some(current) = ancestor {
-                        let settled = settled_nodes.contains(&current);
-                        if published_match_answers.lookup(current).is_some() {
-                            let confined = *confined_ancestors.entry(current).or_insert_with(|| {
-                                style_input_reactions
-                                    .binary_search_by_key(&current, |&(style_node, _, _)| style_node)
-                                    .is_err()
-                                    && engine.winner_delta_is_engine_confined(current)
-                                    && !engine.node_environment_may_move(current)
-                            });
-                            if !confined {
-                                if !settled || unsettled_between {
-                                    return None;
-                                }
-                                relied_on_settled_ancestor = true;
-                            }
-                        }
-                        unsettled_between |= !settled;
-                        ancestor = engine.tree.flat_tree_parent(current);
-                    }
-                    Some(relied_on_settled_ancestor)
+                let parent_inputs = publication::ParentInputsMoved {
+                    inherited_style: reaction & transaction::STYLE_REACTION_INHERITED_STYLE != 0,
+                    display: parent_inputs_moved_nodes.contains(&root),
                 };
-                // A refreshed answer cannot say which entries moved, so the flag stays conservative
-                // for C++; the pseudo winner states themselves are current here and settle it.
-                // A published-style reaction is the engine's to settle, as are the recompute and
-                // the inherited-style reaction the engine derived for a child of an applied
-                // reaction (a reaction C++ asked for through a recorded input is C++'s), and a
-                // first record takes any published-style reaction.
-                const DERIVABLE_REACTIONS: u8 = transaction::STYLE_REACTION_RECOMPUTE_STYLE
+                const DERIVABLE: u8 = transaction::STYLE_REACTION_RECOMPUTE_STYLE
                     | transaction::STYLE_REACTION_INHERITED_STYLE
                     | transaction::STYLE_REACTION_INHERITED_CUSTOM_PROPERTIES;
-                let reaction_is_settleable =
-                    reaction & !(transaction::STYLE_REACTION_PUBLISHED_STYLE | DERIVABLE_REACTIONS) == 0
-                        && !(reaction & DERIVABLE_REACTIONS != 0 && style_input_nodes_for_cpp.contains(&node));
-                let mut parent_inputs_moved = publication::ParentInputsMoved {
-                    inherited_style: reaction & transaction::STYLE_REACTION_INHERITED_STYLE != 0,
-                    display: parent_inputs_moved_nodes.contains(&node),
-                };
-                let mut retry_after_ancestor = false;
-                let engine_computed_gate_passes = if direct_inherited_delta.is_some() {
-                    false
-                } else if reaction == transaction::STYLE_REACTION_INHERITED_CUSTOM_PROPERTIES
-                    && !parent_inputs_moved.display
-                    && !self.node_style_reads_custom_properties(node)
-                {
-                    // C++ only refreshes the inherited environment for a non-consumer. There
-                    // is no element record to recompute or compare against the parent's groups.
-                    false
-                } else if (named_rule_context_changed && old_style_record != 0)
-                    || !(reaction_is_settleable
-                        || (old_style_record == 0 && reaction & transaction::STYLE_REACTION_PUBLISHED_STYLE != 0))
-                {
-                    self.counters.bump(Counter::EngineComputedRecordGateReaction);
-                    false
-                } else if nodes_with_declaration_changes.binary_search(&node).is_ok() {
-                    self.counters.bump(Counter::EngineComputedRecordGateDeclarations);
-                    false
-                } else if self.custom_property_registrations_changed && self.node_style_reads_custom_properties(node) {
-                    self.counters.bump(Counter::EngineComputedRecordBailSubstitution);
-                    false
-                } else if previous_answer_was_incomplete
-                    || selector_truth_changes.deltas_for(node).iter().any(|delta| {
+                let reaction_is_settleable = reaction & !(transaction::STYLE_REACTION_PUBLISHED_STYLE | DERIVABLE) == 0
+                    && !(reaction & DERIVABLE != 0 && style_input_nodes_for_cpp.contains(&root));
+                let can_prepare = !(named_rule_context_changed && old_record.is_some())
+                    && (reaction_is_settleable
+                        || (old_record.is_none() && reaction & transaction::STYLE_REACTION_PUBLISHED_STYLE != 0))
+                    && nodes_with_declaration_changes.binary_search(&root).is_err()
+                    && !(self.custom_property_registrations_changed && self.node_style_reads_custom_properties(root))
+                    && !self.computed_group_sets.node_answer_is_incomplete(root)
+                    && !selector_truth_changes.deltas_for(root).iter().any(|delta| {
                         !self
                             .program
                             .declarations_are_complete_but_for_custom_properties(delta.rule)
-                    })
-                {
-                    // Custom declarations are resolved by the engine's environment computation.
-                    // Other declarations missing from the winner columns still require C++.
-                    self.counters.bump(Counter::EngineComputedRecordGateIncompleteAnswer);
-                    false
+                    });
+                if can_prepare {
+                    let flipped_rules = selector_truth_changes.deltas_for(root);
+                    let answer_is_unchanged =
+                        answer.cascade_input.is_some() && answer.cascade_input == previous_cascade_inputs[root_index];
+                    let flipped: Vec<publication::FlippedRule> = flipped_rules
+                        .iter()
+                        .map(|delta| publication::FlippedRule {
+                            pseudo_kind: self
+                                .programs
+                                .entry(delta.entry)
+                                .1
+                                .pseudo_element
+                                .map(|pseudo| pseudo.kind.0),
+                        })
+                        .collect();
+                    let winners_are_exact = !environment_changed
+                        && !rule_declarations_edited
+                        && selector_truth_changes.refreshes_for(root).is_empty()
+                        && (answer_is_unchanged
+                            || (!flipped_rules.is_empty()
+                                && flipped_rules
+                                    .iter()
+                                    .all(|delta| self.program.declarations_are_complete_for(delta.rule))));
+                    self.prepare_root_font_inputs(
+                        root,
+                        answer.cascade_winners_are_complete,
+                        winners_are_exact.then_some(flipped.as_slice()),
+                        parent_inputs,
+                        &mut engine_computed_record_scratch,
+                        counters,
+                    );
                 } else {
-                    match ancestors_are_confined(
-                        self,
-                        &mut confined_ancestors,
-                        &engine_computed_record_scratch.settled_nodes,
-                    ) {
-                        None => {
-                            self.counters.bump(Counter::EngineComputedRecordGateAncestors);
-                            retry_after_ancestor = self.tree.tree_scope(node) == TreeScopeID::DOCUMENT
-                                && (answer.cascade_winners_are_complete
-                                    || self.cascade_winners_are_complete_but_for_custom_properties(node));
-                            false
-                        }
-                        Some(relied_on_settled_ancestor) => {
-                            parent_inputs_moved.inherited_style |= relied_on_settled_ancestor;
-                            true
-                        }
-                    }
-                };
-                let engine_computed_delta = engine_computed_gate_passes
-                    .then(|| {
-                        // Unchanged winners stand for an unchanged record only when the reaction
-                        // is rules flipping for the node, every one of them known and declaring
-                        // nothing past its winners, or the node's answer is the one it had.
-                        let flipped_rules = selector_truth_changes.deltas_for(node);
-                        let answer_is_unchanged = answer.cascade_input.is_some()
-                            && answer.cascade_input == previous_cascade_inputs[published_index];
-                        let flipped: Vec<publication::FlippedRule> = flipped_rules
-                            .iter()
-                            .map(|delta| publication::FlippedRule {
-                                pseudo_kind: self
-                                    .programs
-                                    .entry(delta.entry)
-                                    .1
-                                    .pseudo_element
-                                    .map(|pseudo| pseudo.kind.0),
-                            })
-                            .collect();
-                        let winners_are_exact = !environment_changed
-                            && !rule_declarations_edited
-                            && selector_truth_changes.refreshes_for(node).is_empty()
-                            && (answer_is_unchanged
-                                || (!flipped_rules.is_empty()
-                                    && flipped_rules
-                                        .iter()
-                                        .all(|delta| self.program.declarations_are_complete_for(delta.rule))));
-                        self.engine_computed_record_delta(
-                            node,
-                            answer.cascade_winners_are_complete,
-                            winners_are_exact.then_some(flipped.as_slice()),
-                            parent_inputs_moved,
-                            &mut engine_computed_record_scratch,
-                        )
-                    })
-                    .flatten();
-                // A first record C++ declines for the custom-property environment it inherits
-                // takes its descendants' first records down with it: a descendant's environment is
-                // the parent's own, which fails the same check whenever the parent's did.
-                if direct_inherited_delta.is_some() || engine_computed_delta.is_some() {
-                    engine_computed_record_scratch.settled_nodes.insert(node);
-                    if let Some((_, new_style_record)) = engine_computed_delta
-                        && self.computed_group_sets.adjustment_facts(node)
-                            & bridge::element_adjustment_fact::IS_DOCUMENT_ELEMENT
-                            != 0
-                        && self.refresh_root_font_metrics_from_record(new_style_record)
-                    {
-                        engine_computed_record_scratch.cold_cohorts.clear();
-                        engine_computed_record_scratch.pseudo_cohorts.clear();
-                    }
-                } else if reaction == transaction::STYLE_REACTION_INHERITED_STYLE {
-                    let index =
-                        node.element_index()
-                            .expect("an inherited style reaction targets an element") as usize;
-                    let (_, growth) = unresolved_inheritance_sources.set(index, true);
-                    self.memory.reserve_required(MemoryCategory::BatchScratch, growth);
-                    unresolved_inheritance_source_bytes += growth;
+                    counters.bump(Counter::RootFontInputsUnprovenFallbacks);
                 }
-                let (old_style_record, new_style_record, damage, gap) =
-                    match (direct_inherited_delta, engine_computed_delta) {
-                        (Some((old_style_record, new_style_record)), _) => (
-                            old_style_record.raw(),
-                            new_style_record.raw(),
-                            FfiStyleDeltaDamage::Full,
-                            FfiStyleDeltaGap::None,
-                        ),
-                        (None, Some((old_style_record, new_style_record))) => (
-                            old_style_record.raw(),
-                            new_style_record.raw(),
-                            FfiStyleDeltaDamage::Full,
-                            FfiStyleDeltaGap::Computed,
-                        ),
-                        (None, None) => (
-                            old_style_record,
-                            0,
-                            FfiStyleDeltaDamage::None,
-                            if retry_after_ancestor {
-                                FfiStyleDeltaGap::RetryAfterAncestor
-                            } else {
-                                FfiStyleDeltaGap::Materialize
-                            },
-                        ),
-                    };
-                // A moved inherited environment the engine leaves to C++ reaches what the node's
-                // custom declarations and substitutions read: C++ recomputes such a node, which
-                // it cannot tell from an engine-computed record.
-                let reaction = if gap == FfiStyleDeltaGap::Materialize
-                    && reaction & transaction::STYLE_REACTION_INHERITED_CUSTOM_PROPERTIES != 0
-                    && reaction & transaction::STYLE_REACTION_RECOMPUTE_STYLE == 0
-                    && self.node_style_reads_custom_properties(node)
-                {
-                    reaction | transaction::STYLE_REACTION_RECOMPUTE_STYLE
-                } else {
-                    reaction
-                };
-                let style_delta = PublishedStyleDeltaRecord {
-                    style_node: node.raw(),
-                    match_answer: answer.cascade_input.map_or(0, |cascade_input| cascade_input.0),
-                    old_style_record,
-                    new_style_record,
-                    damage,
-                    reaction: reaction
-                        | if pseudo_inputs_may_have_changed {
-                            transaction::STYLE_REACTION_PSEUDO_INPUTS_MAY_HAVE_CHANGED
-                        } else {
-                            0
-                        },
-                    inherited_style_groups,
-                    pseudo_kind: u8::MAX,
-                    gap,
-                    uses_substitution: gap == FfiStyleDeltaGap::Computed
-                        && self.nodes_with_substituted_records.contains(&node),
-                };
-                style_deltas.push(style_delta);
-                // The pseudo-element records the engine settled beside an engine-computed record
-                // follow it, for C++ to install with it.
-                if gap == FfiStyleDeltaGap::Computed {
-                    for pseudo in engine_computed_record_scratch.pseudo_deltas.drain(..) {
-                        style_deltas.push(PublishedStyleDeltaRecord {
-                            style_node: node.raw(),
-                            match_answer: style_delta.match_answer,
-                            old_style_record: pseudo.old_style_record.raw(),
-                            new_style_record: pseudo.new_style_record.raw(),
-                            damage: FfiStyleDeltaDamage::Full,
-                            reaction: transaction::STYLE_REACTION_PUBLISHED_STYLE,
-                            inherited_style_groups: 0,
-                            pseudo_kind: pseudo.kind,
-                            gap: FfiStyleDeltaGap::Computed,
-                            uses_substitution: false,
+                computation_scratch_memory.resize_required_to(
+                    &mut self.memory,
+                    engine_computed_record_scratch.capacity_bytes()
+                        + capacity::ShallowCapacityBytes::shallow_capacity_bytes(&confined_ancestors),
+                );
+            }
+            let mut next_published_index = 0;
+            let mut pending_parent_inputs = None;
+            while next_published_index < published_nodes.len() {
+                for (published_index, node) in published_nodes.iter().copied().enumerate().skip(next_published_index) {
+                    let pseudo_inputs_may_have_changed = pseudo_inputs_may_have_changed
+                        || !selector_truth_changes.refreshes_for(node).is_empty()
+                        || selector_truth_changes
+                            .deltas_for(node)
+                            .iter()
+                            .any(|delta| self.programs.entry(delta.entry).1.pseudo_element.is_some());
+                    let answer = published_match_answers
+                        .lookup(node)
+                        .expect("each accepted style reaction has a published match answer");
+                    let style_input_reaction_index = style_input_reactions
+                        .binary_search_by_key(&node, |&(style_node, _, _)| style_node)
+                        .ok();
+                    let (reaction, inherited_style_groups) = style_input_reaction_index
+                        .map_or((transaction::STYLE_REACTION_PUBLISHED_STYLE, 0), |index| {
+                            (style_input_reactions[index].1, style_input_reactions[index].2)
                         });
+                    let pseudo_inputs_may_have_changed =
+                        pseudo_inputs_may_have_changed || style_input_reaction_index.is_some();
+                    let old_style_record = self
+                        .computed_group_sets
+                        .assigned_style_record(node)
+                        .map_or(0, |style_record| style_record.raw());
+                    // A record computed from an answer declaring past its winners (custom properties,
+                    // `all`) is no function of a winner state: the engine derives nothing from it.
+                    let previous_answer_was_incomplete = self.computed_group_sets.node_answer_is_incomplete(node);
+                    // Custom properties alone leave an answer complete enough: the engine computes
+                    // the environment they decide.
+                    let answer_is_incomplete = !answer.cascade_winners_are_complete
+                        && !self.cascade_winners_are_complete_but_for_custom_properties(node);
+                    self.computed_group_sets
+                        .set_node_answer_incomplete(node, answer_is_incomplete);
+                    let prepared_parent_inputs = if engine_computed_record_scratch
+                        .prepared_root_font
+                        .as_ref()
+                        .is_some_and(|(root, _, _)| *root == node)
+                    {
+                        let (_, parent_inputs, font_drive) =
+                            engine_computed_record_scratch.prepared_root_font.take().unwrap();
+                        engine_computed_record_scratch.font_drive = font_drive;
+                        Some(parent_inputs)
+                    } else {
+                        None
+                    };
+                    let resuming_font = engine_computed_record_scratch.font_drive.is_pending();
+                    let direct_inherited_delta = (reaction == transaction::STYLE_REACTION_INHERITED_STYLE
+                        && !resuming_font)
+                        .then(|| self.tree.flat_tree_parent(node))
+                        .flatten()
+                        .filter(|parent| {
+                            parent
+                                .element_index()
+                                .is_none_or(|index| !unresolved_inheritance_sources.contains(index as usize))
+                        })
+                        .and_then(|parent| {
+                            self.computed_group_sets.replace_engine_resolvable_inherited_groups(
+                                node,
+                                parent,
+                                inherited_style_groups,
+                            )
+                        });
+                    // A regular style reaction whose moved winners the engine can compute itself
+                    // publishes its new record here, so C++ applies a record instead of running a
+                    // style computation. A reaction that also carries a style input, or that may have
+                    // moved a pseudo-element's inputs, still materializes in C++. An ancestor this
+                    // flush already settled holds the record the node inherits from.
+                    // The answer says whether the node relied on a settled ancestor, whose record it
+                    // then inherits from in full. C++ closes its batch over the nodes between a
+                    // published descendant and its published ancestor, and folds what the ancestor's
+                    // application derives into each of them before the descendant, so the node's
+                    // parent holds what it inherits from only when every node up to the settled
+                    // ancestor is settled as well.
+                    let ancestors_are_confined = |engine: &Self,
+                                                  confined_ancestors: &mut HashMap<StyleNodeID, bool>,
+                                                  settled_nodes: &HashSet<StyleNodeID>|
+                     -> Option<bool> {
+                        let mut relied_on_settled_ancestor = false;
+                        let mut unsettled_between = false;
+                        let mut ancestor = engine.tree.flat_tree_parent(node);
+                        while let Some(current) = ancestor {
+                            let settled = settled_nodes.contains(&current);
+                            if published_match_answers.lookup(current).is_some() {
+                                let confined = *confined_ancestors.entry(current).or_insert_with(|| {
+                                    style_input_reactions
+                                        .binary_search_by_key(&current, |&(style_node, _, _)| style_node)
+                                        .is_err()
+                                        && engine.winner_delta_is_engine_confined(current)
+                                        && !engine.node_environment_may_move(current)
+                                });
+                                if !confined {
+                                    if !settled || unsettled_between {
+                                        return None;
+                                    }
+                                    relied_on_settled_ancestor = true;
+                                }
+                            }
+                            unsettled_between |= !settled;
+                            ancestor = engine.tree.flat_tree_parent(current);
+                        }
+                        Some(relied_on_settled_ancestor)
+                    };
+                    // A refreshed answer cannot say which entries moved, so the flag stays conservative
+                    // for C++; the pseudo winner states themselves are current here and settle it.
+                    // A published-style reaction is the engine's to settle, as are the recompute and
+                    // the inherited-style reaction the engine derived for a child of an applied
+                    // reaction (a reaction C++ asked for through a recorded input is C++'s), and a
+                    // first record takes any published-style reaction.
+                    const DERIVABLE_REACTIONS: u8 = transaction::STYLE_REACTION_RECOMPUTE_STYLE
+                        | transaction::STYLE_REACTION_INHERITED_STYLE
+                        | transaction::STYLE_REACTION_INHERITED_CUSTOM_PROPERTIES;
+                    let reaction_is_settleable =
+                        reaction & !(transaction::STYLE_REACTION_PUBLISHED_STYLE | DERIVABLE_REACTIONS) == 0
+                            && !(reaction & DERIVABLE_REACTIONS != 0 && style_input_nodes_for_cpp.contains(&node));
+                    let mut parent_inputs_moved = pending_parent_inputs.take().or(prepared_parent_inputs).unwrap_or(
+                        publication::ParentInputsMoved {
+                            inherited_style: reaction & transaction::STYLE_REACTION_INHERITED_STYLE != 0,
+                            display: parent_inputs_moved_nodes.contains(&node),
+                        },
+                    );
+                    let mut retry_after_ancestor = false;
+                    // NB: Entry gates were already established for a suspended computation.
+                    //     Its completed originating record must not change that decision.
+                    let engine_computed_gate_passes = if resuming_font {
+                        true
+                    } else if direct_inherited_delta.is_some() {
+                        false
+                    } else if reaction == transaction::STYLE_REACTION_INHERITED_CUSTOM_PROPERTIES
+                        && !parent_inputs_moved.display
+                        && !self.node_style_reads_custom_properties(node)
+                    {
+                        // C++ only refreshes the inherited environment for a non-consumer. There
+                        // is no element record to recompute or compare against the parent's groups.
+                        false
+                    } else if (named_rule_context_changed && old_style_record != 0)
+                        || !(reaction_is_settleable
+                            || (old_style_record == 0 && reaction & transaction::STYLE_REACTION_PUBLISHED_STYLE != 0))
+                    {
+                        counters.bump(Counter::EngineComputedRecordGateReaction);
+                        false
+                    } else if nodes_with_declaration_changes.binary_search(&node).is_ok() {
+                        counters.bump(Counter::EngineComputedRecordGateDeclarations);
+                        false
+                    } else if self.custom_property_registrations_changed
+                        && self.node_style_reads_custom_properties(node)
+                    {
+                        counters.bump(Counter::EngineComputedRecordBailSubstitution);
+                        false
+                    } else if previous_answer_was_incomplete
+                        || selector_truth_changes.deltas_for(node).iter().any(|delta| {
+                            !self
+                                .program
+                                .declarations_are_complete_but_for_custom_properties(delta.rule)
+                        })
+                    {
+                        // Custom declarations are resolved by the engine's environment computation.
+                        // Other declarations missing from the winner columns still require C++.
+                        counters.bump(Counter::EngineComputedRecordGateIncompleteAnswer);
+                        false
+                    } else {
+                        match ancestors_are_confined(
+                            self,
+                            &mut confined_ancestors,
+                            &engine_computed_record_scratch.settled_nodes,
+                        ) {
+                            None => {
+                                counters.bump(Counter::EngineComputedRecordGateAncestors);
+                                retry_after_ancestor = self.tree.tree_scope(node) == TreeScopeID::DOCUMENT
+                                    && (answer.cascade_winners_are_complete
+                                        || self.cascade_winners_are_complete_but_for_custom_properties(node));
+                                false
+                            }
+                            Some(relied_on_settled_ancestor) => {
+                                parent_inputs_moved.inherited_style |= relied_on_settled_ancestor;
+                                true
+                            }
+                        }
+                    };
+                    let engine_computed_delta = engine_computed_gate_passes
+                        .then(|| {
+                            // Unchanged winners stand for an unchanged record only when the reaction
+                            // is rules flipping for the node, every one of them known and declaring
+                            // nothing past its winners, or the node's answer is the one it had.
+                            let flipped_rules = selector_truth_changes.deltas_for(node);
+                            let answer_is_unchanged = answer.cascade_input.is_some()
+                                && answer.cascade_input == previous_cascade_inputs[published_index];
+                            let flipped: Vec<publication::FlippedRule> = flipped_rules
+                                .iter()
+                                .map(|delta| publication::FlippedRule {
+                                    pseudo_kind: self
+                                        .programs
+                                        .entry(delta.entry)
+                                        .1
+                                        .pseudo_element
+                                        .map(|pseudo| pseudo.kind.0),
+                                })
+                                .collect();
+                            let winners_are_exact = !environment_changed
+                                && !rule_declarations_edited
+                                && selector_truth_changes.refreshes_for(node).is_empty()
+                                && (answer_is_unchanged
+                                    || (!flipped_rules.is_empty()
+                                        && flipped_rules
+                                            .iter()
+                                            .all(|delta| self.program.declarations_are_complete_for(delta.rule))));
+                            self.engine_computed_record_delta(
+                                node,
+                                answer.cascade_winners_are_complete,
+                                winners_are_exact.then_some(flipped.as_slice()),
+                                parent_inputs_moved,
+                                &mut engine_computed_record_scratch,
+                                counters,
+                            )
+                        })
+                        .flatten();
+                    if engine_computed_record_scratch.font_drive.request.is_some() {
+                        // NB: Retain this canonical suffix across refill. Descendants have not read
+                        //     their pending parent's old record, and the journal may be empty.
+                        next_published_index = published_index;
+                        pending_parent_inputs = Some(parent_inputs_moved);
+                        break;
                     }
+                    next_published_index = published_index + 1;
+                    // A first record C++ declines for the custom-property environment it inherits
+                    // takes its descendants' first records down with it: a descendant's environment is
+                    // the parent's own, which fails the same check whenever the parent's did.
+                    if direct_inherited_delta.is_some() || engine_computed_delta.is_some() {
+                        engine_computed_record_scratch.settled_nodes.insert(node);
+                    } else if reaction == transaction::STYLE_REACTION_INHERITED_STYLE {
+                        let index = node
+                            .element_index()
+                            .expect("an inherited style reaction targets an element")
+                            as usize;
+                        let (_, growth) = unresolved_inheritance_sources.set(index, true);
+                        self.memory.reserve_required(MemoryCategory::BatchScratch, growth);
+                        unresolved_inheritance_source_bytes += growth;
+                    }
+                    let (old_style_record, new_style_record, damage, gap) =
+                        match (direct_inherited_delta, engine_computed_delta) {
+                            (Some((old_style_record, new_style_record)), _) => (
+                                old_style_record.raw(),
+                                new_style_record.raw(),
+                                FfiStyleDeltaDamage::Full,
+                                FfiStyleDeltaGap::None,
+                            ),
+                            (None, Some((old_style_record, new_style_record))) => (
+                                old_style_record.raw(),
+                                new_style_record.raw(),
+                                FfiStyleDeltaDamage::Full,
+                                FfiStyleDeltaGap::Computed,
+                            ),
+                            (None, None) => (
+                                old_style_record,
+                                0,
+                                FfiStyleDeltaDamage::None,
+                                if retry_after_ancestor {
+                                    FfiStyleDeltaGap::RetryAfterAncestor
+                                } else {
+                                    FfiStyleDeltaGap::Materialize
+                                },
+                            ),
+                        };
+                    // A moved inherited environment the engine leaves to C++ reaches what the node's
+                    // custom declarations and substitutions read: C++ recomputes such a node, which
+                    // it cannot tell from an engine-computed record.
+                    let reaction = if gap == FfiStyleDeltaGap::Materialize
+                        && reaction & transaction::STYLE_REACTION_INHERITED_CUSTOM_PROPERTIES != 0
+                        && reaction & transaction::STYLE_REACTION_RECOMPUTE_STYLE == 0
+                        && self.node_style_reads_custom_properties(node)
+                    {
+                        reaction | transaction::STYLE_REACTION_RECOMPUTE_STYLE
+                    } else {
+                        reaction
+                    };
+                    let style_delta = PublishedStyleDeltaRecord {
+                        style_node: node.raw(),
+                        match_answer: answer.cascade_input.map_or(0, |cascade_input| cascade_input.0),
+                        old_style_record,
+                        new_style_record,
+                        damage,
+                        reaction: reaction
+                            | if pseudo_inputs_may_have_changed {
+                                transaction::STYLE_REACTION_PSEUDO_INPUTS_MAY_HAVE_CHANGED
+                            } else {
+                                0
+                            },
+                        inherited_style_groups,
+                        pseudo_kind: u8::MAX,
+                        gap,
+                        uses_substitution: gap == FfiStyleDeltaGap::Computed
+                            && self.nodes_with_substituted_records.contains(&node),
+                    };
+                    if style_deltas.len() == style_deltas.capacity() {
+                        style_deltas.reserve(1);
+                        style_delta_memory.resize_required_to(
+                            &mut self.memory,
+                            capacity::ShallowCapacityBytes::shallow_capacity_bytes(&style_deltas),
+                        );
+                    }
+                    style_deltas.push(style_delta);
+                    // The pseudo-element records the engine settled beside an engine-computed record
+                    // follow it, for C++ to install with it.
+                    if gap == FfiStyleDeltaGap::Computed {
+                        for pseudo in engine_computed_record_scratch.pseudo_deltas.drain(..) {
+                            if style_deltas.len() == style_deltas.capacity() {
+                                style_deltas.reserve(1);
+                                style_delta_memory.resize_required_to(
+                                    &mut self.memory,
+                                    capacity::ShallowCapacityBytes::shallow_capacity_bytes(&style_deltas),
+                                );
+                            }
+                            style_deltas.push(PublishedStyleDeltaRecord {
+                                style_node: node.raw(),
+                                match_answer: style_delta.match_answer,
+                                old_style_record: pseudo.old_style_record.raw(),
+                                new_style_record: pseudo.new_style_record.raw(),
+                                damage: FfiStyleDeltaDamage::Full,
+                                reaction: transaction::STYLE_REACTION_PUBLISHED_STYLE,
+                                inherited_style_groups: 0,
+                                pseudo_kind: pseudo.kind,
+                                gap: FfiStyleDeltaGap::Computed,
+                                uses_substitution: false,
+                            });
+                        }
+                    }
+                    // NB: Sample scratch coexistence without scanning its containers per element.
+                    if (published_index + 1).is_multiple_of(256) {
+                        computation_scratch_memory.resize_required_to(
+                            &mut self.memory,
+                            engine_computed_record_scratch.capacity_bytes()
+                                + capacity::ShallowCapacityBytes::shallow_capacity_bytes(&confined_ancestors),
+                        );
+                    }
+                }
+                if let Some(request) = engine_computed_record_scratch.font_drive.request.take() {
+                    computation_scratch_memory.resize_required_to(
+                        &mut self.memory,
+                        engine_computed_record_scratch.capacity_bytes()
+                            + capacity::ShallowCapacityBytes::shallow_capacity_bytes(&confined_ancestors),
+                    );
+                    let node = published_nodes[next_published_index];
+                    self.refill_font_request(node, request, counters);
                 }
             }
-            computation_loop_timer.stop(Counter::ComputationLoopMicroseconds, &mut self.counters);
-            let style_delta_bytes = {
-                let grown = (style_deltas.capacity() * size_of::<PublishedStyleDeltaRecord>()) as u64;
-                if grown > style_delta_bytes {
-                    self.memory
-                        .reserve_required(MemoryCategory::BridgeBuffer, grown - style_delta_bytes);
-                }
-                grown.max(style_delta_bytes)
-            };
-            let cohort_bytes = engine_computed_record_scratch.capacity_bytes()
-                + (confined_ancestors.capacity() * size_of::<(StyleNodeID, bool)>()) as u64;
-            self.memory.reserve_required(MemoryCategory::BatchScratch, cohort_bytes);
+            computation_loop_timer.stop(Counter::ComputationLoopMicroseconds, counters);
+            computation_scratch_memory.resize_required_to(
+                &mut self.memory,
+                engine_computed_record_scratch.capacity_bytes()
+                    + capacity::ShallowCapacityBytes::shallow_capacity_bytes(&confined_ancestors),
+            );
             drop(engine_computed_record_scratch);
             drop(confined_ancestors);
-            self.memory.release(MemoryCategory::BatchScratch, cohort_bytes);
+            computation_scratch_memory.release();
             if !style_deltas.is_empty() {
                 self.settle_computed_memory();
-                self.counters
-                    .add(Counter::PublishedMatchAnswerRecords, style_deltas.len() as u64);
-                clock.enter(Counter::EmitMicroseconds, &mut self.counters);
+                counters.add(Counter::PublishedMatchAnswerRecords, style_deltas.len() as u64);
+                clock.enter(Counter::EmitMicroseconds, counters);
                 emit(transaction_version, program_version, &style_deltas);
             }
-            clock.enter(Counter::TransactionRemainderMicroseconds, &mut self.counters);
-            self.memory.release(MemoryCategory::BridgeBuffer, style_delta_bytes);
+            clock.enter(Counter::TransactionRemainderMicroseconds, counters);
             self.memory.release(
                 MemoryCategory::BatchScratch,
                 (published_nodes.capacity() * size_of::<StyleNodeID>()) as u64,
@@ -1874,16 +2044,15 @@ impl StyleEngine {
         self.memory
             .release(MemoryCategory::BatchScratch, style_input_reaction_bytes);
         drop(impact_region_scratch);
-        published_match_answers.match_element_calls_at_publication = self
-            .counters
-            .get(Counter::MatchElementCallsDuringPublishedStyleTransaction);
+        published_match_answers.match_element_calls_at_publication =
+            counters.get(Counter::MatchElementCallsDuringPublishedStyleTransaction);
         published_match_answers.discard_unobserved_retained_answers = publish_document_root_arrival || plan_is_broad;
         self.published_match_answers = published_match_answers;
         if initial_tree_was_bulk_loaded {
-            self.counters.bump(Counter::InitialBulkMatchLoads);
-            self.counters.add(Counter::InitialBulkMatchRows, node_count);
+            counters.bump(Counter::InitialBulkMatchLoads);
+            counters.add(Counter::InitialBulkMatchRows, node_count);
         }
-        self.counters.add(Counter::InvalidatedStyleNodes, node_count);
+        counters.add(Counter::InvalidatedStyleNodes, node_count);
         if node_count == 0 {
             self.discard_prepared_batch_matching_traversal();
             self.memory.release(MemoryCategory::BatchScratch, topology_bytes);

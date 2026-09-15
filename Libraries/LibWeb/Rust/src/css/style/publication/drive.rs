@@ -6,7 +6,43 @@
 
 use super::*;
 
-impl StyleEngine {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FontDriveGoal {
+    Complete,
+    RootInputs,
+}
+
+#[derive(Default)]
+pub(in crate::css::style) struct FontDriveScratch {
+    pub(super) root_inputs: Option<RootFontInputs>,
+    pub(super) root_inputs_unproven: bool,
+    pub(in crate::css::style) request: Option<font_resolution::FontRequest>,
+    pending: Option<PendingFontDrive>,
+}
+
+impl FontDriveScratch {
+    pub(in crate::css::style) fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub(in crate::css::style) fn capacity_bytes(&self) -> u64 {
+        self.pending
+            .as_ref()
+            .map_or(0, |pending| pending.table.owned_capacity_bytes())
+    }
+}
+
+/// The completed font phase owns its table. No parent/context borrow survives refill;
+/// the caller resumes the same subject before evaluating any later canonical element.
+struct PendingFontDrive {
+    root_font_complete: bool,
+    table: ComputedLonghandTable,
+    results: crate::css::style_compute::FfiLonghandDriverResults,
+    effective_color_scheme: i16,
+    resolved_viewport_relative_length: bool,
+}
+
+impl StyleEngineState {
     /// Run the drive's remaining phase for the selected longhands over a copy of the node's
     /// current table, against the record's own font metrics, the document's computation inputs
     /// and the parent's record. The required driver inputs recompute on every drive and their
@@ -19,6 +55,7 @@ impl StyleEngine {
         store: &CascadedPropertyStore,
         selected: &[u64],
         inputs: &bridge::FfiDocumentStyleComputationInputs,
+        counters: &mut Counters,
     ) -> Option<(
         ComputedLonghandTable,
         crate::css::style_compute::FfiLengthResolutionContext,
@@ -33,15 +70,15 @@ impl StyleEngine {
         };
 
         let Some(view) = self.computed_group_sets.style_record_view(old_style_record.raw()) else {
-            self.counters.bump(Counter::EngineComputedRecordBailRecord);
+            counters.bump(Counter::EngineComputedRecordBailRecord);
             return None;
         };
         if !view.animated_overlay.is_null() {
-            self.counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
+            counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
             return None;
         }
         let Some(old_table) = (unsafe { view.longhand_table.as_ref() }) else {
-            self.counters.bump(Counter::EngineComputedRecordBailRecordTable);
+            counters.bump(Counter::EngineComputedRecordBailRecordTable);
             return None;
         };
         // A record under display:none may no longer be the style C++ holds, and a property change
@@ -49,7 +86,7 @@ impl StyleEngine {
         if view.dependency_flags & (1 << 2) != 0
             || crate::css::style_compute::has_active_transition_properties(old_table)
         {
-            self.counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
+            counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
             return None;
         }
         let snapshot = match self.tree.flat_tree_parent(node) {
@@ -61,13 +98,13 @@ impl StyleEngine {
                         .style_record_view(record.raw())
                         .is_some_and(|view| !view.animated_overlay.is_null());
                     if parent_has_animation_overlay {
-                        self.counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
+                        counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
                         return None;
                     }
                     Some(parent_snapshot_for_style_record(self, record.raw(), None))
                 }
                 None => {
-                    self.counters.bump(Counter::EngineComputedRecordBailRecordParent);
+                    counters.bump(Counter::EngineComputedRecordBailRecordParent);
                     return None;
                 }
             },
@@ -161,16 +198,16 @@ impl StyleEngine {
                 true,
             );
         }
-        self.counters.bump(Counter::EnginePartialDrivesStarted);
-        self.counters.add(
+        counters.bump(Counter::EnginePartialDrivesStarted);
+        counters.add(
             Counter::EngineDriveCopiedTableSlots,
             crate::css::property_metadata::NUMBER_OF_LONGHAND_PROPERTIES as u64,
         );
-        self.counters.add(
+        counters.add(
             Counter::EnginePhysicalLonghandEvaluations,
             u64::from(results.longhand_evaluations),
         );
-        self.counters.add(
+        counters.add(
             Counter::EnginePartialLonghandEvaluations,
             u64::from(results.longhand_evaluations),
         );
@@ -178,7 +215,7 @@ impl StyleEngine {
             || results.uses_tree_counting_function
             || table.display_before_box_type_transformation() != old_table.display_before_box_type_transformation()
         {
-            self.counters.bump(Counter::EngineComputedRecordBailDrive);
+            counters.bump(Counter::EngineComputedRecordBailDrive);
             return None;
         }
         let old_values = old_table.value_pointers();
@@ -202,11 +239,11 @@ impl StyleEngine {
                 }
             };
             if !equal {
-                self.counters.bump(Counter::EngineComputedRecordBailDrive);
+                counters.bump(Counter::EngineComputedRecordBailDrive);
                 return None;
             }
             table.copy_slot_from(old_table, property);
-            self.counters.bump(Counter::EngineDriveCopiedTableSlots);
+            counters.bump(Counter::EngineDriveCopiedTableSlots);
         }
         // The group builders resolve against the same context; they report no viewport dependence
         // of their own.
@@ -220,15 +257,18 @@ impl StyleEngine {
     /// Drive a record through every phase: the font phase against the parent's metrics, the
     /// element's font resolved through the document's resolver, line-height and color-scheme
     /// against that font, and the remaining phase with the element facts the box-type
-    /// transformation reads. Elements whose font family selects the monospace default size, and
-    /// the document element, still compute in C++.
-    #[allow(clippy::too_many_lines)]
+    /// transformation reads. Root-input preparation finishes only the font and line-height
+    /// phases and preserves them for completion. Monospace default-size recascade stays in C++.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) fn engine_full_drive(
         &mut self,
         subject: DriveSubject,
         old_style_record: Option<computed::FinalStyleRecordID>,
         store: &CascadedPropertyStore,
         inputs: &bridge::FfiDocumentStyleComputationInputs,
+        font_scratch: &mut FontDriveScratch,
+        goal: FontDriveGoal,
+        counters: &mut Counters,
     ) -> Option<(
         ComputedLonghandTable,
         crate::css::style_compute::FfiLengthResolutionContext,
@@ -252,38 +292,38 @@ impl StyleEngine {
         let is_document_element = has(fact::IS_DOCUMENT_ELEMENT);
         // An element with animations composes its style with their effects in C++.
         if facts & fact::HAS_ANIMATIONS != 0 {
-            self.counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
+            counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
             return None;
         }
         if self.font_resolver.is_none() {
-            self.counters.bump(Counter::EngineComputedRecordBailNoEnvironment);
+            counters.bump(Counter::EngineComputedRecordBailNoEnvironment);
             return None;
         }
         if store
             .winning_declaration(prop::FONT_FAMILY)
             .is_some_and(|(value, ..)| font_family_is_monospace(unsafe { &*value.cast::<StyleValueData>() }))
         {
-            self.counters.bump(Counter::EngineComputedRecordBailFontPhase);
+            counters.bump(Counter::EngineComputedRecordBailFontPhase);
             return None;
         }
         let old_table = match old_style_record {
             Some(old_style_record) => {
                 let Some(view) = self.computed_group_sets.style_record_view(old_style_record.raw()) else {
-                    self.counters.bump(Counter::EngineComputedRecordBailRecord);
+                    counters.bump(Counter::EngineComputedRecordBailRecord);
                     return None;
                 };
                 if !view.animated_overlay.is_null() {
-                    self.counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
+                    counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
                     return None;
                 }
                 let Some(old_table) = (unsafe { view.longhand_table.as_ref() }) else {
-                    self.counters.bump(Counter::EngineComputedRecordBailRecordTable);
+                    counters.bump(Counter::EngineComputedRecordBailRecordTable);
                     return None;
                 };
                 if view.dependency_flags & (1 << 2) != 0
                     || crate::css::style_compute::has_active_transition_properties(old_table)
                 {
-                    self.counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
+                    counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
                     return None;
                 }
                 Some(old_table)
@@ -293,15 +333,15 @@ impl StyleEngine {
         let parent_view = match parent {
             Some(parent) => {
                 let Some(parent_record) = self.computed_group_sets.assigned_style_record(parent) else {
-                    self.counters.bump(Counter::EngineComputedRecordBailRecordParent);
+                    counters.bump(Counter::EngineComputedRecordBailRecordParent);
                     return None;
                 };
                 let Some(parent_view) = self.computed_group_sets.style_record_view(parent_record.raw()) else {
-                    self.counters.bump(Counter::EngineComputedRecordBailRecordParent);
+                    counters.bump(Counter::EngineComputedRecordBailRecordParent);
                     return None;
                 };
                 if !parent_view.animated_overlay.is_null() {
-                    self.counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
+                    counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
                     return None;
                 }
                 Some(parent_view)
@@ -344,7 +384,7 @@ impl StyleEngine {
                 .as_ref()
                 .is_some_and(|parent_view| parent_view.dependency_flags & (1 << 2) != 0)
         {
-            self.counters.bump(Counter::EngineComputedRecordBailRecordParent);
+            counters.bump(Counter::EngineComputedRecordBailRecordParent);
             return None;
         }
         // The parent's display, past any display:contents ancestor, is what the box-type
@@ -371,7 +411,7 @@ impl StyleEngine {
         let snapshot = match &parent_view {
             Some(parent_view) => {
                 let Some(parent_table) = (unsafe { parent_view.longhand_table.as_ref() }) else {
-                    self.counters.bump(Counter::EngineComputedRecordBailRecordParent);
+                    counters.bump(Counter::EngineComputedRecordBailRecordParent);
                     return None;
                 };
                 Some(crate::css::style_compute::ParentSnapshot::new(
@@ -388,7 +428,7 @@ impl StyleEngine {
         let inherited_box_payload = match old_style_record {
             Some(old_style_record) => {
                 let Some(view) = self.computed_group_sets.style_record_view(old_style_record.raw()) else {
-                    self.counters.bump(Counter::EngineComputedRecordBailRecord);
+                    counters.bump(Counter::EngineComputedRecordBailRecord);
                     return None;
                 };
                 Some(view.payloads[STYLE_GROUP_INDEX_INHERITED_BOX])
@@ -462,16 +502,36 @@ impl StyleEngine {
                 subject_inline_axis_is_horizontal,
                 resolved_viewport_relative_length: resolved_viewport_relative_length_pointer,
             };
-        self.counters.bump(Counter::EngineFullDrivesStarted);
-        if old_table.is_some() {
-            self.counters.add(
-                Counter::EngineDriveCopiedTableSlots,
-                crate::css::property_metadata::NUMBER_OF_LONGHAND_PROPERTIES as u64,
-            );
+        let resumed = font_scratch.pending.take();
+        let resuming = resumed.is_some();
+        let root_font_complete = resumed.as_ref().is_some_and(|pending| pending.root_font_complete);
+        if !resuming {
+            counters.bump(Counter::EngineFullDrivesStarted);
+            if old_table.is_some() {
+                counters.add(
+                    Counter::EngineDriveCopiedTableSlots,
+                    crate::css::property_metadata::NUMBER_OF_LONGHAND_PROPERTIES as u64,
+                );
+            }
         }
-        let mut table = old_table.map_or_else(ComputedLonghandTable::new, ComputedLonghandTable::copied_for_drive);
-        let mut results = empty_longhand_driver_results();
-        let mut effective_color_scheme: i16 = -1;
+        let (mut table, mut results, mut effective_color_scheme) = match resumed {
+            Some(pending) => {
+                resolved_viewport_relative_length = pending.resolved_viewport_relative_length;
+                if !pending.root_font_complete {
+                    counters.bump(Counter::FontRefillResumedDrives);
+                    counters.add(
+                        Counter::FontRefillPreservedLonghands,
+                        u64::from(pending.results.longhand_evaluations),
+                    );
+                }
+                (pending.table, pending.results, pending.effective_color_scheme)
+            }
+            None => (
+                old_table.map_or_else(ComputedLonghandTable::new, ComputedLonghandTable::copied_for_drive),
+                empty_longhand_driver_results(),
+                -1,
+            ),
+        };
         let drive = |counters: &mut Counters,
                      table: &mut ComputedLonghandTable,
                      results: &mut crate::css::style_compute::FfiLonghandDriverResults,
@@ -513,16 +573,18 @@ impl StyleEngine {
                 inputs.root_font_metrics_depend_on_viewport_metrics,
             )
         };
-        drive(
-            &mut self.counters,
-            &mut table,
-            &mut results,
-            &mut effective_color_scheme,
-            LONGHAND_DRIVE_PHASE_FONT,
-            &raw const font_length,
-            std::ptr::null(),
-            std::ptr::null(),
-        );
+        if !resuming {
+            drive(
+                counters,
+                &mut table,
+                &mut results,
+                &mut effective_color_scheme,
+                LONGHAND_DRIVE_PHASE_FONT,
+                &raw const font_length,
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+        }
 
         // The element's own font, resolved as the C++ font computer would for these values.
         let value_of = |table: &ComputedLonghandTable, property: u16| -> Option<&StyleValueData> {
@@ -551,7 +613,7 @@ impl StyleEngine {
         ] {
             if !matches!(value_of(&table, property), Some(StyleValueData::Keyword { keyword }) if *keyword == default_keyword)
             {
-                self.counters.bump(Counter::EngineComputedRecordBailFontPhase);
+                counters.bump(Counter::EngineComputedRecordBailFontPhase);
                 return None;
             }
         }
@@ -562,7 +624,7 @@ impl StyleEngine {
                 CssPixels::nearest_value_for(*value).to_double()
             }
             _ => {
-                self.counters.bump(Counter::EngineComputedRecordBailFontPhase);
+                counters.bump(Counter::EngineComputedRecordBailFontPhase);
                 return None;
             }
         };
@@ -582,7 +644,7 @@ impl StyleEngine {
                 (*weight, *width)
             }
             _ => {
-                self.counters.bump(Counter::EngineComputedRecordBailFontPhase);
+                counters.bump(Counter::EngineComputedRecordBailFontPhase);
                 return None;
             }
         };
@@ -603,12 +665,23 @@ impl StyleEngine {
         };
         let Some(resolved) = self
             .font_resolver
-            .as_mut()
-            .and_then(|resolver| resolver.resolve(request))
+            .as_ref()
+            .and_then(|resolver| resolver.lookup(request))
         else {
-            self.counters.bump(Counter::EngineComputedRecordBailFontPhase);
+            font_scratch.request = Some(font_resolution::FontRequest::new(request));
+            font_scratch.pending = Some(PendingFontDrive {
+                root_font_complete: false,
+                table,
+                results,
+                effective_color_scheme,
+                resolved_viewport_relative_length,
+            });
             return None;
         };
+        if resolved.font_cascade_list.is_null() {
+            counters.bump(Counter::EngineComputedRecordBailFontPhase);
+            return None;
+        }
         let own_metrics = |line_height: f64| FfiFontMetrics {
             font_size,
             x_height: drive_font_metric(resolved.x_height),
@@ -632,27 +705,18 @@ impl StyleEngine {
                 inputs.root_font_metrics_depend_on_viewport_metrics,
             )
         };
-        drive(
-            &mut self.counters,
-            &mut table,
-            &mut results,
-            &mut effective_color_scheme,
-            LONGHAND_DRIVE_PHASE_LINE_HEIGHT,
-            &raw const line_height_length,
-            std::ptr::null(),
-            std::ptr::null(),
-        );
-        drive(
-            &mut self.counters,
-            &mut table,
-            &mut results,
-            &mut effective_color_scheme,
-            LONGHAND_DRIVE_PHASE_COLOR_SCHEME,
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
-        effective_color_scheme = table.effective_color_scheme();
+        if !root_font_complete {
+            drive(
+                counters,
+                &mut table,
+                &mut results,
+                &mut effective_color_scheme,
+                LONGHAND_DRIVE_PHASE_LINE_HEIGHT,
+                &raw const line_height_length,
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+        }
 
         // The used line height, as the C++ working set reads it from the computed value.
         let normal_line_height = f64::from(resolved.ascent.round() as i32 + resolved.descent.round() as i32);
@@ -667,9 +731,41 @@ impl StyleEngine {
             }
         };
         let Some(line_height_before_adjustments) = line_height_used(&table) else {
-            self.counters.bump(Counter::EngineComputedRecordBailFontPhase);
+            counters.bump(Counter::EngineComputedRecordBailFontPhase);
             return None;
         };
+        if goal == FontDriveGoal::RootInputs {
+            font_scratch.root_inputs = Some(RootFontInputs {
+                metrics: [
+                    font_size.to_bits(),
+                    drive_font_metric(resolved.x_height).to_bits(),
+                    drive_font_metric(resolved.ascent).to_bits(),
+                    drive_font_metric(resolved.zero_advance).to_bits(),
+                    line_height_before_adjustments.to_bits(),
+                ],
+                depends_on_viewport: results.font_metrics_depend_on_viewport_metrics,
+            });
+            font_scratch.pending = Some(PendingFontDrive {
+                root_font_complete: true,
+                table,
+                results,
+                effective_color_scheme,
+                resolved_viewport_relative_length,
+            });
+            return None;
+        }
+        drive(
+            counters,
+            &mut table,
+            &mut results,
+            &mut effective_color_scheme,
+            LONGHAND_DRIVE_PHASE_COLOR_SCHEME,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        effective_color_scheme = table.effective_color_scheme();
+
         let remaining_length = length_context(
             own_metrics(line_height_before_adjustments),
             results.font_metrics_depend_on_viewport_metrics,
@@ -689,7 +785,7 @@ impl StyleEngine {
         };
         let line_height_value = table.effective_value(None, prop::LINE_HEIGHT, true).value;
         drive(
-            &mut self.counters,
+            counters,
             &mut table,
             &mut results,
             &mut effective_color_scheme,
@@ -699,11 +795,11 @@ impl StyleEngine {
             line_height_value,
         );
         if results.explicitly_inherited_non_inherited_style_groups != 0 || results.uses_tree_counting_function {
-            self.counters.bump(Counter::EngineComputedRecordBailDrive);
+            counters.bump(Counter::EngineComputedRecordBailDrive);
             return None;
         }
         let Some(line_height_used_after) = line_height_used(&table) else {
-            self.counters.bump(Counter::EngineComputedRecordBailFontPhase);
+            counters.bump(Counter::EngineComputedRecordBailFontPhase);
             return None;
         };
         let keyword_code = |property: u16, map: fn(u16) -> Option<u8>| match value_of(&table, property) {

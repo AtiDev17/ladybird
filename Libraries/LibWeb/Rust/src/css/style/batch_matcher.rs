@@ -460,6 +460,7 @@ pub(super) struct AncestorRequirements {
     unbounded: Vec<bool>,
     /// The one row a per-element summary describes, or none when every row has a slice of its own.
     single_row: Option<u32>,
+    selected_rows: Vec<u32>,
 }
 
 impl AncestorRequirements {
@@ -540,6 +541,7 @@ impl AncestorRequirements {
             bits,
             unbounded,
             single_row: None,
+            selected_rows: Vec::new(),
         }
     }
 
@@ -586,7 +588,34 @@ impl AncestorRequirements {
             bits,
             unbounded: vec![unbounded],
             single_row: Some(row),
+            selected_rows: Vec::new(),
         })
+    }
+
+    fn build_for_nodes(
+        tree: &StyleNodeTree,
+        facts: &StyleNodeFacts,
+        dispatch: &RuleDispatch,
+        nodes: &[StyleNodeID],
+    ) -> Self {
+        let mut selected_rows: Vec<u32> = nodes.iter().filter_map(|&node| facts.row_of(node)).collect();
+        selected_rows.sort_unstable();
+        selected_rows.dedup();
+        let words_per_row = dispatch.ancestor_key_count().div_ceil(u64::BITS as usize);
+        let mut bits = Vec::with_capacity(selected_rows.len().saturating_mul(words_per_row));
+        let mut unbounded = Vec::with_capacity(selected_rows.len());
+        for &row in &selected_rows {
+            let local = Self::build_for_node(tree, facts, dispatch, facts.node_at(row)).unwrap();
+            bits.extend_from_slice(&local.bits);
+            unbounded.push(local.unbounded[0]);
+        }
+        Self {
+            words_per_row,
+            bits,
+            unbounded,
+            single_row: None,
+            selected_rows,
+        }
     }
 
     #[must_use]
@@ -596,6 +625,10 @@ impl AncestorRequirements {
                 debug_assert_eq!(row, single_row);
                 0
             }
+            None if !self.selected_rows.is_empty() => self
+                .selected_rows
+                .binary_search(&row)
+                .expect("a matched row must have prepared ancestor requirements"),
             None => row as usize,
         };
         let first = row * self.words_per_row;
@@ -605,7 +638,7 @@ impl AncestorRequirements {
     #[must_use]
     fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
-            shallow [self.bits, self.unbounded];
+            shallow [self.bits, self.unbounded, self.selected_rows];
             cached [];
             nested [];
             skip [self.words_per_row, self.single_row];
@@ -613,128 +646,70 @@ impl AncestorRequirements {
     }
 }
 
-/// Exact ancestor summaries shared by one synchronous matching traversal.
-const ANCESTOR_REQUIREMENTS_PROMOTION_ASKS: u32 = 128;
-
+/// Exact ancestor summaries prepared before one synchronous matching traversal.
 #[derive(Default)]
 pub(super) struct AncestorRequirementsCache {
-    // A document has a handful of selector topologies at most, so a list keeps the summaries
-    // contiguous. Concrete rule identities and cascade ranks do not affect ancestor requirements.
+    // Concrete rule identities and cascade ranks do not affect ancestor requirements.
     by_topology: Vec<(AncestorDispatchTopologyID, AncestorRequirements)>,
-    local_asks: Vec<(AncestorDispatchTopologyID, u32)>,
-    local_answer: Option<AncestorRequirements>,
-    last_answered: usize,
     charged_bytes: u64,
 }
 
 impl AncestorRequirementsCache {
     fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
-            shallow [self.by_topology, self.local_asks];
+            shallow [self.by_topology];
             cached [];
-            nested [self
-                .by_topology
-                .iter()
-                .map(|(_, requirements)| requirements.capacity_bytes())
-                .sum::<u64>(), self.local_answer.as_ref().map_or(0, AncestorRequirements::capacity_bytes)];
-            skip [self.last_answered, self.charged_bytes];
+            nested [self.by_topology.iter().map(|(_, requirements)| requirements.capacity_bytes()).sum::<u64>()];
+            skip [self.charged_bytes];
         }
     }
 
-    fn index_of(&self, topology: AncestorDispatchTopologyID) -> Option<usize> {
-        if let Some((held, _)) = self.by_topology.get(self.last_answered)
-            && *held == topology
-        {
-            return Some(self.last_answered);
-        }
-        self.by_topology.iter().position(|(held, _)| *held == topology)
-    }
-
-    pub(super) fn get_or_build(
+    pub(super) fn prepare(
         &mut self,
         tree: &StyleNodeTree,
         facts: &StyleNodeFacts,
         dispatch: &RuleDispatch,
+        nodes: Option<&[StyleNodeID]>,
         memory: &mut MemoryController,
     ) -> &AncestorRequirements {
         let topology = dispatch.ancestor_topology_id();
-        let index = match self.index_of(topology) {
-            Some(index) => index,
-            None => {
-                let build_scratch =
-                    AncestorRequirements::required_bytes(facts.row_count(), dispatch.ancestor_key_count());
-                memory.reserve_required(MemoryCategory::BatchScratch, build_scratch);
-                self.by_topology
-                    .push((topology, AncestorRequirements::build(tree, facts, dispatch)));
-
-                let current = self.capacity_bytes();
-                let growth = current.saturating_sub(self.charged_bytes);
-                if growth > build_scratch {
-                    memory.reserve_required(MemoryCategory::BatchScratch, growth - build_scratch);
-                } else {
-                    memory.release(MemoryCategory::BatchScratch, build_scratch - growth);
-                }
-                self.charged_bytes = current;
-                self.by_topology.len() - 1
+        if !self.by_topology.iter().any(|(held, _)| *held == topology) {
+            let build_scratch = AncestorRequirements::required_bytes(
+                nodes.map_or(facts.row_count(), <[StyleNodeID]>::len),
+                dispatch.ancestor_key_count(),
+            );
+            memory.reserve_required(MemoryCategory::BatchScratch, build_scratch);
+            let requirements = match nodes {
+                Some(nodes) => AncestorRequirements::build_for_nodes(tree, facts, dispatch, nodes),
+                None => AncestorRequirements::build(tree, facts, dispatch),
+            };
+            self.by_topology.push((topology, requirements));
+            let current = self.capacity_bytes();
+            let growth = current.saturating_sub(self.charged_bytes);
+            if growth > build_scratch {
+                memory.reserve_required(MemoryCategory::BatchScratch, growth - build_scratch);
+            } else {
+                memory.release(MemoryCategory::BatchScratch, build_scratch - growth);
             }
-        };
-        self.last_answered = index;
-        &self.by_topology[index].1
+            self.charged_bytes = current;
+        }
+        self.get(dispatch)
     }
 
-    pub(super) fn get_or_build_for_node(
-        &mut self,
-        tree: &StyleNodeTree,
-        facts: &StyleNodeFacts,
-        dispatch: &RuleDispatch,
-        node: StyleNodeID,
-        memory: &mut MemoryController,
-    ) -> &AncestorRequirements {
+    pub(super) fn get(&self, dispatch: &RuleDispatch) -> &AncestorRequirements {
         let topology = dispatch.ancestor_topology_id();
-        if let Some(index) = self.index_of(topology) {
-            self.last_answered = index;
-            return &self.by_topology[index].1;
-        }
-
-        let asks = match self.local_asks.iter_mut().find(|(candidate, _)| *candidate == topology) {
-            Some((_, asks)) => asks,
-            None => {
-                self.local_asks.push((topology, 0));
-                &mut self.local_asks.last_mut().unwrap().1
-            }
-        };
-        *asks = asks.checked_add(1).expect("ancestor summary ask count overflow");
-        // A local summary walks only this node's shallow ancestry. Promote a topology only after
-        // enough asks to amortize scanning every prepared fact row into a reusable dense matrix.
-        if *asks >= ANCESTOR_REQUIREMENTS_PROMOTION_ASKS && tree.tree_scope(node) == TreeScopeID::DOCUMENT {
-            self.local_answer = None;
-            return self.get_or_build(tree, facts, dispatch, memory);
-        }
-
-        let build_scratch = AncestorRequirements::required_bytes_for_one_row(dispatch.ancestor_key_count());
-        memory.reserve_required(MemoryCategory::BatchScratch, build_scratch);
-        self.local_answer = Some(
-            AncestorRequirements::build_for_node(tree, facts, dispatch, node)
-                .expect("a matched node must have prepared facts"),
-        );
-        let current = self.capacity_bytes();
-        let growth = current.saturating_sub(self.charged_bytes);
-        if growth > build_scratch {
-            memory.reserve_required(MemoryCategory::BatchScratch, growth - build_scratch);
-        } else {
-            memory.release(MemoryCategory::BatchScratch, build_scratch - growth);
-        }
-        self.charged_bytes = current;
-        self.local_answer.as_ref().unwrap()
+        &self
+            .by_topology
+            .iter()
+            .find(|(held, _)| *held == topology)
+            .expect("ancestor requirements must be prepared before matching")
+            .1
     }
 
     pub(super) fn release(&mut self, memory: &mut MemoryController) {
         memory.release(MemoryCategory::BatchScratch, self.charged_bytes);
         self.charged_bytes = 0;
         self.by_topology = Vec::new();
-        self.local_asks = Vec::new();
-        self.local_answer = None;
-        self.last_answered = 0;
     }
 }
 
@@ -768,6 +743,12 @@ pub struct BatchMatcher<'a> {
     rule_filter: Option<&'a [(RuleID, SelectorProgramID)]>,
     cascade_only: bool,
     witnesses: Option<&'a std::cell::RefCell<RelationalWitnesses>>,
+}
+
+/// Pruning remains relevant when an incomplete attempt retains completed candidates for a retry.
+pub(super) struct BatchMatchOutcome {
+    pub result: Result<(), Incomplete>,
+    pub answer_is_exact: bool,
 }
 
 /// Reusable output-side state for one exact matching attempt.
@@ -1204,18 +1185,21 @@ impl<'a> BatchMatcher<'a> {
         let mut dispatch_workspace = DispatchCandidateWorkspace::default();
         let mut prefix_states = PrefixStates::new(self.facts.row_count());
         for node in self.tree.preorder(root) {
-            if let Err(incomplete) = self.match_node_collecting_requests(
-                node,
-                out,
-                counters,
-                BatchMatchState {
-                    dispatch_workspace: &mut dispatch_workspace,
-                    requests: None,
-                    completed: None,
-                    prefix_states: Some(&mut prefix_states),
-                    deferred_prefix_matches: None,
-                },
-            ) {
+            if let Err(incomplete) = self
+                .match_node_collecting_requests(
+                    node,
+                    out,
+                    counters,
+                    BatchMatchState {
+                        dispatch_workspace: &mut dispatch_workspace,
+                        requests: None,
+                        completed: None,
+                        prefix_states: Some(&mut prefix_states),
+                        deferred_prefix_matches: None,
+                    },
+                )
+                .result
+            {
                 out.truncate(start, selector_truth_start);
                 return Err(incomplete);
             }
@@ -1246,6 +1230,7 @@ impl<'a> BatchMatcher<'a> {
                 deferred_prefix_matches: None,
             },
         )
+        .result
     }
 
     /// Evaluate one style node while retaining every fact request the candidate set discovers.
@@ -1261,7 +1246,8 @@ impl<'a> BatchMatcher<'a> {
         out: &mut RuleMatches,
         counters: &mut Counters,
         state: BatchMatchState<'_>,
-    ) -> Result<(), Incomplete> {
+    ) -> BatchMatchOutcome {
+        let mut answer_is_exact = true;
         let BatchMatchState {
             dispatch_workspace,
             mut requests,
@@ -1270,7 +1256,10 @@ impl<'a> BatchMatcher<'a> {
             deferred_prefix_matches,
         } = state;
         let Some(row) = self.facts.row_of(node) else {
-            return Err(Incomplete::MissingFacts(node));
+            return BatchMatchOutcome {
+                result: Err(Incomplete::MissingFacts(node)),
+                answer_is_exact,
+            };
         };
         // A filtered ask is a patch re-deriving part of one answer, not a cold evaluation.
         if self.rule_filter.is_none() {
@@ -1291,7 +1280,10 @@ impl<'a> BatchMatcher<'a> {
             evaluator = evaluator.observing_witnesses(witnesses);
         }
         if let Some(rules) = self.rule_filter.filter(|rules| self.filtered_rules_are_narrow(rules)) {
-            return self.match_filtered_rules_directly(node, row, rules, &evaluator, out, counters);
+            return BatchMatchOutcome {
+                result: self.match_filtered_rules_directly(node, row, rules, &evaluator, out, counters),
+                answer_is_exact,
+            };
         }
         let start = out.matches.len();
         let selector_truth_start = out.selector_truth_len();
@@ -1323,7 +1315,10 @@ impl<'a> BatchMatcher<'a> {
                             missing,
                         ))) if self.dispatch.prefixes().has_sibling_steps() => {
                             let Some(requests) = requests.as_deref_mut() else {
-                                return Err(Incomplete::MissingFacts(missing));
+                                return BatchMatchOutcome {
+                                    result: Err(Incomplete::MissingFacts(missing)),
+                                    answer_is_exact,
+                                };
                             };
                             let mut level = Some(node);
                             while let Some(current) = level {
@@ -1497,6 +1492,7 @@ impl<'a> BatchMatcher<'a> {
                             .is_some_and(|winner| winner.priority >= candidate.cascade_order)
                     })
                 {
+                    answer_is_exact = false;
                     counters.bump(Counter::CascadeCandidatesRejectedByWinner);
                     if let Some(completed) = completed.as_deref_mut() {
                         completed[candidate_index] = true;
@@ -1585,7 +1581,10 @@ impl<'a> BatchMatcher<'a> {
                         continue;
                     }
                     out.truncate(start, selector_truth_start);
-                    return Err(incomplete);
+                    return BatchMatchOutcome {
+                        result: Err(incomplete),
+                        answer_is_exact,
+                    };
                 }
             }
 
@@ -1600,7 +1599,10 @@ impl<'a> BatchMatcher<'a> {
                         continue;
                     }
                     out.truncate(start, selector_truth_start);
-                    return Err(incomplete);
+                    return BatchMatchOutcome {
+                        result: Err(incomplete),
+                        answer_is_exact,
+                    };
                 }
             };
             if self.dispatch.cascade_pruning_blocker(candidate) {
@@ -1637,9 +1639,15 @@ impl<'a> BatchMatcher<'a> {
             if completed.is_none() {
                 out.truncate(start, selector_truth_start);
             }
-            return Err(incomplete);
+            return BatchMatchOutcome {
+                result: Err(incomplete),
+                answer_is_exact,
+            };
         }
-        Ok(())
+        BatchMatchOutcome {
+            result: Ok(()),
+            answer_is_exact,
+        }
     }
 }
 
@@ -2087,6 +2095,7 @@ mod tests {
                         deferred_prefix_matches: None,
                     },
                 )
+                .result
                 .expect("the node has complete facts");
         }
         assert_eq!(document.matched_nodes(&matches, item), vec![1, 1]);
@@ -2143,10 +2152,10 @@ mod tests {
         let dispatch = build_scope_dispatch(&document.program, &document.programs, TreeScopeID::DOCUMENT);
         let baseline = document.memory.bytes_in_category(MemoryCategory::BatchScratch);
         let mut cache = AncestorRequirementsCache::default();
-        cache.get_or_build(&document.tree, &document.facts, &dispatch, &mut document.memory);
+        cache.prepare(&document.tree, &document.facts, &dispatch, None, &mut document.memory);
         let after_first = document.memory.bytes_in_category(MemoryCategory::BatchScratch);
         assert!(after_first > baseline);
-        cache.get_or_build(&document.tree, &document.facts, &dispatch, &mut document.memory);
+        cache.prepare(&document.tree, &document.facts, &dispatch, None, &mut document.memory);
         assert_eq!(
             document.memory.bytes_in_category(MemoryCategory::BatchScratch),
             after_first,
@@ -2161,7 +2170,7 @@ mod tests {
     }
 
     #[test]
-    fn one_node_ancestor_summaries_promote_after_sustained_reuse() {
+    fn prepared_sparse_ancestor_requirements_match_the_exact_batch() {
         let mut document = Document::new();
         document.add_rule(|builder| {
             let theme = builder.push_feature(FeatureTest::Class(CLASS_THEME));
@@ -2171,62 +2180,33 @@ mod tests {
             builder.push_entry(root);
         });
         let dispatch = build_scope_dispatch(&document.program, &document.programs, TreeScopeID::DOCUMENT);
-        let baseline = document.memory.bytes_in_category(MemoryCategory::BatchScratch);
-        let mut cache = AncestorRequirementsCache::default();
-        for _ in 1..ANCESTOR_REQUIREMENTS_PROMOTION_ASKS {
-            let requirements = cache.get_or_build_for_node(
+        let nodes = [document.nodes[2], document.nodes[1]];
+        let requirements = AncestorRequirements::build_for_nodes(&document.tree, &document.facts, &dispatch, &nodes);
+        let mut expected = RuleMatches::new();
+        let mut actual = RuleMatches::new();
+        for node in nodes {
+            BatchMatcher::new(
                 &document.tree,
                 &document.facts,
                 &dispatch,
-                document.nodes[1],
-                &mut document.memory,
-            );
-            assert!(requirements.single_row.is_some());
-        }
-        assert!(cache.by_topology.is_empty());
-
-        let requirements = cache.get_or_build_for_node(
-            &document.tree,
-            &document.facts,
-            &dispatch,
-            document.nodes[1],
-            &mut document.memory,
-        );
-        assert!(requirements.single_row.is_none());
-        assert_eq!(cache.by_topology.len(), 1);
-
-        cache.release(&mut document.memory);
-        assert_eq!(
-            document.memory.bytes_in_category(MemoryCategory::BatchScratch),
-            baseline
-        );
-    }
-
-    #[test]
-    fn shadow_scope_ancestor_summaries_remain_local() {
-        let mut document = Document::new();
-        document.tree.enable_tree_scopes(&mut document.memory);
-        document.tree.set_tree_scope(document.nodes[1], TreeScopeID(1));
-        document.add_rule(|builder| {
-            let theme = builder.push_feature(FeatureTest::Class(CLASS_THEME));
-            let ancestor = builder.push(SelectorOp::Ancestor(theme));
-            let any = builder.push_feature(FeatureTest::AnyElement);
-            let root = builder.push_compound(&[any, ancestor]);
-            builder.push_entry(root);
-        });
-        let dispatch = build_scope_dispatch(&document.program, &document.programs, TreeScopeID::DOCUMENT);
-        let mut cache = AncestorRequirementsCache::default();
-        for _ in 0..ANCESTOR_REQUIREMENTS_PROMOTION_ASKS * 2 {
-            let requirements = cache.get_or_build_for_node(
+                &document.programs,
+                &document.program,
+            )
+            .match_node(node, &mut expected, &mut document.counters)
+            .unwrap();
+            BatchMatcher::new(
                 &document.tree,
                 &document.facts,
                 &dispatch,
-                document.nodes[1],
-                &mut document.memory,
-            );
-            assert!(requirements.single_row.is_some());
+                &document.programs,
+                &document.program,
+            )
+            .with_ancestor_requirements(&requirements)
+            .match_node(node, &mut actual, &mut document.counters)
+            .unwrap();
         }
-        assert!(cache.by_topology.is_empty());
+        assert!(!actual.is_empty());
+        assert_eq!(actual.as_slice(), expected.as_slice());
     }
 
     #[test]

@@ -716,6 +716,22 @@ Comparable selector answers are immutable and interned under a compact integer i
 
 These identities are document-local acceleration, not a retained per-element match column. A style ask publishes only the identity of the answer it just produced, and answer caches may carry that identity to their consumers. Program changes reach their candidates through selector dispatch and exact evaluation of the old or new program as appropriate. Do not retain a complete `RuleID -> elements` relation; inverse match sets are optional query-level materializations only.
 
+Scope dispatch versions and encapsulation depths are resolved at matching-context
+preparation. Matching and answer materialization borrow the prepared dispatch;
+they do not rebuild a program or update a last-scope memo. The prepared scope set
+includes host, slotted and part projections. Ancestor requirements are prepared
+per topology before a batch, using dense rows for the document topology and
+selected primary rows for other topologies. An adaptive retry prepares its
+extended facts and primary ancestor summary before matching. Unbounded ancestry
+rejects nothing, and secondary scope projections do not use primary ancestry.
+
+Prefix row storage is prepared against the fact batch's generation and row
+count before matching, answer patching or convergence. Adaptive retries
+prepare their rebuilt packed rows and restore a suspended batch's row domain
+before returning. Prepared allocation charges are settled even when no node
+uses the rows before retention. Transition evaluation and interning remain
+mutable; row preparation does not change their ownership.
+
 ### 9.2 Cascade priority
 
 A declaration's priority is a comparison program over stable identities:
@@ -775,6 +791,14 @@ Declaration identity and source position are excluded, which is what makes theme
 4. **Reuse gating.** The winner-key stop may reuse the previous computed result only when the previous computation's recorded inputs still hold: its input record pins the values and parent groups it read, records which inherited custom-property bindings the computation actually consulted, and carries a conservative `read_beyond_the_record` bit covering every dynamic dependency not individually tracked (container, attributes, sibling position). The bit defaults to "incomplete", so an untracked dependency forces resolution rather than a wrong reuse. Live transitions and changed custom-property environments likewise force resolution.
 5. **Dependency masks after resolution.** When winners did change, the semantic delta narrows downstream work to the affected computed groups and property words rather than rebuilding the whole style; final record-identity equality then lets unchanged payloads be shared.
 
+Static checks of a declaration's original spelling are prepared with rule and
+per-element declaration inputs. Computability after custom-property substitution
+is a dynamic evaluation result, memoized in caller-owned scratch by node identity,
+winner generation/state, current environment identity and registration generation.
+Rust record computation shares that scratch for the transaction; a host
+publication call owns a local context. Neither context retains answers into another update.
+Synthetic pseudo masks are stored when match answers are interned.
+
 ### 9.5 Cascade-wide keywords
 
 `inherit`, `initial`, `unset`, `revert`, and `revert-layer` are cascade **operators**, not eagerly flattened values, so their dependencies on parent style, origin, and layer topology stay explicit.
@@ -800,6 +824,50 @@ font environment    -> font-relative metrics
 anchor geometry     -> anchor functions
 tree position       -> tree-counting functions
 ```
+
+Root font inputs are a separate dependency from immediate-parent inheritance.
+Before the consumer pass, a reached document element prepares its font and used
+line height when the engine can compute them. A missing font is synchronously
+refilled at this boundary before publishing the proven inputs. The completed
+phases stay in owned scratch and resume at the root's normal record
+position; neither remaining properties nor pseudos are required for font readiness.
+The root's own remaining phase retains its existing pre-computation document
+context. Root pseudos resolve against their originating record's current metrics.
+An incremental root otherwise reads current retained document inputs.
+
+A host-materialized root keeps its existing host route without adding descendant
+deferral. C++'s root-metric comparison still routes recomputation across fixed-font
+intermediaries. Font work already performed is preserved across preparation and
+refill; consumers never use an engine-computed root's unproven font inputs.
+`rootFontInputsUnprovenFallbacks` counts these unproven reached roots and
+`rootFontInputsPrepared` counts successful preparations; neither selects behavior.
+Prepared root changes independently invalidate winner/partial-table and pseudo
+reuse. Cold, donor, cohort and shared-context keys carry all five actual root
+metrics and their viewport-dependence bit. C++ input records carry the same inputs
+in their element portion, so a root change cannot be mistaken for only a change
+of declarations. Root publication does not clear cohort caches.
+
+Font resolution reads a generation-scoped prepared table. A missing synchronous
+result suspends the current canonical element and ends the serial computation
+pass. Its owned font-phase table, completed originating record and completed
+pseudo prefix survive boundary resolution; the same element resumes before the
+unvisited suffix, even with an empty journal. Parent and document contexts are
+rebuilt from the unchanged inputs, with no borrowed stack pointers retained.
+No full drive or font longhand is restarted. This boundary also applies to the
+host's retry after an ancestor has been installed.
+
+A null synchronous resolution is a completed unsupported result, eligible for
+existing host handling rather than endless refill. An unloaded web face is
+instead retained in the returned font cascade with current fallback metrics.
+Metric probes do not start its load; rendering still initiates loading and the
+font-display timeline. Load completion changes the font environment and prepares
+a new table. Font matching and platform ownership remain in the host.
+
+Diagnostic counters report refill passes, requests, resumed drives, preserved
+font longhands and the maximum resident selector-tree depth of a suspended element
+(including that element). This depth is a diagnostic location, not the flat-tree
+dependency span when the two axes differ. Repeated physical work remains visible in the ordinary drive and
+longhand counters; none of these observations controls readiness or completion.
 
 ### 9.7 Custom properties
 
@@ -901,7 +969,7 @@ Each document has a derived-style memory controller tracking exact bytes by logi
 
 At each flush boundary the controller opens a new admission period for every Tier-3 category and records its starting residency. Admission remains work-conserving while the complete Tier-3 pool has space; there are no per-category partitions.
 
-Owners account exact capacity at arena, slab, vector, bitmap, and table growth boundaries. The growth that crosses the global Tier-3 limit remains usable for the current quota period and closes that category to new retained entries for the rest of the period. Existing entries may continue changing so they never become stale or partial. At the following flush boundary, an over-limit category is dropped whole; there is no mid-traversal eviction, retry, or rebuild.
+Owners account exact capacity at arena, slab, vector, bitmap, and table growth boundaries. Growth crossing the global Tier-3 limit remains usable throughout the current evaluation loop. At the loop boundary, a pure decision over final category residency and the quota-period starting residency closes the categories that grew to new entries for later loops in that period. The Rust transaction and the host cold-matching batch each have an explicit end boundary. Exact-versus-pruned answer completion is selected before its batch and remains fixed throughout it. Existing entries may continue changing so they never become stale or partial. At the following flush boundary, an over-limit category is dropped whole; there is no mid-traversal eviction, retry, or rebuild.
 
 ```text
 Tier3Limit = min(
@@ -930,6 +998,8 @@ Tier4Limit = min(
 The scratch cap is 32 MiB and the transaction node allowance is 768 bytes. The multiplier on `Tier3Limit` is 1, not 2, so transaction scratch cannot dominate the document's total style footprint; the 4 MiB floor matters most on small documents. Tier 4 is a **reported ceiling**, not a refusable cap: scratch charges cannot be refused because the flush must complete. The limit makes an over-limit transaction visible in the pressure report but changes no allocation or planning decision.
 
 During an active capture (and its replay), the memory policy pins the Tier-3 limit to the device cap so recorded eviction decisions are reproducible; ordinary builds never run that policy.
+
+Accounting uses one plain-integer ledger per document or shared-program context, mutated through exclusive borrows. Leases share only the accounting lifetime, so destroying an outliving query or shared program still releases its charge. Ledger operations never select admission or refuse required capacity. Peak charged live bytes and peak scratch bytes remain available after temporary charges are released. Required output and node workspace is reserved before computation. Output capacity is reconciled at vector growth; computation scratch capacity is sampled every 256 published elements and reconciled after the loop, before release. Its high-water observation reports accounted capacity at those points, not an allocator-level peak.
 
 Byte accounting happens at arena, slab, vector-capacity, bitmap, and hash-table allocation boundaries: operators update aggregate counters when capacity changes, not on every lookup.
 
@@ -982,7 +1052,7 @@ Memory pressure never degrades correctness; it degrades retention. The Tier-3 ch
 
 ```text
 account exact coarse growth and keep it usable for this quota period
-    -> close that category to new retained entries
+    -> at the loop boundary, close grown categories to new retained entries
     -> continue exact evaluation for entries that remain uncached
     -> drop the complete over-limit category at the next flush boundary
 ```
@@ -1235,7 +1305,8 @@ The doctrine over any future counter: ratios with a zero denominator report the 
 
 `internals.styleEngineCounters()` reports cumulative integer microseconds at the
 `take_style_transaction` boundary. `transactionMicroseconds` equals the sum of
-`commitMicroseconds`, `routingPlanningMicroseconds`, `matchingCascadeMicroseconds`,
+`commitMicroseconds`, `routingPlanningMicroseconds`, `prepareMicroseconds`,
+`matchingCascadeMicroseconds`,
 `computationPublicationMicroseconds`, `emitMicroseconds`, and
 `transactionRemainderMicroseconds`. Take two snapshots and subtract each field
 when measuring an update. Rounded cumulative endpoints preserve the identity even
@@ -1245,7 +1316,11 @@ The fused names describe the current execution: routing performs exact planning
 and prefix matching inline; answer patching and completion update winners;
 computation interns and installs records immediately. No per-element clocks try
 to subdivide that work. Commit includes reclamation and journal application.
-Remainder covers final bookkeeping, retained traversal preparation, and cleanup.
+Prepare covers reached-scope preparation and completion-batch construction before
+matching. Routing-specific dispatch preparation remains within routing/planning;
+program and declaration input preparation remains within commit. Standalone host
+matching prepares its context in the enclosing C++ caller interval. Remainder
+covers final bookkeeping, retained traversal handoff, and cleanup.
 
 The C++ ledger (`internals.getStyleInvalidationCounters()`) has its own identity:
 `styleUpdateMicroseconds` equals `styleUpdateSubmissionMicroseconds` plus

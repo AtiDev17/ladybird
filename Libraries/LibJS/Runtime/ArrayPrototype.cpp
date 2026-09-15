@@ -157,6 +157,15 @@ static bool can_use_packed_array_fast_path(Array const& array)
     return array.is_simple_packed_array() && array.default_prototype_chain_intact();
 }
 
+static bool can_use_packed_or_empty_array_fast_path(Array const& array)
+{
+    // An array that never had any elements has no indexed storage at all. Like a packed array, it has no holes that
+    // could read through to the prototype chain.
+    if (array.indexed_storage_kind() == IndexedStorageKind::None && array.indexed_array_like_size() == 0)
+        return !array.is_proxy_target() && !array.may_interfere_with_indexed_property_access() && array.default_prototype_chain_intact();
+    return can_use_packed_array_fast_path(array);
+}
+
 static bool can_use_packed_shift_fast_path(Array const& array)
 {
     // Packed: every index in [0, size) is an own property, so memmove semantics match the spec even if the prototype
@@ -213,40 +222,48 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::concat)
     auto* new_array = TRY(array_species_create(vm, this_object, 0));
     auto concat_spreadable_key = PropertyKey { vm.well_known_symbol_is_concat_spreadable() };
 
-    // OPTIMIZATION: Fast path for packed arrays when ArraySpeciesCreate produced a
-    // default Array and every object argument is a packed Array without a custom
-    // @@isConcatSpreadable override.
-    if (auto* array = as_if<Array>(*this_object); array && can_use_packed_array_fast_path(*array)
+    // OPTIMIZATION: Fast path for packed or empty arrays when ArraySpeciesCreate produced an empty default Array and
+    //               every object argument is a packed or empty Array without an own @@isConcatSpreadable. The intact
+    //               default prototype chains mean @@isConcatSpreadable cannot be inherited either, so every Array is
+    //               spread and every other value is appended as a single element.
+    //               The result must not be one of the inputs, since we copy input storage into it.
+    if (auto* array = as_if<Array>(*this_object); array && can_use_packed_or_empty_array_fast_path(*array)
         && !TRY(this_object->has_own_property(concat_spreadable_key))) {
-        if (auto* result_array = fast_array_species_result(*new_array)) {
+        auto* result_array = fast_array_species_result(*new_array);
+        if (result_array && result_array != array && result_array->indexed_array_like_size() == 0
+            && result_array->indexed_storage_kind() <= IndexedStorageKind::Packed) {
             bool all_fast_path_arguments = true;
+            u64 total_length = array->indexed_array_like_size();
             for (size_t i = 0; i < vm.argument_count(); ++i) {
                 auto arg = vm.argument(i);
-                if (!arg.is_object())
+                if (!arg.is_object()) {
+                    ++total_length;
                     continue;
+                }
 
                 auto* argument_array = as_if<Array>(arg.as_object());
-                if (!argument_array || !can_use_packed_array_fast_path(*argument_array)
+                if (!argument_array || argument_array == result_array
+                    || !can_use_packed_or_empty_array_fast_path(*argument_array)
                     || TRY(argument_array->has_own_property(concat_spreadable_key))) {
                     all_fast_path_arguments = false;
                     break;
                 }
+                total_length += argument_array->indexed_array_like_size();
             }
 
-            if (all_fast_path_arguments) {
-                for (u32 i = 0; i < array->indexed_array_like_size(); ++i)
-                    result_array->indexed_append(array->indexed_get(i)->value);
+            if (all_fast_path_arguments && total_length <= NumericLimits<u32>::max()) {
+                auto append_array = [&](Array const& source) {
+                    if (source.indexed_storage_kind() == IndexedStorageKind::Packed)
+                        result_array->indexed_append(source.indexed_packed_elements_span());
+                };
 
+                append_array(*array);
                 for (size_t argument_index = 0; argument_index < vm.argument_count(); ++argument_index) {
                     auto arg = vm.argument(argument_index);
-                    if (!arg.is_object()) {
+                    if (arg.is_object())
+                        append_array(static_cast<Array const&>(arg.as_object()));
+                    else
                         result_array->indexed_append(arg);
-                        continue;
-                    }
-
-                    auto& argument_array = static_cast<Array&>(arg.as_object());
-                    for (u32 i = 0; i < argument_array.indexed_array_like_size(); ++i)
-                        result_array->indexed_append(argument_array.indexed_get(i)->value);
                 }
                 return result_array;
             }
@@ -1421,6 +1438,12 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::slice)
             u32 end = static_cast<u32>(final);
             for (u32 i = start; i < end; ++i)
                 result_array->indexed_put(i - start, array->indexed_get(i)->value);
+
+            // NB: A species constructor can return an array with more elements than the slice. The spec sets the
+            //     length of the result at the end, which removes them.
+            u32 result_length = end > start ? end - start : 0;
+            if (result_array->indexed_array_like_size() != result_length)
+                VERIFY(result_array->set_indexed_array_like_size(result_length));
             return result_array;
         }
     }
@@ -1656,7 +1679,8 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::splice)
         && actual_start <= NumericLimits<u32>::max()
         && actual_delete_count <= NumericLimits<u32>::max()
         && item_count <= NumericLimits<u32>::max()) {
-        if (auto* removed_array = fast_array_species_result(*removed_elements)) {
+        // NB: The removed elements array must not be this array, since we copy from it while shifting its elements.
+        if (auto* removed_array = fast_array_species_result(*removed_elements); removed_array && removed_array != array) {
             u32 start = static_cast<u32>(actual_start);
             u32 delete_count = static_cast<u32>(actual_delete_count);
             u32 item_count_u32 = static_cast<u32>(item_count);
@@ -1664,6 +1688,11 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::splice)
 
             for (u32 i = 0; i < delete_count; ++i)
                 removed_array->indexed_put(i, array->indexed_get(start + i)->value);
+
+            // NB: A species constructor can return an array with more elements than were removed. The spec sets its
+            //     length to actualDeleteCount, which removes them.
+            if (removed_array->indexed_array_like_size() != delete_count)
+                VERIFY(removed_array->set_indexed_array_like_size(delete_count));
 
             if (item_count_u32 == delete_count) {
                 for (u32 i = 0; i < item_count_u32; ++i)

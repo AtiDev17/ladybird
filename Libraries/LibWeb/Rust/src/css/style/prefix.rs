@@ -53,7 +53,6 @@ use super::selector::MatchEvaluator;
 use super::selector::MatchFactRow;
 use super::selector::NamespaceTest;
 use super::selector::PrefixStructuralTest;
-use super::selector::RouteID;
 use super::selector::SelectorPrefixAxis;
 use super::selector::SelectorPrefixLocal;
 use super::selector::SelectorPrefixStep;
@@ -72,38 +71,6 @@ define_id! { pub(super) struct PrefixStepID(); }
 #[derive(Clone, Copy)]
 pub(super) struct PrefixProducer {
     pub step: PrefixStepID,
-}
-
-#[derive(Default)]
-pub(super) struct PrefixProducerCache {
-    ranges: Vec<Option<std::ops::Range<u32>>>,
-    producers: Vec<PrefixProducer>,
-}
-
-impl PrefixProducerCache {
-    pub(super) fn producers_for_route(
-        &mut self,
-        route: RouteID,
-        prefixes: &PrefixAutomaton,
-        entry: EntryID,
-        inverse_path_length: usize,
-    ) -> &[PrefixProducer] {
-        if self.ranges.len() <= route.index() {
-            self.ranges.resize(route.index() + 1, None);
-        }
-        let range = self.ranges[route.index()].get_or_insert_with(|| {
-            let start = u32::try_from(self.producers.len()).expect("prefix producer space exhausted");
-            prefixes.append_route_producers(entry, inverse_path_length, &mut self.producers);
-            let end = u32::try_from(self.producers.len()).expect("prefix producer space exhausted");
-            start..end
-        });
-        &self.producers[range.start as usize..range.end as usize]
-    }
-
-    pub(super) fn capacity_bytes(&self) -> usize {
-        self.ranges.capacity() * size_of::<Option<std::ops::Range<u32>>>()
-            + self.producers.capacity() * size_of::<PrefixProducer>()
-    }
 }
 
 impl PrefixProducer {
@@ -855,23 +822,15 @@ impl PrefixAutomaton {
         selection
     }
 
-    pub(super) fn append_route_producers(
-        &self,
-        entry: EntryID,
-        inverse_path_length: usize,
-        into: &mut Vec<PrefixProducer>,
-    ) -> bool {
-        let Some(path) = self.path_for(entry) else {
-            return false;
-        };
-        let Some(index) = path.len().checked_sub(inverse_path_length.saturating_add(1)) else {
-            return false;
-        };
-        let Some(&step) = path.get(index) else {
-            return false;
-        };
-        into.push(PrefixProducer { step });
-        true
+    /// The producer step a route reaches at `inverse_path_length` steps from the entry's end.
+    /// Each entry stores exactly one prefix path, so this is a read of finished program data:
+    /// routing borrows it and no per-transaction producer cache exists.
+    pub(super) fn route_producer(&self, entry: EntryID, inverse_path_length: usize) -> Option<PrefixProducer> {
+        let path = self.path_for(entry)?;
+        let index = path.len().checked_sub(inverse_path_length.saturating_add(1))?;
+        Some(PrefixProducer {
+            step: *path.get(index)?,
+        })
     }
 
     #[must_use]
@@ -2634,7 +2593,6 @@ impl PrefixStates {
         delta_arena: &mut PrefixDeltaArena,
         counters: &mut Counters,
     ) -> PrefixTransitionLookup<PrefixDifference> {
-        self.prepare_rows(evaluation.facts.generation(), evaluation.facts.row_count());
         let row = match evaluation.row_of(node) {
             Ok(row) => row,
             Err(incomplete) => {
@@ -3244,7 +3202,7 @@ impl PrefixStates {
     /// Per-row transitions and local-fact representatives hold raw row indices. A batch rebuild
     /// renumbers rows, so holding them across generations reads the wrong element's facts, or
     /// past the end of the batch. Appending keeps the generation and the held rows.
-    fn prepare_rows(&mut self, generation: u64, row_count: usize) {
+    pub(super) fn prepare_rows(&mut self, generation: u64, row_count: usize) {
         if self.facts_generation != generation || generation == 0 {
             self.facts_generation = generation;
             self.transition_by_row.clear();
@@ -4458,7 +4416,7 @@ impl PrefixStateCache {
         }
     }
 
-    pub(super) fn get_or_insert(
+    pub(super) fn prepare_program_rows(
         &mut self,
         program: ScopeProgramID,
         generation: u64,
@@ -4503,7 +4461,6 @@ impl PrefixStateCache {
         }
         if self.lifecycle.is_retained() {
             self.residency.reconcile_committed(memory, bytes);
-            memory.finish_committed_acceleration_growth(MemoryCategory::PrefixTransitionCache);
         } else {
             self.scratch_memory.resize_required_to(memory, bytes);
         }
@@ -4561,7 +4518,6 @@ impl PrefixStateCache {
             return false;
         }
         self.residency.reconcile_committed(memory, working_bytes);
-        memory.finish_committed_acceleration_growth(MemoryCategory::PrefixTransitionCache);
         self.scratch_memory.release();
         self.lifecycle = match self.lifecycle {
             PrefixStateCacheLifecycle::Scratch(coverage) => PrefixStateCacheLifecycle::Retained(coverage),
@@ -5397,7 +5353,7 @@ mod tests {
             &[],
         );
         {
-            let states = cache.get_or_insert(ScopeProgramID(0), facts.generation(), 1);
+            let states = cache.prepare_program_rows(ScopeProgramID(0), facts.generation(), 1);
             states
                 .local_fact_interner
                 .intern(&facts, 0, &PrefixFactDependencies::default(), &mut counters);
@@ -5409,7 +5365,7 @@ mod tests {
         // A generation change clears the entry's local-fact interner, shrinking its capacity. On a
         // a retained cache that shrink must reconcile the residency lease at settlement; the
         // scratch lease holds zero bytes here and would underflow if it were adjusted instead.
-        let _ = cache.get_or_insert(ScopeProgramID(0), facts.generation() + 1, 1);
+        let _ = cache.prepare_program_rows(ScopeProgramID(0), facts.generation() + 1, 1);
         cache.settle_memory(&mut memory);
         assert_eq!(memory.bytes_in_category(MemoryCategory::BatchScratch), 0);
     }
