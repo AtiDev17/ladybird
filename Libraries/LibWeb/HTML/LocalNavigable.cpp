@@ -3580,19 +3580,17 @@ void LocalNavigable::navigate_to_a_fragment(URL::URL const& url, HistoryHandling
         script_history_length = script_history_index + 1;
     }
 
-    // 12. Set navigable's active session history entry to historyEntry.
+    // 12. Set navigable's active document's URL to url.
+    active_document()->set_url(url);
+
+    // 13. Set navigable's active session history entry to historyEntry.
     m_active_session_history_entry = history_entry;
 
-    // 13. Update document for history step application given navigable's active document, historyEntry, true, scriptHistoryIndex, and scriptHistoryLength.
-    // AD HOC: Skip updating the navigation api entries twice here
-    active_document()->update_for_history_step_application(*history_entry, true, script_history_length, script_history_index, navigation_type, {}, {}, false);
-
-    // 14. Update the navigation API entries for a same-document navigation given navigation, historyEntry, and historyHandling.
-    navigation->update_the_navigation_api_entries_for_a_same_document_navigation(history_entry, navigation_type);
+    // 14. Update document for history step application given navigable's active document, historyEntry, true,
+    //     scriptHistoryIndex, scriptHistoryLength, and historyHandling.
+    active_document()->update_for_history_step_application(*history_entry, true, script_history_length, script_history_index, navigation_type);
 
     // 15. Scroll to the fragment given navigable's active document.
-    // FIXME: Specification doesn't say when document url needs to update during fragment navigation
-    active_document()->set_url(url);
     active_document()->scroll_to_the_fragment();
 
     // 16. Let traversable be navigable's traversable navigable.
@@ -5420,12 +5418,14 @@ void LocalNavigable::inform_the_navigation_api_about_aborting_navigation()
     // 2. Let navigation be navigable's active window's navigation API.
     auto navigation = active_window()->navigation();
 
-    // 3. If navigation's ongoing navigate event is null, then return.
-    if (navigation->ongoing_navigate_event() == nullptr)
-        return;
-
-    // 4. Abort the ongoing navigation given navigation.
-    navigation->abort_the_ongoing_navigation();
+    // 3. While navigation's ongoing navigate event is not null:
+    // NOTE: This is a loop, since abort the ongoing navigation can run JavaScript (e.g., via the navigateerror event),
+    //       which might start a new navigation. Since such a newly-started navigation will be superseded by the
+    //       completion of this navigation, it gets signaled to the navigation API as aborted.
+    while (navigation->ongoing_navigate_event()) {
+        // 1. Abort the ongoing navigation given navigation.
+        navigation->abort_the_ongoing_navigation();
+    }
 }
 
 bool LocalNavigable::is_focused() const

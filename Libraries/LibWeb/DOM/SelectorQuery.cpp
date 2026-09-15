@@ -9,7 +9,6 @@
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineBridge.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
-#include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ParentNode.h>
@@ -31,8 +30,9 @@ public:
         // Attribute-name and default value case behavior are compiled into a query, so publish the document kind
         // before any query is compiled rather than while facts are populated afterward.
         CSS::configure_isolated_selector_query_engine(m_engine, root.document());
-        CSS::populate_isolated_selector_query_engine(m_engine, root, [&](GC::Ref<Element> element, CSS::StyleNodeID identity) {
+        m_root_identity = CSS::populate_isolated_selector_query_engine(m_engine, root, [&](GC::Ref<Element> element, CSS::StyleNodeID identity) {
             m_identities.set(element, identity);
+            m_elements.set(identity, element);
         });
     }
 
@@ -56,8 +56,46 @@ public:
         return *result;
     }
 
+    GC::Ptr<Element> query_first(SelectorQuery const& query, ParentNode const& root)
+    {
+        auto context = subtree_query(root);
+        if (!context.root)
+            return nullptr;
+        CSS::StyleNodeID matched;
+        VERIFY(m_engine.selector_query_first(compiled_query_for(query), context.root, context.include_root, context.scope, 0, m_has_document_root, matched));
+        return matched.value() ? m_elements.get(matched).value() : nullptr;
+    }
+
+    void query_all(SelectorQuery const& query, ParentNode const& root, Vector<GC::RawPtr<Element>>& elements)
+    {
+        auto context = subtree_query(root);
+        if (!context.root)
+            return;
+        Vector<CSS::StyleNodeID> matches;
+        VERIFY(m_engine.selector_query_all(compiled_query_for(query), context.root, context.include_root, context.scope, 0, m_has_document_root, matches));
+        elements.ensure_capacity(matches.size());
+        for (auto identity : matches)
+            elements.unchecked_append(m_elements.get(identity).value());
+    }
+
 private:
-    void const* compiled_query_for(SelectorQuery const& query)
+    struct SubtreeQuery {
+        CSS::StyleNodeID root;
+        CSS::StyleNodeID scope;
+        bool include_root;
+    };
+
+    SubtreeQuery subtree_query(ParentNode const& root) const
+    {
+        if (auto* element = as_if<Element>(root)) {
+            auto identity = m_identities.get(element).value();
+            return { identity, identity, false };
+        }
+        // A document's element participates in its query; a fragment's synthetic root does not.
+        return { m_root_identity, {}, m_has_document_root };
+    }
+
+    void* compiled_query_for(SelectorQuery const& query)
     {
         if (auto it = m_compiled_queries.find(&query); it != m_compiled_queries.end())
             return it->value.handle;
@@ -76,9 +114,9 @@ private:
         // the facts again before the query matches.
         auto* handle = m_engine.compile_selector_query(selector_handles, [&] {
             for (auto const& it : m_identities) {
-                it.key->for_each_attribute([&](Attr const& attribute) {
-                    auto name_atom = m_engine.intern_attribute_name(attribute.local_name(), attribute.namespace_uri());
-                    m_engine.backfill_attribute_value_text_if_required(name_atom, attribute.value());
+                it.key->for_each_attribute([&](QualifiedName const& name, Utf16String const& value) {
+                    auto name_atom = m_engine.intern_attribute_name(name.local_name(), name.namespace_());
+                    m_engine.backfill_attribute_value_text_if_required(name_atom, value);
                 });
             }
         });
@@ -102,6 +140,8 @@ private:
 
     CSS::StyleEngine m_engine;
     HashMap<GC::Ptr<Element const>, CSS::StyleNodeID> m_identities;
+    HashMap<CSS::StyleNodeID, GC::RawPtr<Element>> m_elements;
+    CSS::StyleNodeID m_root_identity;
     HashMap<SelectorQuery const*, CompiledQuery> m_compiled_queries;
     bool m_has_document_root { false };
 };
@@ -255,6 +295,14 @@ SelectorQuery::SelectorQuery(Document& document, CSS::SelectorList&& selectors)
     m_engine_query = document.style_computer().style_engine().compile_selector_query(selector_handles);
     m_can_match_in_dom = m_selectors.size() == 1
         && CSS::SelectorFFI::rust_selector_supports_simple_dom_matching(&m_selectors.first()->rust_selector());
+    m_can_match_locally_in_dom = all_of(m_selectors, [&](auto const& selector) {
+        bool needs_id = false;
+        bool needs_classes = false;
+        auto supported = CSS::SelectorFFI::rust_selector_supports_local_dom_matching(&selector->rust_selector(), &needs_id, &needs_classes);
+        m_dom_matching_needs_id |= needs_id;
+        m_dom_matching_needs_classes |= needs_classes;
+        return supported;
+    });
     m_matches_every_element = m_selectors.size() == 1
         && CSS::SelectorFFI::rust_selector_matches_every_element(&m_selectors.first()->rust_selector());
 
@@ -294,7 +342,7 @@ static uintptr_t interned_name_identity(Utf16FlyString const& name)
 
 bool SelectorQuery::matches_simple_selector_in_dom(Element const& element) const
 {
-    auto const& classes = element.class_names();
+    auto const classes = m_dom_matching_needs_classes ? element.class_names().span() : ReadonlySpan<Utf16FlyString> {};
     Vector<uintptr_t, 8> class_identities;
     Vector<Utf16FlyString, 8> lowercase_classes;
     Vector<uintptr_t, 8> lowercase_class_identities;
@@ -310,30 +358,53 @@ bool SelectorQuery::matches_simple_selector_in_dom(Element const& element) const
             lowercase_class_identities.unchecked_append(interned_name_identity(class_name));
     }
 
-    auto id = element.id().value_or({});
+    auto id = m_dom_matching_needs_id ? element.id().value_or({}) : Utf16FlyString {};
     Utf16FlyString lowercase_id;
     if (element.document().in_quirks_mode())
         lowercase_id = id.to_ascii_lowercase();
-    auto result = CSS::SelectorFFI::rust_selector_matches_simple_dom(
-        &m_selectors.first()->rust_selector(),
-        interned_name_identity(element.local_name()),
-        interned_name_identity(element.lowercased_local_name()),
-        interned_name_identity(id),
-        interned_name_identity(lowercase_id),
-        class_identities.data(),
-        lowercase_class_identities.data(),
-        class_identities.size(),
-        element.is_html_element() && element.document().is_html_document(),
-        element.document().in_quirks_mode());
-    VERIFY(result != NumericLimits<u8>::max());
-    return result != 0;
+    struct AttributeContext {
+        GC::Ref<Element const> element;
+        Optional<Utf16String> value;
+    } attribute_context { element, {} };
+    for (auto const& selector : m_selectors) {
+        auto result = CSS::SelectorFFI::rust_selector_matches_simple_dom(
+            &selector->rust_selector(),
+            interned_name_identity(element.local_name()),
+            interned_name_identity(element.lowercased_local_name()),
+            interned_name_identity(id),
+            interned_name_identity(lowercase_id),
+            class_identities.data(),
+            lowercase_class_identities.data(),
+            class_identities.size(),
+            element.is_html_element() && element.document().is_html_document(),
+            element.document().in_quirks_mode(),
+            &attribute_context,
+            [](void* context, uintptr_t name_identity, CSS::SelectorFFI::FfiUtf16View* result) {
+                auto& attributes = *static_cast<AttributeContext*>(context);
+                auto name = Utf16FlyString::from_raw(name_identity);
+                attributes.value = attributes.element->get_attribute_ns({}, name);
+                if (!attributes.value.has_value())
+                    return false;
+                Utf16View view = *attributes.value;
+                *result = {
+                    .ascii = view.has_ascii_storage() ? reinterpret_cast<u8 const*>(view.ascii_span().data()) : nullptr,
+                    .utf16 = view.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(view.utf16_span().data()),
+                    .length = view.length_in_code_units(),
+                };
+                return true;
+            });
+        VERIFY(result != NumericLimits<u8>::max());
+        if (result != 0)
+            return true;
+    }
+    return false;
 }
 
 bool SelectorQuery::matches(Element const& element, ParentNode const& scope) const
 {
     if (m_matches_every_element)
         return true;
-    if (m_can_match_in_dom)
+    if (m_can_match_locally_in_dom)
         return matches_simple_selector_in_dom(element);
 
     auto& document = const_cast<Document&>(element.document());
@@ -368,7 +439,7 @@ bool SelectorQuery::matches_in_style_engine(Element const& element, ParentNode c
 
 GC::Ptr<Element const> SelectorQuery::closest(Element const& element) const
 {
-    if (m_can_match_in_dom) {
+    if (m_can_match_locally_in_dom) {
         if (matches_simple_selector_in_dom(element))
             return &element;
         for (auto ancestor = element.parent_element(); ancestor; ancestor = ancestor->parent_element()) {
@@ -405,11 +476,25 @@ GC::Ptr<Element const> SelectorQuery::closest(Element const& element) const
     return nullptr;
 }
 
+// Small subtrees cost less to inspect directly than to settle a query engine. Count before
+// matching so large roots only pay for a bounded tree walk before using their indexes.
+static bool is_small_query_subtree(ParentNode& root)
+{
+    size_t visited = 0;
+    root.for_each_in_subtree_of_type<Element>([&](auto&) {
+        return ++visited > 32 ? TraversalDecision::Break : TraversalDecision::Continue;
+    });
+    return visited <= 32;
+}
+
 // https://dom.spec.whatwg.org/#scope-match-a-selectors-string
 // This implements step 3, "match a selector against a tree" with the parsed selectors,
 // stopping at the first match.
 GC::Ptr<Element> SelectorQuery::query_first(ParentNode& root) const
 {
+    if (!root.first_element_child())
+        return nullptr;
+
     auto cache_result = [&](GC::Ptr<Element> result) {
         if (m_is_result_cacheable) {
             Vector<GC::RawPtr<Element>> elements;
@@ -426,6 +511,9 @@ GC::Ptr<Element> SelectorQuery::query_first(ParentNode& root) const
             return cached_elements->is_empty() ? nullptr : cached_elements->first().ptr();
     }
 
+    if (m_can_match_locally_in_dom && !m_can_match_in_dom && is_small_query_subtree(root))
+        return cache_result(first_match(root, [&](auto& element) { return matches_simple_selector_in_dom(element); }));
+
     if (m_matches_every_element)
         return cache_result(first_match(root, [](auto&) { return true; }));
     if (m_can_match_in_dom)
@@ -435,10 +523,10 @@ GC::Ptr<Element> SelectorQuery::query_first(ParentNode& root) const
         auto& tree_root = as<ParentNode>(root.root());
         if (m_is_result_cacheable) {
             auto& engine = root.document().isolated_selector_query_engine_cache().engine_for(tree_root);
-            return cache_result(first_match(root, [&](auto& element) { return engine.matches(*this, element, root); }));
+            return cache_result(engine.query_first(*this, root));
         }
         IsolatedSelectorQueryEngine engine(tree_root);
-        return first_match(root, [&](auto& element) { return engine.matches(*this, element, root); });
+        return engine.query_first(*this, root);
     }
 
     auto& document = root.document();
@@ -472,6 +560,9 @@ static GC::Ref<NodeList> create_node_list(Vector<GC::RawPtr<Element>> const& ele
 // This implements step 3, "match a selector against a tree" with the parsed selectors.
 GC::Ref<NodeList> SelectorQuery::query_all(ParentNode& root) const
 {
+    if (!root.first_element_child())
+        return create_node_list({});
+
     auto& document = root.document();
 
     if (m_is_result_cacheable) {
@@ -482,16 +573,16 @@ GC::Ref<NodeList> SelectorQuery::query_all(ParentNode& root) const
     Vector<GC::RawPtr<Element>> elements;
     if (m_matches_every_element) {
         collect_matches(root, [](auto&) { return true; }, elements);
-    } else if (m_can_match_in_dom) {
+    } else if (m_can_match_in_dom || (m_can_match_locally_in_dom && is_small_query_subtree(root))) {
         collect_matches(root, [&](auto& element) { return matches_simple_selector_in_dom(element); }, elements);
     } else if (!root.is_connected()) {
         auto& tree_root = as<ParentNode>(root.root());
         if (m_is_result_cacheable) {
             auto& engine = document.isolated_selector_query_engine_cache().engine_for(tree_root);
-            collect_matches(root, [&](auto& element) { return engine.matches(*this, element, root); }, elements);
+            engine.query_all(*this, root, elements);
         } else {
             IsolatedSelectorQueryEngine engine(tree_root);
-            collect_matches(root, [&](auto& element) { return engine.matches(*this, element, root); }, elements);
+            engine.query_all(*this, root, elements);
         }
     } else {
         settle_connected_selector_query(document);

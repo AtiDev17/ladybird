@@ -6742,73 +6742,76 @@ fn an_identity_only_published_prefix_answer_is_returned_in_cascade_order() {
 
 #[test]
 fn shared_retained_answer_completion_reuses_compact_cascade_state() {
-    let (mut engine, nodes) = nested_document();
-    let target = StyleAtomID(200);
-    for index in 0..10 {
-        let rule = add_target_rule(&mut engine, StyleSheetObjectID(index + 1), target);
-        engine.set_rule_declared_properties(rule, &[(1, false)], true);
-    }
-    for &node in &nodes {
-        for kind in ElementDeclarationKind::ALL {
-            engine.set_element_declared_properties(node, kind, &[], Vec::new(), Vec::new(), Vec::new(), true);
+    for declarations_overlap in [true, false] {
+        let (mut engine, nodes) = nested_document();
+        let target = StyleAtomID(200);
+        for index in 0..10 {
+            let rule = add_target_rule(&mut engine, StyleSheetObjectID(index + 1), target);
+            let property = if declarations_overlap { 1 } else { (index + 1) as u16 };
+            engine.set_rule_declared_properties(rule, &[(property, false)], true);
         }
-    }
-    for node in [nodes[2], nodes[3]] {
-        add_feature(&mut engine, node, LocalFeatureKey::Class(target));
-    }
-    discard_transaction(&mut engine);
+        for &node in &nodes {
+            for kind in ElementDeclarationKind::ALL {
+                engine.set_element_declared_properties(node, kind, &[], Vec::new(), Vec::new(), Vec::new(), true);
+            }
+        }
+        for node in [nodes[2], nodes[3]] {
+            add_feature(&mut engine, node, LocalFeatureKey::Class(target));
+        }
+        discard_transaction(&mut engine);
 
-    let first_matches = engine.match_element(nodes[2]).unwrap();
-    let second_matches = engine.match_element(nodes[3]).unwrap();
-    assert_eq!(first_matches.len(), 10);
-    assert_eq!(second_matches.len(), 10);
-    engine.remember_retained_match_answer(nodes[2], &first_matches);
-    engine.remember_retained_match_answer(nodes[3], &second_matches);
-    let first_identity = engine.retained_match_answers.answer_identity(nodes[2]).unwrap();
-    assert_eq!(
-        engine.retained_match_answers.answer_identity(nodes[3]),
-        Some(first_identity)
-    );
+        let first_matches = engine.match_element(nodes[2]).unwrap();
+        let second_matches = engine.match_element(nodes[3]).unwrap();
+        assert_eq!(first_matches.len(), 10);
+        assert_eq!(second_matches.len(), 10);
+        engine.remember_retained_match_answer(nodes[2], &first_matches);
+        engine.remember_retained_match_answer(nodes[3], &second_matches);
+        let first_identity = engine.retained_match_answers.answer_identity(nodes[2]).unwrap();
+        assert_eq!(
+            engine.retained_match_answers.answer_identity(nodes[3]),
+            Some(first_identity)
+        );
 
-    let (_, dispatch) = engine.ranked_scope_program(TreeScopeID::DOCUMENT);
-    let first = engine
-        .complete_published_match_answer(nodes[2], Some(&dispatch))
-        .unwrap();
-    let cascade_input = first.cascade_input.unwrap();
-    assert!(engine.shared_cascade_completion_is_profitable(first_identity, cascade_input));
-    let compaction_rows = engine.counters().get(Counter::CascadeMatchesBeforeCompaction);
+        let (_, dispatch) = engine.ranked_scope_program(TreeScopeID::DOCUMENT);
+        let first = engine
+            .complete_published_match_answer(nodes[2], Some(&dispatch))
+            .unwrap();
+        let cascade_input = first.cascade_input.unwrap();
+        assert!(engine.shared_cascade_completion_is_profitable(first_identity));
+        let compaction_rows = engine.counters().get(Counter::CascadeMatchesBeforeCompaction);
 
-    let second = engine
-        .complete_published_match_answer_from_cascade_input(
-            nodes[3],
-            nodes[2],
-            cascade_input,
-            first.cascade_winners_are_complete,
-        )
-        .unwrap();
+        let second = engine
+            .complete_published_match_answer_from_cascade_input(
+                nodes[3],
+                nodes[2],
+                cascade_input,
+                first.cascade_winners_are_complete,
+            )
+            .unwrap();
 
-    assert_eq!(second.cascade_input, Some(cascade_input));
-    assert!(second.matches.is_none());
-    engine
-        .published_match_answers
-        .push(second, &mut engine.memory, &mut engine.counters);
-    engine.published_match_answers.sort();
-    let materialized = engine.consume_published_match_answer(nodes[3]).unwrap();
-    assert_eq!(materialized.len(), 1);
-    assert_eq!(materialized[0].node, nodes[3]);
-    assert_eq!(
-        engine.counters().get(Counter::CascadeMatchesBeforeCompaction),
-        compaction_rows
-    );
-    let program_version = engine.program.version();
-    assert_eq!(
+        assert_eq!(second.cascade_input, Some(cascade_input));
+        assert!(second.matches.is_none());
         engine
-            .winner_groups
-            .token_for(WinnerGroupKey::current(nodes[2], program_version)),
-        engine
-            .winner_groups
-            .token_for(WinnerGroupKey::current(nodes[3], program_version))
-    );
+            .published_match_answers
+            .push(second, &mut engine.memory, &mut engine.counters);
+        engine.published_match_answers.sort();
+        let materialized = engine.consume_published_match_answer(nodes[3]).unwrap();
+        assert_eq!(materialized.len(), if declarations_overlap { 1 } else { 10 });
+        assert_eq!(materialized[0].node, nodes[3]);
+        assert_eq!(
+            engine.counters().get(Counter::CascadeMatchesBeforeCompaction),
+            compaction_rows
+        );
+        let program_version = engine.program.version();
+        assert_eq!(
+            engine
+                .winner_groups
+                .token_for(WinnerGroupKey::current(nodes[2], program_version)),
+            engine
+                .winner_groups
+                .token_for(WinnerGroupKey::current(nodes[3], program_version))
+        );
+    }
 }
 
 #[test]
@@ -8471,6 +8474,79 @@ fn a_sibling_fact_request_is_taken_a_doubling_window_at_a_time() {
         engine.widen_fact_coverage(&mut covered, repeated, &mut window),
         Err(nodes[1])
     );
+}
+
+#[test]
+fn duplicate_fact_requests_share_one_window_per_matching_pass() {
+    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut raw = [0_u32; 65];
+    engine.allocate_style_nodes(&mut raw);
+    let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
+    engine.record_tree_delta(nodes[0], None, Some(relations(None, None, None)));
+    for index in 1..nodes.len() {
+        engine.record_tree_delta(
+            nodes[index],
+            None,
+            Some(relations(
+                Some(nodes[0].raw()),
+                (index > 1).then(|| nodes[index - 1].raw()),
+                None,
+            )),
+        );
+    }
+    discard_transaction(&mut engine);
+
+    for request in [
+        Incomplete::MissingFacts(nodes[1]),
+        Incomplete::MissingSiblingFacts {
+            first: nodes[1],
+            last_exclusive: None,
+        },
+        Incomplete::MissingDescendantFacts {
+            root: nodes[0],
+            first: nodes[1],
+        },
+    ] {
+        let mut covered = Vec::new();
+        let mut window = INITIAL_SIBLING_FACT_WINDOW;
+        let requests = vec![request; 64];
+        engine
+            .widen_fact_coverage_for_requests(&mut covered, &requests, &mut window)
+            .unwrap();
+        let expected = if matches!(request, Incomplete::MissingFacts(_)) {
+            1
+        } else {
+            INITIAL_SIBLING_FACT_WINDOW
+        };
+        assert_eq!(covered, nodes[1..=expected]);
+        assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+        assert_eq!(
+            engine.widen_fact_coverage_for_requests(&mut covered, &requests, &mut window),
+            Err(nodes[1]),
+            "a row requested again after materialization still reports failure to make progress"
+        );
+        assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+    }
+
+    let mut covered = vec![nodes[0]];
+    let mut window = INITIAL_SIBLING_FACT_WINDOW;
+    let requests = [
+        Incomplete::MissingFacts(nodes[1]),
+        Incomplete::MissingSiblingFacts {
+            first: nodes[1],
+            last_exclusive: Some(nodes[9]),
+        },
+        Incomplete::MissingFacts(nodes[2]),
+    ];
+    engine
+        .widen_fact_coverage_for_requests(&mut covered, &requests, &mut window)
+        .unwrap();
+    assert_eq!(
+        covered,
+        nodes[..9],
+        "overlapping requests retain discovery order without duplicates"
+    );
+    assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
 }
 
 fn typed_nth_of_type_document() -> (StyleEngine, Vec<StyleNodeID>) {
