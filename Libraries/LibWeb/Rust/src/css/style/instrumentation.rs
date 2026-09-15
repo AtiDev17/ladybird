@@ -66,6 +66,37 @@ define_counters! {
     LanguageTextsPublished => "languageTextsPublished",
     CustomPropertyNamesPublished => "customPropertyNamesPublished",
 
+    // Exclusive transaction intervals. Fused stages retain one name until execution splits.
+    TransactionMicroseconds => "transactionMicroseconds",
+    CommitMicroseconds => "commitMicroseconds",
+    RoutingPlanningMicroseconds => "routingPlanningMicroseconds",
+    MatchingCascadeMicroseconds => "matchingCascadeMicroseconds",
+    ComputationPublicationMicroseconds => "computationPublicationMicroseconds",
+    EmitMicroseconds => "emitMicroseconds",
+    TransactionRemainderMicroseconds => "transactionRemainderMicroseconds",
+    // The passes inside those phases, clocked only when `LIBWEB_STYLE_PASS_CLOCKS` is set. The
+    // phase clocks say which quarter of the transaction a millisecond is in; these say which
+    // pass, which is what decides whether a pass is per-node work or bookkeeping around it.
+    RoutingSetupMicroseconds => "routingSetupMicroseconds",
+    RoutingInputsMicroseconds => "routingInputsMicroseconds",
+    SequenceRoutingMicroseconds => "sequenceRoutingMicroseconds",
+    PendingRouteFlushMicroseconds => "pendingRouteFlushMicroseconds",
+    BatchCompilationMicroseconds => "batchCompilationMicroseconds",
+    WinnerVersionAdvanceMicroseconds => "winnerVersionAdvanceMicroseconds",
+    RetainedAnswerPatchLoopMicroseconds => "retainedAnswerPatchLoopMicroseconds",
+    CompletionBatchBeginMicroseconds => "completionBatchBeginMicroseconds",
+    CompletionBatchMaterializeMicroseconds => "completionBatchMaterializeMicroseconds",
+    CompletionBatchRelationMicroseconds => "completionBatchRelationMicroseconds",
+    CompletionPassMicroseconds => "completionPassMicroseconds",
+    ComputationLoopMicroseconds => "computationLoopMicroseconds",
+    // Physical work, including drives whose output is later abandoned.
+    EngineFullDrivesStarted => "engineFullDrivesStarted",
+    EnginePartialDrivesStarted => "enginePartialDrivesStarted",
+    EnginePhysicalLonghandEvaluations => "enginePhysicalLonghandEvaluations",
+    EnginePartialLonghandEvaluations => "enginePartialLonghandEvaluations",
+    EngineDriveCopiedTableSlots => "engineDriveCopiedTableSlots",
+    ReachedStyleNodes => "reachedStyleNodes",
+
     // Stylesheet program.
     StyleRulesCompiled => "styleRulesCompiled",
     ExactSelectorEntries => "exactSelectorEntries",
@@ -231,6 +262,13 @@ define_counters! {
     SpecifiedValuesReused => "specifiedValuesReused",
     ComputedGroupNodeHandlesPublished => "computedGroupNodeHandlesPublished",
     ComputedGroupsReused => "computedGroupsReused",
+    // The identities each catalog mints. Unlike the reuse counters above, which credit the
+    // publication that happened to intern an identity first, these count the identities a
+    // run creates, which is a property of the content and not of the execution order.
+    ComputedGroupIdentitiesMinted => "computedGroupIdentitiesMinted",
+    ComputedGroupSetIdentitiesMinted => "computedGroupSetIdentitiesMinted",
+    InheritedGroupSetIdentitiesMinted => "inheritedGroupSetIdentitiesMinted",
+    StyleRecordIdentitiesMinted => "styleRecordIdentitiesMinted",
     ComputedGroupsRetained => "computedGroupsRetained",
     ComputedGroupsReachable => "computedGroupsReachable",
     ComputedGroupSetsReused => "computedGroupSetsReused",

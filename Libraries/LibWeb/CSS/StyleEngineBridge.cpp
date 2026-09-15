@@ -5,6 +5,7 @@
  */
 
 #include <AK/StdLibExtras.h>
+#include <AK/Time.h>
 #include <LibWeb/CSS/RustDeclarationBlock.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineBridge.h>
@@ -205,9 +206,9 @@ bool StyleEngine::style_records_match_for_verification(StyleNodeID node, u8 pseu
     return StyleEngineFFI::style_engine_style_records_match_for_verification(m_impl, node.value(), pseudo_kind, first.value(), second.value());
 }
 
-u32 StyleEngine::compare_style_records(StyleRecordID old_style_record, StyleRecordID new_style_record, bool font_lists_equal, bool element_folds_transform_into_layout) const
+u32 StyleEngine::compare_style_records(StyleRecordID old_style_record, StyleRecordID new_style_record, bool font_lists_equal, bool element_folds_transform_into_layout, bool element_propagates_overflow_to_viewport) const
 {
-    return StyleEngineFFI::style_engine_compare_style_records(m_impl, old_style_record.value(), new_style_record.value(), font_lists_equal, element_folds_transform_into_layout);
+    return StyleEngineFFI::style_engine_compare_style_records(m_impl, old_style_record.value(), new_style_record.value(), font_lists_equal, element_folds_transform_into_layout, element_propagates_overflow_to_viewport);
 }
 
 bool StyleEngine::animation_overlay_changed(StyleRecordID old_style_record, void const* animated_overlay) const
@@ -616,6 +617,7 @@ void StyleEngine::discard_style_transaction_outputs()
 
 StyleEngine::PublishedStyleTransaction StyleEngine::take_style_transaction(StyleNodeID root)
 {
+    auto submission_started_at = MonotonicTime::now();
     submit_recorded_input();
     StyleEngineFFI::FfiDocumentStyleComputationInputs computation_inputs {};
     if (m_style_computer) {
@@ -663,7 +665,9 @@ StyleEngine::PublishedStyleTransaction StyleEngine::take_style_transaction(Style
             }
         }
     }
+    auto bridge_started_at = MonotonicTime::now();
     auto view = StyleEngineFFI::style_engine_take_style_transaction(m_impl, root.value(), computation_inputs);
+    auto bridge_microseconds = (MonotonicTime::now() - bridge_started_at).to_truncated_microseconds();
     if (view.reclaimed_style_atom_count != 0) {
         HashTable<StyleAtomID> reclaimed_atoms;
         reclaimed_atoms.ensure_capacity(view.reclaimed_style_atom_count);
@@ -695,6 +699,8 @@ StyleEngine::PublishedStyleTransaction StyleEngine::take_style_transaction(Style
         .reactions = { view.answers, view.count },
         .is_scoped = view.scoped,
         .only_derived_child_reactions = view.only_derived_child_reactions,
+        .submission_microseconds = static_cast<u64>((bridge_started_at - submission_started_at).to_truncated_microseconds()),
+        .bridge_microseconds = static_cast<u64>(bridge_microseconds),
     };
 }
 
