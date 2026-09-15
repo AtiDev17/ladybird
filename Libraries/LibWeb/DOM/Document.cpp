@@ -4200,8 +4200,9 @@ void Document::dispatch_events_for_animation_if_necessary(GC::Ref<Animations::An
     auto& css_animation = as<CSS::CSSAnimation>(*animation);
 
     auto previous_phase = effect->previous_phase();
-    auto current_phase = effect->phase();
-    auto current_iteration = effect->current_iteration().value_or(0.0);
+    auto resolved_timing = effect->resolve_timing();
+    auto current_phase = resolved_timing.phase;
+    auto current_iteration = effect->current_iteration(resolved_timing).value_or(0.0);
 
     auto owning_element = css_animation.owning_element();
 
@@ -4250,25 +4251,29 @@ void Document::dispatch_events_for_animation_if_necessary(GC::Ref<Animations::An
     // For calculating the elapsedTime of each event, the following definitions are used:
 
     // - interval start = max(min(-start delay, active duration), 0)
-    auto interval_start = max(min(-effect->start_delay(), effect->active_duration()), Animations::TimeValue::create_zero(animation->timeline()));
+    auto interval_start = [&]() {
+        return max(min(-effect->start_delay(), effect->active_duration()), Animations::TimeValue::create_zero(animation->timeline()));
+    };
 
     // - interval end = max(min(associated effect end - start delay, active duration), 0)
-    auto interval_end = max(min(effect->end_time() - effect->start_delay(), effect->active_duration()), Animations::TimeValue::create_zero(animation->timeline()));
+    auto interval_end = [&]() {
+        return max(min(effect->end_time() - effect->start_delay(), effect->active_duration()), Animations::TimeValue::create_zero(animation->timeline()));
+    };
 
     switch (previous_phase) {
     case Animations::AnimationEffect::Phase::Before:
         [[fallthrough]];
     case Animations::AnimationEffect::Phase::Idle:
         if (current_phase == Animations::AnimationEffect::Phase::Active) {
-            dispatch_event(HTML::EventNames::animationstart, interval_start);
+            dispatch_event(HTML::EventNames::animationstart, interval_start());
         } else if (current_phase == Animations::AnimationEffect::Phase::After) {
-            dispatch_event(HTML::EventNames::animationstart, interval_start);
-            dispatch_event(HTML::EventNames::animationend, interval_end);
+            dispatch_event(HTML::EventNames::animationstart, interval_start());
+            dispatch_event(HTML::EventNames::animationend, interval_end());
         }
         break;
     case Animations::AnimationEffect::Phase::Active:
         if (current_phase == Animations::AnimationEffect::Phase::Before) {
-            dispatch_event(HTML::EventNames::animationend, interval_start);
+            dispatch_event(HTML::EventNames::animationend, interval_start());
         } else if (current_phase == Animations::AnimationEffect::Phase::Active) {
             auto previous_current_iteration = effect->previous_current_iteration();
             if (previous_current_iteration != current_iteration) {
@@ -4286,15 +4291,15 @@ void Document::dispatch_events_for_animation_if_necessary(GC::Ref<Animations::An
                 dispatch_event(HTML::EventNames::animationiteration, elapsed_time);
             }
         } else if (current_phase == Animations::AnimationEffect::Phase::After) {
-            dispatch_event(HTML::EventNames::animationend, interval_end);
+            dispatch_event(HTML::EventNames::animationend, interval_end());
         }
         break;
     case Animations::AnimationEffect::Phase::After:
         if (current_phase == Animations::AnimationEffect::Phase::Active) {
-            dispatch_event(HTML::EventNames::animationstart, interval_end);
+            dispatch_event(HTML::EventNames::animationstart, interval_end());
         } else if (current_phase == Animations::AnimationEffect::Phase::Before) {
-            dispatch_event(HTML::EventNames::animationstart, interval_end);
-            dispatch_event(HTML::EventNames::animationend, interval_start);
+            dispatch_event(HTML::EventNames::animationstart, interval_end());
+            dispatch_event(HTML::EventNames::animationend, interval_start());
         }
         break;
     }
@@ -7562,8 +7567,10 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
     if (animation->pending() && !is_initial_pending_css_transition)
         return {};
     auto timeline = animation->timeline();
-    if (!timeline || !timeline->is_monotonically_increasing()
-        || (!effect.is_in_the_before_phase() && !effect.is_in_the_active_phase()))
+    if (!timeline || !timeline->is_monotonically_increasing())
+        return {};
+    auto phase = effect.phase();
+    if (phase != Animations::AnimationEffect::Phase::Before && phase != Animations::AnimationEffect::Phase::Active)
         return {};
     if ((!isinf(effect.iteration_count()) && effect.iteration_count() != 1) || effect.composite() != Bindings::CompositeOperation::Replace)
         return {};
@@ -7573,7 +7580,7 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
         || effect.iteration_duration().type != Animations::TimeValue::Type::Milliseconds
         || effect.iteration_duration().value <= 0)
         return {};
-    if (effect.is_in_the_before_phase() && effect.before_active_boundary_time() != effect.start_delay())
+    if (phase == Animations::AnimationEffect::Phase::Before && effect.before_active_boundary_time() != effect.start_delay())
         return {};
     auto current_time = animation->current_time();
     if (!current_time.has_value() || current_time->type != Animations::TimeValue::Type::Milliseconds)
@@ -7894,8 +7901,7 @@ static Optional<double> next_throttled_animation_iteration_event_time(Animations
         || effect.iteration_duration().type != Animations::TimeValue::Type::Milliseconds
         || effect.iteration_duration().value <= 0 || !isfinite(effect.iteration_duration().value)
         || !effect.can_skip_per_frame_style_update()
-        || !effect.is_in_the_active_phase()
-        || effect.can_skip_per_frame_animation_tick())
+        || effect.phase() != Animations::AnimationEffect::Phase::Active)
         return {};
 
     // NB: Observable throttled animations need a rendering update at the next iteration boundary,
@@ -7945,7 +7951,7 @@ void Document::service_compositor_animation_wakeup(double timestamp)
         if (!animation.pending()
             && animation.playback_rate() > 0
             && effect.start_delay().type == Animations::TimeValue::Type::Milliseconds
-            && effect.is_in_the_before_phase()) {
+            && effect.phase() == Animations::AnimationEffect::Phase::Before) {
             if (current_time->value < effect.start_delay().value) {
                 auto delay = (effect.start_delay().value - current_time->value) / animation.playback_rate();
                 if (!next_wakeup_delay_ms.has_value() || delay < *next_wakeup_delay_ms)
@@ -7957,7 +7963,8 @@ void Document::service_compositor_animation_wakeup(double timestamp)
                     reached_compositor_active_start = true;
             }
         }
-        if (auto iteration_event_time = next_throttled_animation_iteration_event_time(animation, effect); iteration_event_time.has_value()) {
+        if (auto iteration_event_time = next_throttled_animation_iteration_event_time(animation, effect);
+            iteration_event_time.has_value() && !effect.can_skip_per_frame_animation_tick()) {
             if (current_time->value < *iteration_event_time) {
                 auto delay = (*iteration_event_time - current_time->value) / animation.playback_rate();
                 if (!next_wakeup_delay_ms.has_value() || delay < *next_wakeup_delay_ms)
@@ -8359,7 +8366,7 @@ void Document::update_compositor_animations()
         effect.set_is_offscreen_throttled(false);
         effect.set_is_observation_relevant_compositor_animation(false);
 
-        if (animation.is_idle() || (!effect.is_in_effect() && !effect.is_in_the_before_phase()))
+        if (animation.is_idle() || (!effect.is_in_effect() && effect.phase() != Animations::AnimationEffect::Phase::Before))
             continue;
         auto target = effect.target_abstract_element();
         if (!target.has_value())
@@ -8498,14 +8505,14 @@ void Document::update_compositor_animations()
         auto abstract_target = effect.target_abstract_element();
         if (!abstract_target.has_value() || effect.target_properties().is_empty())
             continue;
-        if (animation.is_idle() || (!effect.is_in_effect() && !effect.is_in_the_before_phase()))
+        if (animation.is_idle() || (!effect.is_in_effect() && effect.phase() != Animations::AnimationEffect::Phase::Before))
             continue;
         auto& target = abstract_target->element();
 
         bool can_throttle_paint_only_effect = animation.play_state() == Bindings::AnimationPlayState::Running
             && !animation.pending() && animation.playback_rate() > 0 && isfinite(animation.playback_rate())
             && animation.timeline() && animation.timeline()->is_monotonically_increasing()
-            && effect.is_in_the_active_phase()
+            && effect.phase() == Animations::AnimationEffect::Phase::Active
             && effect.start_delay().type == Animations::TimeValue::Type::Milliseconds
             && effect.iteration_duration().type == Animations::TimeValue::Type::Milliseconds
             && effect.iteration_duration().value > 0 && isfinite(effect.iteration_duration().value)
@@ -8591,7 +8598,7 @@ void Document::update_compositor_animations()
                 && !animation.pending()
                 && animation.playback_rate() > 0
                 && animation.timeline() && animation.timeline()->is_monotonically_increasing()
-                && effect.is_in_the_active_phase()
+                && effect.phase() == Animations::AnimationEffect::Phase::Active
                 && (isinf(effect.iteration_count()) || effect.iteration_count() == 1)
                 && effect.start_delay().type == Animations::TimeValue::Type::Milliseconds
                 && effect.iteration_duration().type == Animations::TimeValue::Type::Milliseconds;
@@ -8793,8 +8800,9 @@ void Document::prepare_to_observe_css_animation_events()
     // OPTIMIZATION: Events which occurred while there were no listeners were intentionally not sampled. Establish
     //               the current phase as the baseline so a newly added listener only observes future events.
     for (auto& effect : effects_to_synchronize) {
-        effect->set_previous_phase(effect->phase());
-        effect->set_previous_current_iteration(effect->current_iteration().value_or(0.0));
+        auto resolved_timing = effect->resolve_timing();
+        effect->set_previous_phase(resolved_timing.phase);
+        effect->set_previous_current_iteration(effect->current_iteration(resolved_timing).value_or(0.0));
         effect->clear_per_frame_animation_tick_was_skipped();
     }
 }

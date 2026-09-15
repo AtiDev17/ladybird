@@ -104,17 +104,11 @@ public:
     Optional<TimeValue> active_time() const;
     Optional<TimeValue> active_time_using_fill(Bindings::FillMode) const;
 
-    bool is_in_play() const;
     bool is_current() const;
     bool is_in_effect() const;
 
     TimeValue before_active_boundary_time() const;
     TimeValue after_active_boundary_time() const;
-
-    bool is_in_the_before_phase() const;
-    bool is_in_the_after_phase() const;
-    bool is_in_the_active_phase() const;
-    bool is_in_the_idle_phase() const;
 
     // Keep this enum up to date with CSSTransition::Phase.
     enum class Phase {
@@ -125,16 +119,22 @@ public:
     };
     Phase phase() const;
 
+    // Everything a progress calculation needs, resolved together from one local time.
+    struct ResolvedTiming {
+        Phase phase;
+        Optional<TimeValue> local_time;
+        Optional<TimeValue> active_time;
+        Optional<double> overall_progress;
+    };
+    ResolvedTiming resolve_timing() const;
+
     Phase previous_phase() const { return m_previous_phase; }
     void set_previous_phase(Phase value) { m_previous_phase = value; }
     double previous_current_iteration() const { return m_previous_current_iteration; }
     void set_previous_current_iteration(double value) { m_previous_current_iteration = value; }
 
-    Optional<double> overall_progress() const;
-    Optional<double> directed_progress() const;
-    AnimationDirection current_direction() const;
-    Optional<double> simple_iteration_progress() const;
     Optional<double> current_iteration() const;
+    Optional<double> current_iteration(ResolvedTiming const&) const;
     Optional<double> transformed_progress() const;
 
     void normalize_specified_timing();
@@ -156,10 +156,19 @@ protected:
     virtual void visit_edges(GC::Cell::Visitor&) override;
     virtual GC::Ptr<Bindings::Wrappable> relevant_global_impl() const override;
 
+    bool is_in_play(Phase) const;
+
     TimeValue intrinsic_iteration_duration() const;
     void convert_a_time_based_animation_to_a_proportional_animation();
     GC::Ptr<AnimationTimeline> associated_timeline() const;
     Optional<TimeValue> timeline_duration() const;
+
+    Phase phase(Optional<TimeValue> const& local_time) const;
+    Optional<TimeValue> active_time_for_phase(Phase, Optional<TimeValue> const& local_time, Bindings::FillMode) const;
+    Optional<double> overall_progress_for_phase(Phase, Optional<TimeValue> const& active_time) const;
+    Optional<double> simple_iteration_progress(ResolvedTiming const&) const;
+    Optional<double> directed_progress(ResolvedTiming const&) const;
+    AnimationDirection current_direction(ResolvedTiming const&) const;
 
     // https://drafts.csswg.org/web-animations-2/#specified-start-delay
     double m_specified_start_delay { 0.0 };
