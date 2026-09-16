@@ -293,6 +293,15 @@ impl DisplayListRecorder {
         self.ambient_inline_clips.len()
     }
 
+    /// Output copied between frames must start and end here: no open group, and no inline
+    /// clip, transform or contrast backdrop carried over from an enclosing recording.
+    pub fn is_producer_boundary(&self) -> bool {
+        self.builder.open_group_depth() == 0
+            && self.ambient_inline_clips.is_empty()
+            && self.ambient_inline_transform.is_none()
+            && self.contrast_backdrop.is_none()
+    }
+
     pub fn ambient_inline_transform(&self) -> Option<AffineTransform> {
         self.ambient_inline_transform
     }
@@ -1153,6 +1162,35 @@ impl DisplayListRecorder {
                 color,
                 corner_radii,
                 background_color_animation_effect: EffectNodeIndex::NONE,
+            },
+            &[],
+        );
+    }
+
+    /// Fills the band between `rect` with `corner_radii` and the same outline shrunk by `edge_widths`
+    /// (top, right, bottom, left), as a uniformly colored border covers it.
+    pub fn fill_rounded_rect_ring(
+        &mut self,
+        rect: IntRect,
+        corner_radii: CornerRadii,
+        edge_widths: [i32; 4],
+        color: Color,
+        force_dark_role: ForceDarkRole,
+    ) {
+        if rect.is_empty() || color.alpha() == 0 || edge_widths.iter().all(|width| *width <= 0) {
+            return;
+        }
+        let color = self.resolve_color(color, force_dark_role);
+        let [top_width, right_width, bottom_width, left_width] = edge_widths;
+        self.append_command(
+            &FillRoundedRectRing {
+                rect,
+                corner_radii,
+                top_width,
+                right_width,
+                bottom_width,
+                left_width,
+                color,
             },
             &[],
         );

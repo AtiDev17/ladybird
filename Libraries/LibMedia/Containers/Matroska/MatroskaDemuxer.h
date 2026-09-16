@@ -7,13 +7,13 @@
 #pragma once
 
 #include <AK/HashMap.h>
+#include <AK/Mutex.h>
 #include <LibMedia/ContainerID.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/DemuxerScanThread.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
-#include <LibSync/Mutex.h>
 
 #include "Reader.h"
 
@@ -77,7 +77,7 @@ private:
     Reader m_reader;
     RefPtr<DemuxerScanThread<BufferedScanPayload>> m_buffered_scan_thread;
 
-    mutable Sync::Mutex m_track_statuses_mutex;
+    mutable Mutex m_track_statuses_mutex;
     HashMap<Track, TrackStatus> m_track_statuses;
 };
 

@@ -28,6 +28,7 @@ use std::ffi::c_void;
 
 use crate::abort_on_panic as abort_on_boundary_panic;
 use crate::css::custom_properties::CustomPropertyRegistry;
+use crate::css::host_shared::{HostShared, SharedPayload};
 use crate::css::selector::CompiledSelector;
 use crate::css::selector::RustSelector;
 use crate::css::style_value::RetainedStyleValueData;
@@ -152,7 +153,14 @@ pub struct FfiStyleDelta {
 pub struct FfiEngineComputedRecord {
     pub style_record: u64,
     pub uses_substitution: bool,
+    /// The synthetic pseudo-element kinds whose records the engine settled beside the
+    /// element's, as a bit per kind; a present slot holding zero is a removal.
+    pub pseudo_records_present: u8,
+    pub pseudo_records: [u64; RETRY_PSEUDO_RECORD_SLOTS],
 }
+
+/// One record slot per synthetic pseudo-element kind in a retried record.
+pub const RETRY_PSEUDO_RECORD_SLOTS: usize = 8;
 
 #[derive(Default)]
 pub(super) struct FfiStyleTransactionOutput {
@@ -188,6 +196,42 @@ pub struct FfiStyleTransactionView {
     pub only_derived_child_reactions: bool,
 }
 
+/// A host-owned object the engine names but never follows.
+///
+/// The engine holds it as an integer rather than a raw pointer, because the read side an
+/// evaluation step borrows has to be `Sync` and a raw pointer is neither `Send` nor `Sync` — for
+/// the good reason that nothing about it says who may follow it. Only the bridge turns one back
+/// into a pointer, at a host call, which never happens inside a step.
+/// C++ hands one over as the address of the object it owns.
+///
+/// NB: The pointer that becomes a handle is exposed, and the handle becomes a pointer through
+///     that exposed provenance, because the host call does dereference it (a style value is
+///     retained, a registry is read). A bare address would be a pointer nothing may access.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FfiHostHandle {
+    pub address: usize,
+}
+
+impl FfiHostHandle {
+    #[must_use]
+    pub fn from_pointer(pointer: *const c_void) -> Self {
+        Self {
+            address: pointer.expose_provenance(),
+        }
+    }
+
+    #[must_use]
+    pub fn as_pointer(self) -> *const c_void {
+        std::ptr::with_exposed_provenance(self.address)
+    }
+
+    #[must_use]
+    pub fn is_none(self) -> bool {
+        self.address == 0
+    }
+}
+
 /// Document-wide scalar computation inputs captured at a style transaction boundary.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -219,7 +263,7 @@ pub struct FfiDocumentStyleComputationInputs {
     pub document_supported_scheme_codes: [u8; 4],
     /// The document's custom-property registry, and the generation its registrations are at:
     /// what an engine-computed environment resolves registered names against.
-    pub custom_property_registry: *const c_void,
+    pub custom_property_registry: FfiHostHandle,
     pub custom_property_registration_generation: u64,
 }
 
@@ -247,7 +291,7 @@ impl Default for FfiDocumentStyleComputationInputs {
             has_document_supported_schemes: false,
             document_supported_scheme_count: 0,
             document_supported_scheme_codes: [0; 4],
-            custom_property_registry: std::ptr::null(),
+            custom_property_registry: FfiHostHandle { address: 0 },
             custom_property_registration_generation: 0,
         }
     }
@@ -256,7 +300,7 @@ impl Default for FfiDocumentStyleComputationInputs {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FfiFontResolutionRequest {
-    pub font_family: *const c_void,
+    pub font_family: FfiHostHandle,
     pub font_size_raw: i32,
     pub font_slope: i32,
     pub font_weight: f64,
@@ -268,8 +312,10 @@ pub struct FfiFontResolutionRequest {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct FfiResolvedFont {
-    pub first_available_font: *const c_void,
-    pub font_cascade_list: *const c_void,
+    /// The two host font objects a resolution names. The engine holds them as handles and hands
+    /// them straight back to C++ when it publishes a record; nothing in Rust follows either.
+    pub first_available_font: FfiHostHandle,
+    pub font_cascade_list: FfiHostHandle,
     pub ascent: f32,
     pub descent: f32,
     pub x_height: f32,
@@ -838,47 +884,50 @@ impl StyleEngineState {
     ) -> FfiSourceSlotAssignmentView {
         let bytes =
             (assignments.capacity() * size_of::<crate::css::cascaded_properties::FfiSourceSlotAssignment>()) as u64;
-        self.ffi_retained_cascade_assignments = assignments;
-        self.ffi_retained_cascade_assignments_memory
-            .resize_required_to(&mut self.memory, bytes);
+        self.host.ffi_retained_cascade_assignments = assignments;
+        self.host
+            .ffi_retained_cascade_assignments_memory
+            .resize_required_to(&mut self.retained.memory, bytes);
         FfiSourceSlotAssignmentView {
-            assignments: self.ffi_retained_cascade_assignments.as_ptr().cast(),
-            count: self.ffi_retained_cascade_assignments.len(),
+            assignments: self.host.ffi_retained_cascade_assignments.as_ptr().cast(),
+            count: self.host.ffi_retained_cascade_assignments.len(),
         }
     }
 
     fn clear_ffi_retained_cascade_assignments(&mut self) {
-        self.ffi_retained_cascade_assignments = Vec::new();
-        self.ffi_retained_cascade_assignments_memory.shrink_to(0);
+        self.host.ffi_retained_cascade_assignments = Vec::new();
+        self.host.ffi_retained_cascade_assignments_memory.shrink_to(0);
     }
 
     fn install_ffi_style_node_query(&mut self, nodes: Vec<u32>) -> FfiStyleNodeSlice {
         let bytes = (nodes.capacity() * size_of::<u32>()) as u64;
-        self.ffi_style_node_query = nodes;
-        self.ffi_style_node_query_memory
-            .resize_required_to(&mut self.memory, bytes);
+        self.host.ffi_style_node_query = nodes;
+        self.host
+            .ffi_style_node_query_memory
+            .resize_required_to(&mut self.retained.memory, bytes);
         FfiStyleNodeSlice {
-            nodes: self.ffi_style_node_query.as_ptr(),
-            count: self.ffi_style_node_query.len(),
+            nodes: self.host.ffi_style_node_query.as_ptr(),
+            count: self.host.ffi_style_node_query.len(),
         }
     }
 
     fn clear_ffi_style_node_query(&mut self) {
-        self.ffi_style_node_query = Vec::new();
-        self.ffi_style_node_query_memory.shrink_to(0);
+        self.host.ffi_style_node_query = Vec::new();
+        self.host.ffi_style_node_query_memory.shrink_to(0);
     }
 
     fn install_ffi_style_transaction_output(&mut self, output: FfiStyleTransactionOutput) {
         let bytes = (output.answers.capacity() * size_of::<FfiStyleDelta>()
             + output.reclaimed_style_atoms.capacity() * size_of::<FfiReclaimedStyleAtom>()) as u64;
-        self.ffi_style_transaction_output = output;
-        self.ffi_style_transaction_output_memory
-            .resize_required_to(&mut self.memory, bytes);
+        self.host.ffi_style_transaction_output = output;
+        self.host
+            .ffi_style_transaction_output_memory
+            .resize_required_to(&mut self.retained.memory, bytes);
     }
 
     pub(super) fn clear_ffi_style_transaction_output(&mut self) {
-        self.ffi_style_transaction_output = FfiStyleTransactionOutput::default();
-        self.ffi_style_transaction_output_memory.shrink_to(0);
+        self.host.ffi_style_transaction_output = FfiStyleTransactionOutput::default();
+        self.host.ffi_style_transaction_output_memory.shrink_to(0);
     }
 
     /// Apply one flat transaction. Tree deltas are staged in arrival order so derived neighbour
@@ -932,7 +981,7 @@ impl StyleEngineState {
             }
         }
         if !initial_tree_was_bulk_loaded {
-            self.initial_tree_batch_applied |= !tree_deltas.is_empty();
+            self.host.initial_tree_batch_applied |= !tree_deltas.is_empty();
             for delta in tree_deltas {
                 let Some(node) = StyleNodeID::from_raw(delta.node) else {
                     continue;
@@ -1077,8 +1126,9 @@ pub unsafe extern "C" fn style_engine_install_font_resolver(
     resolve: unsafe extern "C" fn(*mut c_void, FfiFontResolutionRequest) -> FfiResolvedFont,
 ) {
     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
-    assert!(engine.font_resolver.is_none(), "font resolver is installed once");
-    engine.font_resolver = Some(super::font_resolution::FontResolver::new(context, resolve));
+    assert!(engine.host.font_resolver.is_none(), "font resolver is installed once");
+    engine.host.font_resolver = Some(super::font_resolution::FontResolverHost::new(context, resolve));
+    engine.retained.font_resolution = Some(super::font_resolution::FontResolutionCache::default());
 }
 
 /// Creates a replay engine whose atom keys are opaque capture tokens rather than live fly strings.
@@ -2294,14 +2344,16 @@ pub unsafe extern "C" fn style_engine_publish_computed_groups(
     }
     let payloads = match count {
         0 => &[],
-        _ => unsafe { std::slice::from_raw_parts(payloads, count) },
+        _ => SharedPayload::from_pointer_slice(unsafe { std::slice::from_raw_parts(payloads, count) }),
     };
     if animation_overlay_payload_count != 0 && animation_overlay_payloads.is_null() {
         return FfiStyleRecordDelta::default();
     }
     let animation_overlay_payloads = match animation_overlay_payload_count {
         0 => &[],
-        _ => unsafe { std::slice::from_raw_parts(animation_overlay_payloads, animation_overlay_payload_count) },
+        _ => SharedPayload::from_pointer_slice(unsafe {
+            std::slice::from_raw_parts(animation_overlay_payloads, animation_overlay_payload_count)
+        }),
     };
     let longhand_table = unsafe {
         longhand_table
@@ -2332,14 +2384,14 @@ pub(crate) fn publish_computed_groups_from_inputs(
     engine: &mut StyleEngine,
     node: u32,
     pseudo_kind: u8,
-    payloads: &[*const c_void],
+    payloads: &[SharedPayload],
     inherited_group_count: usize,
     custom_property_environment: u64,
     inherited_group_swap_candidate: bool,
     counter_style_environment_identity: u64,
     animation_overlay_identity: u64,
     animated_overlay: *const c_void,
-    animation_overlay_payloads: &[*const c_void],
+    animation_overlay_payloads: &[SharedPayload],
     longhand_table: Option<&crate::css::computed_longhand_table::ComputedLonghandTable>,
     custom_property_store: *const c_void,
 ) -> FfiStyleRecordDelta {
@@ -2349,15 +2401,18 @@ pub(crate) fn publish_computed_groups_from_inputs(
     let inherited_group_swap_eligible = longhand_table.is_some_and(|table| {
         inherited_group_swap_candidate && table.property_inheritance_is_standard() && !table.display_is_list_item()
     });
-    let holds_image_values = crate::css::computed_values::style_group_payloads_hold_image_values(payloads)
-        || crate::css::computed_values::style_group_payloads_hold_image_values(animation_overlay_payloads);
+    let holds_image_values =
+        crate::css::computed_values::style_group_payloads_hold_image_values(HostShared::as_pointer_slice(payloads))
+            || crate::css::computed_values::style_group_payloads_hold_image_values(HostShared::as_pointer_slice(
+                animation_overlay_payloads,
+            ));
     let dependency_flags = longhand_table.map_or(0, |table| table.publication_dependency_flags())
         | (u8::from(inherited_group_swap_eligible) * super::computed::INHERITED_GROUP_SWAP_ELIGIBLE)
         | (u8::from(holds_image_values) * super::computed::HOLDS_IMAGE_VALUES);
     if animation_overlay_identity != 0 && animated_overlay.is_null() {
         return FfiStyleRecordDelta::default();
     }
-    let verifying_computed_record = engine.computed_record_verification_counters.is_some();
+    let verifying_computed_record = engine.host.computed_record_verification_counters.is_some();
     let metadata_input = super::computed::ComputedMetadataInput {
         pseudo_element_styles,
         dependency_flags,
@@ -2368,20 +2423,20 @@ pub(crate) fn publish_computed_groups_from_inputs(
             animation_overlay_identity
         },
         animated_overlay: if verifying_computed_record {
-            std::ptr::null()
+            HostShared::null()
         } else {
-            animated_overlay.cast()
+            HostShared::new(animated_overlay).cast()
         },
         animation_overlay_payloads: if verifying_computed_record {
             &[]
         } else {
             animation_overlay_payloads
         },
-        longhand_table: longhand_table.map_or(std::ptr::null(), std::ptr::from_ref),
+        longhand_table: HostShared::new(longhand_table.map_or(std::ptr::null(), std::ptr::from_ref)),
     };
     // A C++ verification computation interns a comparable record without replacing the engine's
     // authoritative assignment for the node it is checking.
-    let publication = if engine.computed_record_verification_counters.is_none()
+    let publication = if engine.host.computed_record_verification_counters.is_none()
         && let Some(node) = StyleNodeID::from_raw(node)
     {
         let target = super::computed::ComputedStyleTarget::new(node, pseudo_kind);
@@ -2412,7 +2467,7 @@ pub(crate) fn publish_computed_groups_from_inputs(
             .custom_property_environments
             .retain(custom_property_environment, custom_property_store);
     }
-    if engine.computed_record_verification_counters.is_none()
+    if engine.host.computed_record_verification_counters.is_none()
         && pseudo_kind == u8::MAX
         && let Some(node) = StyleNodeID::from_raw(node)
     {
@@ -2424,11 +2479,14 @@ pub(crate) fn publish_computed_groups_from_inputs(
             .map_or(0, super::computed::FinalStyleRecordID::raw),
         new_style_record: publication.style_record_identity.raw(),
     };
-    if engine.computed_record_verification_counters.is_some() {
+    if engine.host.computed_record_verification_counters.is_some() {
         // C++ can retain a verification record on a pseudo-element the authoritative reaction
         // leaves unchanged. With no target assignment to own it, keep it live with the engine.
         engine.pin_style_record(result.new_style_record);
-        engine.computed_record_verification_pins.push(result.new_style_record);
+        engine
+            .host
+            .computed_record_verification_pins
+            .push(result.new_style_record);
     }
     engine.record_boundary_call(EventKind::PublishComputedGroups, |payload| {
         let pointer_token = |pointer: *const c_void| match pointer.is_null() {
@@ -2460,7 +2518,7 @@ pub(crate) fn publish_computed_groups_from_inputs(
         payload.write_u64(u64::from(!animated_overlay.is_null()));
         payload.write_length(animation_overlay_payloads.len());
         for &pointer in animation_overlay_payloads {
-            payload.write_u64(pointer_token(pointer));
+            payload.write_u64(pointer_token(pointer.as_ptr()));
         }
         payload.write_bytes(longhand_table.map_or(&[], |table| table.importance_bits()));
         payload.write_bytes(longhand_table.map_or(&[], |table| table.inheritance_bits()));
@@ -2495,8 +2553,10 @@ pub(crate) fn publish_computed_groups_from_inputs(
                 payload.write_length(stored_values.len());
                 for (index, &value) in stored_values {
                     payload.write_u16(crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID + index as u16);
-                    payload.write_u64(pointer_token(value));
-                    payload.write_u8(crate::css::style_value::style_value_dependency_flags(value.cast()));
+                    payload.write_u64(pointer_token(value.as_ptr()));
+                    payload.write_u8(crate::css::style_value::style_value_dependency_flags(
+                        value.cast().as_ptr(),
+                    ));
                 }
             }
         }
@@ -2513,9 +2573,9 @@ pub(crate) fn publish_computed_groups_from_inputs(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_begin_computed_record_verification(engine: *mut c_void) {
     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
-    assert!(engine.computed_record_verification_counters.is_none());
-    assert!(engine.computed_record_verification_pins.is_empty());
-    engine.computed_record_verification_counters = Some(Box::new(engine.counters.clone()));
+    assert!(engine.host.computed_record_verification_counters.is_none());
+    assert!(engine.host.computed_record_verification_pins.is_empty());
+    engine.host.computed_record_verification_counters = Some(Box::new(engine.counters.clone()));
     engine.suspend_computed_group_content_identities(true);
 }
 
@@ -2526,11 +2586,12 @@ pub unsafe extern "C" fn style_engine_begin_computed_record_verification(engine:
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_end_computed_record_verification(engine: *mut c_void) {
     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
-    for style_record in std::mem::take(&mut engine.computed_record_verification_pins) {
+    for style_record in std::mem::take(&mut engine.host.computed_record_verification_pins) {
         engine.unpin_style_record(style_record);
     }
     engine.suspend_computed_group_content_identities(false);
     engine.counters = *engine
+        .host
         .computed_record_verification_counters
         .take()
         .expect("computed-record verification scope must be active");
@@ -2564,13 +2625,13 @@ pub unsafe extern "C" fn style_engine_publish_animation_overlay(
     }
     let payloads = match payload_count {
         0 => &[],
-        _ => unsafe { std::slice::from_raw_parts(payloads, payload_count) },
+        _ => SharedPayload::from_pointer_slice(unsafe { std::slice::from_raw_parts(payloads, payload_count) }),
     };
     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
     let Some(publication) = engine.publish_animation_overlay_impl(
         super::computed::ComputedStyleTarget::new(node, pseudo_kind),
         animation_overlay_identity,
-        animated_overlay.cast(),
+        HostShared::new(animated_overlay).cast(),
         payloads,
     ) else {
         return FfiStyleRecordDelta::default();
@@ -2636,14 +2697,14 @@ pub unsafe extern "C" fn style_engine_assign_shared_style_record(
         StyleNodeID::from_raw(node).expect("a nonzero node must be a style node"),
         pseudo_kind,
     );
-    if engine.computed_record_verification_counters.is_some() {
+    if engine.host.computed_record_verification_counters.is_some() {
         let style_record = engine
             .computed_group_sets
             .style_record_for_shared_assignment(target, style_record)
             .expect("a shared style record must name a live base record")
             .raw();
         engine.pin_style_record(style_record);
-        engine.computed_record_verification_pins.push(style_record);
+        engine.host.computed_record_verification_pins.push(style_record);
         return FfiStyleRecordDelta {
             old_style_record: 0,
             new_style_record: style_record,
@@ -2689,7 +2750,7 @@ pub unsafe extern "C" fn style_engine_style_record_payloads(engine: *const c_voi
                 .iter()
                 .map(|&pointer| {
                     engine
-                        .recording_pointer_token(pointer as usize)
+                        .recording_pointer_token(pointer.addr())
                         .expect("an enabled recorder must tokenize the pointer")
                 })
                 .collect::<Vec<_>>()
@@ -2829,7 +2890,7 @@ pub unsafe extern "C" fn style_engine_compare_animation_overlay(
     is_document_element: bool,
 ) -> FfiAnimationInvalidation {
     let engine = unsafe { &*engine.cast::<StyleEngine>() };
-    let payloads = unsafe { std::slice::from_raw_parts(payloads, payload_count) };
+    let payloads = SharedPayload::from_pointer_slice(unsafe { std::slice::from_raw_parts(payloads, payload_count) });
     engine.compare_animation_overlay(old_style_record, animated_overlay.cast(), payloads, is_document_element)
 }
 
@@ -2847,10 +2908,10 @@ pub unsafe extern "C" fn style_engine_style_record_view(
     let result = match &view {
         None => FfiStyleRecordView::missing(),
         Some(view) => FfiStyleRecordView {
-            payloads: view.payloads.as_ptr(),
-            base_payloads: view.base_payloads.as_ptr(),
-            longhand_table: view.longhand_table.cast(),
-            animated_overlay: view.animated_overlay.cast(),
+            payloads: SharedPayload::as_pointer_slice(view.payloads).as_ptr(),
+            base_payloads: SharedPayload::as_pointer_slice(view.base_payloads).as_ptr(),
+            longhand_table: view.longhand_table.cast().as_ptr(),
+            animated_overlay: view.animated_overlay.cast().as_ptr(),
             payload_count: view.payloads.len(),
             pseudo_element_styles: view.pseudo_element_styles,
             counter_style_environment_identity: view.counter_style_environment_identity,
@@ -2883,7 +2944,7 @@ pub unsafe extern "C" fn style_engine_style_record_view(
                 .iter()
                 .map(|&pointer| {
                     engine
-                        .recording_pointer_token(pointer as usize)
+                        .recording_pointer_token(pointer.addr())
                         .expect("an enabled recorder must tokenize the pointer")
                 })
                 .collect(),
@@ -2928,7 +2989,7 @@ pub unsafe extern "C" fn style_engine_style_record_view(
             payload.write_u64(match value.is_null() {
                 true => 0,
                 false => engine
-                    .recording_pointer_token(value as usize)
+                    .recording_pointer_token(value.addr())
                     .expect("an enabled recorder must tokenize the pointer"),
             });
         }
@@ -3062,10 +3123,12 @@ pub unsafe extern "C" fn style_engine_retry_engine_record_after_ancestor(
         let Some(style_node) = StyleNodeID::from_raw(node) else {
             return FfiEngineComputedRecord::default();
         };
-        let style_record = engine.retry_engine_record_after_ancestor(style_node);
+        let retried = engine.retry_engine_record_after_ancestor(style_node);
         let result = FfiEngineComputedRecord {
-            style_record,
-            uses_substitution: style_record != 0 && engine.nodes_with_substituted_records.contains(&style_node),
+            style_record: retried.style_record,
+            uses_substitution: retried.style_record != 0 && engine.nodes_with_substituted_records.contains(&style_node),
+            pseudo_records_present: retried.pseudo_records_present,
+            pseudo_records: retried.pseudo_records,
         };
         engine.record_boundary_call(EventKind::RetryEngineRecordAfterAncestor, |payload| {
             payload.write_u32(node);
@@ -3225,7 +3288,7 @@ pub unsafe extern "C" fn style_engine_native_rule_successor(
 ///
 /// # Safety
 /// Engine, sheet, rule, callbacks, and any non-null detached import must be live. Native rules must
-/// belong to Rc allocations. No graph or engine borrow spans a host callback.
+/// belong to Arc allocations. No graph or engine borrow spans a host callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_remove_native_rule(
     engine: *mut c_void,
@@ -3430,14 +3493,14 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
         output.program_version = program_version.0;
         output.answers.extend_from_slice(answers);
     });
-    output.reclaimed_style_atoms = std::mem::take(&mut engine.reclaimed_style_atoms)
+    output.reclaimed_style_atoms = std::mem::take(&mut engine.host.reclaimed_style_atoms)
         .into_iter()
         .map(|reclaimed| FfiReclaimedStyleAtom {
             raw: reclaimed.raw,
             atom: reclaimed.atom.0,
         })
         .collect();
-    output.style_atoms_swept = std::mem::take(&mut engine.style_atoms_swept);
+    output.style_atoms_swept = std::mem::take(&mut engine.host.style_atoms_swept);
     output.only_derived_child_reactions = engine.take_only_derived_child_reactions();
     if engine.recording_id().is_some() {
         engine.record_boundary_call(EventKind::StyleDeltaBatch, |payload| {
@@ -3464,10 +3527,11 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
             for code in computation_inputs.document_supported_scheme_codes {
                 payload.write_u8(code);
             }
-            let custom_property_registry_is_engine_usable = !computation_inputs.custom_property_registry.is_null()
+            let custom_property_registry_is_engine_usable = !computation_inputs.custom_property_registry.is_none()
                 && !unsafe {
                     &*computation_inputs
                         .custom_property_registry
+                        .as_pointer()
                         .cast::<CustomPropertyRegistry>()
                 }
                 .has_registrations();
@@ -3482,7 +3546,7 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
         engine.forget_recording_atom_mappings(output.reclaimed_style_atoms.iter().map(|reclaimed| reclaimed.atom));
     }
     engine.install_ffi_style_transaction_output(output);
-    let output = &engine.ffi_style_transaction_output;
+    let output = &engine.host.ffi_style_transaction_output;
     FfiStyleTransactionView {
         transaction_version: output.transaction_version,
         program_version: output.program_version,
@@ -3555,14 +3619,14 @@ pub unsafe extern "C" fn style_engine_set_replay_reclaimed_style_atoms(
     count: usize,
 ) {
     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
-    assert!(engine.replay_reclaimed_style_atoms.is_none());
+    assert!(engine.host.replay_reclaimed_style_atoms.is_none());
     let atoms = if count == 0 {
         &[]
     } else {
         assert!(!atoms.is_null());
         unsafe { std::slice::from_raw_parts(atoms, count) }
     };
-    engine.replay_reclaimed_style_atoms = Some(atoms.iter().copied().map(StyleAtomID).collect());
+    engine.host.replay_reclaimed_style_atoms = Some(atoms.iter().copied().map(StyleAtomID).collect());
 }
 /// Reads one counter by index, returning its stable name and writing its value and name length, or
 /// null once the index is past the end. C++ enumerates the counters this way rather than

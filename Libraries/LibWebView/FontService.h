@@ -7,12 +7,12 @@
 #pragma once
 
 #include <AK/HashMap.h>
+#include <AK/Mutex.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/String.h>
 #include <LibGfx/Font/FontCatalog.h>
 #include <LibGfx/Font/SharedFontProvider.h>
 #include <LibGfx/Font/TypefaceSkia.h>
-#include <LibSync/Mutex.h>
 #include <LibThreading/Thread.h>
 #include <LibWebView/Export.h>
 
@@ -70,7 +70,7 @@ private:
     HashMap<String, u64> m_dynamic_match_cache;
 
     // Font requests arrive on the UI process's renderer connections and the Compositor's dedicated font connection.
-    Sync::Mutex m_mutex;
+    Mutex m_mutex;
 };
 
 }

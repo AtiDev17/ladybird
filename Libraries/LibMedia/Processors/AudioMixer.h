@@ -8,6 +8,7 @@
 
 #include <AK/Atomic.h>
 #include <AK/HashMap.h>
+#include <AK/Mutex.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefPtr.h>
 #include <LibMedia/Audio/Forward.h>
@@ -18,7 +19,6 @@
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Processors/AudioProcessor.h>
 #include <LibMedia/Producers/AudioProducer.h>
-#include <LibSync/Mutex.h>
 
 namespace Media {
 
@@ -58,7 +58,7 @@ private:
 
     void disconnect_input_while_locked(NonnullRefPtr<AudioProducer> const&);
 
-    mutable Sync::Mutex m_mutex;
+    mutable Mutex m_mutex;
     Audio::SampleSpecification m_sample_specification;
     HashMap<NonnullRefPtr<AudioProducer>, InputMixingData> m_inputs;
     i64 m_next_frame_to_write { 0 };

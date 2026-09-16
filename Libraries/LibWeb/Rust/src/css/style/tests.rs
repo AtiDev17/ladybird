@@ -743,9 +743,9 @@ fn retained_winners_construct_a_source_free_cascade_store() {
     commit_test_setup(&mut engine);
     let matches = vec![concrete_rule_match(&engine, nodes[1], rule, 0, None)];
     engine.matches_for_cascade(matches, false, Some(nodes[1]));
-    engine.state.published_match_answers.push(
+    engine.state.retained.published_match_answers.push(
         published_match_answer(nodes[1].raw(), None, 1),
-        &mut engine.state.memory,
+        &mut engine.state.retained.memory,
         &mut engine.counters,
     );
     engine.published_match_answers.sort();
@@ -771,7 +771,7 @@ fn retained_stores_reject_every_logically_mapped_property() {
     {
         if crate::css::property_metadata::property_is_in_logical_group(property) {
             mapped_property_count += 1;
-            assert!(!StyleEngineState::retained_store_supports_property(target, property));
+            assert!(!RetainedState::retained_store_supports_property(target, property));
         }
     }
 
@@ -829,7 +829,7 @@ fn retained_answer_delta_memo_accounts_its_tuple_capacity() {
             winner_state: None,
             winners_updated: false,
             cascade_winners_are_complete: false,
-            pseudo_winner_states: Rc::from(Vec::new()),
+            pseudo_winner_states: Arc::from(Vec::new()),
         },
     };
 
@@ -883,9 +883,9 @@ fn publish_current_cascade_as_computed(engine: &mut StyleEngine, node: StyleNode
             dependency_flags: 0,
             counter_style_environment_identity: 0,
             animation_overlay_identity: 0,
-            animated_overlay: std::ptr::null(),
+            animated_overlay: HostShared::null(),
             animation_overlay_payloads: &[],
-            longhand_table: std::ptr::null(),
+            longhand_table: HostShared::null(),
         },
     );
     assert_eq!(
@@ -917,12 +917,14 @@ fn flat_tree_descendant_collection_follows_shadow_and_slot_relations() {
     engine.tree.set_parent(*assigned_child, Some(*assigned));
     engine
         .state
+        .retained
         .tree
-        .set_shadow_root(*host, *shadow_root, &mut engine.state.memory);
+        .set_shadow_root(*host, *shadow_root, &mut engine.state.retained.memory);
     engine
         .state
+        .retained
         .tree
-        .set_assigned_slot(*assigned, Some(*slot), &mut engine.state.memory);
+        .set_assigned_slot(*assigned, Some(*slot), &mut engine.state.retained.memory);
 
     let mut descendants = Vec::new();
     engine.for_each_flat_tree_descendant(*host, |node| descendants.push(node));
@@ -1712,8 +1714,9 @@ fn failed_posting_rebuild_does_not_condemn_resident_postings() {
     ));
     engine
         .state
+        .retained
         .memory
-        .set_tier3_limit_for_test(engine.state.memory.bytes_in_tier(memory::Tier::Acceleration));
+        .set_tier3_limit_for_test(engine.state.retained.memory.bytes_in_tier(memory::Tier::Acceleration));
 
     engine.record_environment_change();
     engine.take_style_transaction_nodes(nodes[0], |_| {});
@@ -2759,6 +2762,7 @@ fn a_retained_witness_carries_an_anchor_through_its_lifecycle() {
     assert!(!engine.match_element(nodes[1]).unwrap().is_empty());
     let (key, retained) = engine
         .state
+        .retained
         .pending_witness_effects
         .iter()
         .find_map(|effect| match effect {
@@ -2767,13 +2771,13 @@ fn a_retained_witness_carries_an_anchor_through_its_lifecycle() {
         })
         .expect("matching must produce a positive witness effect");
     assert!(matches!(
-        engine.state.relational_witnesses.lookup(key),
+        engine.state.retained.relational_witnesses.lookup(key),
         Lookup::Missing(_)
     ));
     engine.match_element(nodes[2]).unwrap();
     engine.end_cold_matching_batch();
-    assert!(engine.state.pending_witness_effects.is_empty());
-    assert!(matches!(engine.state.relational_witnesses.lookup(key), Lookup::Known(&node) if node == retained));
+    assert!(engine.state.retained.pending_witness_effects.is_empty());
+    assert!(matches!(engine.state.retained.relational_witnesses.lookup(key), Lookup::Known(&node) if node == retained));
 
     // A second witness appearing cannot flip an anchor that is already true, so the retained
     // witness answers for it and nothing is routed.
@@ -3504,8 +3508,9 @@ fn an_evicted_retained_match_answer_falls_back_to_cold_matching() {
     engine.remember_cascade_input(nodes[1], &compact_answer);
     engine
         .state
+        .retained
         .retained_match_answers
-        .evict(&mut engine.state.match_answers);
+        .evict(&mut engine.state.retained.match_answers);
     assert!(matches!(
         engine.retained_match_answer(nodes[1]),
         Lookup::Missing(gap) if gap == nodes[1]
@@ -3589,8 +3594,9 @@ fn an_evicted_answer_payload_repairs_to_its_retained_identity() {
     engine.remember_cascade_input(nodes[1], &compact_answer);
     engine
         .state
+        .retained
         .retained_match_answers
-        .evict(&mut engine.state.match_answers);
+        .evict(&mut engine.state.retained.match_answers);
 
     engine.set_rule_conditions_hold(losing_rule, false);
     let repairs_before = engine.counters().get(Counter::PublishedMatchAnswerIdentityRepairs);
@@ -3792,9 +3798,14 @@ fn an_exact_unchanged_custom_state_cascade_stops_before_style_recomputation() {
     discard_transaction(&mut engine);
     engine
         .state
+        .retained
         .facts
-        .set_custom_states(nodes[1], &[], &mut engine.state.memory);
-    engine.state.facts.apply_staged(&mut engine.state.memory);
+        .set_custom_states(nodes[1], &[], &mut engine.state.retained.memory);
+    engine
+        .state
+        .retained
+        .facts
+        .apply_staged(&mut engine.state.retained.memory);
 
     let old_answer = engine.match_element_for_cascade(nodes[1]).unwrap();
     assert_eq!(old_answer.len(), 1);
@@ -3834,27 +3845,32 @@ fn retained_answer_patching_evaluates_narrow_affected_rules_directly() {
     let compact_answer = engine.matches_for_cascade(exact_answer.clone(), false, None);
     engine.remember_retained_match_answer(nodes[1], &exact_answer);
     engine.remember_cascade_input(nodes[1], &compact_answer);
-    let mut patch = engine.state.prepare_retained_answer_patch(
-        RetainedAnswerPatchSelection {
+    let matching_program = engine
+        .state
+        .retained
+        .program
+        .rule_version(matching_rule)
+        .selector_program
+        .unwrap();
+    let unrelated_program = engine
+        .state
+        .retained
+        .program
+        .rule_version(unrelated_rule)
+        .selector_program
+        .unwrap();
+    let mut patch = engine
+        .state
+        .prepare_retained_answer_patch(RetainedAnswerPatchSelection {
             affected: vec![
                 RetainedAnswerPatchSelectionRule {
                     rule: matching_rule,
-                    program: engine
-                        .state
-                        .program
-                        .rule_version(matching_rule)
-                        .selector_program
-                        .unwrap(),
+                    program: matching_program,
                     evaluate: true,
                 },
                 RetainedAnswerPatchSelectionRule {
                     rule: unrelated_rule,
-                    program: engine
-                        .state
-                        .program
-                        .rule_version(unrelated_rule)
-                        .selector_program
-                        .unwrap(),
+                    program: unrelated_program,
                     evaluate: true,
                 },
             ],
@@ -3862,9 +3878,7 @@ fn retained_answer_patching_evaluates_narrow_affected_rules_directly() {
             orders_shifted: false,
             requires_full_match: false,
             ..Default::default()
-        },
-        &mut Counters::default(),
-    );
+        });
     let feature_tests_before = engine.counters().get(Counter::LocalFeatureTests);
 
     assert_eq!(
@@ -3897,21 +3911,22 @@ fn retained_answer_patching_applies_complete_signed_deltas_without_matching() {
     remove_feature(&mut engine, nodes[1], LocalFeatureKey::Class(target));
     let program = engine.program.rule_version(rule).selector_program.unwrap();
     // Match-input preparation follows fact commit, as it does in a style transaction.
-    engine.state.facts.apply_staged(&mut engine.state.memory);
-    let mut patch = engine.prepare_retained_answer_patch(
-        RetainedAnswerPatchSelection {
-            affected: vec![RetainedAnswerPatchSelectionRule {
-                rule,
-                program,
-                evaluate: true,
-            }],
-            always_emit: false,
-            orders_shifted: false,
-            requires_full_match: false,
-            ..Default::default()
-        },
-        &mut Counters::default(),
-    );
+    engine
+        .state
+        .retained
+        .facts
+        .apply_staged(&mut engine.state.retained.memory);
+    let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
+        affected: vec![RetainedAnswerPatchSelectionRule {
+            rule,
+            program,
+            evaluate: true,
+        }],
+        always_emit: false,
+        orders_shifted: false,
+        requires_full_match: false,
+        ..Default::default()
+    });
     let feature_tests_before = engine.counters().get(Counter::LocalFeatureTests);
 
     let outcome = engine
@@ -4068,20 +4083,21 @@ fn recycled_selector_entries_keep_delta_answers_canonical() {
         _ => panic!("initial cascade input must be retained"),
     };
     add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(second));
-    engine.state.facts.apply_staged(&mut engine.state.memory);
+    engine
+        .state
+        .retained
+        .facts
+        .apply_staged(&mut engine.state.retained.memory);
 
-    let mut patch = engine.prepare_retained_answer_patch(
-        RetainedAnswerPatchSelection {
-            affected: vec![RetainedAnswerPatchSelectionRule {
-                rule,
-                program,
-                evaluate: true,
-            }],
-            requires_full_match: true,
-            ..Default::default()
-        },
-        &mut Counters::default(),
-    );
+    let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
+        affected: vec![RetainedAnswerPatchSelectionRule {
+            rule,
+            program,
+            evaluate: true,
+        }],
+        requires_full_match: true,
+        ..Default::default()
+    });
     engine
         .apply_retained_match_answer_deltas(
             nodes[1],
@@ -4110,7 +4126,11 @@ fn recycled_selector_entries_keep_delta_answers_canonical() {
 
     let mut cold = patched;
     cold.sort_unstable();
-    let cold_identity = engine.state.match_answers.intern_prepared(cold, &engine.state.programs);
+    let cold_identity = engine
+        .state
+        .retained
+        .match_answers
+        .intern_prepared(cold, &engine.state.retained.programs);
     assert_eq!(patched_identity, cold_identity);
 }
 
@@ -4149,33 +4169,34 @@ fn retained_answer_patching_matches_only_unresolved_rules_after_signed_deltas() 
     engine.remember_cascade_input(nodes[1], &compact_answer);
     add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(delta_target));
     add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(second_delta_target));
-    engine.state.facts.apply_staged(&mut engine.state.memory);
-    let mut patch = engine.prepare_retained_answer_patch(
-        RetainedAnswerPatchSelection {
-            affected: vec![
-                RetainedAnswerPatchSelectionRule {
-                    rule: delta_rule,
-                    program: delta_program,
-                    evaluate: true,
-                },
-                RetainedAnswerPatchSelectionRule {
-                    rule: second_delta_rule,
-                    program: second_delta_program,
-                    evaluate: true,
-                },
-                RetainedAnswerPatchSelectionRule {
-                    rule: refresh_rule,
-                    program: refresh_program,
-                    evaluate: true,
-                },
-            ],
-            always_emit: false,
-            orders_shifted: false,
-            requires_full_match: false,
-            ..Default::default()
-        },
-        &mut Counters::default(),
-    );
+    engine
+        .state
+        .retained
+        .facts
+        .apply_staged(&mut engine.state.retained.memory);
+    let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
+        affected: vec![
+            RetainedAnswerPatchSelectionRule {
+                rule: delta_rule,
+                program: delta_program,
+                evaluate: true,
+            },
+            RetainedAnswerPatchSelectionRule {
+                rule: second_delta_rule,
+                program: second_delta_program,
+                evaluate: true,
+            },
+            RetainedAnswerPatchSelectionRule {
+                rule: refresh_rule,
+                program: refresh_program,
+                evaluate: true,
+            },
+        ],
+        always_emit: false,
+        orders_shifted: false,
+        requires_full_match: false,
+        ..Default::default()
+    });
     let candidate_checks_before = engine.counters().get(Counter::CandidateChecks);
 
     assert_eq!(
@@ -4241,20 +4262,17 @@ fn retained_answer_patching_preserves_incomplete_cascade_winners() {
     engine.remember_retained_match_answer(nodes[1], &exact_answer);
     engine.remember_cascade_input(nodes[1], &compact_answer);
     let winning_program = engine.program.rule_version(winning_rule).selector_program.unwrap();
-    let mut patch = engine.prepare_retained_answer_patch(
-        RetainedAnswerPatchSelection {
-            affected: vec![RetainedAnswerPatchSelectionRule {
-                rule: winning_rule,
-                program: winning_program,
-                evaluate: true,
-            }],
-            always_emit: false,
-            orders_shifted: false,
-            requires_full_match: false,
-            ..Default::default()
-        },
-        &mut Counters::default(),
-    );
+    let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
+        affected: vec![RetainedAnswerPatchSelectionRule {
+            rule: winning_rule,
+            program: winning_program,
+            evaluate: true,
+        }],
+        always_emit: false,
+        orders_shifted: false,
+        requires_full_match: false,
+        ..Default::default()
+    });
 
     let outcome = engine
         .patch_retained_match_answer(
@@ -4277,20 +4295,17 @@ fn retained_answer_patching_preserves_incomplete_cascade_winners() {
 fn selector_list_entry_deltas_fall_back_when_the_compact_winner_is_insufficient() {
     let (mut engine, nodes) = linear_document();
     let (rule, program) = add_selector_list_rule(&mut engine, StyleAtomID(200), StyleAtomID(201));
-    let mut patch = engine.prepare_retained_answer_patch(
-        RetainedAnswerPatchSelection {
-            affected: vec![RetainedAnswerPatchSelectionRule {
-                rule,
-                program,
-                evaluate: true,
-            }],
-            always_emit: false,
-            orders_shifted: false,
-            requires_full_match: false,
-            ..Default::default()
-        },
-        &mut Counters::default(),
-    );
+    let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
+        affected: vec![RetainedAnswerPatchSelectionRule {
+            rule,
+            program,
+            evaluate: true,
+        }],
+        always_emit: false,
+        orders_shifted: false,
+        requires_full_match: false,
+        ..Default::default()
+    });
     let retained = [RetainedRuleMatch {
         rule,
         program,
@@ -4355,20 +4370,17 @@ fn retained_answer_repair_returns_signed_selector_truth() {
     remove_feature(&mut engine, nodes[1], LocalFeatureKey::Class(target));
     discard_transaction(&mut engine);
     let program = engine.program.rule_version(rule).selector_program.unwrap();
-    let mut patch = engine.prepare_retained_answer_patch(
-        RetainedAnswerPatchSelection {
-            affected: vec![RetainedAnswerPatchSelectionRule {
-                rule,
-                program,
-                evaluate: true,
-            }],
-            always_emit: false,
-            orders_shifted: false,
-            requires_full_match: false,
-            ..Default::default()
-        },
-        &mut Counters::default(),
-    );
+    let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
+        affected: vec![RetainedAnswerPatchSelectionRule {
+            rule,
+            program,
+            evaluate: true,
+        }],
+        always_emit: false,
+        orders_shifted: false,
+        requires_full_match: false,
+        ..Default::default()
+    });
     let repair_upqueries_before = engine.counters().get(Counter::SelectorTruthRepairUpqueries);
     let repair_removals_before = engine.counters().get(Counter::SelectorTruthRepairRemovals);
     let delta_patches_before = engine.counters().get(Counter::RetainedMatchAnswerDeltaPatches);
@@ -4477,7 +4489,11 @@ fn already_planned_routes_attribute_their_extent() {
     // rule into the node's patch union.
     assert!(engine.already_planned_selector_truth.as_slice().is_empty());
     engine.resolve_already_planned_selector_truth(&regions, None);
-    engine.state.selector_truth_changes.consolidate(&mut engine.counters);
+    engine
+        .state
+        .retained
+        .selector_truth_changes
+        .consolidate(&mut engine.counters);
     assert!(engine.selector_truth_changes.deltas.as_slice().is_empty());
     assert!(engine.selector_truth_changes.refreshes.as_slice().is_empty());
 
@@ -4983,12 +4999,18 @@ fn rule_declaration_edits_repair_only_their_property_inventory() {
     let mut version = engine.program.rule_version(rule);
     version.declaration_block = Some(DeclarationBlockID(2));
     engine.replace_rule_version(rule, version);
-    assert_eq!(engine.program_staging.rule_declaration_changes.len(), 1);
-    assert_eq!(engine.program_staging.rule_declaration_changes[0].old_properties, [1]);
-    assert_eq!(engine.program_staging.rule_declaration_changes[0].new_properties, [2]);
+    assert_eq!(engine.host.program_staging.rule_declaration_changes.len(), 1);
+    assert_eq!(
+        engine.host.program_staging.rule_declaration_changes[0].old_properties,
+        [1]
+    );
+    assert_eq!(
+        engine.host.program_staging.rule_declaration_changes[0].new_properties,
+        [2]
+    );
     assert_eq!(engine.program.declared_properties_of(rule)[0].property, 1);
     assert_eq!(engine.current_declared_properties_of(rule)[0].property, 2);
-    assert!(engine.program_staging.base_version.is_some());
+    assert!(engine.host.program_staging.base_version.is_some());
     let feature_tests_before = engine.counters().get(Counter::LocalFeatureTests);
 
     let mut planned = Vec::new();
@@ -5162,10 +5184,14 @@ fn held_pseudo_styles_without_witnesses_force_a_recompute() {
     let target = tree::PseudoElementTarget::new(tree::PseudoElementKind(u16::from(pseudo_kind)));
     let version = engine.program.version();
     assert!(engine.winner_groups.set_pseudo(node, target, state, version));
-    engine.state.computed_group_sets.observe_pseudo_retained_cascade_state(
-        computed::ComputedStyleTarget::new(node, pseudo_kind),
-        Some((engine.state.winner_groups.generation(), state)),
-    );
+    engine
+        .state
+        .retained
+        .computed_group_sets
+        .observe_pseudo_retained_cascade_state(
+            computed::ComputedStyleTarget::new(node, pseudo_kind),
+            Some((engine.state.retained.winner_groups.generation(), state)),
+        );
     assert!(engine.pseudo_cascade_states_are_unchanged(node));
 
     // Losing the winner rows again, as an eviction does, must flip the answer back.
@@ -5186,12 +5212,12 @@ fn assigned_marker_and_backdrop_winners_without_retained_states_force_a_recomput
         engine
             .computed_group_sets
             .record_pseudo_kind_for_test(node, pseudo_kind);
-        assert!(
-            engine
-                .state
-                .winner_groups
-                .set_pseudo(node, target, state, engine.state.program.version())
-        );
+        assert!(engine.state.retained.winner_groups.set_pseudo(
+            node,
+            target,
+            state,
+            engine.state.retained.program.version()
+        ));
 
         assert!(
             !engine.pseudo_cascade_states_are_unchanged(node),
@@ -5613,21 +5639,25 @@ fn an_alternate_ancestor_witness_keeps_a_candidate_out_of_the_plan() {
     assert_eq!(engine.counters().get(Counter::PrefixConvergenceStops), 1);
 }
 
-fn test_prefix_relation(engine: &mut StyleEngine, root: StyleNodeID) -> (Rc<RuleDispatch>, prefix::PrefixRelation) {
-    for node in engine.state.tree.preorder(root) {
-        engine.state.facts.ensure_row(node);
+fn test_prefix_relation(engine: &mut StyleEngine, root: StyleNodeID) -> (Arc<RuleDispatch>, prefix::PrefixRelation) {
+    for node in engine.state.retained.tree.preorder(root) {
+        engine.state.retained.facts.ensure_row(node);
     }
-    engine.state.facts.apply_staged(&mut engine.state.memory);
+    engine
+        .state
+        .retained
+        .facts
+        .apply_staged(&mut engine.state.retained.memory);
     let (_, dispatch) = engine.prepare_scope_program(TreeScopeID::DOCUMENT);
     let mut workspace = MatchScratch::default();
-    let facts = engine.state.facts.primary();
-    let mut evaluator = MatchEvaluator::new(&engine.state.tree, facts)
+    let facts = engine.state.retained.facts.primary();
+    let mut evaluator = MatchEvaluator::new(&engine.state.retained.tree, facts)
         .with_match_workspace(&mut workspace, MatchEvaluationSide::Current);
     let mut evaluation = PrefixEvaluation::new(
         dispatch.prefixes(),
-        &engine.state.tree,
+        &engine.state.retained.tree,
         facts,
-        &engine.state.programs,
+        &engine.state.retained.programs,
         &mut evaluator,
         None,
         None,
@@ -5774,8 +5804,7 @@ fn prefix_completion_reuses_positive_and_negative_relation_answers() {
     );
     let mut counters = Counters::default();
     let mut states = PrefixStates::new();
-    let mut context =
-        super::prefix::PrefixTransitionContext::new(&mut states, dispatch.prefixes(), facts, &mut counters);
+    let mut context = super::prefix::PrefixTransitionContext::new(&mut states, facts);
     assert!(!states.complete_nodes_with_budget(
         &mut context.scratch,
         &mut context.effects,
@@ -6838,8 +6867,8 @@ fn a_prefix_upquery_retains_every_transition_on_its_ancestor_chain() {
         assert!(nodes.iter().all(|&node| states.has_transition(node)));
     }
 
-    let mut caches = engine.state.prefix_caches.borrow_mut();
-    caches.states.make_scratch(&mut engine.state.memory);
+    let mut caches = engine.state.retained.prefix_caches.borrow_mut();
+    caches.states.make_scratch(&mut engine.state.retained.memory);
     assert!(matches!(caches.states.lookup_mut(scope_program), Lookup::Known(_)));
     caches.states.release();
     assert!(matches!(
@@ -6944,10 +6973,11 @@ fn an_identity_only_published_prefix_answer_is_returned_in_cascade_order() {
     assert_eq!(engine.counters().get(Counter::PrefixAnswerCacheMisses), 1);
     assert_eq!(engine.counters().get(Counter::PrefixAnswerCacheHits), 1);
 
-    engine
-        .state
-        .published_match_answers
-        .push(published, &mut engine.state.memory, &mut engine.counters);
+    engine.state.retained.published_match_answers.push(
+        published,
+        &mut engine.state.retained.memory,
+        &mut engine.counters,
+    );
     engine.published_match_answers.sort();
 
     let matches = engine.consume_published_match_answer(nodes[3]).unwrap();
@@ -7023,10 +7053,11 @@ fn shared_retained_answer_completion_reuses_compact_cascade_state() {
 
         assert_eq!(second.cascade_input, Some(cascade_input));
         assert!(second.matches.is_none());
-        engine
-            .state
-            .published_match_answers
-            .push(second, &mut engine.state.memory, &mut engine.counters);
+        engine.state.retained.published_match_answers.push(
+            second,
+            &mut engine.state.retained.memory,
+            &mut engine.counters,
+        );
         engine.published_match_answers.sort();
         let materialized = engine.consume_published_match_answer(nodes[3]).unwrap();
         assert_eq!(materialized.len(), if declarations_overlap { 1 } else { 10 });
@@ -7785,7 +7816,7 @@ fn positional_answers_stay_cold_equivalent_across_sequence_mutations() {
         orders.sort_unstable_by_key(|&(rule, program, entry, _)| (rule, program, entry));
         orders.dedup_by(|left, right| (left.0, left.1, left.2) == (right.0, right.1, right.2));
         for &node in &live {
-            let Some(retained) = engine.retained_match_answer(node).sparse().ok().map(Rc::clone) else {
+            let Some(retained) = engine.retained_match_answer(node).sparse().ok().map(Arc::clone) else {
                 continue;
             };
             if !matches!(
@@ -9194,7 +9225,7 @@ fn element_inputs_force_only_their_own_retained_answer_reactions() {
         }
         let transaction = engine.take_transaction();
         let selection = engine.rules_for_retained_answer_patch(&transaction).unwrap();
-        let mut patch = engine.prepare_retained_answer_patch(selection, &mut Counters::default());
+        let mut patch = engine.prepare_retained_answer_patch(selection);
         for &node in &nodes {
             let outcome = engine
                 .patch_retained_match_answer(node, &mut patch, SelectorTruthPatch::Direct(&[]))
@@ -9222,7 +9253,7 @@ fn keyframes_force_only_their_named_consumers_retained_answer_reactions() {
     engine.add_keyframes_rule(sheet, None, name);
     let transaction = engine.take_transaction();
     let selection = engine.rules_for_retained_answer_patch(&transaction).unwrap();
-    let mut patch = engine.prepare_retained_answer_patch(selection, &mut Counters::default());
+    let mut patch = engine.prepare_retained_answer_patch(selection);
     for &node in &nodes {
         let outcome = engine
             .patch_retained_match_answer(node, &mut patch, SelectorTruthPatch::Direct(&[]))
@@ -9760,7 +9791,7 @@ fn equivalent_sheet_programs_share_dispatch_topology() {
 
     let (_, first) = engine.prepare_scope_program(TreeScopeID(1));
     let (_, second) = engine.prepare_scope_program(TreeScopeID(2));
-    assert!(!Rc::ptr_eq(&first, &second));
+    assert!(!Arc::ptr_eq(&first, &second));
     assert!(first.shares_topology_with(&second));
     assert!(first.shares_entries_with(&second));
     assert_eq!(engine.scope_cascade_templates.len(), 1);
@@ -10367,7 +10398,11 @@ fn repeated_selector_replacement_reuses_program_and_route_storage() {
             .programs
             .add_with_status(test_selector_program(".target", &[("target", StyleAtomID(index + 1))]));
         engine.selector_programs_need_sweep |= inserted;
-        engine.state.programs.settle_memory(&mut engine.state.memory);
+        engine
+            .state
+            .retained
+            .programs
+            .settle_memory(&mut engine.state.retained.memory);
         engine.add_routing_rule(rule, program);
         let mut version = engine.program.rule_version(rule);
         version.selector_program = Some(program);
@@ -10396,15 +10431,19 @@ fn adding_a_live_selector_program_keeps_existing_routing() {
             .programs
             .add_with_status(test_selector_program(".target", &[("target", StyleAtomID(index + 1))]));
         engine.selector_programs_need_sweep |= inserted;
-        engine.state.programs.settle_memory(&mut engine.state.memory);
+        engine
+            .state
+            .retained
+            .programs
+            .settle_memory(&mut engine.state.retained.memory);
         engine.add_routing_rule(rule, program);
         let mut version = engine.program.rule_version(rule);
         version.selector_program = Some(program);
         engine.replace_rule_version(rule, version);
 
-        let routing_before_sweep = Rc::clone(&engine.routing);
+        let routing_before_sweep = Arc::clone(&engine.routing);
         discard_transaction(&mut engine);
-        assert!(Rc::ptr_eq(&routing_before_sweep, &engine.routing));
+        assert!(Arc::ptr_eq(&routing_before_sweep, &engine.routing));
     }
     assert_eq!(engine.routing.len(), 2);
 }
@@ -10764,13 +10803,13 @@ fn rule_changes_share_one_sheet_attachment_decision_per_transaction() {
 
     engine.append_rule(sheet, None, RuleKind::Style);
     engine.append_rule(sheet, None, RuleKind::Style);
-    assert_eq!(engine.program_staging.rule_change_is_carried_by_sheet.len(), 1);
+    assert_eq!(engine.host.program_staging.rule_change_is_carried_by_sheet.len(), 1);
 
     discard_transaction(&mut engine);
-    assert!(engine.program_staging.rule_change_is_carried_by_sheet.is_empty());
+    assert!(engine.host.program_staging.rule_change_is_carried_by_sheet.is_empty());
 
     engine.append_rule(sheet, None, RuleKind::Style);
-    assert_eq!(engine.program_staging.rule_change_is_carried_by_sheet.len(), 1);
+    assert_eq!(engine.host.program_staging.rule_change_is_carried_by_sheet.len(), 1);
     let transaction = engine.take_transaction();
     assert!(
         transaction
@@ -10848,7 +10887,7 @@ fn publishing_an_implicit_layer_order_does_not_edit_the_program() {
     engine.set_layer_order(TreeScopeID::DOCUMENT, &[CascadeLayerID::UNLAYERED]);
 
     assert_eq!(engine.program.version(), version);
-    assert!(engine.program_staging.base_version.is_none());
+    assert!(engine.host.program_staging.base_version.is_none());
     let transaction = engine.take_transaction();
     assert!(transaction.is_empty());
     engine.release_transaction(transaction);
@@ -11007,12 +11046,14 @@ fn native_atom_reclamation_does_not_claim_a_cpp_memo_reference() {
     engine.sweep_style_atoms();
     assert!(
         engine
+            .host
             .reclaimed_style_atoms
             .iter()
             .any(|entry| entry.atom == native && entry.raw == 0)
     );
     assert!(
         engine
+            .host
             .reclaimed_style_atoms
             .iter()
             .any(|entry| entry.atom == shared && entry.raw == 0x1001)
@@ -11049,7 +11090,7 @@ fn releasing_a_flush_transaction_does_not_reclaim_atoms() {
     let transaction = engine.take_transaction();
     engine.release_transaction(transaction);
 
-    assert!(engine.reclaimed_style_atoms.is_empty());
+    assert!(engine.host.reclaimed_style_atoms.is_empty());
     assert_eq!(engine.counters().get(Counter::AtomSweeps), 0);
 }
 
@@ -11082,23 +11123,23 @@ fn atom_sweep_waits_for_an_active_matching_traversal() {
     assert!(engine.take_style_transaction(nodes[0], |_, _, _| {}));
     assert_eq!(engine.counters().get(Counter::AtomSweeps), 0);
     assert_eq!(engine.counters().get(Counter::AtomSweepsDeferredForActiveTraversal), 1);
-    assert!(engine.reclaimed_style_atoms.is_empty());
+    assert!(engine.host.reclaimed_style_atoms.is_empty());
 
     engine.end_cold_matching_batch();
     assert!(engine.take_style_transaction(nodes[0], |_, _, _| {}));
     assert_eq!(engine.counters().get(Counter::AtomSweeps), 1);
-    assert!(!engine.reclaimed_style_atoms.is_empty());
+    assert!(!engine.host.reclaimed_style_atoms.is_empty());
 }
 
 #[test]
 fn replay_forces_a_recorded_atom_sweep_without_reclaims() {
     let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
-    engine.replay_reclaimed_style_atoms = Some(Vec::new());
+    engine.host.replay_reclaimed_style_atoms = Some(Vec::new());
 
     engine.sweep_style_atoms();
 
     assert_eq!(engine.counters().get(Counter::AtomSweeps), 1);
-    assert!(engine.style_atoms_swept);
+    assert!(engine.host.style_atoms_swept);
 }
 
 #[test]
@@ -11156,6 +11197,7 @@ fn pinned_attribute_names_keep_all_noted_forms_live() {
     engine.sweep_style_atoms();
 
     let reclaimed = engine
+        .host
         .reclaimed_style_atoms
         .iter()
         .map(|reclaimed| reclaimed.atom)
@@ -11210,6 +11252,7 @@ fn qualified_attribute_programs_keep_local_name_forms_live() {
     engine.sweep_style_atoms();
 
     let reclaimed = engine
+        .host
         .reclaimed_style_atoms
         .iter()
         .map(|reclaimed| reclaimed.atom)
@@ -11234,11 +11277,12 @@ fn engine_atom_sweeps_preserve_roots_and_purge_reused_identities() {
     engine.sweep_style_atoms();
     assert!(
         engine
+            .host
             .reclaimed_style_atoms
             .iter()
             .all(|reclaimed| reclaimed.atom != old_class)
     );
-    engine.reclaimed_style_atoms.clear();
+    engine.host.reclaimed_style_atoms.clear();
 
     remove_feature(&mut engine, nodes[1], LocalFeatureKey::Class(old_class));
     discard_transaction(&mut engine);
@@ -11251,11 +11295,12 @@ fn engine_atom_sweeps_preserve_roots_and_purge_reused_identities() {
     engine.sweep_style_atoms();
     assert!(
         engine
+            .host
             .reclaimed_style_atoms
             .iter()
             .any(|reclaimed| reclaimed.atom == old_class)
     );
-    engine.reclaimed_style_atoms.clear();
+    engine.host.reclaimed_style_atoms.clear();
 
     let new_class = engine.intern_atom(0x4000);
     assert_eq!(new_class, old_class);
@@ -11308,6 +11353,7 @@ fn engine_atom_reuse_replaces_catalog_text_and_name_forms() {
     }
     engine.sweep_style_atoms();
     let reclaimed = engine
+        .host
         .reclaimed_style_atoms
         .iter()
         .map(|reclaimed| reclaimed.atom)
@@ -11315,7 +11361,7 @@ fn engine_atom_reuse_replaces_catalog_text_and_name_forms() {
     for atom in [old_name, old_any_namespace, old_value, old_language] {
         assert!(reclaimed.contains(&atom));
     }
-    engine.reclaimed_style_atoms.clear();
+    engine.host.reclaimed_style_atoms.clear();
 
     let new_name = engine.intern_atom(0x3000);
     let new_any_namespace = engine.intern_qualified_atom(StyleAtomID::NONE, new_name);
@@ -11415,11 +11461,12 @@ fn engine_atom_reuse_replaces_custom_property_names() {
 
     assert!(
         engine
+            .host
             .reclaimed_style_atoms
             .iter()
             .any(|reclaimed| reclaimed.atom == old_name)
     );
-    engine.reclaimed_style_atoms.clear();
+    engine.host.reclaimed_style_atoms.clear();
 
     let new_name = engine.intern_atom(0x3000);
     assert_eq!(new_name, old_name);
@@ -11474,15 +11521,15 @@ fn owed_element_style_inputs_fold_into_covering_reactions() {
     // Inputs the engine derived make the next transaction one more generation of the same style
     // change; one C++ records for a node the engine did not derive makes it a new pass.
     engine.record_derived_element_style_input(other, STYLE_REACTION_RECOMPUTE_STYLE, 0);
-    assert!(engine.externally_recorded_style_input_nodes.is_empty());
+    assert!(engine.host.externally_recorded_style_input_nodes.is_empty());
     engine.record_element_style_input(other, STYLE_REACTION_INHERITED_STYLE, 0);
-    assert!(engine.externally_recorded_style_input_nodes.is_empty());
+    assert!(engine.host.externally_recorded_style_input_nodes.is_empty());
     engine.record_element_style_input(node, STYLE_REACTION_RECOMPUTE_STYLE, 0);
-    assert!(engine.externally_recorded_style_input_nodes.contains(&node));
+    assert!(engine.host.externally_recorded_style_input_nodes.contains(&node));
     engine.record_element_style_input(node, STYLE_REACTION_INHERITED_STYLE, 0);
-    assert!(engine.externally_recorded_style_input_nodes.contains(&node));
+    assert!(engine.host.externally_recorded_style_input_nodes.contains(&node));
     engine.consume_element_style_input(node);
-    assert!(engine.externally_recorded_style_input_nodes.is_empty());
+    assert!(engine.host.externally_recorded_style_input_nodes.is_empty());
 }
 
 #[test]
@@ -11499,9 +11546,9 @@ fn shared_computation_context_checks_fixed_inputs_and_record_liveness() {
                     dependency_flags: 0,
                     counter_style_environment_identity: 0,
                     animation_overlay_identity: 0,
-                    animated_overlay: std::ptr::null(),
+                    animated_overlay: HostShared::null(),
                     animation_overlay_payloads: &[],
-                    longhand_table: std::ptr::null(),
+                    longhand_table: HostShared::null(),
                 },
             )
             .style_record_identity

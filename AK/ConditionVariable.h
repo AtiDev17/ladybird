@@ -1,0 +1,73 @@
+/*
+ * Copyright (c) 2021, kleines Filmröllchen <filmroellchen@serenityos.org>.
+ * Copyright (c) 2025, Ryszard Goc <ryszardgoc@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Concepts.h>
+#include <AK/Forward.h>
+#include <AK/Function.h>
+#include <AK/Mutex.h>
+#include <AK/MutexPolicy.h>
+#include <AK/Noncopyable.h>
+#include <AK/Platform.h>
+
+#if !defined(AK_OS_WINDOWS)
+#    include <pthread.h>
+#endif
+
+namespace AK {
+
+// A signaling condition variable that wraps over the platform APIs.
+// On posix it is a wrapper of pthread_cond_*.
+// On Windows it wraps ConditionVariable
+template<typename MutexType>
+requires Detail::IsIntraprocess<MutexType> && Detail::IsNonRecursive<MutexType>
+class ConditionVariableBase {
+    AK_MAKE_NONCOPYABLE(ConditionVariableBase);
+    AK_MAKE_NONMOVABLE(ConditionVariableBase);
+
+public:
+    ConditionVariableBase(MutexType& to_wait_on);
+    ~ConditionVariableBase();
+
+    // As with pthread APIs, the mutex must be locked or undefined behavior ensues.
+    // Condition variables are allowed spurious wakeups. As such waiting on a condition in a loop is preferred.
+    void wait();
+    bool wait_for(AK::Duration const&);
+
+    ALWAYS_INLINE void wait_while(Function<bool()> condition)
+    {
+        while (condition())
+            wait();
+    }
+    // Release at least one of the threads waiting on this variable.
+    void signal();
+
+    // Release all of the threads waiting on this variable.
+    void broadcast();
+
+private:
+#ifdef AK_OS_WINDOWS
+    using StorageType = void*;
+#else
+    using StorageType = pthread_cond_t;
+#endif
+
+    alignas(StorageType) unsigned char m_storage[sizeof(StorageType)];
+    MutexType& m_to_wait_on;
+};
+
+template<typename MutexType>
+ConditionVariableBase(MutexType&) -> ConditionVariableBase<MutexType>;
+
+using ConditionVariable = ConditionVariableBase<Mutex>;
+
+}
+
+#if USING_AK_GLOBALLY
+using AK::ConditionVariable;
+#endif

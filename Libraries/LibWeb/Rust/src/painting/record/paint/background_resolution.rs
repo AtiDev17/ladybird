@@ -543,7 +543,11 @@ fn resolve_layers<'a, O: Observer>(
         // If the background-attachment value for this layer is fixed, then this property has no effect: in this case
         // the background positioning area is the initial containing block.
         if layer.attachment == background_attachment::FIXED
-            && background_has_fixed_attachment(recorder.layout_arena, recorder.inputs.root_background_source, paintable)
+            && background_has_fixed_attachment(
+                recorder.layout_arena,
+                recorder.inputs.uncaptured.root_background_source,
+                paintable,
+            )
         {
             background_positioning_area = CssPixelRect::from_location_and_size(
                 crate::css::css_pixels::CssPixelPoint::default(),
@@ -819,17 +823,35 @@ pub(crate) fn has_background_to_paint(
     })
 }
 
+/// The root background covers the viewport and the root's scrollable overflow. Moving the
+/// viewport inside that area does not change the recorded background; growing it does.
+pub(crate) fn root_background_canvas_rect(
+    arena: &impl PaintableRowsRead,
+    root: NodeSlotId,
+    viewport_rect: CssPixelRect,
+) -> CssPixelRect {
+    let mut rect = viewport_rect;
+    if let Some(overflow_rect) = crate::painting::paintable_geometry::scrollable_overflow_rect(arena, root) {
+        rect.unite(overflow_rect);
+    }
+    rect
+}
+
 pub(crate) fn resolve_background_for_paint<'a, O: Observer>(
     recorder: &PaintRecorder<'a, O>,
     paintable: NodeSlotId,
 ) -> Option<BackgroundPaintInputs<'a>> {
-    if !has_background_to_paint(recorder.layout_arena, paintable, recorder.inputs.root_background_source) {
+    if !has_background_to_paint(
+        recorder.layout_arena,
+        paintable,
+        recorder.inputs.uncaptured.root_background_source,
+    ) {
         return None;
     }
     let source = background_paint_source_from_style_and_geometry(
         recorder.layout_arena,
         paintable,
-        recorder.inputs.root_background_source,
+        recorder.inputs.uncaptured.root_background_source,
     )?;
     let mut resolved = match source.layers_style_if_live {
         Some(layers_style) => resolve_background_layers(
@@ -855,12 +877,8 @@ pub(crate) fn resolve_background_for_paint<'a, O: Observer>(
         },
     };
     if source.is_root_element {
-        let mut canvas_rect = recorder.inputs.css_viewport_rect;
-        if let Some(overflow_rect) =
-            crate::painting::paintable_geometry::scrollable_overflow_rect(recorder.layout_arena, paintable)
-        {
-            canvas_rect.unite(overflow_rect);
-        }
+        let canvas_rect =
+            root_background_canvas_rect(recorder.layout_arena, paintable, recorder.inputs.css_viewport_rect);
         resolved.background_rect.unite(canvas_rect);
         resolved.color_box.rect.unite(canvas_rect);
     }

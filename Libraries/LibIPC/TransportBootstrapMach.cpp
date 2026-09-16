@@ -6,13 +6,13 @@
 
 #include <AK/Assertions.h>
 #include <AK/ByteString.h>
+#include <AK/Mutex.h>
 #include <AK/Optional.h>
 #include <LibCore/MachPort.h>
 #include <LibCore/System.h>
 #include <LibIPC/MachBootstrapMessages.h>
 #include <LibIPC/TransportBootstrapMach.h>
 #include <LibIPC/TransportMachPort.h>
-#include <LibSync/Mutex.h>
 
 #include <mach/mach.h>
 
@@ -118,7 +118,7 @@ ErrorOr<TransportBootstrapMachServer::BootstrapRequestResult> TransportBootstrap
 {
     Optional<TransportBootstrapMachPorts> child_transport;
     {
-        Sync::MutexLocker locker(m_child_registration_mutex);
+        MutexLocker locker(m_child_registration_mutex);
         child_transport = m_child_transports.take(pid);
     }
 

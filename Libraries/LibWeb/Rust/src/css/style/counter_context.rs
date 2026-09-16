@@ -754,7 +754,7 @@ impl StyleEngine {
     pub(super) fn materialize_current_selector_incidence(
         &mut self,
         program: SelectorProgramID,
-    ) -> Option<Rc<[RetainedSelectorIncidence]>> {
+    ) -> Option<Arc<[RetainedSelectorIncidence]>> {
         self.state
             .materialize_current_selector_incidence(program, &mut self.counters)
     }
@@ -891,12 +891,12 @@ impl StyleEngine {
     #[inline]
     #[cfg(test)]
     pub(super) fn verify_retained_cascade_input(&mut self, node: StyleNodeID, cascade_input: MatchAnswerID) {
-        let traversal = self.state.batch_matching_traversal.take();
+        let traversal = self.state.retained.batch_matching_traversal.take();
         let empty = AnswerEffects::default();
         let effects = traversal.as_ref().map_or(&empty, |traversal| &traversal.answer_effects);
         self.state
             .verify_retained_cascade_input(effects, node, cascade_input, &mut self.counters);
-        self.state.batch_matching_traversal = traversal;
+        self.state.retained.batch_matching_traversal = traversal;
     }
 
     #[inline]
@@ -1010,7 +1010,7 @@ impl StyleEngine {
     /// rejected while the batch was planned may become computable once its inheritance parent is
     /// authoritative.
     #[inline]
-    pub(crate) fn retry_engine_record_after_ancestor(&mut self, node: StyleNodeID) -> u64 {
+    pub(crate) fn retry_engine_record_after_ancestor(&mut self, node: StyleNodeID) -> publication::RetriedEngineRecord {
         self.state.retry_engine_record_after_ancestor(node, &mut self.counters)
     }
 
@@ -1021,7 +1021,7 @@ impl StyleEngine {
     pub(crate) fn publish_computed_groups(
         &mut self,
         target: computed::ComputedStyleTarget,
-        payloads: &[*const std::ffi::c_void],
+        payloads: &[crate::css::host_shared::SharedPayload],
         inherited_group_count: usize,
         custom_property_environment: u64,
         metadata_input: computed::ComputedMetadataInput<'_>,
@@ -1067,7 +1067,7 @@ impl StyleEngine {
     #[inline]
     pub(crate) fn intern_computed_groups(
         &mut self,
-        payloads: &[*const std::ffi::c_void],
+        payloads: &[crate::css::host_shared::SharedPayload],
         inherited_group_count: usize,
         custom_property_environment: u64,
         metadata_input: computed::ComputedMetadataInput<'_>,
@@ -1091,8 +1091,8 @@ impl StyleEngine {
         &mut self,
         target: computed::ComputedStyleTarget,
         source_identity: u64,
-        animated_overlay: *const crate::css::animated_overlay::AnimatedOverlay,
-        payloads: &[*const std::ffi::c_void],
+        animated_overlay: crate::css::host_shared::HostShared<crate::css::animated_overlay::AnimatedOverlay>,
+        payloads: &[crate::css::host_shared::SharedPayload],
     ) -> Option<computed::AnimationOverlayUpdate> {
         self.state.publish_animation_overlay_impl(
             target,

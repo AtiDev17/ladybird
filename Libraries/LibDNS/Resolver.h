@@ -13,6 +13,7 @@
 #include <AK/MemoryStream.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/QuickSort.h>
+#include <AK/RWLockProtected.h>
 #include <AK/Random.h>
 #include <AK/StringView.h>
 #include <AK/TemporaryChange.h>
@@ -25,7 +26,6 @@
 #include <LibCrypto/Curves/EdwardsCurve.h>
 #include <LibCrypto/PK/RSA.h>
 #include <LibDNS/Message.h>
-#include <LibSync/RWLockProtected.h>
 #include <LibThreading/ThreadPool.h>
 
 #define TRY_OR_REJECT_PROMISE(promise, expr)          \
@@ -1419,10 +1419,10 @@ private:
         });
     }
 
-    Sync::RWLockProtected<HashMap<ByteString, NonnullRefPtr<LookupResult>>> m_cache;
-    Sync::RWLockProtected<HashMap<ByteString, NonnullRefPtr<PendingSystemResolution>>> m_pending_system_resolutions;
-    Sync::RWLockProtected<NonnullOwnPtr<RedBlackTree<u16, PendingLookup>>> m_pending_lookups;
-    Sync::RWLockProtected<Optional<MaybeOwned<Core::Socket>>> m_socket;
+    RWLockProtected<HashMap<ByteString, NonnullRefPtr<LookupResult>>> m_cache;
+    RWLockProtected<HashMap<ByteString, NonnullRefPtr<PendingSystemResolution>>> m_pending_system_resolutions;
+    RWLockProtected<NonnullOwnPtr<RedBlackTree<u16, PendingLookup>>> m_pending_lookups;
+    RWLockProtected<Optional<MaybeOwned<Core::Socket>>> m_socket;
     Function<ErrorOr<SocketResult>()> m_create_socket;
     bool m_attempting_restart { false };
     ConnectionMode m_mode { ConnectionMode::UDP };

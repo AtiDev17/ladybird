@@ -44,13 +44,14 @@ use super::instrumentation::Counters;
 use super::shared_vector::{SharedVector, SharedVectorPool};
 use smallvec::SmallVec;
 use std::cell::Cell;
-use std::cell::Ref;
 use std::cell::RefCell;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::num::NonZeroU32;
-use std::rc::Rc;
-use std::rc::Weak;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::Weak;
 
 use super::TransactionFactSide;
 use super::TransactionFactView;
@@ -2565,11 +2566,11 @@ struct SharedSelectorProgram {
 /// A strong identity for a process-interned selector. Keeping the payload alive prevents an
 /// address from being recycled while a dispatch sharing key still refers to it.
 #[derive(Clone)]
-pub(super) struct SharedSelectorIdentity(Rc<SharedSelectorProgram>);
+pub(super) struct SharedSelectorIdentity(Arc<SharedSelectorProgram>);
 
 impl PartialEq for SharedSelectorIdentity {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -2577,7 +2578,7 @@ impl Eq for SharedSelectorIdentity {}
 
 impl Hash for SharedSelectorIdentity {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        Rc::as_ptr(&self.0).hash(state);
+        Arc::as_ptr(&self.0).hash(state);
     }
 }
 
@@ -2617,7 +2618,7 @@ thread_local! {
     static SHARED_SELECTOR_PROGRAMS: RefCell<SharedSelectorPrograms> = RefCell::new(SharedSelectorPrograms::default());
 }
 
-fn share_selector_program(program: SelectorProgram) -> Rc<SharedSelectorProgram> {
+fn share_selector_program(program: SelectorProgram) -> Arc<SharedSelectorProgram> {
     let hash = SelectorPrograms::program_hash(&program);
     SHARED_SELECTOR_PROGRAMS.with_borrow_mut(|shared| {
         let bucket = shared.by_hash.entry(hash).or_default();
@@ -2637,27 +2638,27 @@ fn share_selector_program(program: SelectorProgram) -> Rc<SharedSelectorProgram>
 
         let mut program_memory = MemoryLease::new(MemoryCategory::RuleProgram);
         program_memory.reconcile_committed(&mut shared.memory, program.capacity_bytes());
-        let program = Rc::new(SharedSelectorProgram {
+        let program = Arc::new(SharedSelectorProgram {
             program,
             hash,
             _memory: program_memory,
         });
-        bucket.push(Rc::downgrade(&program));
+        bucket.push(Arc::downgrade(&program));
         program
     })
 }
 
 #[derive(Clone)]
 enum SelectorProgramStorage {
-    Document(Rc<SelectorProgram>),
-    Process(Rc<SharedSelectorProgram>),
+    Document(Arc<SelectorProgram>),
+    Process(Arc<SharedSelectorProgram>),
 }
 
 impl PartialEq for SelectorProgramStorage {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Document(first), Self::Document(second)) => Rc::ptr_eq(first, second),
-            (Self::Process(first), Self::Process(second)) => Rc::ptr_eq(first, second),
+            (Self::Document(first), Self::Document(second)) => Arc::ptr_eq(first, second),
+            (Self::Process(first), Self::Process(second)) => Arc::ptr_eq(first, second),
             _ => false,
         }
     }
@@ -2669,8 +2670,8 @@ impl Hash for SelectorProgramStorage {
     fn hash<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
-            Self::Document(program) => Rc::as_ptr(program).hash(state),
-            Self::Process(program) => Rc::as_ptr(program).hash(state),
+            Self::Document(program) => Arc::as_ptr(program).hash(state),
+            Self::Process(program) => Arc::as_ptr(program).hash(state),
         }
     }
 }
@@ -2705,8 +2706,8 @@ enum SelectorProgramScope {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum SelectorEntryIDs {
     Consecutive { first: EntryID, count: u32 },
-    // Keep a thin pointer here: an Rc slice would enlarge every inline consecutive range.
-    Explicit(Rc<Box<[EntryID]>>),
+    // Keep a thin pointer here: an Arc slice would enlarge every inline consecutive range.
+    Explicit(Arc<Box<[EntryID]>>),
 }
 
 impl SelectorEntryIDs {
@@ -2720,7 +2721,7 @@ impl SelectorEntryIDs {
                 count: u32::try_from(entries.len()).expect("selector program entry space exhausted"),
             }
         } else {
-            Self::Explicit(Rc::new(entries.into_boxed_slice()))
+            Self::Explicit(Arc::new(entries.into_boxed_slice()))
         }
     }
 
@@ -2860,7 +2861,7 @@ impl SelectorPrograms {
         let stored_id = Self::stored_program_id(id);
         self.vacant_programs.pop();
         let program = match self.scope {
-            SelectorProgramScope::Document => SelectorProgramStorage::Document(Rc::new(program)),
+            SelectorProgramScope::Document => SelectorProgramStorage::Document(Arc::new(program)),
             SelectorProgramScope::Process => SelectorProgramStorage::Process(share_selector_program(program)),
         };
         self.program_memory.grow_committed(program.document_capacity_bytes());
@@ -2980,7 +2981,7 @@ impl SelectorPrograms {
             return None;
         };
         Some((
-            SharedSelectorIdentity(Rc::clone(shared)),
+            SharedSelectorIdentity(Arc::clone(shared)),
             self.entry_ids_by_program[program.0 as usize].as_ref()?.clone(),
         ))
     }
@@ -3241,7 +3242,7 @@ impl Drop for SharedFlatRouteDirectory {
     }
 }
 
-fn share_flat_route_directory(data: FlatRouteDirectoryData) -> Option<Rc<SharedFlatRouteDirectory>> {
+fn share_flat_route_directory(data: FlatRouteDirectoryData) -> Option<Arc<SharedFlatRouteDirectory>> {
     if data.ranges.is_empty() {
         debug_assert!(data.routes.is_empty());
         return None;
@@ -3275,12 +3276,12 @@ fn share_flat_route_directory(data: FlatRouteDirectoryData) -> Option<Rc<SharedF
                 + data.ranges.shallow_capacity_bytes()
                 + data.routes.shallow_capacity_bytes(),
         );
-        let shared = Rc::new(SharedFlatRouteDirectory {
+        let shared = Arc::new(SharedFlatRouteDirectory {
             data,
             hash,
             _memory: memory,
         });
-        bucket.push(Rc::downgrade(&shared));
+        bucket.push(Arc::downgrade(&shared));
         shared
     }))
 }
@@ -3289,8 +3290,12 @@ enum RouteDirectory {
     BuildingAfterIdle(HashMap<RoutingKey, Vec<RouteID>>),
     BuildingAfterChange(HashMap<RoutingKey, Vec<RouteID>>),
     BuildingIdleAfterChange(HashMap<RoutingKey, Vec<RouteID>>),
-    FlatAfterIdle { data: Option<Rc<SharedFlatRouteDirectory>> },
-    FlatAfterChange { data: Option<Rc<SharedFlatRouteDirectory>> },
+    FlatAfterIdle {
+        data: Option<Arc<SharedFlatRouteDirectory>>,
+    },
+    FlatAfterChange {
+        data: Option<Arc<SharedFlatRouteDirectory>>,
+    },
 }
 
 impl Default for RouteDirectory {
@@ -3300,7 +3305,7 @@ impl Default for RouteDirectory {
 }
 
 impl RouteDirectory {
-    fn reopen(data: Option<Rc<SharedFlatRouteDirectory>>) -> HashMap<RoutingKey, Vec<RouteID>> {
+    fn reopen(data: Option<Arc<SharedFlatRouteDirectory>>) -> HashMap<RoutingKey, Vec<RouteID>> {
         let Some(data) = data else { return HashMap::default() };
         let mut building = HashMap::with_capacity_and_hasher(data.data.ranges.len(), Default::default());
         for (&key, range) in &data.data.ranges {
@@ -3470,7 +3475,7 @@ impl Hash for RouteColumnData {
 // A later stylesheet edit detaches the columns before appending routes.
 enum RouteColumns {
     Owned(Box<RouteColumnData>),
-    Shared(Rc<SharedRouteColumns>),
+    Shared(Arc<SharedRouteColumns>),
 }
 
 impl Default for RouteColumns {
@@ -3530,7 +3535,7 @@ impl RouteColumns {
             let Self::Shared(shared) = std::mem::take(self) else {
                 unreachable!()
             };
-            let data = match Rc::try_unwrap(shared) {
+            let data = match Arc::try_unwrap(shared) {
                 Ok(mut shared) => std::mem::take(&mut shared.data),
                 Err(shared) => shared.data.clone(),
             };
@@ -3582,12 +3587,12 @@ impl RouteColumns {
             data.waypoints.share(&SHARED_ROUTE_RANGES);
             let mut memory = MemoryLease::new(MemoryCategory::RoutingRegistry);
             memory.resize_required_to(&mut table.memory, data.capacity_bytes());
-            let shared = Rc::new(SharedRouteColumns {
+            let shared = Arc::new(SharedRouteColumns {
                 data: *data,
                 hash,
                 _memory: memory,
             });
-            table.by_hash.get_mut(&hash).unwrap().push(Rc::downgrade(&shared));
+            table.by_hash.get_mut(&hash).unwrap().push(Arc::downgrade(&shared));
             shared
         });
         *self = Self::Shared(shared);
@@ -4091,19 +4096,26 @@ fn state_is_published_on_arrival(fact: StateFact) -> bool {
 /// ordinary mutation would change the hot path's asymptotics, so routing has to be an index.
 /// Feature postings may accelerate subject enumeration on top of it, but evicting a posting never
 /// changes which routes run.
+const LIVENESS_LOCK: &str = "the routing liveness view is never held across a panic";
+
 pub struct RoutingRegistry {
     routes: RouteColumns,
     /// Sibling-first routes indexed by a distinguishing feature of their left compound.
     sibling_first_by_origin: HashMap<DispatchKey, Vec<RouteID>>,
     by_input: RouteDirectory,
     arrival_by_input: RouteDirectory,
-    route_liveness: RefCell<BitColumn>,
-    live_relational_routes: RefCell<Vec<LiveRelationalRoute>>,
-    live_sibling_entries: RefCell<Vec<SiblingEntry>>,
-    live_sibling_workspace: RefCell<SiblingCandidateWorkspace>,
-    live_sequence_entries: RefCell<Vec<SequenceEntry>>,
-    live_sequence_index: RefCell<SequenceEntryIndex>,
-    route_liveness_version: Cell<Option<u64>>,
+    /// The liveness view, rebuilt by `prepare_route_liveness` whenever the program's routing
+    /// liveness version moves and read-only after that. Plain fields, not cells: the registry is
+    /// on the read side an evaluation step borrows, which has to be `Sync`.
+    route_liveness: BitColumn,
+    live_relational_routes: Vec<LiveRelationalRoute>,
+    live_sibling_entries: Vec<SiblingEntry>,
+    live_sequence_entries: Vec<SequenceEntry>,
+    /// The two members of the view a routing pass mutates as it runs. Each is taken once per
+    /// pass, never per route, so the lock is a formality that makes the registry shareable.
+    live_sibling_workspace: Mutex<SiblingCandidateWorkspace>,
+    live_sequence_index: Mutex<SequenceEntryIndex>,
+    route_liveness_version: Option<u64>,
     memory: MemoryLease,
     nested_memory: MemoryLease,
 }
@@ -4115,13 +4127,13 @@ impl Default for RoutingRegistry {
             sibling_first_by_origin: HashMap::default(),
             by_input: RouteDirectory::default(),
             arrival_by_input: RouteDirectory::default(),
-            route_liveness: RefCell::new(BitColumn::default()),
-            live_relational_routes: RefCell::new(Vec::new()),
-            live_sibling_entries: RefCell::new(Vec::new()),
-            live_sibling_workspace: RefCell::new(SiblingCandidateWorkspace::new(&[])),
-            live_sequence_entries: RefCell::new(Vec::new()),
-            live_sequence_index: RefCell::new(SequenceEntryIndex::default()),
-            route_liveness_version: Cell::new(None),
+            route_liveness: BitColumn::default(),
+            live_relational_routes: Vec::new(),
+            live_sibling_entries: Vec::new(),
+            live_sequence_entries: Vec::new(),
+            live_sibling_workspace: Mutex::new(SiblingCandidateWorkspace::new(&[])),
+            live_sequence_index: Mutex::new(SequenceEntryIndex::default()),
+            route_liveness_version: None,
             memory: MemoryLease::new(MemoryCategory::RoutingRegistry),
             nested_memory: MemoryLease::new(MemoryCategory::RoutingRegistry),
         }
@@ -4219,7 +4231,7 @@ impl RoutingRegistry {
                     },
                 },
             );
-            self.route_liveness_version.set(None);
+            self.route_liveness_version = None;
             if anchor.is_some() {
                 self.routes.make_mut().relational.push(route);
             }
@@ -4330,12 +4342,16 @@ impl RoutingRegistry {
             && program.rule_version(header.rule).selector_program == Some(selector_program)
     }
 
-    pub(super) fn prepare_route_liveness(&self, program: &StyleSheetProgram, programs: &SelectorPrograms) {
+    /// Rebuild the liveness view when the program's routing liveness version moves.
+    ///
+    /// This takes `&mut self` so the view itself needs no interior mutability: the registry is on
+    /// the read side, and a walk reads it without being able to rebuild it.
+    pub(super) fn prepare_route_liveness(&mut self, program: &StyleSheetProgram, programs: &SelectorPrograms) {
         let version = program.routing_liveness_version();
-        if self.route_liveness_version.get() == Some(version) {
+        if self.route_liveness_version == Some(version) {
             return;
         }
-        let mut liveness = self.route_liveness.borrow_mut();
+        let mut liveness = std::mem::take(&mut self.route_liveness);
         for index in 0..self.routes.headers.len() {
             let header = self.routes.headers[index];
             let (selector_program, _) = programs.entry_location(header.entry);
@@ -4345,7 +4361,7 @@ impl RoutingRegistry {
                     && program.rule_version(header.rule).selector_program == Some(selector_program),
             );
         }
-        let mut live_relational_routes = self.live_relational_routes.borrow_mut();
+        let mut live_relational_routes = std::mem::take(&mut self.live_relational_routes);
         live_relational_routes.clear();
         live_relational_routes.extend(self.routes.relational.iter().copied().filter_map(|route| {
             if !liveness.contains(route.index()) {
@@ -4359,7 +4375,7 @@ impl RoutingRegistry {
                 anchor: point.anchor.expect("a relational route must carry an anchor"),
             })
         }));
-        let mut live_sibling_entries = self.live_sibling_entries.borrow_mut();
+        let mut live_sibling_entries = std::mem::take(&mut self.live_sibling_entries);
         live_sibling_entries.clear();
         live_sibling_entries.extend(
             self.routes
@@ -4369,8 +4385,8 @@ impl RoutingRegistry {
                 .filter(|route| liveness.contains(route.index()))
                 .map(|route| SiblingEntry { route }),
         );
-        *self.live_sibling_workspace.borrow_mut() = SiblingCandidateWorkspace::new(&live_sibling_entries);
-        let mut live_sequence_entries = self.live_sequence_entries.borrow_mut();
+        let sibling_workspace = SiblingCandidateWorkspace::new(&live_sibling_entries);
+        let mut live_sequence_entries = std::mem::take(&mut self.live_sequence_entries);
         live_sequence_entries.clear();
         for &route in self.routes_for(RoutingKey::Structural) {
             if !liveness.contains(route.index()) {
@@ -4391,65 +4407,51 @@ impl RoutingRegistry {
                     && selector_entry.observes_sibling_relation(),
             });
         }
-        *self.live_sequence_index.borrow_mut() = SequenceEntryIndex::build(&live_sequence_entries, self);
-        self.route_liveness_version.set(Some(version));
+        let sequence_index = SequenceEntryIndex::build(&live_sequence_entries, self);
+        self.route_liveness = liveness;
+        self.live_relational_routes = live_relational_routes;
+        self.live_sibling_entries = live_sibling_entries;
+        self.live_sequence_entries = live_sequence_entries;
+        *self.live_sibling_workspace.get_mut().expect(LIVENESS_LOCK) = sibling_workspace;
+        *self.live_sequence_index.get_mut().expect(LIVENESS_LOCK) = sequence_index;
+        self.route_liveness_version = Some(version);
     }
 
     #[must_use]
-    pub(super) fn route_liveness(&self, program: &StyleSheetProgram) -> Ref<'_, BitColumn> {
-        debug_assert_eq!(
-            self.route_liveness_version.get(),
-            Some(program.routing_liveness_version())
-        );
-        self.route_liveness.borrow()
+    pub(super) fn route_liveness(&self, program: &StyleSheetProgram) -> &BitColumn {
+        debug_assert_eq!(self.route_liveness_version, Some(program.routing_liveness_version()));
+        &self.route_liveness
     }
 
     #[must_use]
-    pub(super) fn live_relational_routes(&self, program: &StyleSheetProgram) -> Ref<'_, [LiveRelationalRoute]> {
-        debug_assert_eq!(
-            self.route_liveness_version.get(),
-            Some(program.routing_liveness_version())
-        );
-        Ref::map(self.live_relational_routes.borrow(), Vec::as_slice)
+    pub(super) fn live_relational_routes(&self, program: &StyleSheetProgram) -> &[LiveRelationalRoute] {
+        debug_assert_eq!(self.route_liveness_version, Some(program.routing_liveness_version()));
+        &self.live_relational_routes
     }
 
     #[must_use]
-    pub(super) fn live_sibling_entries(&self, program: &StyleSheetProgram) -> Ref<'_, [SiblingEntry]> {
-        debug_assert_eq!(
-            self.route_liveness_version.get(),
-            Some(program.routing_liveness_version())
-        );
-        Ref::map(self.live_sibling_entries.borrow(), Vec::as_slice)
+    pub(super) fn live_sibling_entries(&self, program: &StyleSheetProgram) -> &[SiblingEntry] {
+        debug_assert_eq!(self.route_liveness_version, Some(program.routing_liveness_version()));
+        &self.live_sibling_entries
     }
 
-    #[must_use]
     pub(super) fn live_sibling_workspace(
         &self,
         program: &StyleSheetProgram,
-    ) -> std::cell::RefMut<'_, SiblingCandidateWorkspace> {
-        debug_assert_eq!(
-            self.route_liveness_version.get(),
-            Some(program.routing_liveness_version())
-        );
-        self.live_sibling_workspace.borrow_mut()
+    ) -> MutexGuard<'_, SiblingCandidateWorkspace> {
+        debug_assert_eq!(self.route_liveness_version, Some(program.routing_liveness_version()));
+        self.live_sibling_workspace.lock().expect(LIVENESS_LOCK)
     }
 
     #[must_use]
-    pub(super) fn live_sequence_entries(&self, program: &StyleSheetProgram) -> Ref<'_, [SequenceEntry]> {
-        debug_assert_eq!(
-            self.route_liveness_version.get(),
-            Some(program.routing_liveness_version())
-        );
-        Ref::map(self.live_sequence_entries.borrow(), Vec::as_slice)
+    pub(super) fn live_sequence_entries(&self, program: &StyleSheetProgram) -> &[SequenceEntry] {
+        debug_assert_eq!(self.route_liveness_version, Some(program.routing_liveness_version()));
+        &self.live_sequence_entries
     }
 
-    #[must_use]
-    pub(super) fn live_sequence_index(&self, program: &StyleSheetProgram) -> std::cell::RefMut<'_, SequenceEntryIndex> {
-        debug_assert_eq!(
-            self.route_liveness_version.get(),
-            Some(program.routing_liveness_version())
-        );
-        self.live_sequence_index.borrow_mut()
+    pub(super) fn live_sequence_index(&self, program: &StyleSheetProgram) -> MutexGuard<'_, SequenceEntryIndex> {
+        debug_assert_eq!(self.route_liveness_version, Some(program.routing_liveness_version()));
+        self.live_sequence_index.lock().expect(LIVENESS_LOCK)
     }
 
     fn entry_facts_of(&self, route: RouteID) -> EntryRouteFacts {
@@ -4683,13 +4685,12 @@ impl RoutingRegistry {
                 self.routes.capacity_bytes()
                     + self.by_input.capacity_bytes()
                     + self.arrival_by_input.capacity_bytes()
-                    + self.route_liveness.borrow().capacity_bytes()
-                    + self.live_relational_routes.borrow().capacity() as u64
-                        * size_of::<LiveRelationalRoute>() as u64
-                    + self.live_sibling_entries.borrow().capacity() as u64 * size_of::<SiblingEntry>() as u64
-                    + self.live_sibling_workspace.borrow().capacity_bytes()
-                    + self.live_sequence_entries.borrow().capacity() as u64 * size_of::<SequenceEntry>() as u64
-                    + self.live_sequence_index.borrow().capacity_bytes()
+                    + self.route_liveness.capacity_bytes()
+                    + self.live_relational_routes.capacity() as u64 * size_of::<LiveRelationalRoute>() as u64
+                    + self.live_sibling_entries.capacity() as u64 * size_of::<SiblingEntry>() as u64
+                    + self.live_sibling_workspace.lock().expect(LIVENESS_LOCK).capacity_bytes()
+                    + self.live_sequence_entries.capacity() as u64 * size_of::<SequenceEntry>() as u64
+                    + self.live_sequence_index.lock().expect(LIVENESS_LOCK).capacity_bytes()
             ];
             skip [self.memory];
         }
@@ -5220,7 +5221,7 @@ type SiblingSequenceMembershipColumn = PagedColumn<ValuePage<SiblingSequenceMemb
 
 #[derive(Default)]
 pub(super) struct SiblingSequenceGeometry {
-    sequences: Vec<Rc<[StyleNodeID]>>,
+    sequences: Vec<Arc<[StyleNodeID]>>,
     memberships: SiblingSequenceMembershipColumn,
     /// Bytes held by the sequences themselves, kept running so `capacity_bytes` is O(1) on the
     /// per-candidate before-and-after accounting path.
@@ -5228,9 +5229,9 @@ pub(super) struct SiblingSequenceGeometry {
 }
 
 impl SiblingSequenceGeometry {
-    fn insert_sequence(&mut self, children: Vec<StyleNodeID>) -> (u32, Rc<[StyleNodeID]>, usize) {
+    fn insert_sequence(&mut self, children: Vec<StyleNodeID>) -> (u32, Arc<[StyleNodeID]>, usize) {
         u32::try_from(children.len()).expect("sibling sequence space exhausted");
-        let children: Rc<[StyleNodeID]> = children.into();
+        let children: Arc<[StyleNodeID]> = children.into();
         let sequence = u32::try_from(self.sequences.len()).expect("sibling sequence index space exhausted");
         self.sequence_bytes += children.len() * size_of::<StyleNodeID>() + 2 * size_of::<usize>();
         self.sequences.push(children.clone());
@@ -5253,7 +5254,7 @@ impl SiblingSequenceGeometry {
         (sequence, children, pages)
     }
 
-    fn sequence_and_ordinal(&self, node: StyleNodeID) -> Option<(&Rc<[StyleNodeID]>, u32)> {
+    fn sequence_and_ordinal(&self, node: StyleNodeID) -> Option<(&Arc<[StyleNodeID]>, u32)> {
         let membership = self.memberships.get(node.element_index()? as usize)?;
         Some((&self.sequences[membership.sequence as usize], membership.ordinal))
     }
@@ -5540,7 +5541,7 @@ impl MatchScratch {
         &mut self,
         children: Vec<StyleNodeID>,
         side: MatchEvaluationSide,
-    ) -> (Rc<[StyleNodeID]>, usize, bool) {
+    ) -> (Arc<[StyleNodeID]>, usize, bool) {
         if let Some(&first) = children.first()
             && let Some((sequence, _)) =
                 self.sibling_geometry_by_tree_side[side.tree_side()].sequence_and_ordinal(first)
@@ -7126,7 +7127,7 @@ mod tests {
         let (RouteColumns::Shared(a), RouteColumns::Shared(b)) = (&first, &second) else {
             panic!("columns were not shared")
         };
-        assert!(Rc::ptr_eq(a, b));
+        assert!(Arc::ptr_eq(a, b));
         second.make_mut().inverse_steps.push(InverseStep::Descendants);
         second.make_mut().keys.push(DispatchKey::Universal);
         assert_eq!(first.inverse_steps, [InverseStep::Children]);
@@ -7232,7 +7233,7 @@ mod tests {
             cache.publish_sibling_sequence(vec![node, next_page], MatchEvaluationSide::OldFacts);
         assert_eq!(pages, 0);
         assert!(!published);
-        assert!(Rc::ptr_eq(&sequence, &reused));
+        assert!(Arc::ptr_eq(&sequence, &reused));
         assert_eq!(
             cache.sibling_position(node, MatchEvaluationSide::OldFacts, false),
             Some(position)
@@ -8270,11 +8271,11 @@ mod tests {
         let mut registry = RoutingRegistry::new();
         let before = registry.capacity_bytes();
 
-        let (changed, growth) = registry.route_liveness.get_mut().set(511, true);
+        let (changed, growth) = registry.route_liveness.set(511, true);
 
         assert!(changed);
         assert_eq!(registry.capacity_bytes() - before, growth);
-        assert_eq!(registry.route_liveness.get_mut().capacity_bytes(), growth);
+        assert_eq!(registry.route_liveness.capacity_bytes(), growth);
     }
 
     #[test]
@@ -8347,7 +8348,7 @@ mod tests {
         else {
             panic!("directories were not flattened");
         };
-        assert!(Rc::ptr_eq(a, b));
+        assert!(Arc::ptr_eq(a, b));
         second.push(key, RouteID::from_index(1));
         assert_eq!(first.get(key), &[RouteID::from_index(0)]);
         assert_eq!(second.get(key), &[RouteID::from_index(0), RouteID::from_index(1)]);
@@ -8507,7 +8508,7 @@ mod tests {
         let (SelectorEntryIDs::Explicit(first), SelectorEntryIDs::Explicit(second)) = (&fragmented, &cloned) else {
             panic!("fragmented entry identities need an explicit list");
         };
-        assert!(Rc::ptr_eq(first, second));
+        assert!(Arc::ptr_eq(first, second));
         assert_eq!(cloned.iter().collect::<Vec<_>>(), [EntryID(1), EntryID(4), EntryID(5)]);
         assert_eq!(SelectorEntryIDs::from_entries(Vec::new()).len(), 0);
     }
@@ -8583,7 +8584,7 @@ mod tests {
         ) else {
             panic!("replay selector programs must have process storage");
         };
-        assert!(Rc::ptr_eq(first_program, second_program));
+        assert!(Arc::ptr_eq(first_program, second_program));
         SHARED_SELECTOR_PROGRAMS.with_borrow(|shared| {
             assert_eq!(
                 shared.memory.bytes_in_category(MemoryCategory::RuleProgram),

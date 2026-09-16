@@ -1,0 +1,96 @@
+/*
+ * Copyright (c) 2024, Ali Mohammad Pur <mpfard@serenityos.org>
+ * Copyright (c) 2025, Ryszard Goc <ryszardgoc@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Noncopyable.h>
+#include <AK/Platform.h>
+#include <AK/Types.h>
+
+#if !defined(AK_OS_WINDOWS)
+#    include <pthread.h>
+#endif
+namespace AK {
+
+// TODO: Implement interprocess RWLocks. This needs a hand-rolled implementation for win32.
+class RWLock {
+    AK_MAKE_NONCOPYABLE(RWLock);
+    AK_MAKE_NONMOVABLE(RWLock);
+
+public:
+    enum class Mode : u8 {
+        Read,
+        Write,
+    };
+
+    RWLock();
+    ~RWLock();
+
+    bool try_lock_read();
+    bool try_lock_write();
+
+    // Recursively acquiring a RWLock is not supported
+    void lock_read();
+    void lock_write();
+
+    // NOTE: While the pthread api has one unlock method, the Win32 api has separate ones per lock mode
+    void unlock_read();
+    void unlock_write();
+
+private:
+#ifdef AK_OS_WINDOWS
+    using StorageType = void*;
+#else
+    using StorageType = pthread_rwlock_t;
+#endif
+
+    alignas(StorageType) unsigned char m_storage[sizeof(StorageType)];
+};
+
+template<RWLock::Mode mode>
+class RWLockLocker {
+    AK_MAKE_NONCOPYABLE(RWLockLocker);
+    AK_MAKE_NONMOVABLE(RWLockLocker);
+
+public:
+    ALWAYS_INLINE explicit RWLockLocker(RWLock& l)
+        : m_lock(l)
+    {
+        lock();
+    }
+
+    ALWAYS_INLINE ~RWLockLocker()
+    {
+        unlock();
+    }
+
+    ALWAYS_INLINE void unlock()
+    {
+        if constexpr (mode == RWLock::Mode::Read)
+            m_lock.unlock_read();
+        else
+            m_lock.unlock_write();
+    }
+
+    ALWAYS_INLINE void lock()
+    {
+        if constexpr (mode == RWLock::Mode::Read)
+            m_lock.lock_read();
+        else
+            m_lock.lock_write();
+    }
+
+private:
+    RWLock& m_lock;
+};
+
+}
+
+#if USING_AK_GLOBALLY
+using AK::RWLock;
+using AK::RWLockLocker;
+#endif

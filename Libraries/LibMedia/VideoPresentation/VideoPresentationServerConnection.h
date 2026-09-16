@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/HashMap.h>
+#include <AK/ThreadSafeWeakable.h>
 #include <LibIPC/ConnectionFromClient.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/PlaybackManager.h>
@@ -14,7 +15,6 @@
 #include <LibMedia/VideoPresentation/VideoPresentationClientEndpoint.h>
 #include <LibMedia/VideoPresentation/VideoPresentationServerEndpoint.h>
 #include <LibMedia/VideoSinkHandle.h>
-#include <LibSync/Weakable.h>
 
 namespace Media {
 
@@ -23,7 +23,7 @@ namespace Media {
 // the edge's shared-memory handles to the presentation client, and routes the consumer's demands to the pump.
 class MEDIA_API VideoPresentationServerConnection final
     : public IPC::ConnectionFromClient<VideoPresentationClientEndpoint, VideoPresentationServerEndpoint>
-    , public Sync::Weakable<VideoPresentationServerConnection> {
+    , public ThreadSafeWeakable<VideoPresentationServerConnection> {
     C_OBJECT(VideoPresentationServerConnection);
 
 public:

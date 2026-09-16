@@ -133,7 +133,7 @@ fn custom_property_value_is_engine_resolvable(value: &StyleValueData) -> bool {
     )
 }
 
-impl StyleEngineState {
+impl RetainedState {
     /// Hand each of a node's element-target matches, with the cascade inputs its priority is
     /// computed from, to `visit`, stopping when it breaks. `None` when the node has no answer to read.
     fn try_for_each_element_match(
@@ -462,11 +462,11 @@ impl StyleEngineState {
             return Some(parent_environment);
         }
         let registry = inputs.custom_property_registry;
-        if registry.is_null() {
+        if registry.is_none() {
             counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
             return None;
         }
-        let registry_ref = unsafe { &*registry.cast::<CustomPropertyRegistry>() };
+        let registry_ref = unsafe { &*registry.as_pointer().cast::<CustomPropertyRegistry>() };
         if registry_ref.has_registrations() {
             counters.bump(Counter::EngineCustomPropertyEnvironmentBails);
             return None;
@@ -523,7 +523,8 @@ impl StyleEngineState {
         let cascaded_store = unsafe { CustomPropertyStore::cascaded_child(parent_store, values) };
         let mut random_function_index = 0_usize;
         let parse_context = registry_ref.parse_context(&mut random_function_index);
-        let resolution_context = engine_resolution_context(&parse_context, cascaded_store, parent_store, registry);
+        let resolution_context =
+            engine_resolution_context(&parse_context, cascaded_store, parent_store, registry.as_pointer());
         let mut finalizer = EngineFinalizer { parent_store };
         let drive = FfiCustomPropertyDriveInput {
             store: cascaded_store,
@@ -582,7 +583,7 @@ impl StyleEngineState {
             return None;
         };
         let registry = inputs.custom_property_registry;
-        if registry.is_null() {
+        if registry.is_none() {
             counters.bump(Counter::EngineComputedRecordBailSubstitution);
             return None;
         }
@@ -600,7 +601,7 @@ impl StyleEngineState {
                 store
             }
         };
-        let registry_ref = unsafe { &*registry.cast::<CustomPropertyRegistry>() };
+        let registry_ref = unsafe { &*registry.as_pointer().cast::<CustomPropertyRegistry>() };
         let mut random_function_index = 0_usize;
         let mut parse_context = registry_ref.parse_context(&mut random_function_index);
         parse_context.in_quirks_mode = inputs.in_quirks_mode;
@@ -616,7 +617,7 @@ impl StyleEngineState {
             crate::css::custom_properties::resolve_vars(
                 store,
                 std::ptr::null(),
-                registry,
+                registry.as_pointer(),
                 Some(&parse_context),
                 None,
                 None,

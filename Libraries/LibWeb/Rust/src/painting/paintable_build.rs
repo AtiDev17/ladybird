@@ -9,6 +9,7 @@ use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::{DomPaintFact, NodeKind, NodeSlotId};
 use crate::layout::{formatting_context, fragment_tree, node_facts, used_values};
 use crate::painting::node_painting;
+use crate::painting::record::damage::PaintDamage;
 use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
 
 #[derive(Clone, Copy, Debug)]
@@ -129,7 +130,6 @@ impl<'a> PaintableCommit<'a> {
             if row_existed_before_this_commit {
                 let reset = {
                     let arena = self.arena();
-                    arena.invalidate_paint_cache(node);
                     arena
                         .prepare_paintable_row_cleared_reset(node)
                         .expect("live row for node could not be cleared")
@@ -163,7 +163,7 @@ impl<'a> PaintableCommit<'a> {
             let inline_paint_changed = enclosing_line_root_changes.inline_content_changed
                 || (enclosing_line_root_changes.fragment_changed && has_descendant_dependent_paint(self.arena(), node));
             if row_existed_before_this_commit && inline_paint_changed {
-                self.arena().paintable_rows().mark_paint_cache_self_dirty(node);
+                self.arena().push_paint_damage(node, PaintDamage::ALL_PRODUCERS);
             }
             if row_existed_before_this_commit && enclosing_line_root_changes.fragment_changed {
                 self.arena()
@@ -228,6 +228,7 @@ impl<'a> PaintableCommit<'a> {
         let mut own_paint_unchanged = false;
         let mut child_placements_unchanged = false;
         let mut inline_content_unchanged = false;
+        let mut child_sequence_unchanged = false;
         let (old_identity, old_content_size) = self.arena().with_committed_fragment_link(node, |old_link| {
             old_link.map_or((0, used_values::FfiCssPixelSize::default()), |old_link| {
                 let previous = &old_link.fragment;
@@ -235,12 +236,14 @@ impl<'a> PaintableCommit<'a> {
                     own_paint_unchanged = true;
                     child_placements_unchanged = true;
                     inline_content_unchanged = true;
+                    child_sequence_unchanged = true;
                 } else {
                     inline_content_unchanged = same_inline_content(fragment, previous);
                     own_paint_unchanged = inline_content_unchanged
                         && fragment.has_same_box_properties(previous)
                         && !has_descendant_dependent_paint(self.arena(), node);
                     child_placements_unchanged = fragment.has_same_child_placements(previous);
+                    child_sequence_unchanged = fragment.has_same_child_sequence(previous);
                 }
                 own_paint_unchanged &= old_link.has_same_placement(link);
                 (
@@ -263,6 +266,11 @@ impl<'a> PaintableCommit<'a> {
             content_size_change = Some((old_content_size, new_content_size));
         }
         let committed_fragment_identity_changed = old_identity != fragment.identity;
+        // Inserted, removed or reordered children change which scopes this row's plans list,
+        // independently of where the children were placed.
+        if !child_sequence_unchanged {
+            self.arena().push_paint_damage(node, PaintDamage::ORDER);
+        }
         let painted_geometry_lives_in_enclosing_line_root = {
             let data = self.arena().data(node);
             node_facts::node_is_fragmented_inline(data, node_facts::node_style_view(data))
@@ -293,20 +301,14 @@ impl<'a> PaintableCommit<'a> {
                 .line_data
                 .as_ref()
                 .is_none_or(|content| content.fragments.is_empty());
-        // Equality only avoids adding dirtiness; it never clears a pending style/content repaint.
-        if !own_paint_unchanged
-            || !paint_offset_unchanged
-            || enclosing_inline_paint_changed
-            || empty_editable_children_changed
-        {
-            self.arena().paintable_rows().mark_paint_cache_self_dirty(node);
-        } else if !child_placements_unchanged {
-            // Rebuild captures containing inserted, removed or reordered children, while
-            // retaining the box's own commands. Changed child output propagates separately.
-            self.arena()
-                .paintable_rows()
-                .mark_descendant_subtree_caches_dirty_along_paint_chain(node);
+        let mut damage = PaintDamage::NONE;
+        if !own_paint_unchanged || enclosing_inline_paint_changed || empty_editable_children_changed {
+            damage |= PaintDamage::ALL_PRODUCERS;
         }
+        if !paint_offset_unchanged {
+            damage |= PaintDamage::MOVED;
+        }
+        self.arena().push_paint_damage(node, damage);
         if !offset_unchanged {
             self.arena()
                 .note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::MovedWithDescendants);
@@ -403,6 +405,7 @@ impl<'a> PaintableCommit<'a> {
         data.containing_block = containing_block;
         if containing_block_changed {
             paintable_rows.note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::ContainingBlockChanged);
+            paintable_rows.push_paint_damage(node, PaintDamage::MOVED);
         }
     }
 

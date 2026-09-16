@@ -8,13 +8,13 @@
 
 #include <AK/Atomic.h>
 #include <AK/Math.h>
+#include <AK/Mutex.h>
 #include <AK/ScopeGuard.h>
 #include <AK/SourceLocation.h>
 #include <AK/Vector.h>
 #include <AK/kmalloc.h>
 #include <LibCore/ThreadedPromise.h>
 #include <LibMedia/Audio/PlaybackStreamAudioUnit.h>
-#include <LibSync/Mutex.h>
 
 #include <AudioToolbox/AudioFormat.h>
 #include <AudioUnit/AudioUnit.h>
@@ -212,7 +212,7 @@ public:
 
     void queue_task(AudioTask task)
     {
-        Sync::MutexLocker lock(m_task_queue_mutex);
+        MutexLocker lock(m_task_queue_mutex);
         m_task_queue.append(move(task));
         m_task_queue_is_empty = false;
     }
@@ -243,7 +243,7 @@ private:
         if (m_task_queue_is_empty.load())
             return {};
 
-        Sync::MutexLocker lock(m_task_queue_mutex);
+        MutexLocker lock(m_task_queue_mutex);
 
         m_task_queue_is_empty = m_task_queue.size() == 1;
         return m_task_queue.take_first();
@@ -324,7 +324,7 @@ private:
     AudioComponentInstance m_audio_unit { nullptr };
     SampleSpecification m_sample_specification;
 
-    Sync::Mutex m_task_queue_mutex;
+    Mutex m_task_queue_mutex;
     Vector<AudioTask, 4> m_task_queue;
     Atomic<bool> m_task_queue_is_empty { true };
 

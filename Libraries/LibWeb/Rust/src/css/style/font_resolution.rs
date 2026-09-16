@@ -25,7 +25,7 @@ struct FontResolutionKey {
 impl FontResolutionKey {
     fn new(request: FfiFontResolutionRequest) -> Self {
         Self {
-            font_family: request.font_family as usize,
+            font_family: request.font_family.address,
             font_size_raw: request.font_size_raw,
             font_slope: request.font_slope,
             font_weight: request.font_weight.to_bits(),
@@ -43,36 +43,48 @@ pub(super) struct FontRequest {
 
 impl FontRequest {
     pub fn new(ffi: FfiFontResolutionRequest) -> Self {
-        let family =
-            unsafe { RetainedStyleValueData::from_retained_pointer(retain_style_value(ffi.font_family.cast())) };
+        let family = unsafe {
+            RetainedStyleValueData::from_retained_pointer(retain_style_value(ffi.font_family.as_pointer().cast()))
+        };
         Self { ffi, family }
     }
 }
 
+/// One reference to a host `Gfx::FontCascadeList`, held so the list the engine names stays alive
+/// while a resolution names it.
+struct SharedFontCascadeList(#[expect(dead_code, reason = "held for the reference it owns")] FontCascadeListHandle);
+
+// SAFETY: An evaluation step reaches this type only through `&FontResolutionCache`, and `lookup`
+// copies the `FfiResolvedFont` out without ever naming the handle, so no worker can move or drop
+// one. That is exactly `Sync` and deliberately not `Send`: the handle is borrowed by a walk,
+// never given to it. What matters is which thread performs the *final* release, because that runs
+// `~FontCascadeList` and drops non-atomically counted `Gfx::Font` references. This handle is the
+// reason it is never a worker: the cache holds one reference per cached resolution for the whole
+// font-environment generation, taken here and given up only in `FontResolutionCache::prepare` or
+// when the cache is dropped - a host round on the engine's thread. A step that builds a font
+// style group takes a second reference to the same list (`build_font_group` in
+// `table_group_builder.rs`) and may give it up again when the rebuilt payload is canonicalized
+// away; `Gfx::FontCascadeList` is `AtomicRefCounted` so that pair is safe, and the reference held
+// here is what keeps it from ever reaching zero on a worker.
+unsafe impl Sync for SharedFontCascadeList {}
+
 struct ResolvedFont {
     // Keep the family alive for the pointer identity in the cache key.
     _font_family: RetainedStyleValueData,
-    _font_cascade_list: Option<FontCascadeListHandle>,
+    _font_cascade_list: Option<SharedFontCascadeList>,
     ffi: FfiResolvedFont,
 }
 
-pub(super) struct FontResolver {
-    context: *mut c_void,
-    resolve: ResolveFontCallback,
+/// The resolutions this document has already been given, keyed by content and scoped to one
+/// font-environment generation. This is retained engine state: an evaluation step reads it and
+/// never calls the host.
+#[derive(Default)]
+pub(super) struct FontResolutionCache {
     generation: Option<u64>,
     cache: HashMap<FontResolutionKey, ResolvedFont>,
 }
 
-impl FontResolver {
-    pub fn new(context: *mut c_void, resolve: ResolveFontCallback) -> Self {
-        Self {
-            context,
-            resolve,
-            generation: None,
-            cache: HashMap::default(),
-        }
-    }
-
+impl FontResolutionCache {
     pub fn prepare(&mut self, generation: u64) {
         if self.generation != Some(generation) {
             self.cache.clear();
@@ -89,15 +101,11 @@ impl FontResolver {
             .map(|resolved| resolved.ffi)
     }
 
-    /// Service a synchronous request between evaluation passes. Pending web faces remain in
-    /// the returned cascade and retain the host's rendering-triggered loading behavior.
-    pub fn refill(&mut self, request: FontRequest) {
-        self.prepare(request.ffi.font_environment_generation);
-        let ffi = unsafe { (self.resolve)(self.context, request.ffi) };
+    fn insert(&mut self, request: FontRequest, ffi: FfiResolvedFont) {
         // A null result is a completed, unsupported host resolution, not another cache miss.
-        let font_cascade_list = (!ffi.font_cascade_list.is_null()).then(|| {
+        let font_cascade_list = (!ffi.font_cascade_list.is_none()).then(|| {
             // SAFETY: The callback transfers one reference to a live list.
-            unsafe { FontCascadeListHandle::adopt(ffi.font_cascade_list) }
+            SharedFontCascadeList(unsafe { FontCascadeListHandle::adopt(ffi.font_cascade_list.as_pointer()) })
         });
         self.cache.insert(
             FontResolutionKey::new(request.ffi),
@@ -107,6 +115,27 @@ impl FontResolver {
                 ffi,
             },
         );
+    }
+}
+
+/// The host's synchronous font resolver. This is host state: it holds a C++ context pointer and
+/// the callback into it, and only a round between evaluation passes may call it.
+pub(super) struct FontResolverHost {
+    context: *mut c_void,
+    resolve: ResolveFontCallback,
+}
+
+impl FontResolverHost {
+    pub fn new(context: *mut c_void, resolve: ResolveFontCallback) -> Self {
+        Self { context, resolve }
+    }
+
+    /// Service a synchronous request between evaluation passes. Pending web faces remain in
+    /// the returned cascade and retain the host's rendering-triggered loading behavior.
+    pub fn refill(&self, cache: &mut FontResolutionCache, request: FontRequest) {
+        cache.prepare(request.ffi.font_environment_generation);
+        let ffi = unsafe { (self.resolve)(self.context, request.ffi) };
+        cache.insert(request, ffi);
     }
 }
 
@@ -122,8 +151,8 @@ mod tests {
     unsafe extern "C" fn resolve_font(_context: *mut c_void, _request: FfiFontResolutionRequest) -> FfiResolvedFont {
         RESOLVES.fetch_add(1, Ordering::Relaxed);
         FfiResolvedFont {
-            first_available_font: std::ptr::dangling(),
-            font_cascade_list: std::ptr::dangling(),
+            first_available_font: crate::css::style::bridge::FfiHostHandle::from_pointer(std::ptr::dangling()),
+            font_cascade_list: crate::css::style::bridge::FfiHostHandle::from_pointer(std::ptr::dangling()),
             ..Default::default()
         }
     }
@@ -133,9 +162,10 @@ mod tests {
         RESOLVES.store(0, Ordering::Relaxed);
         let unrefs_before = font_cascade_list_unref_count();
         let family = RetainedStyleValueData::from_owned(StyleValueData::Keyword { keyword: 1 });
-        let mut resolver = FontResolver::new(std::ptr::null_mut(), resolve_font);
+        let host = FontResolverHost::new(std::ptr::null_mut(), resolve_font);
+        let mut resolver = FontResolutionCache::default();
         let mut request = FfiFontResolutionRequest {
-            font_family: family.pointer().cast(),
+            font_family: crate::css::style::bridge::FfiHostHandle::from_pointer(family.pointer().cast()),
             font_size_raw: 1024,
             font_slope: 0,
             font_weight: 400.0,
@@ -147,7 +177,7 @@ mod tests {
         resolver.prepare(1);
         assert!(resolver.lookup(request).is_none());
         assert_eq!(RESOLVES.load(Ordering::Relaxed), 0);
-        resolver.refill(FontRequest::new(request));
+        host.refill(&mut resolver, FontRequest::new(request));
         let first = resolver.lookup(request).unwrap();
         assert_eq!(
             resolver.lookup(request).unwrap().font_cascade_list,
@@ -160,7 +190,7 @@ mod tests {
         assert!(resolver.lookup(request).is_none());
         resolver.prepare(2);
         assert_eq!(font_cascade_list_unref_count(), unrefs_before + 1);
-        resolver.refill(FontRequest::new(request));
+        host.refill(&mut resolver, FontRequest::new(request));
         resolver.lookup(request).unwrap();
         assert_eq!(RESOLVES.load(Ordering::Relaxed), 2);
         assert_eq!(font_cascade_list_unref_count(), unrefs_before + 1);
@@ -176,7 +206,7 @@ mod tests {
         }
         let family = RetainedStyleValueData::from_owned(StyleValueData::Keyword { keyword: 1 });
         let request = FfiFontResolutionRequest {
-            font_family: family.pointer().cast(),
+            font_family: crate::css::style::bridge::FfiHostHandle::from_pointer(family.pointer().cast()),
             font_size_raw: 1024,
             font_slope: 0,
             font_weight: 400.0,
@@ -184,14 +214,15 @@ mod tests {
             font_optical_sizing: 0,
             font_environment_generation: 1,
         };
-        let mut resolver = FontResolver::new(std::ptr::null_mut(), unavailable);
+        let host = FontResolverHost::new(std::ptr::null_mut(), unavailable);
+        let mut resolver = FontResolutionCache::default();
         resolver.prepare(1);
         let owned = FontRequest::new(request);
         drop(family);
         assert!(resolver.lookup(request).is_none());
-        resolver.refill(owned);
-        assert!(resolver.lookup(request).unwrap().font_cascade_list.is_null());
-        assert!(resolver.lookup(request).unwrap().font_cascade_list.is_null());
+        host.refill(&mut resolver, owned);
+        assert!(resolver.lookup(request).unwrap().font_cascade_list.is_none());
+        assert!(resolver.lookup(request).unwrap().font_cascade_list.is_none());
         // A failed synchronous result must not cause an endless refill loop.
         let next = FfiFontResolutionRequest {
             font_environment_generation: 2,

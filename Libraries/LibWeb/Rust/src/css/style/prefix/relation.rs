@@ -132,7 +132,7 @@ impl<T> ShallowCapacityBytes for PrefixMembership<T> {
 }
 
 pub(in crate::css::style) struct PrefixRelation {
-    program: std::rc::Rc<PrefixRelationProgram>,
+    program: std::sync::Arc<PrefixRelationProgram>,
     // Membership positions are stable slots. Inserting or removing a node does not renumber
     // unrelated matches; retired slots are reused only after their memberships are removed.
     nodes: Vec<StyleNodeID>,
@@ -168,9 +168,9 @@ impl PrefixRelation {
         let mut scalar = PrefixStates::new();
         let mut counters = Counters::default();
         let mut context = if evaluation.facts_are_composite() {
-            super::PrefixTransitionContext::new_composite(&mut scalar, evaluation.facts, &[], &mut counters)
+            super::PrefixTransitionContext::new_composite(&mut scalar, evaluation.facts, &[])
         } else {
-            super::PrefixTransitionContext::new(&mut scalar, evaluation.automaton, evaluation.facts, &mut counters)
+            super::PrefixTransitionContext::new(&mut scalar, evaluation.facts)
         };
         for (position, &node) in self.nodes.iter().enumerate() {
             if !self.live[position] {
@@ -579,10 +579,13 @@ impl PrefixRelation {
             keys.dedup();
             let store = std::ptr::from_ref(row.facts);
             let facts = local_facts.entry(store).or_insert_with(LocalFactStore::new);
-            let identity = facts
-                .interner
-                .intern(row.facts, row.row, &automaton.local_fact_dependencies, counters)
-                as usize;
+            let identity = facts.interner.intern(
+                &mut facts.representatives,
+                row.facts,
+                row.row,
+                &automaton.local_fact_dependencies,
+                counters,
+            ) as usize;
             let identity = facts.dense_identity(identity, &mut next_local_identity);
             let is_root = evaluation.tree.parent(node).is_none();
             for key in &keys {
@@ -1053,10 +1056,16 @@ impl PrefixAutomaton {
             .enumerate()
             .map(|(position, row)| {
                 let store = std::ptr::from_ref(row.facts);
-                let identity = local_facts
+                let (interner, representatives) = local_facts
                     .entry(store)
-                    .or_insert_with(super::LocalFactInterner::new)
-                    .intern(row.facts, row.row, &self.local_fact_dependencies, counters);
+                    .or_insert_with(|| (super::LocalFactInterner::new(), Default::default()));
+                let identity = interner.intern(
+                    representatives,
+                    row.facts,
+                    row.row,
+                    &self.local_fact_dependencies,
+                    counters,
+                );
                 let next = identities.len();
                 *identities
                     .entry((store, identity, parents[position] == usize::MAX))
@@ -1211,7 +1220,7 @@ impl PrefixAutomaton {
             entries.sort_unstable();
             entries.dedup();
         }
-        let program = std::rc::Rc::clone(self.relation_program.get_or_init(|| {
+        let program = std::sync::Arc::clone(self.relation_program.get_or_init(|| {
             // Pack compounds with the same dispatch key into one immutable array. Preserve their
             // original order within each key without retaining a separate allocation for each list.
             let mut keyed_compounds: Vec<u32> = (0..self.compounds.len())
@@ -1278,7 +1287,7 @@ impl PrefixAutomaton {
             RELATION_PROGRAM_MEMORY.with_borrow_mut(|memory| {
                 program.memory.resize_required_to(memory, program.capacity_bytes());
             });
-            std::rc::Rc::new(program)
+            std::sync::Arc::new(program)
         }));
         let mut relation = PrefixRelation {
             program,
@@ -1364,6 +1373,7 @@ impl PrefixWalkMemo {
 /// store so that a memo entry names a compound result with a single integer.
 struct LocalFactStore {
     interner: super::LocalFactInterner,
+    representatives: super::super::intern_table::InternTable<super::LocalFactSlot, (u32, u32)>,
     dense: Vec<u32>,
 }
 
@@ -1371,6 +1381,7 @@ impl LocalFactStore {
     fn new() -> Self {
         Self {
             interner: super::LocalFactInterner::new(),
+            representatives: Default::default(),
             dense: Vec::new(),
         }
     }

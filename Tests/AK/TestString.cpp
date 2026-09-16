@@ -11,12 +11,14 @@
 
 #include <LibTest/TestCase.h>
 
+#include <AK/Array.h>
 #include <AK/MemoryStream.h>
 #include <AK/StringBuilder.h>
 #include <AK/Try.h>
 #include <AK/Utf16View.h>
 #include <AK/Utf8View.h>
 #include <AK/Vector.h>
+#include <LibThreading/Thread.h>
 #include <ctype.h>
 
 TEST_CASE(short_ascii_literal_is_constexpr)
@@ -248,6 +250,57 @@ TEST_CASE(substring_with_shared_superstring)
 
     auto substring2 = MUST(superstring.substring_from_byte_offset_with_shared_superstring(0, 10));
     EXPECT_EQ(substring2, "Hello I am"sv);
+}
+
+TEST_CASE(copies_on_several_threads_keep_an_exact_reference_count)
+{
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto string = "Hello I am a long string"_string;
+
+    Vector<NonnullRefPtr<Threading::Thread>> threads;
+    for (size_t i = 0; i < 8; ++i) {
+        auto thread = Threading::Thread::construct("StringCopier"sv, [&string]() {
+            Vector<String> copies;
+            copies.ensure_capacity(1000);
+            for (size_t batch = 0; batch < 1000; ++batch) {
+                for (size_t copy = 0; copy < 1000; ++copy)
+                    copies.unchecked_append(string);
+                copies.clear_with_capacity();
+            }
+            return 0;
+        });
+        thread->start();
+        threads.append(move(thread));
+    }
+    for (auto& thread : threads)
+        (void)thread->join();
+
+    // One reference belongs to the string itself, and one to the raw value we read it through.
+    auto raw = string.to_raw_leaked();
+    EXPECT_EQ(bit_cast<AK::Detail::StringData const*>(raw)->ref_count(), 2u);
+    String::unref_raw(raw);
+}
+
+// Only ThreadSanitizer can catch a regression here, since every thread computes and caches the same hash.
+TEST_CASE(hash_one_string_on_several_threads)
+{
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto string = "Hello I am a long string that nobody has hashed yet"_string;
+    auto expected_hash = "Hello I am a long string that nobody has hashed yet"_string.hash();
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Array<unsigned, 8> hashes {};
+    Vector<NonnullRefPtr<Threading::Thread>> threads;
+    for (size_t i = 0; i < hashes.size(); ++i) {
+        auto thread = Threading::Thread::construct("StringHasher"sv, [&string, &hashes, i]() {
+            hashes[i] = string.hash();
+            return 0;
+        });
+        thread->start();
+        threads.append(move(thread));
+    }
+    for (auto& thread : threads)
+        (void)thread->join();
+
+    for (auto hash : hashes)
+        EXPECT_EQ(hash, expected_hash);
 }
 
 TEST_CASE(code_points)

@@ -8,13 +8,13 @@
 
 #include <AK/Atomic.h>
 #include <AK/AtomicRefCounted.h>
+#include <AK/ConditionVariable.h>
 #include <AK/Function.h>
 #include <AK/HashTable.h>
+#include <AK/Mutex.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/Vector.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
 #include <LibThreading/Thread.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/WebAudio/ControlMessageQueue.h>
@@ -83,8 +83,8 @@ private:
     Function<void(double)> m_on_suspended;
     Function<void(Vector<NodeID> const&)> m_on_sources_ended;
 
-    Sync::Mutex m_suspend_mutex;
-    Sync::ConditionVariable m_resume_signal { m_suspend_mutex };
+    Mutex m_suspend_mutex;
+    ConditionVariable m_resume_signal { m_suspend_mutex };
     HashTable<u64> m_suspend_frames;
 
     // The next render quantum boundary at which the rendering thread will look for a scheduled suspension. It is

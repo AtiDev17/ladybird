@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <AK/ConditionVariable.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
+#include <AK/Mutex.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/RefCounted.h>
@@ -15,8 +17,6 @@
 #include <AK/Vector.h>
 #include <LibCore/Forward.h>
 #include <LibDatabase/Forward.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
 #include <LibThreading/Thread.h>
 #include <LibWebView/Autocomplete.h>
 #include <LibWebView/Export.h>
@@ -70,8 +70,8 @@ private:
     HashMap<ClientID, NonnullRefPtr<Client>> m_clients;
     ClientID m_next_client_id { 0 };
 
-    Sync::Mutex m_worker_mutex;
-    Sync::ConditionVariable m_worker_condition { m_worker_mutex };
+    Mutex m_worker_mutex;
+    ConditionVariable m_worker_condition { m_worker_mutex };
     HashMap<ClientID, Query> m_active_queries;
     Vector<Query> m_pending_queries;
     Optional<Vector<AutocompleteBookmark>> m_pending_bookmarks;

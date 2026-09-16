@@ -6,7 +6,7 @@
 
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use super::StyleEngine;
 use super::batch_matcher::AncestorRequirements;
@@ -313,7 +313,7 @@ fn exact_matches(engine: &mut StyleEngine, node: StyleNodeID) -> Vec<RuleMatch> 
 }
 
 fn retained_matches(engine: &mut StyleEngine, node: StyleNodeID) -> Option<Vec<RuleMatch>> {
-    let retained = Rc::clone(engine.retained_match_answer(node).sparse().ok()?);
+    let retained = Arc::clone(engine.retained_match_answer(node).sparse().ok()?);
     if !matches!(
         engine.retained_match_answers.cascade_input_lookup(node),
         Lookup::Known(_)
@@ -414,9 +414,9 @@ fn style_record_for_winners(engine: &mut StyleEngine, winners: &[PropertyWinner]
                 dependency_flags,
                 counter_style_environment_identity: 0,
                 animation_overlay_identity: 0,
-                animated_overlay: std::ptr::null(),
+                animated_overlay: crate::css::host_shared::HostShared::null(),
                 animation_overlay_payloads: &[],
-                longhand_table: std::ptr::null(),
+                longhand_table: crate::css::host_shared::HostShared::null(),
             },
         )
         .style_record_identity
@@ -683,7 +683,7 @@ fn incomplete_answer_batches_preserve_pending_lookups_and_release_ownership() {
             })
             .collect();
         for &node in &nodes {
-            let state = &mut workload.engine.state;
+            let state = &mut workload.engine.state.retained;
             state.retained_match_answers.forget(&mut state.match_answers, node);
             state.winner_groups.remove(node);
         }
@@ -735,7 +735,7 @@ fn incomplete_answer_batches_preserve_pending_lookups_and_release_ownership() {
             //     installing the pending prefix before this completion call resumes it.
             let node = nodes[2];
             let node_index = workload.nodes.iter().position(|&candidate| candidate == node).unwrap();
-            let state = &mut workload.engine.state;
+            let state = &mut workload.engine.state.retained;
             state.facts.set_tag(node, tag_atom(node), &mut state.memory);
             for &class in &workload.classes[node_index] {
                 state.facts.set_class(node, class_atom(class), true, &mut state.memory);

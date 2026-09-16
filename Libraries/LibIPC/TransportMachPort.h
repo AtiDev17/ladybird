@@ -13,6 +13,8 @@
 #endif
 
 #include <AK/Atomic.h>
+#include <AK/ConditionVariable.h>
+#include <AK/Mutex.h>
 #include <AK/Queue.h>
 #include <AK/RefPtr.h>
 #include <AK/Vector.h>
@@ -23,8 +25,6 @@
 #include <LibIPC/Forward.h>
 #include <LibIPC/ReceivedMessageBytes.h>
 #include <LibIPC/TransportHandle.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
 #include <LibThreading/Thread.h>
 
 namespace IPC {
@@ -116,15 +116,15 @@ private:
     Atomic<bool> m_peer_eof { false };
 
     Vector<PendingMessage> m_pending_send_messages;
-    Sync::Mutex m_send_mutex;
-    Sync::ConditionVariable m_sent_cv { m_send_mutex };
+    Mutex m_send_mutex;
+    ConditionVariable m_sent_cv { m_send_mutex };
     // True while the IO thread is sending a batch it has already taken off m_pending_send_messages.
     bool m_send_in_progress { false };
     bool m_send_waiters_released { false };
     Vector<u8> m_send_buffer;
 
-    Sync::Mutex m_incoming_mutex;
-    Sync::ConditionVariable m_incoming_cv { m_incoming_mutex };
+    Mutex m_incoming_mutex;
+    ConditionVariable m_incoming_cv { m_incoming_mutex };
     Vector<NonnullOwnPtr<Message>> m_incoming_messages;
     u64 m_receive_barriers_sent { 0 };
     u64 m_receive_barriers_received { 0 };

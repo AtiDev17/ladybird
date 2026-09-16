@@ -10,7 +10,7 @@ use std::rc::Rc;
 pub(crate) struct PendingRecording {
     pub(crate) recording: crate::painting::record::RecordingResult,
     pub(crate) recording_from_scratch: Option<crate::painting::record::RecordingResult>,
-    pub(crate) paint_command_cache_read_write: bool,
+    pub(crate) publishes_recording: bool,
 }
 
 pub(crate) struct PendingRecordingTrace {
@@ -28,8 +28,11 @@ pub struct PaintState {
     pub(crate) hit_test_list: Option<crate::painting::hit_test::HitTestList>,
     pub(crate) hit_test_list_generation: u64,
     pub(crate) last_recording: Option<Rc<crate::painting::record::RecordingOutput>>,
-    pub(crate) paint_command_cache_source: Option<Rc<crate::painting::record::RecordingOutput>>,
-    pub(crate) hit_test_item_cache_source: Option<Rc<crate::painting::record::cache::HitTestItemCacheSource>>,
+    pub(crate) published_frame: Option<Rc<crate::painting::record::RecordingOutput>>,
+    pub(crate) published_hit_test_items: Option<Rc<crate::painting::record::PublishedHitTestItems>>,
+    // The paint-order tree describing the published frame; a recording appends to it and
+    // publication or discarding decides what stays.
+    pub(crate) paint_order_tree: std::cell::RefCell<crate::painting::record::order_tree::PaintOrderTree>,
     pub(crate) selection: Option<crate::painting::selection::SelectionRange>,
     pub(crate) selection_pseudo_styles:
         std::collections::HashMap<NodeSlotId, Rc<crate::painting::record::paint::text::SelectionStyleAnswer>>,
@@ -47,11 +50,16 @@ impl PaintState {
         if previous == source {
             return false;
         }
-        // Propagation changes which box paints the body's background. Invalidate both
-        // the old and new owners, including inline pieces cached by their containing block.
+        use crate::painting::record::damage::PaintDamage;
+        // Propagation changes which box paints the body's background. Push both the old
+        // and new owners, including inline pieces painted by their containing block.
         for source in [previous, source] {
             for slot in [source.root_layout_node, source.body_layout_node] {
-                arena.invalidate_for_repaint(slot);
+                arena.push_paint_damage_for_repaint(slot, PaintDamage::DRAW_BACKGROUND);
+            }
+            // The viewport's scrollbars take their colors from the propagated background.
+            if let Some(viewport) = arena.node_parent_if_live(source.root_layout_node) {
+                arena.push_paint_damage(viewport, PaintDamage::DRAW_OVERLAY | PaintDamage::SCROLL_METADATA);
             }
         }
         true

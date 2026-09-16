@@ -6,12 +6,15 @@
 
 use crate::painting::record::trace::{Observer, Operation};
 
+pub(crate) mod assemble;
 pub mod async_scroll_metadata;
-pub mod cache;
-pub(crate) mod cache_compatibility;
+pub(crate) mod damage;
+pub(crate) mod frame_inputs;
 pub mod hit_test_items;
 pub(crate) mod inputs;
+pub(crate) mod order_tree;
 pub mod paint;
+pub(crate) mod producers;
 pub(crate) mod publish;
 pub(crate) mod resources;
 pub(crate) mod scratch;
@@ -22,18 +25,20 @@ pub(crate) mod vector_images;
 pub(crate) mod verify;
 
 use crate::css::css_enums;
+use crate::css::css_pixels::CssPixelRect;
+use crate::css::style::fast_hash::FastSet;
 use crate::layout::node_data::NodeSlotId;
 use crate::layout::node_data::{NodeFlag, NodeKind};
 use crate::painting::border_radii::BorderRadii;
-use crate::painting::display_list::builder::{CommandRange, PendingInlineClip, RecordedDisplayList};
+use crate::painting::display_list::builder::{PendingInlineClip, RecordedDisplayList};
 use crate::painting::display_list::commands::{ContextRef, SpatialNodeIndex};
 use crate::painting::display_list::device_pixels::DevicePixelConverter;
 use crate::painting::display_list::recorder::DisplayListRecorder;
+use crate::painting::hit_test::HitTestItem;
 use crate::painting::hit_test::HitTestList;
 use crate::painting::paintable_data::{InlineBoxPieceRecord, PaintableData};
 use crate::painting::paintable_rows::PaintableRowsRef;
-use crate::painting::record::cache::{OpenCapture, PendingPaintCacheUpdates, RecordGen};
-use crate::painting::record::cache_compatibility::{PaintCacheCompatibility, PaintCacheInputs};
+use crate::painting::record::frame_inputs::FrameInputs;
 use crate::painting::record::svg_resources::SvgResourceWalk;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -43,19 +48,28 @@ pub(crate) use inputs::RecordingInputs;
 #[derive(Default)]
 pub struct RecordingOutput {
     pub recorded_structural_epoch: u64,
-    pub(crate) cache_inputs: PaintCacheInputs,
+    pub(crate) frame_inputs: FrameInputs,
+    // The area the root background painted: the viewport united with the root's overflow. Only
+    // the root's background reads it, so a change pushes that producer instead of a new frame.
+    pub(crate) root_background_canvas_rect: CssPixelRect,
+    // The bytes before the viewport's scope: the canvas, recorded outside the tree.
+    pub(crate) prologue_bytes: u32,
     pub hit_test_list: HitTestList,
     pub display_list: Arc<RecordedDisplayList>,
     pub has_blocking_wheel_event_listeners: bool,
     pub wheel_event_listener_state_generation: u64,
-    pub is_identical_to_cache_source: bool,
+    pub is_identical_to_published_frame: bool,
     pub(crate) capture_log_for_verification: Option<verify::CaptureLog>,
 }
 
 pub(crate) struct RecordingResult {
     pub(crate) output: RecordingOutput,
     pub(crate) resources: resources::RecordingResourceManifest,
-    pub(crate) cache_updates: PendingPaintCacheUpdates,
+}
+
+/// The hit-test items of the published frame, shared with the list that hit testing reads.
+pub struct PublishedHitTestItems {
+    pub items: Rc<Vec<HitTestItem>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -76,12 +90,6 @@ impl PaintPhase {
         1 << self as u8
     }
 }
-pub(crate) struct DeferredWholeTapeSplice {
-    pub(crate) source_display_list: Arc<RecordedDisplayList>,
-    pub(crate) prologue_byte_count: usize,
-    pub(crate) source_range: CommandRange,
-}
-
 pub struct PaintRecorder<'a, O: Observer> {
     pub(crate) layout_arena: &'a PaintableRowsRef<'a>,
     pub(crate) paint_state: &'a crate::painting::paint_state::PaintState,
@@ -90,19 +98,20 @@ pub struct PaintRecorder<'a, O: Observer> {
     pub(crate) converter: DevicePixelConverter,
     pub(crate) svg_resource_walk: Option<SvgResourceWalk>,
     pub(crate) viewport: NodeSlotId,
-    command_cache_source: Option<Rc<RecordingOutput>>,
-    item_cache_source: Option<Rc<crate::painting::record::cache::HitTestItemCacheSource>>,
-    cache_compatibility: PaintCacheCompatibility,
-    open_capture_stack: Vec<OpenCapture>,
-    cache_updates: PendingPaintCacheUpdates,
-    deferred_whole_tape_splice: Option<DeferredWholeTapeSplice>,
+    // The published frame whose clean output this recording copies, when its inputs match.
+    pub(crate) source_frame: Option<Rc<RecordingOutput>>,
+    pub(crate) source_items: Option<Rc<PublishedHitTestItems>>,
+    // Set while a producer records output that must record again every frame.
+    live_producer: bool,
+    // The verification recording plans from current style instead of the prepared per-row
+    // inputs, so a snapshot that went stale shows up as a difference.
+    pub(crate) plan_from_prepared_inputs: bool,
+    // Rows of the layout subtrees whose root moved: every producer of theirs records again.
+    pub(crate) moved_expansion: FastSet<NodeSlotId>,
     pub(crate) blocking_wheel_event_region_count: u32,
-    uncacheable_paint_generation: u64,
     pub(crate) observer: O,
     list: HitTestList,
     pub(crate) scratch: &'a mut scratch::RecordingScratch,
-    pub(crate) completed_record_gen: RecordGen,
-    pub(crate) all_paint_caches_dirty: bool,
     pub(crate) resources: resources::RecordingResourceManifest,
 }
 
@@ -119,11 +128,8 @@ pub(crate) struct BasePaintFacts {
 }
 
 impl<O: Observer> PaintRecorder<'_, O> {
-    pub(crate) fn mark_open_captures_unsplicable(&mut self) {
-        self.uncacheable_paint_generation = self
-            .uncacheable_paint_generation
-            .checked_add(1)
-            .expect("uncacheable paint generation overflowed");
+    pub(crate) fn mark_live_producer(&mut self) {
+        self.live_producer = true;
     }
 
     pub(crate) fn data(&self, paintable: NodeSlotId) -> &PaintableData {
@@ -420,13 +426,13 @@ impl<O: Observer> PaintRecorder<'_, O> {
             paints_border_image,
             has_fixed_background: paint::background_resolution::background_has_fixed_attachment(
                 self.layout_arena,
-                self.inputs.root_background_source,
+                self.inputs.uncaptured.root_background_source,
                 paintable,
             ),
             has_scroll_offset_dependent_background:
                 paint::background_resolution::background_depends_on_live_scroll_offset(
                     self.layout_arena,
-                    self.inputs.root_background_source,
+                    self.inputs.uncaptured.root_background_source,
                     paintable,
                 ),
             paint_phase_mask: 0,
@@ -546,7 +552,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
         // Pattern tiles exclude the root's own transform: patternTransform reaches the replay-side
         // tile shader instead, so the tiling grid repeats under it rather than the content scaling
         // twice.
-        self.trace_paint(Operation::Producer(Some(pattern), "svg-pattern"), |this| {
+        self.trace_paint(Operation::Named(Some(pattern), "svg-pattern"), |this| {
             this.walk_svg_resource(pattern, root_transform, false, false);
         });
         let records = Rc::new(self.recorder.finish_detached_records(detached));

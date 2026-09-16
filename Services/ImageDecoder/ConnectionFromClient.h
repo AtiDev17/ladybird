@@ -9,6 +9,7 @@
 #include <AK/Atomic.h>
 #include <AK/AtomicRefCounted.h>
 #include <AK/HashMap.h>
+#include <AK/Mutex.h>
 #include <ImageDecoder/Forward.h>
 #include <ImageDecoder/ImageDecoderClientEndpoint.h>
 #include <ImageDecoder/ImageDecoderServerEndpoint.h>
@@ -17,7 +18,6 @@
 #include <LibGfx/ColorSpace.h>
 #include <LibGfx/ImageFormats/ImageDecoder.h>
 #include <LibIPC/ConnectionFromClient.h>
-#include <LibSync/Mutex.h>
 
 namespace ImageDecoder {
 
@@ -48,7 +48,7 @@ public:
         Core::AnonymousBuffer encoded_data;
         RefPtr<Gfx::ImageDecoder> decoder;
         u32 frame_count { 0 };
-        Sync::Mutex decoder_mutex;
+        Mutex decoder_mutex;
     };
 
 private:

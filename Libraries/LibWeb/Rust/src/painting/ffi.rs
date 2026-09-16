@@ -46,7 +46,7 @@ pub enum ScrollDirection {
     Vertical,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct FfiChromeMetrics {
     pub scroll_thumb_min_length: CssPixels,
@@ -100,7 +100,12 @@ pub unsafe extern "C" fn layout_arena_paintable_set_scrollbar_enlarged(
         ScrollDirection::Horizontal => PaintableFlag::HorizontalScrollbarEnlarged,
         ScrollDirection::Vertical => PaintableFlag::VerticalScrollbarEnlarged,
     };
+    if rows.paintable_data(slot).has_flag(flag) == enlarged {
+        return;
+    }
     rows.paintable_data_mut(slot).set_flag(flag, enlarged);
+    use crate::painting::record::damage::PaintDamage;
+    rows.push_paint_damage(slot, PaintDamage::DRAW_OVERLAY | PaintDamage::HIT_OVERLAY);
 }
 
 /// Decide if force-dark should invert an image: the caller owns the sampling, this owns the policy. Returns false
@@ -420,7 +425,8 @@ pub unsafe extern "C" fn layout_arena_invalidate_nearest_self_painting_inline_pa
     if let Some(ancestor) =
         crate::painting::fragment_ownership::nearest_self_painting_inline_box(&arena.paintable_rows(), node)
     {
-        arena.invalidate_paint_cache(ancestor);
+        use crate::painting::record::damage::PaintDamage;
+        arena.push_paint_damage(ancestor, PaintDamage::ALL_DRAW | PaintDamage::ALL_HIT);
     }
 }
 
@@ -444,7 +450,6 @@ pub unsafe extern "C" fn layout_arena_paintable_row(arena: *mut c_void, slot: No
 pub unsafe extern "C" fn layout_arena_paintable_cleared_from_node(arena: *mut c_void, layout_node: NodeSlotId) {
     let reset = {
         let arena = unsafe { arena_from_handle(arena) };
-        arena.invalidate_paint_cache(layout_node);
         arena.clear_committed_fragment_link(layout_node);
         arena.prepare_paintable_row_cleared_reset(layout_node)
     };
@@ -1203,11 +1208,12 @@ fn fresh_visual_context_tree_build(
     };
     let arena = unsafe { arena_from_handle_mut(arena) };
     outcome.mask_node_owners_changed = true;
+    // Everything records again; pushing that first keeps the per-row pushes below free.
+    arena.push_all_paint_damage();
     apply_walk_assignments(arena, viewport, &mut outcome, state);
     arena.rebuild_all_stacking_context_entries_from_records(viewport);
     arena.take_line_roots_needing_fragment_ownership();
     crate::painting::fragment_ownership::assign_fragment_ownership(&arena.paintable_rows(), viewport);
-    arena.mark_all_paint_caches_dirty();
     state.quarantined_slots_are_releasable = false;
     debug_assert_every_live_node_is_owned(
         &arena.paintable_rows(),
@@ -1481,6 +1487,10 @@ pub unsafe extern "C" fn layout_arena_record_display_list(
     let arena = unsafe { arena_from_handle(arena) };
     {
         let mut paint_state = arena.paint_state().borrow_mut();
+        debug_assert!(
+            paint_state.pending_recording.is_none(),
+            "a recording must be published before the next one starts"
+        );
         paint_state.pending_recording_trace = None;
         paint_state.pending_recording = None;
     }
@@ -1502,42 +1512,73 @@ pub unsafe extern "C" fn layout_arena_record_display_list(
                     .expect("a recording follows paint preparation"),
             )
         };
+        // The root background paints the union of the viewport and the root's overflow, so it
+        // is the one output a viewport move can change. Drop its caches before recording
+        // starts instead of treating the viewport position as a frame-wide input.
+        if let Some(source) = &paint_state.published_frame {
+            let root = inputs.uncaptured.root_background_source.root_layout_node;
+            let rows = arena.paintable_rows();
+            let canvas_rect = crate::painting::record::paint::background_resolution::root_background_canvas_rect(
+                &rows,
+                root,
+                inputs.css_viewport_rect,
+            );
+            if canvas_rect != source.root_background_canvas_rect {
+                arena.push_paint_damage(root, crate::painting::record::damage::PaintDamage::DRAW_BACKGROUND);
+            }
+        }
+        if inputs.publishes_recording {
+            arena.note_publishing_paint_recording_started();
+        }
         let mut scratch = arena.recording_scratch().borrow_mut();
+        // The retained tree describes the published tape and is written in place while a frame
+        // is assembled, so only a recording that publishes may copy from that frame or touch
+        // the tree; any other recording records from scratch into a tree of its own.
+        let mut retained_tree = paint_state.paint_order_tree.borrow_mut();
+        let mut throwaway_tree = crate::painting::record::order_tree::PaintOrderTree::default();
+        let (tree, source_frame, source_items) = if inputs.publishes_recording {
+            (
+                &mut *retained_tree,
+                paint_state.published_frame.clone(),
+                paint_state.published_hit_test_items.clone(),
+            )
+        } else {
+            (&mut throwaway_tree, None, None)
+        };
+        let copies_from_published_frame = source_frame.is_some();
         arena.set_paint_recording_in_progress(true);
         let recording = crate::painting::record::traversal::record_display_list(
             arena,
             &paint_state,
             &mut scratch,
+            tree,
             viewport,
             &inputs,
             paint_state.hit_test_list_generation + 1,
-            paint_state.paint_command_cache_source.clone(),
-            paint_state.hit_test_item_cache_source.clone(),
+            source_frame,
+            source_items,
+            true,
             paint_state.trace_recordings || crate::painting::record::verify::enabled_by_environment(),
         );
-        let recording_from_scratch = (crate::painting::record::verify::enabled_by_environment()
-            && recording
-                .output
-                .capture_log_for_verification
-                .as_ref()
-                .is_some_and(|log| {
-                    log.command_byte_captures
-                        .iter()
-                        .any(|capture| capture.spliced_from_cache)
-                })
-            && !inputs.should_show_line_box_borders)
-            .then(|| {
+        // The oracle records the same frame from scratch into a throwaway tree whenever the
+        // published frame could have been copied from.
+        let recording_from_scratch =
+            (crate::painting::record::verify::enabled_by_environment() && copies_from_published_frame).then(|| {
                 let mut inputs_for_recording_from_scratch = inputs.clone();
-                inputs_for_recording_from_scratch.paint_command_cache_read_write = false;
+                inputs_for_recording_from_scratch.publishes_recording = false;
+                let mut tree_for_recording_from_scratch =
+                    crate::painting::record::order_tree::PaintOrderTree::default();
                 crate::painting::record::traversal::record_display_list(
                     arena,
                     &paint_state,
                     &mut scratch,
+                    &mut tree_for_recording_from_scratch,
                     viewport,
                     &inputs_for_recording_from_scratch,
                     paint_state.hit_test_list_generation + 1,
                     None,
                     None,
+                    false,
                     false,
                 )
             });
@@ -1554,7 +1595,7 @@ pub unsafe extern "C" fn layout_arena_record_display_list(
     paint_state.pending_recording = Some(crate::painting::paint_state::PendingRecording {
         recording,
         recording_from_scratch,
-        paint_command_cache_read_write: inputs.paint_command_cache_read_write,
+        publishes_recording: inputs.publishes_recording,
     });
     true
 }
@@ -1970,13 +2011,13 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_last_recording_is_identical_to_cache_source(arena: *mut c_void) -> bool {
+pub unsafe extern "C" fn layout_arena_last_recording_is_identical_to_published_frame(arena: *mut c_void) -> bool {
     let arena = unsafe { arena_from_handle(arena) };
     let paint_state = arena.paint_state().borrow();
     paint_state
         .last_recording
         .as_ref()
-        .is_some_and(|recording| recording.is_identical_to_cache_source)
+        .is_some_and(|recording| recording.is_identical_to_published_frame)
 }
 
 /// # Safety
@@ -2001,11 +2042,12 @@ pub unsafe extern "C" fn layout_arena_paintable_invalidate_paint_cache(
     paintable: NodeSlotId,
     propagated_text_decorations: bool,
 ) {
+    use crate::painting::record::damage::PaintDamage;
     let arena = unsafe { arena_from_handle(arena) };
     if propagated_text_decorations {
-        arena.invalidate_propagated_text_decoration_caches(paintable);
+        arena.push_propagated_text_decoration_damage(paintable);
     } else {
-        arena.invalidate_paint_cache(paintable);
+        arena.push_paint_damage(paintable, PaintDamage::ALL_DRAW | PaintDamage::ALL_HIT);
     }
 }
 
@@ -2013,9 +2055,19 @@ pub unsafe extern "C" fn layout_arena_paintable_invalidate_paint_cache(
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_paintable_invalidate_for_repaint(arena: *mut c_void, paintable: NodeSlotId) {
+pub unsafe extern "C" fn layout_arena_paintable_invalidate_for_repaint(
+    arena: *mut c_void,
+    paintable: NodeSlotId,
+    include_hit_test_items: bool,
+) {
+    use crate::painting::record::damage::PaintDamage;
     let arena = unsafe { arena_from_handle(arena) };
-    arena.invalidate_for_repaint(paintable);
+    let damage = if include_hit_test_items {
+        PaintDamage::ALL_PRODUCERS
+    } else {
+        PaintDamage::ALL_DRAW
+    };
+    arena.push_paint_damage_for_repaint(paintable, damage);
 }
 
 /// # Safety
@@ -2027,7 +2079,7 @@ pub unsafe extern "C" fn layout_arena_paintable_invalidate_subtree_for_repaint(
     paintable: NodeSlotId,
 ) {
     let arena = unsafe { arena_from_handle(arena) };
-    arena.invalidate_subtree_for_repaint(paintable);
+    arena.push_paint_damage_to_paint_subtree(paintable, crate::painting::record::damage::PaintDamage::ALL_PRODUCERS);
 }
 
 /// # Safety
@@ -2036,7 +2088,7 @@ pub unsafe extern "C" fn layout_arena_paintable_invalidate_subtree_for_repaint(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_invalidate_all_paint_caches(arena: *mut c_void) {
     let arena = unsafe { arena_from_handle(arena) };
-    arena.mark_all_paint_caches_dirty();
+    arena.push_all_paint_damage();
 }
 
 /// # Safety
@@ -3782,6 +3834,8 @@ pub unsafe extern "C" fn layout_arena_sync_svg_paint_resources(
             unsafe { resolve_paint_server(arena.shell_if_live(slot), is_stroke, (&raw mut published).cast()) };
             if resources.publish_paint_server(slot, kind, published) {
                 any_changed = true;
+                use crate::painting::record::damage::PaintDamage;
+                arena.push_paint_damage(slot, PaintDamage::SVG | PaintDamage::SCOPE_PREAMBLE);
             }
             continue;
         }
@@ -3820,7 +3874,8 @@ pub unsafe extern "C" fn layout_arena_sync_svg_paint_resources(
                     slot,
                     crate::painting::visual_context::dirty::VisualContextBoxDirtyKind::StyleValueChange,
                 );
-                arena.paintable_rows().mark_paint_cache_self_dirty(slot);
+                use crate::painting::record::damage::PaintDamage;
+                arena.push_paint_damage(slot, PaintDamage::SVG | PaintDamage::SCOPE_PREAMBLE);
             }
         }
     }

@@ -43,7 +43,7 @@ struct PendingFontDrive {
     resolved_viewport_relative_length: bool,
 }
 
-impl StyleEngineState {
+impl RetainedState {
     /// Run the drive's remaining phase for the selected longhands over a copy of the node's
     /// current table, against the record's own font metrics, the document's computation inputs
     /// and the parent's record. The required driver inputs recompute on every drive and their
@@ -111,10 +111,15 @@ impl StyleEngineState {
                 }
             },
         };
-        let font =
-            unsafe { &*view.payloads[STYLE_GROUP_INDEX_FONT].cast::<crate::css::computed_value_types::FontValues>() };
+        let font = unsafe {
+            view.payloads[STYLE_GROUP_INDEX_FONT]
+                .cast::<crate::css::computed_value_types::FontValues>()
+                .deref()
+        };
         let inherited_box = unsafe {
-            &*view.payloads[STYLE_GROUP_INDEX_INHERITED_BOX].cast::<crate::css::computed_values::InheritedBoxValues>()
+            view.payloads[STYLE_GROUP_INDEX_INHERITED_BOX]
+                .cast::<crate::css::computed_values::InheritedBoxValues>()
+                .deref()
         };
         let mut resolved_viewport_relative_length = false;
         let length = FfiLengthResolutionContext {
@@ -296,7 +301,7 @@ impl StyleEngineState {
             counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
             return None;
         }
-        if self.font_resolver.is_none() {
+        if self.font_resolution.is_none() {
             counters.bump(Counter::EngineComputedRecordBailNoEnvironment);
             return None;
         }
@@ -362,8 +367,9 @@ impl StyleEngineState {
             match &parent_view {
                 Some(parent_view) => {
                     let parent_font = unsafe {
-                        &*parent_view.payloads[STYLE_GROUP_INDEX_FONT]
+                        parent_view.payloads[STYLE_GROUP_INDEX_FONT]
                             .cast::<crate::css::computed_value_types::FontValues>()
+                            .deref()
                     };
                     (
                         FfiFontMetrics {
@@ -439,7 +445,11 @@ impl StyleEngineState {
                 .map(|parent_view| parent_view.payloads[STYLE_GROUP_INDEX_INHERITED_BOX]),
         };
         let subject_inline_axis_is_horizontal = inherited_box_payload.is_none_or(|payload| {
-            let inherited_box = unsafe { &*payload.cast::<crate::css::computed_values::InheritedBoxValues>() };
+            let inherited_box = unsafe {
+                payload
+                    .cast::<crate::css::computed_values::InheritedBoxValues>()
+                    .deref()
+            };
             inherited_box.writing_mode == crate::css::css_enums::writing_mode::HORIZONTAL_TB
         });
         let document_root_font_metrics = FfiFontMetrics {
@@ -650,7 +660,7 @@ impl StyleEngineState {
             _ => 0,
         };
         let request = bridge::FfiFontResolutionRequest {
-            font_family: font_family.cast(),
+            font_family: bridge::FfiHostHandle::from_pointer(font_family.cast()),
             font_size_raw,
             font_slope,
             font_weight,
@@ -659,9 +669,9 @@ impl StyleEngineState {
             font_environment_generation: inputs.font_environment_generation,
         };
         let Some(resolved) = self
-            .font_resolver
+            .font_resolution
             .as_ref()
-            .and_then(|resolver| resolver.lookup(request))
+            .and_then(|resolutions| resolutions.lookup(request))
         else {
             font_scratch.request = Some(font_resolution::FontRequest::new(request));
             font_scratch.pending = Some(PendingFontDrive {
@@ -673,7 +683,7 @@ impl StyleEngineState {
             });
             return None;
         };
-        if resolved.font_cascade_list.is_null() {
+        if resolved.font_cascade_list.is_none() {
             counters.bump(Counter::EngineComputedRecordBailFontPhase);
             return None;
         }
@@ -816,8 +826,8 @@ impl StyleEngineState {
             font_descent: resolved.descent,
             font_x_height: resolved.x_height,
             font_zero_advance: resolved.zero_advance,
-            first_available_font: resolved.first_available_font,
-            font_cascade_list: resolved.font_cascade_list,
+            first_available_font: resolved.first_available_font.as_pointer(),
+            font_cascade_list: resolved.font_cascade_list.as_pointer(),
             font_weight,
             font_width,
             math_shift: keyword_code(prop::MATH_SHIFT, crate::css::css_enums::keyword_to_math_shift),

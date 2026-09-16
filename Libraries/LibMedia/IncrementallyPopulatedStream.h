@@ -8,8 +8,10 @@
 
 #include <AK/Atomic.h>
 #include <AK/AtomicRefCounted.h>
+#include <AK/ConditionVariable.h>
 #include <AK/Forward.h>
 #include <AK/Function.h>
+#include <AK/Mutex.h>
 #include <AK/RedBlackTree.h>
 #include <AK/RefPtr.h>
 #include <AK/Time.h>
@@ -18,8 +20,6 @@
 #include <LibMedia/DecoderError.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/MediaStream.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
 
 namespace Media {
 
@@ -121,9 +121,9 @@ private:
     size_t read_from_chunks_while_locked(u64 position, Bytes& bytes) const;
     void notify_available_ranges_changed_while_locked();
 
-    mutable Sync::Mutex m_mutex;
+    mutable Mutex m_mutex;
     Vector<Cursor&> m_cursors;
-    Sync::ConditionVariable m_state_changed { m_mutex };
+    ConditionVariable m_state_changed { m_mutex };
 
     Chunks m_chunks;
     Optional<u64> m_expected_size;

@@ -7,15 +7,15 @@
 #pragma once
 
 #include <AK/AtomicRefCounted.h>
+#include <AK/ConditionVariable.h>
 #include <AK/Error.h>
+#include <AK/Mutex.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/Forward.h>
 #include <LibIPC/Forward.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
 #include <LibThreading/Forward.h>
 
 namespace WasmCompilerClient {
@@ -39,9 +39,9 @@ private:
 
     NonnullRefPtr<Threading::Thread> m_thread;
 
-    Sync::Mutex m_mutex;
-    Sync::ConditionVariable m_initialization_condition { m_mutex };
-    Sync::ConditionVariable m_client_unused_condition { m_mutex };
+    Mutex m_mutex;
+    ConditionVariable m_initialization_condition { m_mutex };
+    ConditionVariable m_client_unused_condition { m_mutex };
 
     bool m_initialized { false };
     Optional<Error> m_initialization_error;

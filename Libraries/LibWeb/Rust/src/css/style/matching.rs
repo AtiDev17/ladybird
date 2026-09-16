@@ -96,7 +96,7 @@ impl SelectorQueryCache {
 }
 
 fn verify_match_answer_against_cold(
-    engine: &mut StyleEngineState,
+    engine: &mut RetainedState,
     answer: &[RuleMatch],
     node: StyleNodeID,
     description: &str,
@@ -108,7 +108,7 @@ fn verify_match_answer_against_cold(
 }
 
 fn verify_cascade_answer_against_cold(
-    engine: &mut StyleEngineState,
+    engine: &mut RetainedState,
     answer: &[RuleMatch],
     node: StyleNodeID,
     description: &str,
@@ -119,7 +119,7 @@ fn verify_cascade_answer_against_cold(
     });
 }
 
-impl StyleEngineState {
+impl RetainedState {
     fn retained_answer_delta_memo_key(
         old_answer: MatchAnswerID,
         old_cascade_input: MatchAnswerID,
@@ -156,7 +156,7 @@ impl StyleEngineState {
         &self,
         effects: &AnswerEffects,
         node: StyleNodeID,
-    ) -> Rc<[(tree::PseudoElementTarget, CascadeStateID)]> {
+    ) -> Arc<[(tree::PseudoElementTarget, CascadeStateID)]> {
         effects
             .winners
             .view(&self.winner_groups)
@@ -192,22 +192,6 @@ impl StyleEngineState {
             // A digest collision only forfeits this memo opportunity. It must not replace or use
             // the unrelated transition already stored under the fixed-size probe key.
             Entry::Occupied(_) => {}
-        }
-    }
-
-    pub fn prepare_selector_query(&mut self, counters: &mut Counters) {
-        let has_staged_structure = !(self.tree_staging.is_empty() || self.tree_staging.is_applied());
-        self.apply_staged_tree_deltas(counters);
-        self.discard_prepared_batch_matching_traversal();
-        self.facts.prepare_selector_query(&mut self.memory);
-        // Every candidate of the coming query shares one tree — so its sibling positions are computed once, and reused.
-        // They stay valid until something changes: Every mutation reaches this engine either as a staged-tree delta or
-        // as a non-empty style transaction — and the second is what advances the transaction version. A run of queries
-        // with neither in between — the querySelector-in-a-loop shape — keeps one workspace for the whole run.
-        let settled_version = self.next_style_transaction_version;
-        if has_staged_structure || settled_version != self.query_settled_transaction_version {
-            self.selector_query_generation = self.selector_query_generation.wrapping_add(1);
-            self.query_settled_transaction_version = settled_version;
         }
     }
 
@@ -673,7 +657,7 @@ impl StyleEngineState {
     pub(super) fn retained_answer_dispatch_for_traversal(
         &mut self,
         reuse_retained_match_answers: bool,
-    ) -> Option<Rc<RuleDispatch>> {
+    ) -> Option<Arc<RuleDispatch>> {
         reuse_retained_match_answers.then(|| self.prepare_scope_program(TreeScopeID::DOCUMENT).1)
     }
 
@@ -691,7 +675,7 @@ impl StyleEngineState {
         debug_assert!(self.batch_matching_traversal.is_none());
         // Each completion batch may ask for exact answers again after a quota boundary reopened
         // retained-answer admission.
-        self.completion_exactness = if self.memory.is_tier3_admitting(MemoryCategory::RetainedMatchAnswer) {
+        self.completion_exactness = if self.admission.is_tier3_admitting(MemoryCategory::RetainedMatchAnswer) {
             CompletionExactness::Exact
         } else {
             CompletionExactness::AllowPruning
@@ -754,7 +738,7 @@ impl StyleEngineState {
         }
         let mut prefix_contexts = PrefixTransitionContexts::default();
         if let Some(facts) = batch.as_ref() {
-            self.prepare_prefix_rows_for_batch(facts, &mut prefix_contexts, counters);
+            self.prepare_prefix_rows_for_batch(facts, &mut prefix_contexts);
         }
         relation_timer.stop(Counter::CompletionBatchRelationMicroseconds, counters);
         self.batch_matching_traversal = Some(Box::new(BatchMatchingTraversal {
@@ -840,7 +824,6 @@ impl StyleEngineState {
         topology: Option<TransactionTopology>,
         reuse_retained_match_answers: bool,
         match_workspace: MatchScratch,
-        counters: &mut Counters,
     ) -> Box<BatchMatchingTraversal> {
         let ancestor_requirements = self.prepare_matching_batch(&batch);
         let match_workspace_bytes = match_workspace.capacity_bytes();
@@ -850,7 +833,7 @@ impl StyleEngineState {
             caches.answers.make_scratch(&mut self.memory);
         }
         let mut prefix_contexts = PrefixTransitionContexts::default();
-        self.prepare_prefix_rows_for_batch(&batch, &mut prefix_contexts, counters);
+        self.prepare_prefix_rows_for_batch(&batch, &mut prefix_contexts);
         let retained_answer_dispatch = self.retained_answer_dispatch_for_traversal(reuse_retained_match_answers);
         Box::new(BatchMatchingTraversal {
             pending_published: PublishedMatchAnswers::default(),
@@ -914,7 +897,6 @@ impl StyleEngineState {
             topology,
             reuse_retained_match_answers,
             match_workspace,
-            counters,
         ));
         true
     }
@@ -933,7 +915,6 @@ impl StyleEngineState {
                 prepared.topology,
                 prepared.reuse_retained_match_answers,
                 prepared.match_workspace,
-                counters,
             ));
             return;
         }
@@ -1021,9 +1002,7 @@ impl StyleEngineState {
                         true => usize::MAX,
                         false => PREFIX_TRANSITION_CACHE_COMPLETION_BUDGET,
                     };
-                    traversal
-                        .prefix_contexts
-                        .prepare(scope_program, states, dispatch.prefixes(), batch, counters);
+                    traversal.prefix_contexts.prepare(scope_program, states, batch);
                     let prefix_context = traversal.prefix_contexts.get_mut(scope_program);
                     if let Some(topology) = &traversal.topology {
                         states.complete_nodes_with_budget(
@@ -1169,7 +1148,7 @@ impl StyleEngineState {
     }
 
     /// Build one scope's selector dispatch and rank its static cascade priorities once.
-    pub(super) fn build_ranked_scope_dispatch(&mut self, scope: TreeScopeID) -> Rc<RuleDispatch> {
+    pub(super) fn build_ranked_scope_dispatch(&mut self, scope: TreeScopeID) -> Arc<RuleDispatch> {
         let (mut shape, mut rules) = scope_dispatch_shape_and_rules(&self.program, &self.programs, scope);
         let document_sheet_mode = if scope == TreeScopeID::DOCUMENT {
             DocumentSheetMode::None
@@ -1212,7 +1191,7 @@ impl StyleEngineState {
                     .templates
                     .get(key)
                     .and_then(index::WeakRuleDispatch::upgrade)
-                    .map(Rc::new)
+                    .map(Arc::new)
             })
         });
         let extension_template = exact_template.is_none().then(|| {
@@ -1225,7 +1204,7 @@ impl StyleEngineState {
                 })
                 .filter(|(_, template)| template.entry_count() >= rules.len().div_ceil(2))
                 .max_by_key(|(_, template)| template.entry_count())
-                .map(|(candidate, template)| (candidate.0.len(), Rc::clone(template)))
+                .map(|(candidate, template)| (candidate.0.len(), Arc::clone(template)))
         });
         let mut dispatch = match (exact_template, extension_template.flatten()) {
             (Some(template), _) => RuleDispatch::rebind_rules(&template, &rules),
@@ -1313,7 +1292,7 @@ impl StyleEngineState {
             SHARED_DISPATCHES.with_borrow_mut(|shared| dispatch.settle_topology_memory(&mut shared.memory));
         }
         dispatch.settle_memory(&mut self.memory);
-        let dispatch = Rc::new(dispatch);
+        let dispatch = Arc::new(dispatch);
         if let Some(key) = shared_key {
             SHARED_DISPATCHES.with_borrow_mut(|shared| {
                 shared.templates.insert(key, dispatch.downgrade());
@@ -1321,10 +1300,10 @@ impl StyleEngineState {
         }
         self.scope_cascade_templates
             .entry(cascade_shape)
-            .or_insert_with(|| Rc::clone(&dispatch));
+            .or_insert_with(|| Arc::clone(&dispatch));
         self.scope_dispatch_templates
             .entry(shape)
-            .or_insert_with(|| Rc::clone(&dispatch));
+            .or_insert_with(|| Arc::clone(&dispatch));
         self.ancestor_dispatch_templates
             .entry(ancestor_shape)
             .or_insert_with(|| dispatch.ancestor_topology());
@@ -1409,13 +1388,13 @@ impl StyleEngineState {
     }
 
     /// Resolve the immutable selector program a concrete scope evaluates against.
-    pub(super) fn prepare_scope_program(&mut self, scope: TreeScopeID) -> (ScopeProgramID, Rc<RuleDispatch>) {
+    pub(super) fn prepare_scope_program(&mut self, scope: TreeScopeID) -> (ScopeProgramID, Arc<RuleDispatch>) {
         let depth = self.tree_scope_depth(scope);
         let scope_index = scope.0 as usize;
         if let Some(Some((held_depth, id))) = self.scope_program_by_scope.get(scope_index)
             && *held_depth == depth
         {
-            return (*id, Rc::clone(&self.scope_program(*id).dispatch));
+            return (*id, Arc::clone(&self.scope_program(*id).dispatch));
         }
 
         if let Some((_, previous)) = self.scope_program_by_scope.get_mut(scope_index).and_then(Option::take) {
@@ -1424,7 +1403,7 @@ impl StyleEngineState {
         let key = self.scope_dispatch_key(scope);
         let id = self.intern_scope_program(scope, key);
         self.scope_program_by_scope.insert(scope_index, Some((depth, id)));
-        (id, Rc::clone(&self.scope_program(id).dispatch))
+        (id, Arc::clone(&self.scope_program(id).dispatch))
     }
 
     /// Borrow a scope whose version and encapsulation depth were resolved before matching.
@@ -1484,20 +1463,13 @@ impl StyleEngineState {
         scope: TreeScopeID,
         facts: &StyleNodeFacts,
         contexts: &mut PrefixTransitionContexts,
-        counters: &mut Counters,
     ) {
         let (program, dispatch) = self.prepared_scope_program(scope);
         if dispatch.prefixes().is_empty() {
             return;
         }
         let mut caches = self.prefix_caches.borrow_mut();
-        contexts.prepare(
-            program,
-            caches.states.prepare_program(program),
-            dispatch.prefixes(),
-            facts,
-            counters,
-        );
+        contexts.prepare(program, caches.states.prepare_program(program), facts);
         caches.states.settle_memory(&mut self.memory);
         contexts.settle_memory(&mut self.memory);
     }
@@ -1506,40 +1478,25 @@ impl StyleEngineState {
         &mut self,
         facts: &StyleNodeFacts,
         contexts: &mut PrefixTransitionContexts,
-        counters: &mut Counters,
     ) {
         let mut caches = self.prefix_caches.borrow_mut();
         if !self.tree.has_tree_scopes() && self.scope_roots.is_empty() {
             let (program, dispatch) = self.prepared_scope_program(TreeScopeID::DOCUMENT);
             if !dispatch.prefixes().is_empty() {
-                contexts.prepare(
-                    program,
-                    caches.states.prepare_program(program),
-                    dispatch.prefixes(),
-                    facts,
-                    counters,
-                );
+                contexts.prepare(program, caches.states.prepare_program(program), facts);
             }
             caches.states.settle_memory(&mut self.memory);
             contexts.settle_memory(&mut self.memory);
             return;
         }
-        let mut programs = SmallVec::<[ScopeProgramID; 4]>::new();
         for row in 0..facts.row_count() {
             let row = u32::try_from(row).expect("fact row space exhausted");
             if !facts.has_row(row) {
                 continue;
             }
             let (program, dispatch) = self.prepared_scope_program(self.tree.tree_scope(facts.node_at(row)));
-            if !dispatch.prefixes().is_empty() && !programs.contains(&program) {
-                contexts.prepare(
-                    program,
-                    caches.states.prepare_program(program),
-                    dispatch.prefixes(),
-                    facts,
-                    counters,
-                );
-                programs.push(program);
+            if !dispatch.prefixes().is_empty() {
+                contexts.prepare(program, caches.states.prepare_program(program), facts);
             }
         }
         caches.states.settle_memory(&mut self.memory);
@@ -1635,16 +1592,14 @@ impl StyleEngineState {
                     .expect("prefix rows are prepared before matching"),
             );
             shared_prefix_states.as_deref_mut().map(|states| {
-                prefix_contexts.rebind(scope_program, &mut *states, dispatch.prefixes(), facts, counters);
+                prefix_contexts.rebind(scope_program, &mut *states, facts);
                 (states, prefix_contexts.get_mut(scope_program))
             })
         } else {
             local_prefix_states = Some(PrefixStates::new());
             local_prefix_context = Some(PrefixTransitionContext::new(
                 local_prefix_states.as_mut().unwrap(),
-                dispatch.prefixes(),
                 facts,
-                counters,
             ));
             local_prefix_states
                 .as_mut()
@@ -1793,9 +1748,16 @@ impl StyleEngineState {
     pub(super) fn finish_memory_evaluation_loop(&mut self) {
         self.install_witness_effects();
         self.memory.finish_evaluation_loop();
+        self.refresh_admission_facts();
         self.winner_groups.update_admission(&self.memory);
         self.relational_witnesses
             .set_admitting(self.memory.is_tier3_admitting(MemoryCategory::RetainedWitness));
+    }
+
+    /// Copy the controller's admission decisions onto the read side, at a boundary where no walk
+    /// is open. Everything a walk asks about admission is answered from that copy.
+    pub(super) fn refresh_admission_facts(&mut self) {
+        self.admission = AdmissionFacts::snapshot(&self.memory);
     }
 
     /// Return the retained witness proving that this anchor's Boolean cannot have flipped.
@@ -2086,7 +2048,7 @@ impl StyleEngineState {
         // NB: Column growth is deferred to installation. During an admitting batch,
         //     a pending exact answer can be reused before that growth has happened.
         if (index >= self.retained_match_answers.column.capacity()
-            && !self.memory.is_tier3_admitting(MemoryCategory::RetainedMatchAnswer))
+            && !self.admission.is_tier3_admitting(MemoryCategory::RetainedMatchAnswer))
             || self.match_answers.answer(identity).is_none()
         {
             return false;
@@ -2117,7 +2079,7 @@ impl StyleEngineState {
         &'a self,
         effects: &AnswerEffects,
         node: StyleNodeID,
-    ) -> Lookup<&'a Rc<[RetainedRuleMatch]>, StyleNodeID> {
+    ) -> Lookup<&'a Arc<[RetainedRuleMatch]>, StyleNodeID> {
         match effects
             .answer_identity(&self.retained_match_answers, node)
             .and_then(|identity| self.match_answers.answer(identity))
@@ -2224,7 +2186,7 @@ impl StyleEngineState {
                     u64::try_from(truth_rows).expect("selector truth row count exceeds u64"),
                 );
             }
-            let truth = Rc::clone(self.selector_truth_sets.get(identity));
+            let truth = Arc::clone(self.selector_truth_sets.get(identity));
             let dispatch = self.build_ranked_scope_dispatch(tree_scope);
             let mut derived = RuleMatches::new();
             append_selector_truth_matches(
@@ -2254,7 +2216,7 @@ impl StyleEngineState {
         }
         if node.element_index().is_some()
             && (effects.answer_identity(&self.retained_match_answers, node).is_some()
-                || self.memory.is_tier3_admitting(MemoryCategory::RetainedMatchAnswer))
+                || self.admission.is_tier3_admitting(MemoryCategory::RetainedMatchAnswer))
         {
             let identity = self.match_answers.intern_prepared(answer, &self.programs);
             if effects.answer_identity(&self.retained_match_answers, node) != Some(identity) {
@@ -2267,13 +2229,13 @@ impl StyleEngineState {
             if counters.get(Counter::Tier3RefusalRetainedMatchAnswerBytes) == 0 {
                 counters.set(
                     Counter::Tier3RefusalRetainedMatchAnswerBytes,
-                    self.memory.bytes_in_category(MemoryCategory::RetainedMatchAnswer),
+                    self.admission.retained_match_answer_bytes(),
                 );
             }
         }
     }
 
-    pub(super) fn retained_match_answer(&self, node: StyleNodeID) -> Lookup<&Rc<[RetainedRuleMatch]>, StyleNodeID> {
+    pub(super) fn retained_match_answer(&self, node: StyleNodeID) -> Lookup<&Arc<[RetainedRuleMatch]>, StyleNodeID> {
         match self
             .current_answer_identity(node)
             .and_then(|identity| self.match_answers.answer(identity))
@@ -2290,9 +2252,9 @@ impl StyleEngineState {
         &mut self,
         program: SelectorProgramID,
         document_root: StyleNodeID,
-    ) -> Option<Rc<[RetainedSelectorIncidence]>> {
+    ) -> Option<Arc<[RetainedSelectorIncidence]>> {
         if let Some(incidences) = self.retained_selector_incidences.lookup(program) {
-            return Some(Rc::clone(incidences));
+            return Some(Arc::clone(incidences));
         }
         let mut incidences = Vec::new();
         for node in self.tree.preorder(document_root) {
@@ -2365,9 +2327,9 @@ impl StyleEngineState {
         &mut self,
         program: SelectorProgramID,
         counters: &mut Counters,
-    ) -> Option<Rc<[RetainedSelectorIncidence]>> {
+    ) -> Option<Arc<[RetainedSelectorIncidence]>> {
         if let Some(incidences) = self.retained_selector_incidences.lookup(program) {
-            return Some(Rc::clone(incidences));
+            return Some(Arc::clone(incidences));
         }
         if self.programs.get(program).can_leave_its_scope() {
             return None;
@@ -2914,7 +2876,6 @@ impl StyleEngineState {
     pub(super) fn prepare_retained_answer_patch(
         &mut self,
         selection: RetainedAnswerPatchSelection,
-        counters: &mut Counters,
     ) -> RetainedAnswerPatch {
         let (scope_program, dispatch) = self.prepare_scope_program(TreeScopeID::DOCUMENT);
         let rule_keys: Vec<_> = selection
@@ -2941,7 +2902,7 @@ impl StyleEngineState {
             {
                 PrefixTransitionContext::default()
             } else {
-                PrefixTransitionContext::new(states, dispatch.prefixes(), self.facts.primary(), counters)
+                PrefixTransitionContext::new(states, self.facts.primary())
             };
             caches.states.settle_memory(&mut self.memory);
             context
@@ -4887,12 +4848,7 @@ impl StyleEngineState {
         if let Some(traversal) = traversal.as_mut()
             && let Some(batch) = traversal.batch.as_ref()
         {
-            self.prepare_prefix_rows_for_scope(
-                self.tree.tree_scope(node),
-                batch,
-                &mut traversal.prefix_contexts,
-                counters,
-            );
+            self.prepare_prefix_rows_for_scope(self.tree.tree_scope(node), batch, &mut traversal.prefix_contexts);
         }
         let result = self.match_element_in_traversal(
             &mut effects,
@@ -5284,7 +5240,7 @@ impl StyleEngineState {
                                 answer
                                     .pseudo_winner_groups
                                     .as_ref()
-                                    .map(|(generation, states)| (*generation, Rc::clone(states))),
+                                    .map(|(generation, states)| (*generation, Arc::clone(states))),
                                 answer.cascade_input,
                                 answer.cascade_winner_inventory_is_complete,
                             )
@@ -5553,13 +5509,11 @@ impl StyleEngineState {
             self.facts.materialize(covered.iter().copied(), &mut facts);
             let mut prefix_contexts = PrefixTransitionContexts::default();
             if !self.prepared_scope_program(scope).1.prefixes().is_empty() {
-                let (program, dispatch) = self.prepared_scope_program(scope);
+                let (program, _) = self.prepared_scope_program(scope);
                 prefix_contexts.prepare(
                     program,
                     prefix_caches.borrow_mut().states.prepare_program(program),
-                    dispatch.prefixes(),
                     &facts,
-                    counters,
                 );
                 prefix_caches.borrow_mut().states.settle_memory(&mut self.memory);
             }
@@ -5688,6 +5642,24 @@ impl StyleEngineState {
                     }
                 }
             }
+        }
+    }
+}
+
+impl StyleEngineState {
+    pub fn prepare_selector_query(&mut self, counters: &mut Counters) {
+        let has_staged_structure = !(self.host.tree_staging.is_empty() || self.host.tree_staging.is_applied());
+        self.apply_staged_tree_deltas(counters);
+        self.discard_prepared_batch_matching_traversal();
+        self.retained.facts.prepare_selector_query(&mut self.retained.memory);
+        // Every candidate of the coming query shares one tree — so its sibling positions are computed once, and reused.
+        // They stay valid until something changes: Every mutation reaches this engine either as a staged-tree delta or
+        // as a non-empty style transaction — and the second is what advances the transaction version. A run of queries
+        // with neither in between — the querySelector-in-a-loop shape — keeps one workspace for the whole run.
+        let settled_version = self.retained.next_style_transaction_version;
+        if has_staged_structure || settled_version != self.retained.query_settled_transaction_version {
+            self.retained.selector_query_generation = self.retained.selector_query_generation.wrapping_add(1);
+            self.retained.query_settled_transaction_version = settled_version;
         }
     }
 }

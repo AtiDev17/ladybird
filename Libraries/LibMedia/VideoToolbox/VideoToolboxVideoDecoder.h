@@ -7,6 +7,8 @@
 #pragma once
 
 #include <AK/Atomic.h>
+#include <AK/ConditionVariable.h>
+#include <AK/Mutex.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Vector.h>
 #include <LibMedia/CodecID.h>
@@ -18,8 +20,6 @@
 #include <LibMedia/VideoDecoder.h>
 #include <LibMedia/VideoFramePool.h>
 #include <LibMedia/VideoSurface.h>
-#include <LibSync/ConditionVariable.h>
-#include <LibSync/Mutex.h>
 
 namespace Media::VideoToolbox {
 
@@ -80,8 +80,8 @@ private:
     bool m_reached_end_of_stream { false };
 
     // The media engine decodes on its own threads, so outputs arrive from outside this decoder's caller.
-    mutable Sync::Mutex m_output_mutex;
-    Sync::ConditionVariable m_output_arrived { m_output_mutex };
+    mutable Mutex m_output_mutex;
+    ConditionVariable m_output_arrived { m_output_mutex };
     Vector<DecodedOutput> m_outputs;
     u8 m_reorder_frame_count { 0 };
     Optional<DecoderError> m_decode_failure;

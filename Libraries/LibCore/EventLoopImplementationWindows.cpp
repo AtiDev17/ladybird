@@ -11,6 +11,8 @@
 #include <AK/Atomic.h>
 #include <AK/Diagnostics.h>
 #include <AK/HashMap.h>
+#include <AK/Mutex.h>
+#include <AK/MutexProtected.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Time.h>
 #include <AK/Windows.h>
@@ -19,8 +21,6 @@
 #include <LibCore/ThreadEventQueue.h>
 #include <LibCore/TimeoutSet.h>
 #include <LibCore/Timer.h>
-#include <LibSync/Mutex.h>
-#include <LibSync/MutexProtected.h>
 
 struct OwnHandle {
     HANDLE handle = NULL;
@@ -216,7 +216,7 @@ struct ThreadData {
     NonnullOwnPtr<EventLoopWake> wake_data;
 };
 
-static Sync::MutexProtected<HashMap<pid_t, NonnullOwnPtr<EventLoopProcess>>> s_processes;
+static MutexProtected<HashMap<pid_t, NonnullOwnPtr<EventLoopProcess>>> s_processes;
 
 // Arms (or disarms) the thread's shared waitable timer for the earliest pending deadline.
 static void arm_master_timer(ThreadData& thread_data)

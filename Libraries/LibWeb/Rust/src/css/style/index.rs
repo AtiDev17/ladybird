@@ -34,11 +34,12 @@ use super::fast_hash::FastMap as HashMap;
 use super::fast_hash::FastSet as HashSet;
 use super::shared_vector::{SharedVector, SharedVectorPool};
 use crate::css::style_value::RetainedStyleValueData;
-use std::cell::Cell;
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::num::NonZeroU32;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use super::memory::MemoryCategory;
 use super::memory::MemoryController;
@@ -478,7 +479,7 @@ fn next_batch_generation() -> u64 {
 /// inside the evaluator.
 #[derive(Clone, Default)]
 pub struct StyleNodeFacts {
-    attribute_catalogs: Rc<AttributeCatalogs>,
+    attribute_catalogs: Arc<AttributeCatalogs>,
     primary: bool,
     resident: BitColumn,
     rare_facts: PagedColumn<RareFactPage>,
@@ -536,7 +537,7 @@ pub struct StyleNodeFacts {
 }
 
 pub(super) struct MatchingFactBatch {
-    facts: Rc<StyleNodeFacts>,
+    facts: Arc<StyleNodeFacts>,
     charged_bytes: u64,
 }
 
@@ -544,12 +545,12 @@ impl MatchingFactBatch {
     fn owned(facts: StyleNodeFacts) -> Self {
         let charged_bytes = facts.capacity_bytes();
         Self {
-            facts: Rc::new(facts),
+            facts: Arc::new(facts),
             charged_bytes,
         }
     }
 
-    fn primary_view(facts: Rc<StyleNodeFacts>) -> Self {
+    fn primary_view(facts: Arc<StyleNodeFacts>) -> Self {
         Self {
             facts,
             charged_bytes: 0,
@@ -1280,7 +1281,7 @@ impl StyleNodeFacts {
 
     #[cfg(test)]
     pub fn note_attribute_name_forms(&mut self, name: StyleAtomID, forms: AttributeNameForms) {
-        Rc::make_mut(&mut self.attribute_catalogs)
+        Arc::make_mut(&mut self.attribute_catalogs)
             .name_forms
             .insert(name.0 as usize, forms);
     }
@@ -1675,9 +1676,15 @@ pub struct FeaturePostings {
     cardinality_limited: HashSet<PostingKey>,
     grown_selector_postings: HashSet<PostingKey>,
     selector_posting_limit: usize,
-    benefit_hits: Cell<u64>,
-    benefit_misses: Cell<u64>,
+    /// Posting-benefit observations: hits in the high half, misses in the low half of one word.
+    /// Packed and atomic rather than two `Cell`s because the fact store is on the read side an
+    /// evaluation step borrows, which has to be `Sync`; relaxed, because this is a memory-policy
+    /// ratio and no semantic decision reads it.
+    benefit_lookups: AtomicU64,
 }
+
+/// Mask of the miss half of `FeaturePostings::benefit_lookups`.
+const BENEFIT_HALF_MASK: u64 = 0xffff_ffff;
 
 impl Default for FeaturePostings {
     fn default() -> Self {
@@ -1688,8 +1695,7 @@ impl Default for FeaturePostings {
             cardinality_limited: HashSet::default(),
             grown_selector_postings: HashSet::default(),
             selector_posting_limit: usize::MAX,
-            benefit_hits: Cell::new(0),
-            benefit_misses: Cell::new(0),
+            benefit_lookups: AtomicU64::new(0),
         }
     }
 }
@@ -1924,19 +1930,32 @@ impl FeaturePostings {
     }
 
     fn record_benefit_lookup(&self, hit: bool) {
-        let observations = self.benefit_hits.get() + self.benefit_misses.get();
-        if observations >= 4096 {
-            self.benefit_hits.set(self.benefit_hits.get() / 2);
-            self.benefit_misses.set(self.benefit_misses.get() / 2);
-        }
-        match hit {
-            true => self.benefit_hits.set(self.benefit_hits.get() + 1),
-            false => self.benefit_misses.set(self.benefit_misses.get() + 1),
+        let mut current = self.benefit_lookups.load(Ordering::Relaxed);
+        loop {
+            let mut hits = current >> 32;
+            let mut misses = current & BENEFIT_HALF_MASK;
+            if hits + misses >= 4096 {
+                hits /= 2;
+                misses /= 2;
+            }
+            match hit {
+                true => hits += 1,
+                false => misses += 1,
+            }
+            let updated = (hits << 32) | misses;
+            match self
+                .benefit_lookups
+                .compare_exchange_weak(current, updated, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
         }
     }
 
     pub(super) fn take_benefit_lookups(&self) -> (u64, u64) {
-        (self.benefit_hits.replace(0), self.benefit_misses.replace(0))
+        let observations = self.benefit_lookups.swap(0, Ordering::Relaxed);
+        (observations >> 32, observations & BENEFIT_HALF_MASK)
     }
 
     fn forget_atoms(&mut self, atoms: &HashSet<StyleAtomID>) {
@@ -2426,7 +2445,7 @@ struct RuleDispatchTopology {
     non_prefix_universal_without_parent_filter: Vec<DispatchRow>,
     non_prefix_universal_with_parent_filter: Vec<DispatchRow>,
     finalized: bool,
-    ancestors: Rc<AncestorDispatchTopology>,
+    ancestors: Arc<AncestorDispatchTopology>,
     prefixes: PrefixAutomaton,
     residency: MemoryLease,
 }
@@ -2445,15 +2464,20 @@ impl Default for RuleDispatchTopology {
             non_prefix_universal_without_parent_filter: Vec::new(),
             non_prefix_universal_with_parent_filter: Vec::new(),
             finalized: false,
-            ancestors: Rc::new(AncestorDispatchTopology::default()),
+            ancestors: Arc::new(AncestorDispatchTopology::default()),
             prefixes: PrefixAutomaton::default(),
             residency: MemoryLease::new(MemoryCategory::RuleProgram),
         }
     }
 }
 
+/// The identity of one shared ancestor-dispatch topology: the address of the allocation, held
+/// as an integer.
+///
+/// Nothing follows it — it exists only to say "the same topology as last time" — and an integer
+/// says exactly that, while a raw pointer would make every container holding one unshareable.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct AncestorDispatchTopologyID(*const AncestorDispatchTopology);
+pub(super) struct AncestorDispatchTopologyID(usize);
 
 thread_local! {
     static SHARED_CASCADE_RULE_PAGES: RefCell<SharedVectorPool<CascadeOrderRule>> =
@@ -2469,7 +2493,7 @@ thread_local! {
 }
 
 pub struct RuleDispatch {
-    entries: Rc<RuleDispatchEntries>,
+    entries: Arc<RuleDispatchEntries>,
     entry_bindings: SharedVector<DispatchEntryBinding>,
     /// Direct cascade-order projection for every rule represented in this dispatch. Rule
     /// identities are program indices, so retained answers can restore an entry's order without
@@ -2479,7 +2503,7 @@ pub struct RuleDispatch {
     cascade_orders_by_rule_entry: SharedVector<u32>,
     cascade_properties: SharedVector<u16>,
     cascade_entries: SharedVector<CascadeEntryData>,
-    topology: Rc<RuleDispatchTopology>,
+    topology: Arc<RuleDispatchTopology>,
     residency: MemoryLease,
 }
 
@@ -2491,8 +2515,8 @@ impl Drop for RuleDispatchEntries {
 
 /// Weak references to the actual shared storage, independent of a particular scope wrapper.
 pub(super) struct WeakRuleDispatch {
-    entries: std::rc::Weak<RuleDispatchEntries>,
-    topology: std::rc::Weak<RuleDispatchTopology>,
+    entries: std::sync::Weak<RuleDispatchEntries>,
+    topology: std::sync::Weak<RuleDispatchTopology>,
 }
 
 impl WeakRuleDispatch {
@@ -2523,13 +2547,13 @@ impl Drop for RuleDispatchTopology {
 impl Default for RuleDispatch {
     fn default() -> Self {
         Self {
-            entries: Rc::new(RuleDispatchEntries::default()),
+            entries: Arc::new(RuleDispatchEntries::default()),
             entry_bindings: SharedVector::default(),
             cascade_order_rule_pages: Vec::new(),
             cascade_orders_by_rule_entry: SharedVector::default(),
             cascade_properties: SharedVector::default(),
             cascade_entries: SharedVector::default(),
-            topology: Rc::new(RuleDispatchTopology::default()),
+            topology: Arc::new(RuleDispatchTopology::default()),
             residency: MemoryLease::new(MemoryCategory::RuleProgram),
         }
     }
@@ -2557,8 +2581,8 @@ impl Default for CascadeOrderRule {
 impl RuleDispatch {
     pub(super) fn downgrade(&self) -> WeakRuleDispatch {
         WeakRuleDispatch {
-            entries: Rc::downgrade(&self.entries),
-            topology: Rc::downgrade(&self.topology),
+            entries: Arc::downgrade(&self.entries),
+            topology: Arc::downgrade(&self.topology),
         }
     }
 
@@ -2568,11 +2592,11 @@ impl RuleDispatch {
     }
 
     fn topology_mut(&mut self) -> &mut RuleDispatchTopology {
-        Rc::get_mut(&mut self.topology).expect("a shared selector topology is immutable")
+        Arc::get_mut(&mut self.topology).expect("a shared selector topology is immutable")
     }
 
     fn entries_mut(&mut self) -> &mut Vec<DispatchEntryMetadata> {
-        &mut Rc::make_mut(&mut self.entries).rows
+        &mut Arc::make_mut(&mut self.entries).rows
     }
 
     fn entry(&self, row: DispatchRow) -> DispatchEntry {
@@ -2602,7 +2626,7 @@ impl RuleDispatch {
     pub(super) fn rebind_rules(template: &Self, rules: &[RuleID]) -> Self {
         assert_eq!(template.entries.rows.len(), rules.len());
         Self {
-            entries: Rc::clone(&template.entries),
+            entries: Arc::clone(&template.entries),
             entry_bindings: rules
                 .iter()
                 .copied()
@@ -2615,7 +2639,7 @@ impl RuleDispatch {
             cascade_orders_by_rule_entry: SharedVector::default(),
             cascade_properties: SharedVector::default(),
             cascade_entries: SharedVector::default(),
-            topology: Rc::clone(&template.topology),
+            topology: Arc::clone(&template.topology),
             residency: MemoryLease::new(MemoryCategory::RuleProgram),
         }
     }
@@ -2623,7 +2647,7 @@ impl RuleDispatch {
     pub(super) fn rebind_rules_for_extension(template: &Self, rules: &[RuleID]) -> Self {
         let mut dispatch = Self::rebind_rules(template, rules);
         let topology = &template.topology;
-        dispatch.topology = Rc::new(RuleDispatchTopology {
+        dispatch.topology = Arc::new(RuleDispatchTopology {
             buckets: match topology.finalized {
                 true => topology.bucket_directory.to_buckets(),
                 false => topology.buckets.clone(),
@@ -2641,7 +2665,7 @@ impl RuleDispatch {
             non_prefix_universal_without_parent_filter: Vec::new(),
             non_prefix_universal_with_parent_filter: Vec::new(),
             finalized: false,
-            ancestors: Rc::new((*topology.ancestors).clone()),
+            ancestors: Arc::new((*topology.ancestors).clone()),
             prefixes: topology.prefixes.clone(),
             residency: MemoryLease::new(MemoryCategory::RuleProgram),
         });
@@ -2651,16 +2675,16 @@ impl RuleDispatch {
 
     #[cfg(test)]
     pub(super) fn shares_topology_with(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.topology, &other.topology)
+        Arc::ptr_eq(&self.topology, &other.topology)
     }
 
     #[cfg(test)]
     pub(super) fn shares_entries_with(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.entries, &other.entries)
+        Arc::ptr_eq(&self.entries, &other.entries)
     }
 
     pub(super) fn ancestor_topology_id(&self) -> AncestorDispatchTopologyID {
-        AncestorDispatchTopologyID(Rc::as_ptr(&self.topology.ancestors))
+        AncestorDispatchTopologyID(Arc::as_ptr(&self.topology.ancestors).addr())
     }
 
     pub(super) fn ancestor_dispatch_shape(&self) -> AncestorDispatchShape {
@@ -2672,16 +2696,16 @@ impl RuleDispatch {
         AncestorDispatchShape(keys)
     }
 
-    pub(super) fn ancestor_topology(&self) -> Rc<AncestorDispatchTopology> {
-        Rc::clone(&self.topology.ancestors)
+    pub(super) fn ancestor_topology(&self) -> Arc<AncestorDispatchTopology> {
+        Arc::clone(&self.topology.ancestors)
     }
 
-    pub(super) fn share_ancestor_topology_with(&mut self, template: &Rc<AncestorDispatchTopology>) {
-        if Rc::ptr_eq(&self.topology.ancestors, template) {
+    pub(super) fn share_ancestor_topology_with(&mut self, template: &Arc<AncestorDispatchTopology>) {
+        if Arc::ptr_eq(&self.topology.ancestors, template) {
             return;
         }
         debug_assert_eq!(self.topology.ancestors.key_indices, template.key_indices);
-        self.topology_mut().ancestors = Rc::clone(template);
+        self.topology_mut().ancestors = Arc::clone(template);
     }
 
     pub(super) fn insert(&mut self, key: DispatchKey, mut entry: DispatchEntry) -> DispatchRow {
@@ -2691,12 +2715,12 @@ impl RuleDispatch {
         );
         entry.required_ancestor_index = entry.required_ancestor.map(|required| {
             let topology = self.topology_mut();
-            let ancestors = Rc::get_mut(&mut topology.ancestors).expect("a shared ancestor topology is immutable");
+            let ancestors = Arc::get_mut(&mut topology.ancestors).expect("a shared ancestor topology is immutable");
             let next = u32::try_from(ancestors.key_indices.len()).expect("ancestor requirement space exhausted");
             *ancestors.key_indices.entry(required).or_insert(next)
         });
         let id = DispatchRow::from_index(self.entries.rows.len());
-        Rc::make_mut(&mut self.entries).prepare_entry_tails();
+        Arc::make_mut(&mut self.entries).prepare_entry_tails();
         self.entries_mut().push(DispatchEntryMetadata {
             identity: entry.identity,
             program: entry.program,
@@ -2714,7 +2738,7 @@ impl RuleDispatch {
             rule: entry.rule,
             cascade_order_index: u32::MAX,
         });
-        let entries = Rc::make_mut(&mut self.entries);
+        let entries = Arc::make_mut(&mut self.entries);
         if entries.entry_heads.len() <= entry.identity.0 as usize {
             entries.entry_heads.resize(entry.identity.0 as usize + 1, None);
             entries.entry_tails.resize(entry.identity.0 as usize + 1, None);
@@ -2761,7 +2785,7 @@ impl RuleDispatch {
             || self.entries.entry_heads.capacity() != self.entries.entry_heads.len()
             || self.entries.entry_tails.capacity() != 0
         {
-            let entries = Rc::make_mut(&mut self.entries);
+            let entries = Arc::make_mut(&mut self.entries);
             entries.rows.shrink_to_fit();
             entries.entry_heads.shrink_to_fit();
             entries.entry_tails = Vec::new();
@@ -2822,7 +2846,7 @@ impl RuleDispatch {
     }
 
     fn rebuild_non_prefix_index(&mut self) {
-        let entries = Rc::clone(&self.entries);
+        let entries = Arc::clone(&self.entries);
         let topology = self.topology_mut();
         topology.non_prefix_bucket_directory = topology
             .bucket_directory
@@ -3287,16 +3311,16 @@ impl RuleDispatch {
     }
 
     pub(super) fn settle_topology_memory(&mut self, memory: &mut MemoryController) {
-        if let Some(entries) = Rc::get_mut(&mut self.entries) {
+        if let Some(entries) = Arc::get_mut(&mut self.entries) {
             entries.residency.resize_required_to(memory, entries.capacity_bytes());
         }
-        let Some(topology) = Rc::get_mut(&mut self.topology) else {
+        let Some(topology) = Arc::get_mut(&mut self.topology) else {
             return;
         };
         topology
             .residency
             .resize_required_to(memory, Self::topology_capacity_bytes(topology));
-        let Some(ancestors) = Rc::get_mut(&mut topology.ancestors) else {
+        let Some(ancestors) = Arc::get_mut(&mut topology.ancestors) else {
             return;
         };
         ancestors
@@ -3592,10 +3616,10 @@ impl super::intern_table::InternIdentity for CustomPropertyNameSetID {
 pub struct ElementFactStore {
     /// Required primary arrangement. Element identity selects its fixed column slots directly;
     /// variable facts are append-only payloads reached through the slots' handles.
-    rows: Rc<StyleNodeFacts>,
+    rows: Arc<StyleNodeFacts>,
     /// Shared dictionaries used by primary rows and materialized batches. Keep this handle outside
     /// `rows` so publishing a catalog entry never copies every primary fact column.
-    attribute_catalogs: Rc<AttributeCatalogs>,
+    attribute_catalogs: Arc<AttributeCatalogs>,
     #[cfg(test)]
     attribute_catalog_copies: u64,
     staging: FactStaging,
@@ -3975,11 +3999,11 @@ impl ElementFactMetadata {
 
 impl Default for ElementFactStore {
     fn default() -> Self {
-        let attribute_catalogs = Rc::new(AttributeCatalogs::default());
+        let attribute_catalogs = Arc::new(AttributeCatalogs::default());
         let mut rows = StyleNodeFacts::new_primary();
-        rows.attribute_catalogs = Rc::clone(&attribute_catalogs);
+        rows.attribute_catalogs = Arc::clone(&attribute_catalogs);
         let mut store = Self {
-            rows: Rc::new(rows),
+            rows: Arc::new(rows),
             attribute_catalogs,
             #[cfg(test)]
             attribute_catalog_copies: 0,
@@ -4017,10 +4041,10 @@ impl ElementFactStore {
 
     fn attribute_catalogs_mut(&mut self) -> &mut AttributeCatalogs {
         #[cfg(test)]
-        if Rc::strong_count(&self.attribute_catalogs) != 1 {
+        if Arc::strong_count(&self.attribute_catalogs) != 1 {
             self.attribute_catalog_copies += 1;
         }
-        Rc::make_mut(&mut self.attribute_catalogs)
+        Arc::make_mut(&mut self.attribute_catalogs)
     }
 
     #[cfg(test)]
@@ -4033,12 +4057,12 @@ impl ElementFactStore {
     }
 
     fn prepare_attribute_catalogs(&mut self) {
-        if Rc::ptr_eq(&self.rows.attribute_catalogs, &self.attribute_catalogs) {
+        if Arc::ptr_eq(&self.rows.attribute_catalogs, &self.attribute_catalogs) {
             return;
         }
         // A retained traversal may still share the old rows and their catalog snapshot.
-        let rows = Rc::make_mut(&mut self.rows);
-        rows.attribute_catalogs = Rc::clone(&self.attribute_catalogs);
+        let rows = Arc::make_mut(&mut self.rows);
+        rows.attribute_catalogs = Arc::clone(&self.attribute_catalogs);
     }
 
     fn increment_atom_count(counts: &mut PagedCopyColumn<u32>, atom: StyleAtomID) {
@@ -4371,7 +4395,7 @@ impl ElementFactStore {
             "cannot evaluate facts while fact staging is unapplied"
         );
         self.prepare_attribute_catalogs();
-        MatchingFactBatch::primary_view(Rc::clone(&self.rows))
+        MatchingFactBatch::primary_view(Arc::clone(&self.rows))
     }
 
     #[must_use]
@@ -5264,7 +5288,7 @@ impl ElementFactStore {
                 self.postings.remove(SelectorPostingKey::AttributeValue(value), node);
             }
         }
-        Rc::get_mut(&mut self.rows)
+        Arc::get_mut(&mut self.rows)
             .expect("forgetting a fact row requires unique primary rows")
             .forget_row(node);
         self.primary_live_bytes = self
@@ -5312,17 +5336,17 @@ impl ElementFactStore {
     /// Whether a borrowed primary view (an active or prepared traversal) shares the fact rows.
     #[cfg(test)]
     pub(super) fn primary_rows_are_shared(&self) -> bool {
-        Rc::strong_count(&self.rows) != 1
+        Arc::strong_count(&self.rows) != 1
     }
 
     pub(super) fn sweep_auxiliary_catalogs_without_sync(&mut self) {
         assert_eq!(
-            Rc::strong_count(&self.rows),
+            Arc::strong_count(&self.rows),
             1,
             "auxiliary catalog sweeping requires unique primary rows"
         );
         self.memory_dirty = true;
-        let attribute_catalogs = Rc::make_mut(&mut self.attribute_catalogs);
+        let attribute_catalogs = Arc::make_mut(&mut self.attribute_catalogs);
         // Language spellings and attribute-name forms are retained until their atom is reclaimed;
         // forget_atoms clears them at that authoritative boundary so a reused identity can publish
         // different text. Attribute values can be dropped earlier when their last fact leaves.
@@ -5368,7 +5392,7 @@ impl ElementFactStore {
         }
         self.memory_dirty = true;
         let atoms = atoms.iter().copied().collect::<HashSet<_>>();
-        let catalogs = Rc::make_mut(&mut self.attribute_catalogs);
+        let catalogs = Arc::make_mut(&mut self.attribute_catalogs);
         for atom in &atoms {
             let index = atom.0 as usize;
             if catalogs.name_forms.get(index).is_some() {
@@ -5414,7 +5438,7 @@ impl ElementFactStore {
     //     owner directly and never needs to mutate the shared primary rows.
     pub fn materialize(&self, nodes: impl Iterator<Item = StyleNodeID>, batch: &mut StyleNodeFacts) {
         batch.clear();
-        batch.attribute_catalogs = Rc::clone(&self.attribute_catalogs);
+        batch.attribute_catalogs = Arc::clone(&self.attribute_catalogs);
         for node in nodes {
             self.materialize_row(node, batch);
         }
@@ -5426,7 +5450,7 @@ impl ElementFactStore {
     /// their ancestor chains, and each row is packed at most once per pass instead of once per
     /// ask.
     pub fn materialize_missing(&self, nodes: impl Iterator<Item = StyleNodeID>, batch: &mut StyleNodeFacts) {
-        batch.attribute_catalogs = Rc::clone(&self.attribute_catalogs);
+        batch.attribute_catalogs = Arc::clone(&self.attribute_catalogs);
         for node in nodes {
             if batch.row_of(node).is_some() {
                 continue;
@@ -5556,7 +5580,7 @@ impl ElementFactStore {
             // A selector-free transaction may retain the active traversal's immutable primary
             // view. Preserve that view while advancing the authoritative rows for the next
             // transaction.
-            let stale_payload_bytes = Rc::make_mut(&mut self.rows).set_primary_row(node, facts);
+            let stale_payload_bytes = Arc::make_mut(&mut self.rows).set_primary_row(node, facts);
             let row = self.rows.row_of(node).unwrap();
             let replacement_bytes = self.rows.logical_bytes_of_row(row);
             let replacement_payload_bytes = self.rows.payload_bytes_of_row(row);
@@ -5602,7 +5626,7 @@ impl ElementFactStore {
         }
         nodes.sort_unstable();
         let mut before = StyleNodeFacts::new();
-        before.attribute_catalogs = Rc::clone(&self.attribute_catalogs);
+        before.attribute_catalogs = Arc::clone(&self.attribute_catalogs);
         for node in nodes {
             let pair = self
                 .staging
@@ -5629,7 +5653,7 @@ impl ElementFactStore {
     pub fn release_staging(&mut self, memory: &mut MemoryController) {
         self.staging.clear();
         if self.primary_stale_payload_bytes > self.primary_live_payload_bytes {
-            Rc::get_mut(&mut self.rows)
+            Arc::get_mut(&mut self.rows)
                 .expect("compacting fact payloads requires unique primary rows")
                 .compact_primary_payloads();
             self.primary_stale_payload_bytes = 0;
@@ -6994,10 +7018,10 @@ mod tests {
         store.apply_staged(&mut memory);
         store.release_staging(&mut memory);
 
-        let primary_rows = Rc::as_ptr(&store.rows);
+        let primary_rows = Arc::as_ptr(&store.rows);
         let view = store.primary_view();
         store.note_attribute_name_forms(name, forms);
-        assert_eq!(Rc::as_ptr(&store.rows), primary_rows);
+        assert_eq!(Arc::as_ptr(&store.rows), primary_rows);
         assert_eq!(store.attribute_name_forms(name), forms);
         assert_eq!(
             view.attribute_name_forms(name),
@@ -7009,7 +7033,7 @@ mod tests {
 
         drop(view);
         store.apply_staged(&mut memory);
-        assert_eq!(Rc::as_ptr(&store.rows), primary_rows);
+        assert_eq!(Arc::as_ptr(&store.rows), primary_rows);
         assert_eq!(store.primary().attribute_name_forms(name), forms);
     }
 

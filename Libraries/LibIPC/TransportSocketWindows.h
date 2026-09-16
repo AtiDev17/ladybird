@@ -8,13 +8,13 @@
 #pragma once
 
 #include <AK/Atomic.h>
+#include <AK/Mutex.h>
 #include <AK/Queue.h>
 #include <LibCore/Socket.h>
 #include <LibIPC/Attachment.h>
 #include <LibIPC/Forward.h>
 #include <LibIPC/ReceivedMessageBytes.h>
 #include <LibIPC/TransportHandle.h>
-#include <LibSync/Mutex.h>
 
 namespace IPC {
 
@@ -69,7 +69,7 @@ private:
 private:
     NonnullOwnPtr<Core::LocalSocket> m_socket;
     Atomic<bool> m_socket_is_open { true };
-    Sync::Mutex m_send_mutex;
+    Mutex m_send_mutex;
     ByteBuffer m_unprocessed_bytes;
     int m_peer_pid = -1;
 };

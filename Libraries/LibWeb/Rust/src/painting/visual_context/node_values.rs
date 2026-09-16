@@ -150,9 +150,10 @@ pub(crate) fn compute_transform(
 
     let transform_values = style.transform();
     let style_has_transform = transform_values.resolved_transforms.length != 0;
-    if (!style_has_transform && additional_element_transform.is_none())
-        || !style_queries::is_transformable(layout_arena, node)
-    {
+    let has_transform_node_input = style_has_transform
+        || additional_element_transform.is_some()
+        || style_queries::will_change_promotes_transform_node(style);
+    if !has_transform_node_input || !style_queries::is_transformable(layout_arena, node) {
         return None;
     }
 
@@ -534,6 +535,20 @@ pub(crate) fn mix_blend_mode_to_compositing_and_blending_operator(
 
 /// The referenced filter's region, in the filtered element's user space: the element's border
 /// box, or the whole enclosing viewport rect for an element without geometry of its own.
+// The bounds size the transparent fill that triggers a content-generating SVG filter, which
+// the stacking-context preamble records.
+fn set_svg_filter_bounds(
+    layout_arena: &impl PaintableRowsRead,
+    slot: NodeSlotId,
+    bounds: Option<crate::layout::used_values::FfiCssPixelRect>,
+) {
+    let previous = layout_arena.paintable_side_data(slot).svg_filter_bounds.replace(bounds);
+    if previous != bounds {
+        use crate::painting::record::damage::PaintDamage;
+        layout_arena.push_paint_damage(slot, PaintDamage::SCOPE_PREAMBLE | PaintDamage::SVG);
+    }
+}
+
 fn svg_filter_bounds(layout_arena: &impl PaintableRowsRead, slot: NodeSlotId) -> Option<CssPixelRect> {
     let bounds = paintable_geometry::absolute_border_box_rect(layout_arena, slot);
     if !bounds.is_empty() {
@@ -607,7 +622,9 @@ pub(crate) fn compute_effects_data(
             style,
             device_pixels_per_css_pixel,
         );
-        layout_arena.paintable_side_data(slot).svg_filter_bounds.set(
+        set_svg_filter_bounds(
+            layout_arena,
+            slot,
             resolved_svg_filter
                 .svg_filter_bounds
                 .has_value
@@ -620,18 +637,19 @@ pub(crate) fn compute_effects_data(
         )
         .map(std::rc::Rc::new)
     } else {
-        layout_arena.paintable_side_data(slot).svg_filter_bounds.set(None);
+        set_svg_filter_bounds(layout_arena, slot, None);
         crate::painting::filter_bytes::serialize_non_url_filter(&effects_values.filter, device_pixels_per_css_pixel)
             .map(std::rc::Rc::new)
     };
     let backdrop_filter = compute_backdrop_filter_data(layout_arena, slot, style, device_pixels_per_css_pixel);
-    let needs_compositor_effects_layer = layout_arena
-        .node_has_compositor_animation_frame(slot, crate::layout::node_data::CompositorAnimationFrameKind::Opacity);
+    let keeps_effects_node_for_later_values = layout_arena
+        .node_has_compositor_animation_frame(slot, crate::layout::node_data::CompositorAnimationFrameKind::Opacity)
+        || style_queries::will_change_promotes_effects_node(style);
     if filter.is_none()
         && backdrop_filter.is_none()
         && effects_values.opacity == 1.0
         && effects_values.mix_blend_mode == mix_blend_mode::NORMAL
-        && !needs_compositor_effects_layer
+        && !keeps_effects_node_for_later_values
     {
         return None;
     }
@@ -641,8 +659,8 @@ pub(crate) fn compute_effects_data(
         filter,
         backdrop_filter,
     };
-    let needs_layer = effects.needs_layer() || needs_compositor_effects_layer;
-    needs_layer.then_some(effects)
+    let needs_effects_node = effects.needs_layer() || keeps_effects_node_for_later_values;
+    needs_effects_node.then_some(effects)
 }
 
 // https://drafts.fxtf.org/filter-effects-2/#BackdropFilterProperty

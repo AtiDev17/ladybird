@@ -7,8 +7,8 @@
 #pragma once
 
 #include <AK/AtomicRefCounted.h>
+#include <AK/Mutex.h>
 #include <AK/Vector.h>
-#include <LibSync/Mutex.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/WebAudio/ControlMessage.h>
 
@@ -21,7 +21,7 @@ public:
     Vector<ControlMessage> drain(); // Called by the rendering thread.
 
 private:
-    mutable Sync::Mutex m_mutex;
+    mutable Mutex m_mutex;
     Vector<ControlMessage> m_messages;
 };
 

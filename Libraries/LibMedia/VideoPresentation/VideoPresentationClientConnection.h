@@ -9,6 +9,7 @@
 #include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/Optional.h>
+#include <AK/ThreadSafeWeakable.h>
 #include <LibIPC/ConnectionToServer.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Producers/RemoteVideoProducer.h>
@@ -16,7 +17,6 @@
 #include <LibMedia/VideoPresentation/VideoPresentationClientEndpoint.h>
 #include <LibMedia/VideoPresentation/VideoPresentationServerEndpoint.h>
 #include <LibMedia/VideoSinkHandle.h>
-#include <LibSync/Weakable.h>
 
 namespace Media {
 
@@ -27,7 +27,7 @@ namespace Media {
 class MEDIA_API VideoPresentationClientConnection final
     : public IPC::ConnectionToServer<VideoPresentationClientEndpoint, VideoPresentationServerEndpoint>
     , public VideoPresentationClientEndpoint
-    , public Sync::Weakable<VideoPresentationClientConnection> {
+    , public ThreadSafeWeakable<VideoPresentationClientConnection> {
     C_OBJECT_ABSTRACT(VideoPresentationClientConnection);
 
 public:

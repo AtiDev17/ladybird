@@ -10,6 +10,7 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
+#include <AK/ThreadSafeWeakable.h>
 #include <AK/Time.h>
 #include <LibGfx/Size.h>
 #include <LibMedia/Export.h>
@@ -18,7 +19,6 @@
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Sinks/VideoSink.h>
 #include <LibMedia/VideoPresentation/PresentedFramePage.h>
-#include <LibSync/Weakable.h>
 
 namespace Media {
 
@@ -28,7 +28,7 @@ struct DisplayingVideoSinkUpdateResult {
 };
 
 class MEDIA_API DisplayingVideoSink final : public VideoSink
-    , public Sync::Weakable<DisplayingVideoSink> {
+    , public ThreadSafeWeakable<DisplayingVideoSink> {
 public:
     static ErrorOr<NonnullRefPtr<DisplayingVideoSink>> try_create(MediaTimeReader);
 

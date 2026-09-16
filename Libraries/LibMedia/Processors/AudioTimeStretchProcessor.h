@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Mutex.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
@@ -16,7 +17,6 @@
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Processors/AudioProcessor.h>
 #include <LibMedia/Producers/AudioProducer.h>
-#include <LibSync/Mutex.h>
 
 namespace Media {
 
@@ -45,7 +45,7 @@ private:
     PipelineStatus produce_block_while_locked(AudioBlock&) const;
     void dispatch_wake();
 
-    mutable Sync::Mutex m_mutex;
+    mutable Mutex m_mutex;
     Audio::SampleSpecification m_sample_specification;
     RefPtr<AudioProducer> m_input;
 

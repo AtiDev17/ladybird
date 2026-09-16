@@ -8,59 +8,53 @@ use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::builder::{HEADER_SIZE, for_each_command, read_header};
 use crate::painting::display_list::commands::*;
 use crate::painting::record::RecordingOutput;
-use crate::painting::record::cache::CaptureKind;
+use crate::painting::record::trace::DamageSummary;
 
 pub(crate) fn enabled_by_environment() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("LADYBIRD_VERIFY_PAINT_CACHE").is_some_and(|value| value != "0"))
 }
 
+/// A range of the output attributed to one producer, or to one run of copied output.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LoggedCapture {
     pub(crate) start: u32,
     pub(crate) length: u32,
-    pub(crate) paintable: NodeSlotId,
-    pub(crate) kind: CaptureKind,
-    pub(crate) spliced_from_cache: bool,
+    pub(crate) owner: NodeSlotId,
+    pub(crate) label: &'static str,
+    pub(crate) copied: bool,
 }
 
 #[derive(Default, Debug)]
 pub struct CaptureLog {
     pub(crate) events: Vec<super::trace::Event>,
     pub(crate) open_events: Vec<usize>,
+    pub(crate) damage: Option<DamageSummary>,
     pub(crate) command_byte_captures: Vec<LoggedCapture>,
     pub(crate) hit_test_item_captures: Vec<LoggedCapture>,
 }
 
 fn innermost_logged_capture_containing(records: &[LoggedCapture], position: usize) -> Option<LoggedCapture> {
-    let contains_position = |record: &&LoggedCapture| {
-        let start = record.start as usize;
-        position >= start && position < start + record.length as usize
-    };
     records
         .iter()
-        .filter(|record| matches!(record.kind, CaptureKind::BoxPhase(_)))
-        .filter(contains_position)
-        .min_by_key(|record| record.length)
-        .or_else(|| {
-            records
-                .iter()
-                .filter(contains_position)
-                .min_by_key(|record| record.length)
+        .filter(|record| {
+            let start = record.start as usize;
+            position >= start && position < start + record.length as usize
         })
+        .min_by_key(|record| record.length)
         .copied()
 }
 
 fn describe_enclosing_capture(records: &[LoggedCapture], position: usize) -> String {
     match innermost_logged_capture_containing(records, position) {
         Some(record) => format!(
-            "{:?} of paintable {:?} ({}) at {}+{}",
-            record.kind,
-            record.paintable,
-            if record.spliced_from_cache {
-                "spliced from cache"
+            "{} of paintable {:?} ({}) at {}+{}",
+            record.label,
+            record.owner,
+            if record.copied {
+                "copied from the published frame"
             } else {
-                "recorded from scratch"
+                "recorded"
             },
             record.start,
             record.length
@@ -130,29 +124,29 @@ fn hexdump(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-pub(crate) fn verify_spliced_recording_matches_fresh(
-    recording_with_splices: &RecordingOutput,
+pub(crate) fn verify_assembled_recording_matches_fresh(
+    assembled_recording: &RecordingOutput,
     recording_from_scratch: &RecordingOutput,
 ) {
-    let log = recording_with_splices
+    let log = assembled_recording
         .capture_log_for_verification
         .as_ref()
-        .expect("verification needs the capture log of the recording with splices");
-    let with_splices_bytes = &recording_with_splices.display_list.bytes;
-    let with_splices_commands = decode_commands(with_splices_bytes);
+        .expect("verification needs the capture log of the assembled recording");
+    let assembled_bytes = &assembled_recording.display_list.bytes;
+    let assembled_commands = decode_commands(assembled_bytes);
     let from_scratch_commands = decode_commands(&recording_from_scratch.display_list.bytes);
 
-    for (index, (with_splices_command, from_scratch_command)) in
-        with_splices_commands.iter().zip(&from_scratch_commands).enumerate()
+    for (index, (assembled_command, from_scratch_command)) in
+        assembled_commands.iter().zip(&from_scratch_commands).enumerate()
     {
-        let mut with_splices_payload = with_splices_command.payload.to_vec();
+        let mut assembled_payload = assembled_command.payload.to_vec();
         let mut from_scratch_payload = from_scratch_command.payload.to_vec();
-        zero_resource_ids_minted_per_recording(with_splices_command.header.command_type, &mut with_splices_payload);
+        zero_resource_ids_minted_per_recording(assembled_command.header.command_type, &mut assembled_payload);
         zero_resource_ids_minted_per_recording(from_scratch_command.header.command_type, &mut from_scratch_payload);
-        if with_splices_command.header == from_scratch_command.header && with_splices_payload == from_scratch_payload {
+        if assembled_command.header == from_scratch_command.header && assembled_payload == from_scratch_payload {
             continue;
         }
-        let first_differing_byte = with_splices_payload
+        let first_differing_byte = assembled_payload
             .iter()
             .zip(&from_scratch_payload)
             .position(|(a, b)| a != b)
@@ -160,51 +154,51 @@ pub(crate) fn verify_spliced_recording_matches_fresh(
                 format!("payload byte {byte}")
             });
         panic!(
-            "paint cache verification failed: command #{index} at offset {} (with splices {:?}, from scratch {:?}) differs at {}\n  enclosing capture: {}\n  header with splices:  {:?}\n  header from scratch:  {:?}\n  payload with splices: {}\n  payload from scratch: {}",
-            with_splices_command.offset,
-            with_splices_command.header.command_type,
+            "assembled recording verification failed: command #{index} at offset {} (assembled {:?}, from scratch {:?}) differs at {}\n  enclosing capture: {}\n  header assembled:     {:?}\n  header from scratch:  {:?}\n  payload assembled:    {}\n  payload from scratch: {}",
+            assembled_command.offset,
+            assembled_command.header.command_type,
             from_scratch_command.header.command_type,
             first_differing_byte,
-            describe_enclosing_capture(&log.command_byte_captures, with_splices_command.offset),
-            with_splices_command.header,
+            describe_enclosing_capture(&log.command_byte_captures, assembled_command.offset),
+            assembled_command.header,
             from_scratch_command.header,
-            hexdump(&with_splices_payload),
+            hexdump(&assembled_payload),
             hexdump(&from_scratch_payload),
         );
     }
-    if with_splices_commands.len() != from_scratch_commands.len() {
-        let offset = with_splices_commands
+    if assembled_commands.len() != from_scratch_commands.len() {
+        let offset = assembled_commands
             .get(from_scratch_commands.len())
-            .map_or(with_splices_bytes.len(), |command| command.offset);
+            .map_or(assembled_bytes.len(), |command| command.offset);
         panic!(
-            "paint cache verification failed: recording with splices has {} commands, recording from scratch has {}; first extra command at offset {} ({})",
-            with_splices_commands.len(),
+            "assembled recording verification failed: assembled recording has {} commands, recording from scratch has {}; first extra command at offset {} ({})",
+            assembled_commands.len(),
             from_scratch_commands.len(),
             offset,
             describe_enclosing_capture(
                 &log.command_byte_captures,
-                offset.min(with_splices_bytes.len().saturating_sub(HEADER_SIZE))
+                offset.min(assembled_bytes.len().saturating_sub(HEADER_SIZE))
             ),
         );
     }
 
-    let with_splices_items = &recording_with_splices.hit_test_list.items;
+    let assembled_items = &assembled_recording.hit_test_list.items;
     let from_scratch_items = &recording_from_scratch.hit_test_list.items;
-    for (index, (with_splices_item, from_scratch_item)) in
-        with_splices_items.iter().zip(from_scratch_items.iter()).enumerate()
+    for (index, (assembled_item, from_scratch_item)) in
+        assembled_items.iter().zip(from_scratch_items.iter()).enumerate()
     {
-        if with_splices_item == from_scratch_item {
+        if assembled_item == from_scratch_item {
             continue;
         }
         panic!(
-            "paint cache verification failed: hit-test item #{index} differs\n  enclosing capture: {}\n  with splices:  {with_splices_item:?}\n  from scratch: {from_scratch_item:?}",
+            "assembled recording verification failed: hit-test item #{index} differs\n  enclosing capture: {}\n  assembled:     {assembled_item:?}\n  from scratch: {from_scratch_item:?}",
             describe_enclosing_capture(&log.hit_test_item_captures, index)
         );
     }
     assert_eq!(
-        with_splices_items.len(),
+        assembled_items.len(),
         from_scratch_items.len(),
-        "paint cache verification failed: hit-test item counts differ"
+        "assembled recording verification failed: hit-test item counts differ"
     );
 
     let region_count = |commands: &[DecodedCommand]| {
@@ -214,10 +208,10 @@ pub(crate) fn verify_spliced_recording_matches_fresh(
             .count()
     };
     assert_eq!(
-        recording_with_splices.has_blocking_wheel_event_listeners,
+        assembled_recording.has_blocking_wheel_event_listeners,
         recording_from_scratch.has_blocking_wheel_event_listeners,
-        "paint cache verification failed: blocking wheel event listener flag differs (tape with splices holds {} region commands, tape from scratch {})",
-        region_count(&with_splices_commands),
+        "assembled recording verification failed: blocking wheel event listener flag differs (assembled tape holds {} region commands, tape from scratch {})",
+        region_count(&assembled_commands),
         region_count(&from_scratch_commands)
     );
 }

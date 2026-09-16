@@ -9,6 +9,7 @@
 #include <AK/AtomicRefCounted.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
+#include <AK/Mutex.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/Vector.h>
@@ -17,7 +18,6 @@
 #include <LibMedia/Export.h>
 #include <LibMedia/VideoFrameHandle.h>
 #include <LibMedia/VideoSurface.h>
-#include <LibSync/Mutex.h>
 
 namespace Media {
 
@@ -73,7 +73,7 @@ protected:
     u32 held_slot_count_while_locked() const;
     void publish_acquisition_while_locked(Slot&);
 
-    mutable Sync::Mutex m_mutex;
+    mutable Mutex m_mutex;
     Vector<Slot> m_slots;
 
 private:
