@@ -533,8 +533,9 @@ impl PrefixRelation {
         }
         // Transaction rows can come from several fact stores. Intern within each store so
         // representative row indices are never interpreted in another store's columns.
-        let mut local_facts = HashMap::default();
-        let mut local_matches = HashMap::default();
+        let mut local_facts: HashMap<*const _, LocalFactStore> = HashMap::default();
+        let mut next_local_identity = 0_u32;
+        let mut local_matches: HashMap<u64, bool> = HashMap::default();
         self.geometry_targets[0].sort_unstable();
         self.geometry_targets[0].dedup();
         for &node in changed_nodes {
@@ -577,10 +578,12 @@ impl PrefixRelation {
             keys.sort_unstable();
             keys.dedup();
             let store = std::ptr::from_ref(row.facts);
-            let identity = local_facts
-                .entry(store)
-                .or_insert_with(super::LocalFactInterner::new)
-                .intern(row.facts, row.row, &automaton.local_fact_dependencies, counters);
+            let facts = local_facts.entry(store).or_insert_with(LocalFactStore::new);
+            let identity = facts
+                .interner
+                .intern(row.facts, row.row, &automaton.local_fact_dependencies, counters)
+                as usize;
+            let identity = facts.dense_identity(identity, &mut next_local_identity);
             let is_root = evaluation.tree.parent(node).is_none();
             for key in &keys {
                 let Some(compounds) = self.program.compounds_for_key(key) else {
@@ -609,7 +612,7 @@ impl PrefixRelation {
                     };
                     let matched = positional_matches
                         && *local_matches
-                            .entry((store, identity, is_root, index))
+                            .entry(local_match_key(identity, is_root, index))
                             .or_insert_with(|| {
                                 counters.bump(Counter::PrefixCompoundsEvaluated);
                                 match &compound.predicate {
@@ -674,10 +677,16 @@ impl PrefixRelation {
                 .flat_map(|compounds| compounds.keys().copied()),
         ) {
             for step in self.program.steps_for_compound(compound) {
+                if step_is_inert(automaton, &self.matches, step) {
+                    continue;
+                }
                 self.pending_steps.insert(self.program.step_ranks[step] as usize);
             }
         }
         for &step in following_geometry.keys() {
+            if step_is_inert(automaton, &self.matches, step) {
+                continue;
+            }
             self.pending_steps.insert(self.program.step_ranks[step] as usize);
         }
         let mut step_changes: HashMap<usize, Vec<usize>> = HashMap::default();
@@ -1349,6 +1358,51 @@ impl PrefixWalkMemo {
     fn insert(&mut self, position: usize, truth: bool) {
         self.stamps.insert(position, self.generation | u64::from(truth));
     }
+}
+
+/// One transaction's local fact identities for one fact store, numbered densely across every
+/// store so that a memo entry names a compound result with a single integer.
+struct LocalFactStore {
+    interner: super::LocalFactInterner,
+    dense: Vec<u32>,
+}
+
+impl LocalFactStore {
+    fn new() -> Self {
+        Self {
+            interner: super::LocalFactInterner::new(),
+            dense: Vec::new(),
+        }
+    }
+
+    fn dense_identity(&mut self, identity: usize, next: &mut u32) -> u32 {
+        if self.dense.len() <= identity {
+            self.dense.resize(identity + 1, u32::MAX);
+        }
+        if self.dense[identity] == u32::MAX {
+            self.dense[identity] = *next;
+            *next += 1;
+        }
+        self.dense[identity]
+    }
+}
+
+/// Name one compound's result for one local fact identity. Hashing a single integer costs less
+/// than hashing the store, identity, root flag and compound the memo used to carry separately.
+fn local_match_key(identity: u32, is_root: bool, compound: usize) -> u64 {
+    debug_assert!(compound < 1 << 31, "compound identity space exhausted");
+    (u64::from(identity) << 32) | (u64::from(is_root) << 31) | compound as u64
+}
+
+// A step with no predecessor witness can match nothing, so one which also holds no members has
+// nothing to add and nothing to remove. Leaving it out of the queue is free: a predecessor that
+// gains members later in the same update queues its successors through the automaton's outputs,
+// and the queued step still reads its own compound and geometry changes when it runs.
+fn step_is_inert(automaton: &PrefixAutomaton, matches: &[PrefixMembership<u32>], step: usize) -> bool {
+    matches[step].is_empty()
+        && automaton
+            .predecessor_of(PrefixStepID(step as u32))
+            .is_some_and(|predecessor| matches[predecessor.0 as usize].is_empty())
 }
 
 // Queries already arrive in sorted slot order. Scan the membership once when its
