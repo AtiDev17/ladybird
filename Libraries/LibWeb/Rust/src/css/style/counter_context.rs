@@ -376,8 +376,12 @@ impl StyleEngine {
         can_have_scope_duplicates: bool,
         publish_winners_for: Option<StyleNodeID>,
     ) -> Vec<RuleMatch> {
-        self.state
-            .matches_for_cascade(all, can_have_scope_duplicates, publish_winners_for, &mut self.counters)
+        self.state.matches_for_cascade_immediately(
+            all,
+            can_have_scope_duplicates,
+            publish_winners_for,
+            &mut self.counters,
+        )
     }
 
     /// Repair only the winner properties named by signed match changes.
@@ -393,8 +397,17 @@ impl StyleEngine {
         deltas: &[SelectorTruthDelta],
         candidates: &mut Vec<OrderedCascadeCandidate>,
     ) -> bool {
-        self.state
-            .apply_cascade_winner_match_deltas(node, matches, deltas, candidates, &mut self.counters)
+        let mut effects = AnswerEffects::default();
+        let result = self.state.apply_cascade_winner_match_deltas(
+            &mut effects,
+            node,
+            matches,
+            deltas,
+            candidates,
+            &mut self.counters,
+        );
+        self.state.install_answer_effects(effects);
+        result
     }
 
     /// Exactly match every style node in the document scope against the attached program.
@@ -757,19 +770,21 @@ impl StyleEngine {
         node: StyleNodeID,
         patch: &mut RetainedAnswerPatch,
         old_identity: MatchAnswerID,
-        retained: &[RetainedRuleMatch],
         old_cascade_input: MatchAnswerID,
         deltas: &[SelectorTruthDelta],
     ) -> Option<RetainedAnswerPatchOutcome> {
-        self.state.apply_retained_match_answer_deltas(
+        let mut effects = AnswerEffects::default();
+        let result = self.state.apply_retained_match_answer_deltas(
+            &mut effects,
             node,
             patch,
             old_identity,
-            retained,
             old_cascade_input,
             deltas,
             &mut self.counters,
-        )
+        );
+        self.state.install_answer_effects(effects);
+        result
     }
 
     /// Patch one retained exact answer by re-evaluating only the rules reached by this transaction.
@@ -784,8 +799,12 @@ impl StyleEngine {
         patch: &mut RetainedAnswerPatch,
         truth_patch: SelectorTruthPatch<'_>,
     ) -> Option<RetainedAnswerPatchOutcome> {
-        self.state
-            .patch_retained_match_answer(node, patch, truth_patch, &mut self.counters)
+        let mut effects = AnswerEffects::default();
+        let result = self
+            .state
+            .patch_retained_match_answer(&mut effects, node, patch, truth_patch, &mut self.counters);
+        self.state.install_answer_effects(effects);
+        result
     }
 
     /// Name one ask's answer so the cascade can share its expansion within this transaction.
@@ -838,13 +857,17 @@ impl StyleEngine {
         cascade_input: MatchAnswerID,
         cascade_winners_are_complete: bool,
     ) -> Option<PublishedMatchAnswer> {
-        self.state.complete_published_match_answer_from_cascade_input(
+        let mut effects = AnswerEffects::default();
+        let result = self.state.complete_published_match_answer_from_cascade_input(
+            &mut effects,
             node,
             source,
             cascade_input,
             cascade_winners_are_complete,
             &mut self.counters,
-        )
+        );
+        self.state.install_answer_effects(effects);
+        result
     }
 
     /// Prove that an added-only transition between two compact answers cannot change any cascade
@@ -868,8 +891,12 @@ impl StyleEngine {
     #[inline]
     #[cfg(test)]
     pub(super) fn verify_retained_cascade_input(&mut self, node: StyleNodeID, cascade_input: MatchAnswerID) {
+        let traversal = self.state.batch_matching_traversal.take();
+        let empty = AnswerEffects::default();
+        let effects = traversal.as_ref().map_or(&empty, |traversal| &traversal.answer_effects);
         self.state
-            .verify_retained_cascade_input(node, cascade_input, &mut self.counters);
+            .verify_retained_cascade_input(effects, node, cascade_input, &mut self.counters);
+        self.state.batch_matching_traversal = traversal;
     }
 
     #[inline]

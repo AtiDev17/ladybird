@@ -5,6 +5,7 @@
  */
 
 use super::*;
+use crate::css::cascaded_properties::CascadedValues;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum FontDriveGoal {
@@ -49,10 +50,10 @@ impl StyleEngineState {
     /// post-compute adjustments read element facts this context does not carry, so the table
     /// stands only when they came out exactly as before.
     pub(super) fn engine_driven_table(
-        &mut self,
+        &self,
         node: StyleNodeID,
         old_style_record: computed::FinalStyleRecordID,
-        store: &CascadedPropertyStore,
+        store: &WinnerStore,
         selected: &[u64],
         inputs: &bridge::FfiDocumentStyleComputationInputs,
         counters: &mut Counters,
@@ -62,6 +63,7 @@ impl StyleEngineState {
         u32,
         Option<crate::css::table_group_builder::FfiFontGroupBuildInputs>,
     )> {
+        let store = store.view(self);
         use crate::css::computed_value_types::{STYLE_GROUP_INDEX_FONT, STYLE_GROUP_INDEX_INHERITED_BOX};
         use crate::css::style_compute::{
             FfiEffectiveColorSchemeInput, FfiFontMetrics, FfiLengthResolutionContext, FfiStyleComputationEnvironment,
@@ -183,7 +185,7 @@ impl StyleEngineState {
             drive_property_computation(
                 &raw mut table,
                 std::ptr::null_mut(),
-                store,
+                &store,
                 snapshot.as_ref(),
                 None,
                 &raw const environment,
@@ -199,10 +201,7 @@ impl StyleEngineState {
             );
         }
         counters.bump(Counter::EnginePartialDrivesStarted);
-        counters.add(
-            Counter::EngineDriveCopiedTableSlots,
-            crate::css::property_metadata::NUMBER_OF_LONGHAND_PROPERTIES as u64,
-        );
+
         counters.add(
             Counter::EnginePhysicalLonghandEvaluations,
             u64::from(results.longhand_evaluations),
@@ -225,7 +224,9 @@ impl StyleEngineState {
             }
             let slot = usize::from(property - crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID);
             let old_value = old_values[slot];
-            let new_value = table.value_pointers()[slot];
+            let new_value = table
+                .get(property)
+                .map_or(std::ptr::null(), |value| value.pointer().cast());
             if old_value == new_value {
                 continue;
             }
@@ -243,7 +244,6 @@ impl StyleEngineState {
                 return None;
             }
             table.copy_slot_from(old_table, property);
-            counters.bump(Counter::EngineDriveCopiedTableSlots);
         }
         // The group builders resolve against the same context; they report no viewport dependence
         // of their own.
@@ -261,10 +261,10 @@ impl StyleEngineState {
     /// phases and preserves them for completion. Monospace default-size recascade stays in C++.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) fn engine_full_drive(
-        &mut self,
+        &self,
         subject: DriveSubject,
         old_style_record: Option<computed::FinalStyleRecordID>,
-        store: &CascadedPropertyStore,
+        store: &WinnerStore,
         inputs: &bridge::FfiDocumentStyleComputationInputs,
         font_scratch: &mut FontDriveScratch,
         goal: FontDriveGoal,
@@ -275,6 +275,7 @@ impl StyleEngineState {
         u32,
         Option<crate::css::table_group_builder::FfiFontGroupBuildInputs>,
     )> {
+        let store = store.view(self);
         use crate::css::computed_value_types::{STYLE_GROUP_INDEX_FONT, STYLE_GROUP_INDEX_INHERITED_BOX};
         use crate::css::css_pixels::CssPixels;
         use crate::css::property_metadata::property_id as prop;
@@ -507,12 +508,6 @@ impl StyleEngineState {
         let root_font_complete = resumed.as_ref().is_some_and(|pending| pending.root_font_complete);
         if !resuming {
             counters.bump(Counter::EngineFullDrivesStarted);
-            if old_table.is_some() {
-                counters.add(
-                    Counter::EngineDriveCopiedTableSlots,
-                    crate::css::property_metadata::NUMBER_OF_LONGHAND_PROPERTIES as u64,
-                );
-            }
         }
         let (mut table, mut results, mut effective_color_scheme) = match resumed {
             Some(pending) => {
@@ -544,7 +539,7 @@ impl StyleEngineState {
             drive_property_computation(
                 std::ptr::from_mut(table),
                 std::ptr::null_mut(),
-                store,
+                &store,
                 snapshot.as_ref(),
                 None,
                 &raw const environment,

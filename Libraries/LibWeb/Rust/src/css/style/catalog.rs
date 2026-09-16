@@ -4,9 +4,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use smallvec::SmallVec;
+
 use super::capacity::capacity_bytes;
 use super::column::Column;
 use super::intern_table::content_hash;
+use super::prefix::{PrefixTransitionContext, PrefixTransitionContexts};
 use super::shared_vector::{SharedVector, SharedVectorPool};
 use super::*;
 
@@ -84,6 +87,12 @@ impl SelectorTruthSetCatalog {
     }
 }
 
+enum AnswerReferenceCategory {
+    Retained,
+    Cascade,
+    Prefix,
+}
+
 pub(super) struct MatchAnswerCatalogEntry {
     pub(super) answer: Rc<[RetainedRuleMatch]>,
     synthetic_pseudo_mask: u64,
@@ -91,9 +100,9 @@ pub(super) struct MatchAnswerCatalogEntry {
     pub(super) cascade_references: u32,
     pub(super) cascade_payload_accounted: bool,
     pub(super) retained_references: u32,
+    pending_references: u32,
 }
 
-#[derive(Default)]
 pub(super) struct MatchAnswerCatalog {
     pub(super) answers: super::intern_table::InternTable<MatchAnswerID, Option<MatchAnswerCatalogEntry>>,
     pub(super) prefix_payload_bytes: usize,
@@ -101,9 +110,71 @@ pub(super) struct MatchAnswerCatalog {
     pub(super) retained_payload_bytes: u64,
     pub(super) retained_answer_count: usize,
     pub(super) needs_compaction: bool,
+    pending_payload_bytes: u64,
+    pending_memory: MemoryLease,
+}
+
+impl Default for MatchAnswerCatalog {
+    fn default() -> Self {
+        Self {
+            answers: Default::default(),
+            prefix_payload_bytes: 0,
+            cascade_payload_bytes: 0,
+            retained_payload_bytes: 0,
+            retained_answer_count: 0,
+            needs_compaction: false,
+            pending_payload_bytes: 0,
+            pending_memory: MemoryLease::new(MemoryCategory::BatchScratch),
+        }
+    }
 }
 
 impl MatchAnswerCatalog {
+    #[cfg(test)]
+    pub(super) fn pending_reference_count(&self) -> u64 {
+        self.answers
+            .iter()
+            .flatten()
+            .map(|entry| u64::from(entry.pending_references))
+            .sum()
+    }
+
+    pub(super) fn retain_pending(&mut self, identity: MatchAnswerID, memory: &mut MemoryController) {
+        let entry = self.answers[identity].as_mut().expect("pending answer must be live");
+        if entry.pending_references == 0 {
+            self.pending_payload_bytes += Self::answer_payload_bytes(&entry.answer);
+            self.pending_memory
+                .resize_required_to(memory, self.pending_payload_bytes);
+        }
+        entry.pending_references = entry
+            .pending_references
+            .checked_add(1)
+            .expect("pending answer reference overflow");
+    }
+
+    fn transfer_pending(&mut self, identity: MatchAnswerID, category: AnswerReferenceCategory) {
+        match category {
+            AnswerReferenceCategory::Retained => self.retain_identity(identity),
+            AnswerReferenceCategory::Cascade => self.retain_cascade(identity),
+            AnswerReferenceCategory::Prefix => self.retain_prefix(identity),
+        }
+        self.release_pending(identity);
+    }
+
+    pub(super) fn release_pending(&mut self, identity: MatchAnswerID) {
+        let entry = self.answers[identity].as_mut().expect("pending answer must be live");
+        entry.pending_references = entry
+            .pending_references
+            .checked_sub(1)
+            .expect("releasing an unowned pending answer");
+        if entry.pending_references == 0 {
+            self.pending_payload_bytes -= Self::answer_payload_bytes(&entry.answer);
+            self.pending_memory.shrink_to(self.pending_payload_bytes);
+        }
+        // NB: Reclamation remains at the context boundary, after every pending owner
+        //     has either transferred to a retained category or been released.
+    }
+
     fn answer_payload_bytes(answer: &[RetainedRuleMatch]) -> u64 {
         (size_of_val(answer) + 2 * size_of::<usize>()) as u64
     }
@@ -116,7 +187,10 @@ impl MatchAnswerCatalog {
             referenced[program.0 as usize] = true;
         };
         for entry in self.answers.iter().flatten().filter(|entry| {
-            entry.prefix_references != 0 || entry.cascade_references != 0 || entry.retained_references != 0
+            entry.prefix_references != 0
+                || entry.cascade_references != 0
+                || entry.retained_references != 0
+                || entry.pending_references != 0
         }) {
             for matched in entry.answer.iter() {
                 mark(matched.program);
@@ -182,6 +256,7 @@ impl MatchAnswerCatalog {
                 cascade_references: 0,
                 cascade_payload_accounted: false,
                 retained_references: 0,
+                pending_references: 0,
             }),
         );
         identity
@@ -289,7 +364,7 @@ impl MatchAnswerCatalog {
                 return;
             }
             self.prefix_payload_bytes -= entry.answer.len() * size_of::<RetainedRuleMatch>();
-            entry.cascade_references == 0 && entry.retained_references == 0
+            entry.cascade_references == 0 && entry.retained_references == 0 && entry.pending_references == 0
         };
         if remove {
             self.remove_unreferenced(identity);
@@ -302,7 +377,11 @@ impl MatchAnswerCatalog {
             let Some(entry) = self.answers[index].as_ref() else {
                 continue;
             };
-            if entry.prefix_references == 0 && entry.cascade_references == 0 && entry.retained_references == 0 {
+            if entry.prefix_references == 0
+                && entry.cascade_references == 0
+                && entry.pending_references == 0
+                && entry.retained_references == 0
+            {
                 released_bytes += self.remove_unreferenced(MatchAnswerID(index as u32 + 1));
             }
         }
@@ -341,25 +420,6 @@ impl MatchAnswerCatalog {
         })
     }
 
-    pub(super) fn identity_is_retained(&self, identity: MatchAnswerID) -> bool {
-        self.answers[identity]
-            .as_ref()
-            .is_some_and(|entry| entry.retained_references != 0)
-    }
-
-    pub(super) fn insert_retained(
-        &mut self,
-        answer: Vec<RetainedRuleMatch>,
-        hash: u64,
-        programs: &SelectorPrograms,
-    ) -> MatchAnswerID {
-        debug_assert!(self.identity(&answer, hash).is_none());
-        let mask = Self::mask_for_retained_matches(&answer, programs);
-        let identity = self.insert_new(answer.into(), hash, mask);
-        self.retain_identity(identity);
-        identity
-    }
-
     pub(super) fn retain_identity(&mut self, identity: MatchAnswerID) {
         let entry = self.answers[identity].as_mut().unwrap();
         if entry.retained_references == 0 {
@@ -384,7 +444,7 @@ impl MatchAnswerCatalog {
             }
             self.retained_payload_bytes -= Self::answer_payload_bytes(&entry.answer);
             self.retained_answer_count -= 1;
-            entry.prefix_references == 0 && entry.cascade_references == 0
+            entry.prefix_references == 0 && entry.cascade_references == 0 && entry.pending_references == 0
         };
         if remove {
             self.remove_unreferenced(identity);
@@ -411,6 +471,8 @@ impl MatchAnswerCatalog {
                 self.prefix_payload_bytes,
                 self.cascade_payload_bytes,
                 self.needs_compaction,
+                self.pending_payload_bytes,
+                self.pending_memory,
             ];
         }
     }
@@ -424,7 +486,7 @@ impl MatchAnswerCatalog {
                 continue;
             }
             entry.retained_references = 0;
-            if entry.prefix_references == 0 && entry.cascade_references == 0 {
+            if entry.prefix_references == 0 && entry.cascade_references == 0 && entry.pending_references == 0 {
                 self.remove_unreferenced(MatchAnswerID(index as u32 + 1));
             }
         }
@@ -444,11 +506,41 @@ pub(super) struct PrefixAnswer {
     pub(super) cascade_winner_inventory_is_complete: bool,
 }
 
+struct OwnedPrefixAnswerKey {
+    prefix_contribution: MatchAnswerID,
+    non_prefix_matches: Box<[RetainedRuleMatch]>,
+    non_prefix_hash: u64,
+}
+
+impl OwnedPrefixAnswerKey {
+    fn as_key(&self) -> PrefixAnswerKey<'_> {
+        PrefixAnswerKey {
+            prefix_contribution: self.prefix_contribution,
+            non_prefix_matches: &self.non_prefix_matches,
+            non_prefix_hash: self.non_prefix_hash,
+        }
+    }
+}
+
+impl PrefixAnswerKey<'_> {
+    fn hash(self) -> u64 {
+        content_hash((self.prefix_contribution, self.non_prefix_hash))
+    }
+
+    fn into_owned(self) -> OwnedPrefixAnswerKey {
+        OwnedPrefixAnswerKey {
+            prefix_contribution: self.prefix_contribution,
+            non_prefix_matches: self.non_prefix_matches.into(),
+            non_prefix_hash: self.non_prefix_hash,
+        }
+    }
+}
+
 pub(super) struct PrefixAnswerCache {
     pub(super) prefix_contribution_by_match_set: Column<Column<MatchAnswerID>>,
     pub(super) exact_prefix_by_match_set: Column<Column<MatchAnswerID>>,
-    pub(super) exact_answers: HashMap<PrefixAnswerKey, MatchAnswerID>,
-    pub(super) answers: HashMap<PrefixAnswerKey, PrefixAnswer>,
+    exact_answers: hashbrown::HashTable<(OwnedPrefixAnswerKey, MatchAnswerID)>,
+    answers: hashbrown::HashTable<(OwnedPrefixAnswerKey, PrefixAnswer)>,
     pub(super) scratch_memory: MemoryLease,
     pub(super) residency: MemoryLease,
     pub(super) retained: bool,
@@ -466,8 +558,8 @@ impl Default for PrefixAnswerCache {
         Self {
             prefix_contribution_by_match_set: Column::default(),
             exact_prefix_by_match_set: Column::default(),
-            exact_answers: HashMap::default(),
-            answers: HashMap::default(),
+            exact_answers: hashbrown::HashTable::new(),
+            answers: hashbrown::HashTable::new(),
             scratch_memory: MemoryLease::new(MemoryCategory::BatchScratch),
             residency: MemoryLease::new(MemoryCategory::PrefixAnswerCache),
             retained: false,
@@ -596,25 +688,65 @@ impl PrefixAnswerCache {
         })
     }
 
-    pub(super) fn exact_answer(&self, key: PrefixAnswerKey) -> Lookup<MatchAnswerID, PrefixAnswerKey> {
-        match self.exact_answers.get(&key) {
-            Some(&answer) => Lookup::Known(answer),
+    pub(super) fn exact_answer<'a>(&self, key: PrefixAnswerKey<'a>) -> Lookup<MatchAnswerID, PrefixAnswerKey<'a>> {
+        match self
+            .exact_answers
+            .find(key.hash(), |(candidate, _)| candidate.as_key() == key)
+        {
+            Some((_, answer)) => Lookup::Known(*answer),
             None => Lookup::Missing(key),
         }
     }
 
+    #[cfg(test)]
     pub(super) fn remember_exact_answer(
         &mut self,
         catalog: &mut MatchAnswerCatalog,
-        key: PrefixAnswerKey,
+        key: PrefixAnswerKey<'_>,
         answer: MatchAnswerID,
     ) {
         self.with_payload_accounting(catalog, |cache, catalog| {
             catalog.retain_prefix(answer);
-            if let Some(previous) = cache.exact_answers.insert(key, answer) {
-                catalog.release_prefix(previous);
+            if let Some((_, previous)) = cache
+                .exact_answers
+                .find_mut(key.hash(), |(candidate, _)| candidate.as_key() == key)
+            {
+                catalog.release_prefix(std::mem::replace(previous, answer));
             } else {
-                catalog.retain_prefix(key.non_prefix_matches);
+                cache
+                    .nested_footprint
+                    .grow_committed(size_of_val(key.non_prefix_matches) as u64);
+                cache
+                    .exact_answers
+                    .insert_unique(key.hash(), (key.into_owned(), answer), |(candidate, _)| {
+                        candidate.as_key().hash()
+                    });
+            }
+        });
+    }
+
+    fn install_exact_answer(
+        &mut self,
+        catalog: &mut MatchAnswerCatalog,
+        key: OwnedPrefixAnswerKey,
+        answer: MatchAnswerID,
+    ) {
+        self.with_payload_accounting(catalog, |cache, catalog| {
+            catalog.transfer_pending(answer, AnswerReferenceCategory::Prefix);
+            if let Some((_, previous)) = cache
+                .exact_answers
+                .find_mut(key.as_key().hash(), |(candidate, _)| candidate.as_key() == key.as_key())
+            {
+                catalog.release_prefix(std::mem::replace(previous, answer));
+            } else {
+                cache
+                    .nested_footprint
+                    .grow_committed(size_of_val(key.non_prefix_matches.as_ref()) as u64);
+                cache
+                    .exact_answers
+                    .insert_unique(key.as_key().hash(), (key, answer), |(candidate, _)| {
+                        candidate.as_key().hash()
+                    });
             }
         });
     }
@@ -623,7 +755,7 @@ impl PrefixAnswerCache {
     pub(super) fn remember(
         &mut self,
         catalog: &mut MatchAnswerCatalog,
-        key: PrefixAnswerKey,
+        key: PrefixAnswerKey<'_>,
         answer: &[RuleMatch],
         winner_group: Option<(u64, CascadeStateID)>,
         pseudo_winner_groups: Option<(u64, PseudoWinnerGroups)>,
@@ -633,19 +765,27 @@ impl PrefixAnswerCache {
         self.with_payload_accounting(catalog, |cache, catalog| {
             let matches = catalog.intern(answer);
             catalog.retain_prefix(matches);
-            if let Some(previous) = cache.answers.insert(
-                key,
-                PrefixAnswer {
-                    matches,
-                    winner_group,
-                    pseudo_winner_groups,
-                    cascade_input,
-                    cascade_winner_inventory_is_complete,
-                },
-            ) {
-                catalog.release_prefix(previous.matches);
+            let answer = PrefixAnswer {
+                matches,
+                winner_group,
+                pseudo_winner_groups,
+                cascade_input,
+                cascade_winner_inventory_is_complete,
+            };
+            if let Some((_, previous)) = cache
+                .answers
+                .find_mut(key.hash(), |(candidate, _)| candidate.as_key() == key)
+            {
+                catalog.release_prefix(std::mem::replace(previous, answer).matches);
             } else {
-                catalog.retain_prefix(key.non_prefix_matches);
+                cache
+                    .nested_footprint
+                    .grow_committed(size_of_val(key.non_prefix_matches) as u64);
+                cache
+                    .answers
+                    .insert_unique(key.hash(), (key.into_owned(), answer), |(candidate, _)| {
+                        candidate.as_key().hash()
+                    });
             }
         });
     }
@@ -671,19 +811,17 @@ impl PrefixAnswerCache {
                 }
             }
         }
-        for (&key, answer) in &self.answers {
-            catalog.release_prefix(key.non_prefix_matches);
+        for (_, answer) in &self.answers {
             catalog.release_prefix(answer.matches);
         }
-        for (&key, &answer) in &self.exact_answers {
-            catalog.release_prefix(key.non_prefix_matches);
-            catalog.release_prefix(answer);
+        for (_, answer) in &self.exact_answers {
+            catalog.release_prefix(*answer);
         }
         catalog.compact_if_needed();
         self.prefix_contribution_by_match_set = Column::default();
         self.exact_prefix_by_match_set = Column::default();
-        self.exact_answers = HashMap::default();
-        self.answers = HashMap::default();
+        self.exact_answers = hashbrown::HashTable::new();
+        self.answers = hashbrown::HashTable::new();
         self.nested_footprint.release();
         self.retained = false;
     }
@@ -733,10 +871,12 @@ impl PrefixAnswerCache {
             shallow [
                 self.prefix_contribution_by_match_set,
                 self.exact_prefix_by_match_set,
-                self.exact_answers,
-                self.answers,
             ];
-            cached [self.nested_footprint.bytes()];
+            cached [
+                self.nested_footprint.bytes(),
+                self.exact_answers.capacity() * (size_of::<(OwnedPrefixAnswerKey, MatchAnswerID)>() + 1),
+                self.answers.capacity() * (size_of::<(OwnedPrefixAnswerKey, PrefixAnswer)>() + 1),
+            ];
             nested [];
             skip [self.scratch_memory, self.residency, self.retained];
         }
@@ -744,9 +884,12 @@ impl PrefixAnswerCache {
 }
 
 impl PrefixAnswerCache {
-    pub(super) fn lookup(&self, key: PrefixAnswerKey) -> Lookup<&PrefixAnswer, PrefixAnswerKey> {
-        match self.answers.get(&key) {
-            Some(answer) => Lookup::Known(answer),
+    pub(super) fn lookup<'a>(&self, key: PrefixAnswerKey<'a>) -> Lookup<&PrefixAnswer, PrefixAnswerKey<'a>> {
+        match self
+            .answers
+            .find(key.hash(), |(candidate, _)| candidate.as_key() == key)
+        {
+            Some((_, answer)) => Lookup::Known(answer),
             None => Lookup::Missing(key),
         }
     }
@@ -850,6 +993,279 @@ pub(super) fn merge_retained_match_answers(answer: &mut Vec<RetainedRuleMatch>, 
     }
 }
 
+/// NB: None leaves a column unchanged; Some(None) is a tombstone. Every
+///     nonempty replacement owns a pending catalog reference until installation.
+#[derive(Default)]
+pub(super) struct PendingAnswer {
+    published_index: Option<usize>,
+    observed: bool,
+    pub(super) identity: Option<Option<MatchAnswerID>>,
+    pub(super) cascade_input: Option<Option<MatchAnswerID>>,
+}
+
+/// Ordered node updates and exact-cache discoveries owned by one matching context.
+/// NB: The caller must install these effects or release_pending_all before
+///     discarding the context. An incomplete batch retains the entire owner.
+pub(super) struct AnswerEffects {
+    pub(super) winners: super::cascade::WinnerEffects,
+    entries: Vec<(StyleNodeID, PendingAnswer)>,
+    by_node: HashMap<StyleNodeID, usize>,
+    exact_answers: Vec<(OwnedPrefixAnswerKey, MatchAnswerID)>,
+    by_content: HashMap<u64, SmallVec<[usize; 1]>>,
+    nested_bytes: usize,
+    memory: MemoryLease,
+}
+
+impl Default for AnswerEffects {
+    fn default() -> Self {
+        Self {
+            winners: super::cascade::WinnerEffects::default(),
+            entries: Vec::new(),
+            by_node: HashMap::default(),
+            exact_answers: Vec::new(),
+            by_content: HashMap::default(),
+            nested_bytes: 0,
+            memory: MemoryLease::new(MemoryCategory::BatchScratch),
+        }
+    }
+}
+
+impl AnswerEffects {
+    pub(super) fn published_lookup<'a>(
+        &self,
+        published: &'a PublishedMatchAnswers,
+        node: StyleNodeID,
+    ) -> Option<&'a PublishedMatchAnswer> {
+        self.lookup(node)
+            .and_then(|entry| entry.published_index)
+            .map(|index| &published.entries[index])
+    }
+
+    pub(super) fn note_published(&mut self, node: StyleNodeID, index: usize, memory: &mut MemoryController) {
+        self.entry(node, memory).published_index = Some(index);
+    }
+
+    pub(super) fn mark_observed(&mut self, node: StyleNodeID, memory: &mut MemoryController) {
+        self.entry(node, memory).observed = true;
+    }
+
+    pub(super) fn install_observations(&self, published: &mut PublishedMatchAnswers) {
+        for &(node, ref entry) in &self.entries {
+            if entry.observed {
+                published.mark_observed(node);
+            }
+        }
+    }
+
+    pub(super) fn lookup(&self, node: StyleNodeID) -> Option<&PendingAnswer> {
+        self.by_node.get(&node).map(|&index| &self.entries[index].1)
+    }
+
+    fn entry(&mut self, node: StyleNodeID, memory: &mut MemoryController) -> &mut PendingAnswer {
+        let index = match self.by_node.entry(node) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let index = self.entries.len();
+                self.entries.push((node, PendingAnswer::default()));
+                entry.insert(index);
+                self.settle_memory(memory);
+                index
+            }
+        };
+        &mut self.entries[index].1
+    }
+
+    pub(super) fn answer_identity(&self, retained: &RetainedMatchAnswers, node: StyleNodeID) -> Option<MatchAnswerID> {
+        self.lookup(node)
+            .and_then(|entry| entry.identity)
+            .unwrap_or_else(|| retained.answer_identity(node))
+    }
+
+    pub(super) fn cascade_input(&self, retained: &RetainedMatchAnswers, node: StyleNodeID) -> Option<MatchAnswerID> {
+        self.lookup(node)
+            .and_then(|entry| entry.cascade_input)
+            .unwrap_or_else(|| retained.cascade_input_lookup(node).sparse().ok().copied())
+    }
+
+    pub(super) fn remember_identity(
+        &mut self,
+        node: StyleNodeID,
+        identity: MatchAnswerID,
+        catalog: &mut MatchAnswerCatalog,
+        memory: &mut MemoryController,
+    ) {
+        catalog.retain_pending(identity, memory);
+        if let Some(Some(previous)) = self.entry(node, memory).identity.replace(Some(identity)) {
+            catalog.release_pending(previous);
+        }
+    }
+
+    pub(super) fn remember_cascade_input(
+        &mut self,
+        node: StyleNodeID,
+        identity: MatchAnswerID,
+        catalog: &mut MatchAnswerCatalog,
+        memory: &mut MemoryController,
+    ) {
+        catalog.retain_pending(identity, memory);
+        if let Some(Some(previous)) = self.entry(node, memory).cascade_input.replace(Some(identity)) {
+            catalog.release_pending(previous);
+        }
+    }
+
+    pub(super) fn forget_answer(
+        &mut self,
+        node: StyleNodeID,
+        catalog: &mut MatchAnswerCatalog,
+        memory: &mut MemoryController,
+    ) {
+        if let Some(Some(previous)) = self.entry(node, memory).identity.replace(None) {
+            catalog.release_pending(previous);
+        }
+    }
+
+    pub(super) fn forget_cascade_input(
+        &mut self,
+        node: StyleNodeID,
+        catalog: &mut MatchAnswerCatalog,
+        memory: &mut MemoryController,
+    ) {
+        if let Some(Some(previous)) = self.entry(node, memory).cascade_input.replace(None) {
+            catalog.release_pending(previous);
+        }
+    }
+
+    pub(super) fn forget(
+        &mut self,
+        node: StyleNodeID,
+        catalog: &mut MatchAnswerCatalog,
+        memory: &mut MemoryController,
+    ) {
+        self.forget_answer(node, catalog, memory);
+        self.forget_cascade_input(node, catalog, memory);
+    }
+
+    pub(super) fn exact_answer(&self, key: PrefixAnswerKey<'_>) -> Option<MatchAnswerID> {
+        self.by_content.get(&key.hash())?.iter().rev().find_map(|&index| {
+            let (candidate, identity) = &self.exact_answers[index];
+            (candidate.as_key() == key).then_some(*identity)
+        })
+    }
+
+    pub(super) fn remember_exact_answer(
+        &mut self,
+        key: PrefixAnswerKey<'_>,
+        identity: MatchAnswerID,
+        catalog: &mut MatchAnswerCatalog,
+        memory: &mut MemoryController,
+    ) {
+        catalog.retain_pending(identity, memory);
+        let bucket = self.by_content.entry(key.hash()).or_default();
+        let old_bytes = if bucket.spilled() {
+            bucket.capacity() * size_of::<usize>()
+        } else {
+            0
+        };
+        bucket.push(self.exact_answers.len());
+        let new_bytes = if bucket.spilled() {
+            bucket.capacity() * size_of::<usize>()
+        } else {
+            0
+        };
+        self.nested_bytes += new_bytes - old_bytes + size_of_val(key.non_prefix_matches);
+        self.exact_answers.push((key.into_owned(), identity));
+        self.settle_memory(memory);
+    }
+
+    fn settle_memory(&mut self, memory: &mut MemoryController) {
+        let bytes = (self.entries.capacity() * size_of::<(StyleNodeID, PendingAnswer)>()
+            + self.by_node.capacity() * (size_of::<(StyleNodeID, usize)>() + 1)
+            + self.exact_answers.capacity() * size_of::<(OwnedPrefixAnswerKey, MatchAnswerID)>()
+            + self.by_content.capacity() * (size_of::<(u64, SmallVec<[usize; 1]>)>() + 1)
+            + self.nested_bytes) as u64;
+        self.memory.resize_required_to(memory, bytes);
+    }
+
+    pub(super) fn release_pending_all(
+        self,
+        catalog: &mut MatchAnswerCatalog,
+        winners: &mut super::cascade::WinnerGroups,
+    ) {
+        self.winners.release_pending_all(winners);
+        for (_, entry) in self.entries {
+            if let Some(Some(identity)) = entry.identity {
+                catalog.release_pending(identity);
+            }
+            if let Some(Some(identity)) = entry.cascade_input {
+                catalog.release_pending(identity);
+            }
+        }
+        for (_, identity) in self.exact_answers {
+            catalog.release_pending(identity);
+        }
+    }
+
+    pub(super) fn install(
+        self,
+        retained: &mut RetainedMatchAnswers,
+        catalog: &mut MatchAnswerCatalog,
+        cache: &mut PrefixAnswerCache,
+        memory: &mut MemoryController,
+    ) {
+        if self.entries.is_empty() && self.exact_answers.is_empty() {
+            return;
+        }
+        for (node, entry) in self.entries {
+            let Some(index) = node.element_index().map(|index| index as usize) else {
+                debug_assert!(entry.identity.flatten().is_none() && entry.cascade_input.flatten().is_none());
+                continue;
+            };
+            if let Some(identity) = entry.identity {
+                if let Some(identity) = identity {
+                    catalog.transfer_pending(identity, AnswerReferenceCategory::Retained);
+                    if retained.column.len() <= index {
+                        retained.column.resize(index + 1, MatchAnswerID::default());
+                    }
+                }
+                if let Some(slot) = retained.column.get_mut(index) {
+                    let previous = std::mem::replace(slot, identity.unwrap_or_default());
+                    if previous != MatchAnswerID::default() {
+                        catalog.release_identity(previous);
+                    }
+                }
+            }
+            if let Some(identity) = entry.cascade_input {
+                if let Some(identity) = identity {
+                    catalog.transfer_pending(identity, AnswerReferenceCategory::Cascade);
+                    if retained.cascade_input_column.len() <= index {
+                        retained
+                            .cascade_input_column
+                            .resize(index + 1, MatchAnswerID::default());
+                    }
+                }
+                if let Some(slot) = retained.cascade_input_column.get_mut(index) {
+                    let previous = std::mem::replace(slot, identity.unwrap_or_default());
+                    if previous != MatchAnswerID::default() {
+                        catalog.release_cascade(previous);
+                    }
+                }
+            }
+        }
+        for (key, identity) in self.exact_answers {
+            cache.install_exact_answer(catalog, key, identity);
+        }
+        retained
+            .residency
+            .reconcile_committed(memory, retained.capacity_bytes(catalog));
+        retained
+            .cascade_input_memory
+            .resize_required_to(memory, retained.cascade_input_capacity_bytes(catalog));
+        if !cache.retained {
+            cache.settle_memory(memory);
+        }
+    }
+}
+
 pub(super) struct RetainedMatchAnswers {
     pub(super) column: Vec<MatchAnswerID>,
     pub(super) cascade_input_column: Vec<MatchAnswerID>,
@@ -943,6 +1359,7 @@ impl Default for RetainedMatchAnswers {
 }
 
 pub(super) struct RetainedAnswerPatch {
+    pub(super) prefix_context: PrefixTransitionContext,
     /// Whether this transaction can reorder rules relative to each other (layer or sheet order).
     /// An unchanged match set can then still compact to a different winner, so the unchanged
     /// fast path must not conclude anything from set equality.
@@ -953,7 +1370,7 @@ pub(super) struct RetainedAnswerPatch {
     pub(super) dispatch: Rc<RuleDispatch>,
     /// One shared match workspace for every node this patch visits, carrying the relation and
     /// sibling-prefix caches across them exactly as a matching traversal does.
-    pub(super) match_workspace: MatchEvaluationWorkspace,
+    pub(super) match_workspace: MatchScratch,
     pub(super) prefix_caches: Rc<RefCell<PrefixCaches>>,
     pub(super) dispatch_workspace: DispatchCandidateWorkspace,
     pub(super) always_emit: bool,
@@ -1055,6 +1472,7 @@ impl RetainedAnswerPatch {
             ];
             cached [];
             nested [
+                self.prefix_context.capacity_bytes(),
                 self.dispatch_workspace.capacity_bytes(),
                 self.cascade_compaction_workspace.capacity_bytes(),
                 self.delta_memo
@@ -1109,6 +1527,7 @@ impl RetainedMatchAnswers {
         self.cascade_input_memory.shrink_committed(bytes);
     }
 
+    #[cfg(test)]
     pub(super) fn remember_prepared(
         &mut self,
         catalog: &mut MatchAnswerCatalog,
@@ -1117,77 +1536,19 @@ impl RetainedMatchAnswers {
         programs: &SelectorPrograms,
         memory: &mut MemoryController,
     ) -> Result<(), Vec<RetainedRuleMatch>> {
-        let Some(index) = node.element_index().map(|index| index as usize) else {
-            return Err(answer);
-        };
-        let answer_hash = content_hash(&answer);
-        let held_identity = catalog.identity(&answer, answer_hash);
-        let identity_is_retained = held_identity.is_some_and(|identity| catalog.identity_is_retained(identity));
-        let previous_identity = self
-            .column
-            .get(index)
-            .map_or(MatchAnswerID::default(), |identity| *identity);
-        if previous_identity == MatchAnswerID::default()
-            && !memory.is_tier3_admitting(MemoryCategory::RetainedMatchAnswer)
+        if node.element_index().is_none()
+            || (self.answer_identity(node).is_none() && !memory.is_tier3_admitting(MemoryCategory::RetainedMatchAnswer))
         {
             return Err(answer);
         }
-
-        let identity = match (held_identity, identity_is_retained) {
-            (Some(identity), true) => {
-                if identity != previous_identity {
-                    catalog.retain_identity(identity);
-                }
-                identity
-            }
-            (Some(identity), false) => {
-                catalog.retain_identity(identity);
-                identity
-            }
-            (None, _) => catalog.insert_retained(answer, answer_hash, programs),
-        };
-        if self.column.len() <= index {
-            self.column.resize(index + 1, MatchAnswerID::default());
-        }
-        self.column[index] = identity;
-        if previous_identity != MatchAnswerID::default() && previous_identity != identity {
-            catalog.release_identity(previous_identity);
-        }
-        let current = self.capacity_bytes(catalog);
-        self.residency.reconcile_committed(memory, current);
+        let identity = catalog.intern_prepared(answer, programs);
+        let mut effects = AnswerEffects::default();
+        effects.remember_identity(node, identity, catalog, memory);
+        effects.install(self, catalog, &mut PrefixAnswerCache::default(), memory);
         Ok(())
     }
 
-    /// Repoint one node's retained answer to an identity the catalog already holds. The column may
-    /// grow within its existing capacity, but neither the identity nor the column may allocate.
-    pub(super) fn set_interned_identity(
-        &mut self,
-        node: StyleNodeID,
-        catalog: &mut MatchAnswerCatalog,
-        identity: MatchAnswerID,
-    ) -> bool {
-        let Some(index) = node.element_index().map(|index| index as usize) else {
-            return false;
-        };
-        if index >= self.column.capacity() || catalog.retained_answer(identity).is_none() {
-            return false;
-        }
-        if self.column.len() <= index {
-            self.column.resize(index + 1, MatchAnswerID::default());
-        }
-        let previous_identity = self.column[index];
-        if previous_identity == identity {
-            return true;
-        }
-        catalog.retain_identity(identity);
-        self.column[index] = identity;
-        if previous_identity != MatchAnswerID::default() {
-            catalog.release_identity(previous_identity);
-        }
-        self.residency.shrink_to(self.capacity_bytes(catalog));
-        true
-    }
-
+    #[cfg(test)]
     pub(super) fn remember_cascade_input(
         &mut self,
         catalog: &mut MatchAnswerCatalog,
@@ -1195,24 +1556,12 @@ impl RetainedMatchAnswers {
         cascade_input: MatchAnswerID,
         memory: &mut MemoryController,
     ) {
-        let Some(index) = node.element_index().map(|index| index as usize) else {
-            return;
-        };
-        if self.cascade_input_column.len() <= index {
-            self.cascade_input_column.resize(index + 1, MatchAnswerID::default());
-            let current = self.cascade_input_capacity_bytes(catalog);
-            self.cascade_input_memory.resize_required_to(memory, current);
-        }
-        let previous = std::mem::replace(&mut self.cascade_input_column[index], cascade_input);
-        if previous == cascade_input {
+        if node.element_index().is_none() {
             return;
         }
-        if previous != MatchAnswerID::default() {
-            catalog.release_cascade(previous);
-        }
-        catalog.retain_cascade(cascade_input);
-        let current = self.cascade_input_capacity_bytes(catalog);
-        self.cascade_input_memory.resize_required_to(memory, current);
+        let mut effects = AnswerEffects::default();
+        effects.remember_cascade_input(node, cascade_input, catalog, memory);
+        effects.install(self, catalog, &mut PrefixAnswerCache::default(), memory);
     }
 
     pub(super) fn forget_cascade_input(&mut self, catalog: &mut MatchAnswerCatalog, node: StyleNodeID) {
@@ -1331,6 +1680,9 @@ impl RetainedMatchAnswers {
 
 /// Matching scratch owned by one synchronous style traversal.
 pub(super) struct BatchMatchingTraversal {
+    pub(super) pending_published: PublishedMatchAnswers,
+    pub(super) answer_effects: AnswerEffects,
+    pub(super) prefix_contexts: PrefixTransitionContexts,
     pub(super) root: StyleNodeID,
     pub(super) batch: Option<MatchingFactBatch>,
     pub(super) topology: Option<TransactionTopology>,
@@ -1338,7 +1690,7 @@ pub(super) struct BatchMatchingTraversal {
     pub(super) retained_answer_dispatch: Option<Rc<RuleDispatch>>,
     pub(super) ancestor_requirements: AncestorRequirementsCache,
     pub(super) prefix_caches: Rc<RefCell<PrefixCaches>>,
-    pub(super) match_workspace: MatchEvaluationWorkspace,
+    pub(super) match_workspace: MatchScratch,
     pub(super) match_workspace_bytes: u64,
     pub(super) dispatch_workspace: DispatchCandidateWorkspace,
     pub(super) dispatch_workspace_bytes: u64,
@@ -1353,7 +1705,7 @@ pub(super) struct PreparedBatchMatchingTraversal {
     pub(super) batch: Option<MatchingFactBatch>,
     pub(super) topology: Option<TransactionTopology>,
     pub(super) reuse_retained_match_answers: bool,
-    pub(super) match_workspace: MatchEvaluationWorkspace,
+    pub(super) match_workspace: MatchScratch,
 }
 
 impl PreparedBatchMatchingTraversal {
@@ -1363,7 +1715,7 @@ impl PreparedBatchMatchingTraversal {
             batch: None,
             topology: None,
             reuse_retained_match_answers: false,
-            match_workspace: MatchEvaluationWorkspace::default(),
+            match_workspace: MatchScratch::default(),
         }
     }
 
@@ -1395,6 +1747,7 @@ pub(super) struct PublishedMatchAnswer {
 }
 
 pub(super) struct PublishedMatchAnswers {
+    pub(super) answer_effects: AnswerEffects,
     pub(super) entries: Vec<PublishedMatchAnswer>,
     pub(super) shared_payloads: HashMap<MatchAnswerID, Box<[RuleMatch]>>,
     pub(super) memory: MemoryLease,
@@ -1405,6 +1758,7 @@ pub(super) struct PublishedMatchAnswers {
 impl Default for PublishedMatchAnswers {
     fn default() -> Self {
         Self {
+            answer_effects: AnswerEffects::default(),
             entries: Vec::new(),
             shared_payloads: HashMap::default(),
             memory: MemoryLease::new(MemoryCategory::BatchScratch),
@@ -1415,7 +1769,6 @@ impl Default for PublishedMatchAnswers {
 }
 
 impl PublishedMatchAnswers {
-    #[cfg(test)]
     pub(super) fn recompute_capacity_bytes(&self) -> u64 {
         capacity_bytes! {
             shallow [self.entries, self.shared_payloads];
@@ -1481,6 +1834,18 @@ impl PublishedMatchAnswers {
             + added_payload_bytes;
         let added_bytes = added_bytes as u64;
         self.memory.grow_required(memory, added_bytes);
+    }
+
+    pub(super) fn append_pending(&mut self, mut pending: Self, memory: &mut MemoryController) {
+        if pending.entries.is_empty() {
+            return;
+        }
+        self.entries.append(&mut pending.entries);
+        for (identity, matches) in pending.shared_payloads.drain() {
+            self.shared_payloads.entry(identity).or_insert(matches);
+        }
+        self.sort();
+        self.memory.resize_required_to(memory, self.recompute_capacity_bytes());
     }
 
     pub(super) fn sort(&mut self) {

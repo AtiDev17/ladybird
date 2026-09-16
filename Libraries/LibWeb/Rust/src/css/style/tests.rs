@@ -214,7 +214,7 @@ fn substitution_memo_retains_its_written_value_key() {
     let written = RetainedStyleValueData::from_owned(StyleValueData::Number { value: 1.25 });
     let written_pointer = written.pointer();
     let value = RetainedStyleValueData::from_owned(StyleValueData::Keyword { keyword: 2 });
-    environments.remember_substitution(&written, 1, 0, value);
+    environments.remember_substitution(written.clone_retained(), 1, 0, value);
 
     // SAFETY: `written` and the memo both retain the value while this temporary Arc observes its
     // strong count.
@@ -1021,7 +1021,8 @@ fn an_evicted_prefix_answer_is_a_typed_missing_key() {
     ));
     let key = PrefixAnswerKey {
         prefix_contribution: contribution,
-        non_prefix_matches: non_prefix,
+        non_prefix_matches: &[],
+        non_prefix_hash: super::intern_table::content_hash(&[] as &[RetainedRuleMatch]),
     };
     answers.remember(&mut catalog, key, &[], None, None, MatchAnswerID(1), true);
     answers.settle_memory(&mut memory);
@@ -1055,6 +1056,86 @@ fn an_evicted_prefix_answer_is_a_typed_missing_key() {
     ));
     assert!(matches!(answers.lookup(key), Lookup::Missing(gap) if gap == key));
     assert_eq!(memory.bytes_in_category(MemoryCategory::PrefixAnswerCache), 0);
+}
+
+#[test]
+fn prefix_answer_keys_compare_content_after_hash_collisions() {
+    let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+    let mut answers = PrefixAnswerCache::default();
+    let mut catalog = MatchAnswerCatalog::default();
+    let mut effects = AnswerEffects::default();
+    let contribution =
+        answers.remember_prefix_contribution(&mut catalog, ScopeProgramID(1), PrefixMatchSetID::default(), &[]);
+    let matched = RetainedRuleMatch {
+        rule: RuleID(1),
+        program: SelectorProgramID(1),
+        entry: 0,
+        tree_scope: TreeScopeID::DOCUMENT,
+        scope_proximity: u32::MAX,
+    };
+    // Force every key into the same hash bucket, including across table growth.
+    for entry in 0..64 {
+        let content = [RetainedRuleMatch { entry, ..matched }];
+        let key = PrefixAnswerKey {
+            prefix_contribution: contribution,
+            non_prefix_matches: &content,
+            non_prefix_hash: 0,
+        };
+        assert!(matches!(answers.lookup(key), Lookup::Missing(_)));
+        assert!(matches!(answers.exact_answer(key), Lookup::Missing(_)));
+        answers.remember(
+            &mut catalog,
+            key,
+            &[],
+            None,
+            None,
+            MatchAnswerID(entry + 1),
+            entry % 2 == 0,
+        );
+        effects.remember_exact_answer(key, contribution, &mut catalog, &mut memory);
+    }
+    for entry in 0..64 {
+        let content = vec![RetainedRuleMatch { entry, ..matched }];
+        let key = PrefixAnswerKey {
+            prefix_contribution: contribution,
+            non_prefix_matches: &content,
+            non_prefix_hash: 0,
+        };
+        assert_eq!(effects.exact_answer(key), Some(contribution));
+        assert!(matches!(answers.exact_answer(key), Lookup::Missing(_)));
+    }
+    assert_eq!(catalog.pending_reference_count(), 64);
+    catalog.sweep_unreferenced();
+    effects.install(
+        &mut RetainedMatchAnswers::default(),
+        &mut catalog,
+        &mut answers,
+        &mut memory,
+    );
+    assert_eq!(catalog.pending_reference_count(), 0);
+    // Each probe has a different allocation from the insertion's expired local slice.
+    for entry in 0..64 {
+        let content = vec![RetainedRuleMatch { entry, ..matched }];
+        let key = PrefixAnswerKey {
+            prefix_contribution: contribution,
+            non_prefix_matches: &content,
+            non_prefix_hash: 0,
+        };
+        let answer = answers.lookup(key).sparse().unwrap();
+        assert_eq!(answer.cascade_input, MatchAnswerID(entry + 1));
+        assert_eq!(answer.cascade_winner_inventory_is_complete, entry % 2 == 0);
+        assert_eq!(answers.exact_answer(key).sparse().unwrap(), contribution);
+        let bytes = answers.capacity_bytes();
+        answers.remember(&mut catalog, key, &[], None, None, MatchAnswerID(100), true);
+        answers.remember_exact_answer(&mut catalog, key, contribution);
+        assert_eq!(answers.capacity_bytes(), bytes);
+        assert_eq!(answers.lookup(key).sparse().unwrap().cascade_input, MatchAnswerID(100));
+    }
+    answers.settle_memory(&mut memory);
+    assert!(answers.retain(&mut memory));
+    answers.release(&mut catalog);
+    assert_eq!(memory.bytes_in_category(MemoryCategory::PrefixAnswerCache), 0);
+    assert!(catalog.answer(contribution).is_none());
 }
 
 #[test]
@@ -2669,9 +2750,30 @@ fn a_retained_witness_carries_an_anchor_through_its_lifecycle() {
     for (node, class) in [(nodes[1], anchor), (nodes[2], witness)] {
         add_feature(&mut engine, node, LocalFeatureKey::Class(class));
     }
+    for &node in &nodes {
+        set_atom_feature(&mut engine, node, LocalFeatureKey::TagName, StyleAtomID(100));
+    }
     discard_transaction(&mut engine);
 
+    assert!(engine.begin_cold_matching_batch(nodes[0]));
     assert!(!engine.match_element(nodes[1]).unwrap().is_empty());
+    let (key, retained) = engine
+        .state
+        .pending_witness_effects
+        .iter()
+        .find_map(|effect| match effect {
+            WitnessEffect::Retain(key, witness) if key.anchor == nodes[1] => Some((*key, *witness)),
+            _ => None,
+        })
+        .expect("matching must produce a positive witness effect");
+    assert!(matches!(
+        engine.state.relational_witnesses.lookup(key),
+        Lookup::Missing(_)
+    ));
+    engine.match_element(nodes[2]).unwrap();
+    engine.end_cold_matching_batch();
+    assert!(engine.state.pending_witness_effects.is_empty());
+    assert!(matches!(engine.state.relational_witnesses.lookup(key), Lookup::Known(&node) if node == retained));
 
     // A second witness appearing cannot flip an anchor that is already true, so the retained
     // witness answers for it and nothing is routed.
@@ -3703,9 +3805,8 @@ fn retained_answer_patching_evaluates_narrow_affected_rules_directly() {
     let compact_answer = engine.matches_for_cascade(exact_answer.clone(), false, None);
     engine.remember_retained_match_answer(nodes[1], &exact_answer);
     engine.remember_cascade_input(nodes[1], &compact_answer);
-    let mut patch = engine
-        .state
-        .prepare_retained_answer_patch(RetainedAnswerPatchSelection {
+    let mut patch = engine.state.prepare_retained_answer_patch(
+        RetainedAnswerPatchSelection {
             affected: vec![
                 RetainedAnswerPatchSelectionRule {
                     rule: matching_rule,
@@ -3732,7 +3833,9 @@ fn retained_answer_patching_evaluates_narrow_affected_rules_directly() {
             orders_shifted: false,
             requires_full_match: false,
             ..Default::default()
-        });
+        },
+        &mut Counters::default(),
+    );
     let feature_tests_before = engine.counters().get(Counter::LocalFeatureTests);
 
     assert_eq!(
@@ -3766,17 +3869,20 @@ fn retained_answer_patching_applies_complete_signed_deltas_without_matching() {
     let program = engine.program.rule_version(rule).selector_program.unwrap();
     // Match-input preparation follows fact commit, as it does in a style transaction.
     engine.state.facts.apply_staged(&mut engine.state.memory);
-    let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
-        affected: vec![RetainedAnswerPatchSelectionRule {
-            rule,
-            program,
-            evaluate: true,
-        }],
-        always_emit: false,
-        orders_shifted: false,
-        requires_full_match: false,
-        ..Default::default()
-    });
+    let mut patch = engine.prepare_retained_answer_patch(
+        RetainedAnswerPatchSelection {
+            affected: vec![RetainedAnswerPatchSelectionRule {
+                rule,
+                program,
+                evaluate: true,
+            }],
+            always_emit: false,
+            orders_shifted: false,
+            requires_full_match: false,
+            ..Default::default()
+        },
+        &mut Counters::default(),
+    );
     let feature_tests_before = engine.counters().get(Counter::LocalFeatureTests);
 
     let outcome = engine
@@ -3935,22 +4041,23 @@ fn recycled_selector_entries_keep_delta_answers_canonical() {
     add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(second));
     engine.state.facts.apply_staged(&mut engine.state.memory);
 
-    let retained = prepare_retained_match_answer(retained.into_iter());
-    let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
-        affected: vec![RetainedAnswerPatchSelectionRule {
-            rule,
-            program,
-            evaluate: true,
-        }],
-        requires_full_match: true,
-        ..Default::default()
-    });
+    let mut patch = engine.prepare_retained_answer_patch(
+        RetainedAnswerPatchSelection {
+            affected: vec![RetainedAnswerPatchSelectionRule {
+                rule,
+                program,
+                evaluate: true,
+            }],
+            requires_full_match: true,
+            ..Default::default()
+        },
+        &mut Counters::default(),
+    );
     engine
         .apply_retained_match_answer_deltas(
             nodes[1],
             &mut patch,
             old_identity,
-            &retained,
             old_cascade_input,
             &[SelectorTruthDelta {
                 node: nodes[1],
@@ -4014,29 +4121,32 @@ fn retained_answer_patching_matches_only_unresolved_rules_after_signed_deltas() 
     add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(delta_target));
     add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(second_delta_target));
     engine.state.facts.apply_staged(&mut engine.state.memory);
-    let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
-        affected: vec![
-            RetainedAnswerPatchSelectionRule {
-                rule: delta_rule,
-                program: delta_program,
-                evaluate: true,
-            },
-            RetainedAnswerPatchSelectionRule {
-                rule: second_delta_rule,
-                program: second_delta_program,
-                evaluate: true,
-            },
-            RetainedAnswerPatchSelectionRule {
-                rule: refresh_rule,
-                program: refresh_program,
-                evaluate: true,
-            },
-        ],
-        always_emit: false,
-        orders_shifted: false,
-        requires_full_match: false,
-        ..Default::default()
-    });
+    let mut patch = engine.prepare_retained_answer_patch(
+        RetainedAnswerPatchSelection {
+            affected: vec![
+                RetainedAnswerPatchSelectionRule {
+                    rule: delta_rule,
+                    program: delta_program,
+                    evaluate: true,
+                },
+                RetainedAnswerPatchSelectionRule {
+                    rule: second_delta_rule,
+                    program: second_delta_program,
+                    evaluate: true,
+                },
+                RetainedAnswerPatchSelectionRule {
+                    rule: refresh_rule,
+                    program: refresh_program,
+                    evaluate: true,
+                },
+            ],
+            always_emit: false,
+            orders_shifted: false,
+            requires_full_match: false,
+            ..Default::default()
+        },
+        &mut Counters::default(),
+    );
     let candidate_checks_before = engine.counters().get(Counter::CandidateChecks);
 
     assert_eq!(
@@ -4102,17 +4212,20 @@ fn retained_answer_patching_preserves_incomplete_cascade_winners() {
     engine.remember_retained_match_answer(nodes[1], &exact_answer);
     engine.remember_cascade_input(nodes[1], &compact_answer);
     let winning_program = engine.program.rule_version(winning_rule).selector_program.unwrap();
-    let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
-        affected: vec![RetainedAnswerPatchSelectionRule {
-            rule: winning_rule,
-            program: winning_program,
-            evaluate: true,
-        }],
-        always_emit: false,
-        orders_shifted: false,
-        requires_full_match: false,
-        ..Default::default()
-    });
+    let mut patch = engine.prepare_retained_answer_patch(
+        RetainedAnswerPatchSelection {
+            affected: vec![RetainedAnswerPatchSelectionRule {
+                rule: winning_rule,
+                program: winning_program,
+                evaluate: true,
+            }],
+            always_emit: false,
+            orders_shifted: false,
+            requires_full_match: false,
+            ..Default::default()
+        },
+        &mut Counters::default(),
+    );
 
     let outcome = engine
         .patch_retained_match_answer(
@@ -4135,17 +4248,20 @@ fn retained_answer_patching_preserves_incomplete_cascade_winners() {
 fn selector_list_entry_deltas_fall_back_when_the_compact_winner_is_insufficient() {
     let (mut engine, nodes) = linear_document();
     let (rule, program) = add_selector_list_rule(&mut engine, StyleAtomID(200), StyleAtomID(201));
-    let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
-        affected: vec![RetainedAnswerPatchSelectionRule {
-            rule,
-            program,
-            evaluate: true,
-        }],
-        always_emit: false,
-        orders_shifted: false,
-        requires_full_match: false,
-        ..Default::default()
-    });
+    let mut patch = engine.prepare_retained_answer_patch(
+        RetainedAnswerPatchSelection {
+            affected: vec![RetainedAnswerPatchSelectionRule {
+                rule,
+                program,
+                evaluate: true,
+            }],
+            always_emit: false,
+            orders_shifted: false,
+            requires_full_match: false,
+            ..Default::default()
+        },
+        &mut Counters::default(),
+    );
     let retained = [RetainedRuleMatch {
         rule,
         program,
@@ -4153,6 +4269,8 @@ fn selector_list_entry_deltas_fall_back_when_the_compact_winner_is_insufficient(
         tree_scope: TreeScopeID::DOCUMENT,
         scope_proximity: u32::MAX,
     }];
+    engine.remember_prepared_retained_match_answer_with_truth(nodes[1], retained.to_vec(), None);
+    let old_identity = *engine.retained_match_answers.lookup(nodes[1]).sparse().unwrap();
     let entries = [
         engine.programs.entry_id(program, 0),
         engine.programs.entry_id(program, 1),
@@ -4170,8 +4288,7 @@ fn selector_list_entry_deltas_fall_back_when_the_compact_winner_is_insufficient(
             .apply_retained_match_answer_deltas(
                 nodes[1],
                 &mut patch,
-                MatchAnswerID::default(),
-                &retained,
+                old_identity,
                 MatchAnswerID::default(),
                 &[delta(0, SetChange::Added)],
             )
@@ -4183,8 +4300,7 @@ fn selector_list_entry_deltas_fall_back_when_the_compact_winner_is_insufficient(
             .apply_retained_match_answer_deltas(
                 nodes[1],
                 &mut patch,
-                MatchAnswerID::default(),
-                &retained,
+                old_identity,
                 MatchAnswerID::default(),
                 &[delta(1, SetChange::Removed)],
             )
@@ -4210,17 +4326,20 @@ fn retained_answer_repair_returns_signed_selector_truth() {
     remove_feature(&mut engine, nodes[1], LocalFeatureKey::Class(target));
     discard_transaction(&mut engine);
     let program = engine.program.rule_version(rule).selector_program.unwrap();
-    let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
-        affected: vec![RetainedAnswerPatchSelectionRule {
-            rule,
-            program,
-            evaluate: true,
-        }],
-        always_emit: false,
-        orders_shifted: false,
-        requires_full_match: false,
-        ..Default::default()
-    });
+    let mut patch = engine.prepare_retained_answer_patch(
+        RetainedAnswerPatchSelection {
+            affected: vec![RetainedAnswerPatchSelectionRule {
+                rule,
+                program,
+                evaluate: true,
+            }],
+            always_emit: false,
+            orders_shifted: false,
+            requires_full_match: false,
+            ..Default::default()
+        },
+        &mut Counters::default(),
+    );
     let repair_upqueries_before = engine.counters().get(Counter::SelectorTruthRepairUpqueries);
     let repair_removals_before = engine.counters().get(Counter::SelectorTruthRepairRemovals);
     let delta_patches_before = engine.counters().get(Counter::RetainedMatchAnswerDeltaPatches);
@@ -5471,22 +5590,22 @@ fn test_prefix_relation(engine: &mut StyleEngine, root: StyleNodeID) -> (Rc<Rule
     }
     engine.state.facts.apply_staged(&mut engine.state.memory);
     let (_, dispatch) = engine.prepare_scope_program(TreeScopeID::DOCUMENT);
-    let workspace = MatchEvaluationWorkspace::default();
+    let mut workspace = MatchScratch::default();
     let facts = engine.state.facts.primary();
-    let evaluator =
-        MatchEvaluator::new(&engine.state.tree, facts).with_match_workspace(&workspace, MatchEvaluationSide::Current);
-    let evaluation = PrefixEvaluation::new(
+    let mut evaluator = MatchEvaluator::new(&engine.state.tree, facts)
+        .with_match_workspace(&mut workspace, MatchEvaluationSide::Current);
+    let mut evaluation = PrefixEvaluation::new(
         dispatch.prefixes(),
         &engine.state.tree,
         facts,
         &engine.state.programs,
-        &evaluator,
+        &mut evaluator,
         None,
         None,
     );
     let relation = dispatch
         .prefixes()
-        .build_relation(&evaluation, root, &mut engine.counters);
+        .build_relation(&mut evaluation, root, &mut engine.counters);
     (dispatch, relation)
 }
 
@@ -5498,27 +5617,28 @@ fn update_test_prefix_relation(
     changed: &[StyleNodeID],
     geometry_root: Option<StyleNodeID>,
 ) -> Counters {
-    let workspace = MatchEvaluationWorkspace::default();
+    let mut workspace = MatchScratch::default();
     let facts = engine.facts.primary();
-    let evaluator =
-        MatchEvaluator::new(&engine.tree, facts).with_match_workspace(&workspace, MatchEvaluationSide::Current);
-    let old_evaluator =
-        MatchEvaluator::new(&engine.tree, old_facts).with_match_workspace(&workspace, MatchEvaluationSide::OldTree);
-    let evaluation = PrefixEvaluation::new(
+    let mut evaluator =
+        MatchEvaluator::new(&engine.tree, facts).with_match_workspace(&mut workspace, MatchEvaluationSide::Current);
+    let mut old_workspace = MatchScratch::default();
+    let mut old_evaluator = MatchEvaluator::new(&engine.tree, old_facts)
+        .with_match_workspace(&mut old_workspace, MatchEvaluationSide::OldTree);
+    let mut evaluation = PrefixEvaluation::new(
         dispatch.prefixes(),
         &engine.tree,
         facts,
         &engine.programs,
-        &evaluator,
+        &mut evaluator,
         None,
         None,
     );
-    let old_evaluation = PrefixEvaluation::new(
+    let mut old_evaluation = PrefixEvaluation::new(
         dispatch.prefixes(),
         &engine.tree,
         old_facts,
         &engine.programs,
-        &old_evaluator,
+        &mut old_evaluator,
         None,
         None,
     );
@@ -5534,14 +5654,14 @@ fn update_test_prefix_relation(
         geometry_nodes.extend(engine.tree.preorder(root));
         geometry_nodes.sort_unstable();
         geometry_nodes.dedup();
-        changed.extend(relation.update_geometry(dispatch.prefixes(), &evaluation, &geometry_nodes, &mut counters));
+        changed.extend(relation.update_geometry(dispatch.prefixes(), &mut evaluation, &geometry_nodes, &mut counters));
         changed.sort_unstable();
         changed.dedup();
     }
     relation.update(
         dispatch.prefixes(),
-        &evaluation,
-        &old_evaluation,
+        &mut evaluation,
+        &mut old_evaluation,
         &changed,
         &mut counters,
     );
@@ -5589,7 +5709,7 @@ fn prefix_relation_copies_only_dispatch_complete_predicates() {
         } else {
             assert_eq!(evaluated, 0);
         }
-        let mut states = PrefixStates::new(0);
+        let mut states = PrefixStates::new();
         relation.install_answers(&mut states);
         let expected = if additional_tests { [2, 2, 4, 3] } else { [2, 2, 2, 3] };
         for (&node, count) in nodes.iter().zip(expected) {
@@ -5613,25 +5733,41 @@ fn prefix_completion_reuses_positive_and_negative_relation_answers() {
     discard_transaction(&mut engine);
     let (dispatch, relation) = test_prefix_relation(&mut engine, nodes[0]);
     let facts = engine.facts.primary();
-    let evaluator = MatchEvaluator::new(&engine.tree, facts);
-    let evaluation = PrefixEvaluation::new(
+    let mut evaluator = MatchEvaluator::new(&engine.tree, facts);
+    let mut evaluation = PrefixEvaluation::new(
         dispatch.prefixes(),
         &engine.tree,
         facts,
         &engine.programs,
-        &evaluator,
+        &mut evaluator,
         None,
         None,
     );
     let mut counters = Counters::default();
-    let mut states = PrefixStates::new(facts.row_count());
-    assert!(!states.complete_nodes_with_budget(&evaluation, nodes.iter().copied(), 0, &mut counters));
+    let mut states = PrefixStates::new();
+    let mut context =
+        super::prefix::PrefixTransitionContext::new(&mut states, dispatch.prefixes(), facts, &mut counters);
+    assert!(!states.complete_nodes_with_budget(
+        &mut context.scratch,
+        &mut context.effects,
+        &mut evaluation,
+        nodes.iter().copied(),
+        0,
+        &mut counters
+    ));
     relation.install_answers(&mut states);
     states.relation = Some(Box::new(relation));
     assert!(states.retained_matches_for(nodes[0]).unwrap().is_empty());
     assert_eq!(states.retained_matches_for(nodes[3]).unwrap().len(), 1);
     for budget in [0, usize::MAX] {
-        assert!(states.complete_nodes_with_budget(&evaluation, nodes.iter().copied(), budget, &mut counters));
+        assert!(states.complete_nodes_with_budget(
+            &mut context.scratch,
+            &mut context.effects,
+            &mut evaluation,
+            nodes.iter().copied(),
+            budget,
+            &mut counters
+        ));
         assert_eq!(counters.get(Counter::PrefixCompoundsEvaluated), 0);
         assert_eq!(counters.get(Counter::PrefixTransitionMemoMisses), 0);
     }
@@ -5695,7 +5831,7 @@ fn prefix_relations_share_program_predicates_without_merging_their_paths() {
     let before = engine.counters.get(Counter::PrefixCompoundsEvaluated);
     let (dispatch, mut relation) = test_prefix_relation(&mut engine, nodes[0]);
     assert_eq!(engine.counters.get(Counter::PrefixCompoundsEvaluated) - before, 2);
-    let mut states = PrefixStates::new(0);
+    let mut states = PrefixStates::new();
     relation.install_answers(&mut states);
     let original = states.retained_matches_for(nodes[3]).unwrap().to_vec();
     assert_eq!(original.len(), 1);
@@ -5800,7 +5936,7 @@ fn prefix_relation_reuses_local_facts_without_sharing_position() {
         evaluations, 0,
         "unchanged local facts must retain their predicate answers"
     );
-    let mut states = PrefixStates::new(0);
+    let mut states = PrefixStates::new();
     relation.install_answers(&mut states);
     assert!(states.retained_matches_for(nodes[0]).unwrap().is_empty());
     for (index, &node) in nodes.iter().enumerate().skip(1) {
@@ -5893,7 +6029,7 @@ fn prefix_relation_local_fact_cache_separates_predicates_and_tracks_changes() {
             evaluations < 16,
             "repeated local facts required {evaluations} evaluations"
         );
-        let mut states = PrefixStates::new(0);
+        let mut states = PrefixStates::new();
         relation.install_answers(&mut states);
         for (index, &node) in nodes.iter().enumerate() {
             assert_eq!(
@@ -5922,7 +6058,7 @@ fn prefix_relation_local_fact_cache_separates_predicates_and_tracks_changes() {
         assert_eq!(relation.changed_answers.len(), nodes.len());
         relation.install_answers(&mut states);
         let (_, rebuilt) = test_prefix_relation(&mut engine, nodes[0]);
-        let mut rebuilt_states = PrefixStates::new(0);
+        let mut rebuilt_states = PrefixStates::new();
         rebuilt.install_answers(&mut rebuilt_states);
         for (index, &node) in nodes.iter().enumerate() {
             let selected = index % 2 != 0;
@@ -5959,7 +6095,7 @@ fn prefix_relations_propagate_local_changes_over_every_axis() {
         add_feature(&mut engine, nodes[target_index], LocalFeatureKey::Class(target));
         discard_transaction(&mut engine);
         let (dispatch, mut relation) = test_prefix_relation(&mut engine, nodes[0]);
-        let mut states = PrefixStates::new(0);
+        let mut states = PrefixStates::new();
         relation.install_answers(&mut states);
         assert_eq!(
             states.retained_matches_for(nodes[target_index]).unwrap().len(),
@@ -6211,7 +6347,7 @@ fn prefix_relations_update_adjacency_and_positions_after_sibling_removal() {
     add_feature(&mut engine, nodes[3], LocalFeatureKey::Class(target));
     discard_transaction(&mut engine);
     let (dispatch, mut relation) = test_prefix_relation(&mut engine, nodes[0]);
-    let mut states = PrefixStates::new(0);
+    let mut states = PrefixStates::new();
     relation.install_answers(&mut states);
     assert!(states.retained_matches_for(nodes[3]).unwrap().is_empty());
 
@@ -6662,10 +6798,16 @@ fn a_prefix_upquery_retains_every_transition_on_its_ancestor_chain() {
         Lookup::Known(states) => states,
         Lookup::KnownAbsent | Lookup::Missing(_) => panic!("expected a retained prefix program"),
     };
-    assert!(nodes.iter().all(|&node| states.has_transition(node)));
+    assert!(nodes.iter().all(|&node| !states.has_transition(node)));
     let _ = states;
     drop(caches);
+    assert_eq!(engine.match_element(nodes[3]).unwrap().len(), 1);
     engine.end_cold_matching_batch();
+    {
+        let caches = prefix_caches.borrow();
+        let states = caches.states.lookup(scope_program).sparse().unwrap();
+        assert!(nodes.iter().all(|&node| states.has_transition(node)));
+    }
 
     let mut caches = engine.state.prefix_caches.borrow_mut();
     caches.states.make_scratch(&mut engine.state.memory);
@@ -6916,11 +7058,13 @@ fn closure_identity_stop_verification_is_observer_only() {
             .collect::<Vec<_>>(),
         memory_before
     );
-    assert!(engine.winner_groups.node_rows_are_semantically_equal(
-        &winner_groups_before,
-        nodes[2],
-        engine.program.version()
-    ));
+    assert!(
+        super::cascade::WinnerView::retained(&engine.winner_groups).node_rows_are_semantically_equal(
+            &winner_groups_before,
+            nodes[2],
+            engine.program.version()
+        )
+    );
     assert_eq!(engine.match_answers.answers.live_len(), catalog_entry_count_before);
     assert_eq!(engine.retained_match_answers.column, retained_answer_column_before);
     assert_eq!(
@@ -7090,7 +7234,7 @@ fn element_declarations_refuse_selector_only_prefix_answer_reuse() {
     for (node, value) in [(nodes[2], SpecifiedValueID(102)), (nodes[3], SpecifiedValueID(103))] {
         let key = WinnerGroupKey::current(node, engine.program.version());
         assert!(
-            matches!(engine.winner_groups.winner(key, 2), Lookup::Known(winner) if winner.source == WinnerSource::Element(ElementDeclarationKind::InlineStyle) && winner.key.value == value)
+            matches!(engine.current_winner_groups().winner(key, 2), Lookup::Known(winner) if winner.source == WinnerSource::Element(ElementDeclarationKind::InlineStyle) && winner.key.value == value)
         );
     }
     assert_eq!(engine.counters().get(Counter::PrefixAnswerCacheMisses), 0);
@@ -9021,7 +9165,7 @@ fn element_inputs_force_only_their_own_retained_answer_reactions() {
         }
         let transaction = engine.take_transaction();
         let selection = engine.rules_for_retained_answer_patch(&transaction).unwrap();
-        let mut patch = engine.prepare_retained_answer_patch(selection);
+        let mut patch = engine.prepare_retained_answer_patch(selection, &mut Counters::default());
         for &node in &nodes {
             let outcome = engine
                 .patch_retained_match_answer(node, &mut patch, SelectorTruthPatch::Direct(&[]))
@@ -9049,7 +9193,7 @@ fn keyframes_force_only_their_named_consumers_retained_answer_reactions() {
     engine.add_keyframes_rule(sheet, None, name);
     let transaction = engine.take_transaction();
     let selection = engine.rules_for_retained_answer_patch(&transaction).unwrap();
-    let mut patch = engine.prepare_retained_answer_patch(selection);
+    let mut patch = engine.prepare_retained_answer_patch(selection, &mut Counters::default());
     for &node in &nodes {
         let outcome = engine
             .patch_retained_match_answer(node, &mut patch, SelectorTruthPatch::Direct(&[]))
@@ -10044,6 +10188,7 @@ fn rule_activation_exactly_matches_a_refused_prefix_chain() {
     for &node in &nodes {
         engine.match_element(node).unwrap();
     }
+    engine.end_cold_matching_batch();
     let (scope_program, _) = engine.prepare_scope_program(TreeScopeID::DOCUMENT);
     let caches = engine.prefix_caches.borrow();
     let states = match caches.states.lookup(scope_program) {
@@ -10054,7 +10199,6 @@ fn rule_activation_exactly_matches_a_refused_prefix_chain() {
     drop(caches);
     let incidences = engine.materialize_current_selector_incidence(refused_program).unwrap();
     assert!(incidences.iter().any(|incidence| incidence.node == nodes[35]));
-    engine.end_cold_matching_batch();
 
     engine.set_rule_conditions_hold(refused_rule, true);
     let mut planned = Vec::new();

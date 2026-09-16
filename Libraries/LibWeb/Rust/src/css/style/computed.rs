@@ -327,6 +327,7 @@ struct ComputedGroup {
 struct ComputedGroupSet {
     identity_hash: u64,
     payloads: Box<[*const c_void]>,
+    groups: Box<[ComputedGroupID]>,
     canonical_longhand_table: Option<ComputedLonghandTableID>,
 }
 
@@ -848,22 +849,8 @@ impl ComputedGroupSets {
         Some(self.inherited_sets.get(groups).len())
     }
 
-    fn group_identity(&self, index: usize, payload: *const c_void) -> ComputedGroupID {
-        let key = (index, payload as usize);
-        self.groups
-            .find(content_hash(key), |_identity, group| {
-                (group.index, group.payload as usize) == key
-            })
-            .expect("computed group-set payload names a live group")
-    }
-
     fn group_identities(&self, set: ComputedGroupSetID) -> impl Iterator<Item = ComputedGroupID> {
-        self.sets[set]
-            .payloads
-            .iter()
-            .copied()
-            .enumerate()
-            .map(move |(index, payload)| self.group_identity(index, payload))
+        self.sets[set].groups.iter().copied()
     }
 
     fn pseudo_rows(&self, node: StyleNodeID) -> &[PseudoComputedRow] {
@@ -1001,14 +988,7 @@ impl ComputedGroupSets {
 
     fn intern_group_set(&mut self, groups: &[ComputedGroupID]) -> (ComputedGroupSetID, bool) {
         let hash = content_hash(groups);
-        if let Some(identity) = self.sets.find(hash, |_identity, set| {
-            set.payloads.len() == groups.len()
-                && set
-                    .payloads
-                    .iter()
-                    .zip(groups)
-                    .all(|(&payload, &identity)| payload == self.groups[identity].payload)
-        }) {
+        if let Some(identity) = self.sets.find(hash, |_identity, set| set.groups.as_ref() == groups) {
             return (identity, false);
         }
         let identity = self.sets.take_free_identity().unwrap_or_else(|| {
@@ -1017,10 +997,9 @@ impl ComputedGroupSets {
         let payloads = groups
             .iter()
             .map(|identity| self.groups[*identity].payload)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+            .collect::<Box<[_]>>();
         self.group_set_nested_memory
-            .grow_committed(size_of_val(payloads.as_ref()) as u64);
+            .grow_committed((size_of_val(payloads.as_ref()) + size_of_val(groups)) as u64);
         self.identity_mints.group_sets += 1;
         self.sets.insert(
             hash,
@@ -1028,6 +1007,7 @@ impl ComputedGroupSets {
             ComputedGroupSet {
                 identity_hash: hash,
                 payloads,
+                groups: groups.into(),
                 canonical_longhand_table: None,
             },
         );
@@ -1110,19 +1090,19 @@ impl ComputedGroupSets {
     /// does not. A candidate found equal by comparison is reused before the
     /// table's hash is asked for, so a table that starts empty and computes
     /// to a published state never hashes its values.
-    fn intern_longhand_table(
-        &mut self,
+    fn find_longhand_table(
+        &self,
         table: &ComputedLonghandTable,
         previous: Option<ComputedLonghandTableID>,
         canonical: Option<ComputedLonghandTableID>,
-    ) -> ComputedLonghandTableID {
+    ) -> Result<ComputedLonghandTableID, u64> {
         debug_assert!(table.is_frozen(), "only frozen longhand tables are published");
         for candidate in [previous, canonical].into_iter().flatten() {
             if self.computed_longhand_tables[candidate]
                 .table()
                 .publication_equals(table)
             {
-                return candidate;
+                return Ok(candidate);
             }
         }
         let hash = longhand_table_hash(table);
@@ -1130,17 +1110,48 @@ impl ComputedGroupSets {
             .computed_longhand_tables
             .find(hash, |_identity, candidate| candidate.table().publication_equals(table))
         {
-            return identity;
+            return Ok(identity);
         }
+        Err(hash)
+    }
+
+    fn intern_longhand_table(
+        &mut self,
+        table: &ComputedLonghandTable,
+        previous: Option<ComputedLonghandTableID>,
+        canonical: Option<ComputedLonghandTableID>,
+    ) -> ComputedLonghandTableID {
+        let hash = match self.find_longhand_table(table, previous, canonical) {
+            Ok(identity) => return identity,
+            Err(hash) => hash,
+        };
+        let retained = unsafe { crate::css::computed_longhand_table::rust_computed_longhand_table_retain(table) };
+        self.insert_longhand_table(retained, hash)
+    }
+
+    fn intern_owned_longhand_table(
+        &mut self,
+        table: ComputedLonghandTable,
+        previous: Option<ComputedLonghandTableID>,
+        canonical: Option<ComputedLonghandTableID>,
+    ) -> ComputedLonghandTableID {
+        let hash = match self.find_longhand_table(&table, previous, canonical) {
+            Ok(identity) => return identity,
+            Err(hash) => hash,
+        };
+        // NB: Only a new unique result materializes; ownership transfers to the catalog.
+        self.insert_longhand_table(table.into_raw_shared(), hash)
+    }
+
+    fn insert_longhand_table(&mut self, retained: *const ComputedLonghandTable, hash: u64) -> ComputedLonghandTableID {
         let identity = self.computed_longhand_tables.take_free_identity().unwrap_or_else(|| {
             ComputedLonghandTableID(
                 u32::try_from(self.computed_longhand_tables.len())
                     .expect("computed longhand-table identity space exhausted"),
             )
         });
-        let retained = unsafe { crate::css::computed_longhand_table::rust_computed_longhand_table_retain(table) };
         self.longhand_table_nested_memory
-            .grow_committed(size_of_val(table.value_pointers()) as u64);
+            .grow_committed(unsafe { &*retained }.publication_capacity_bytes());
         self.computed_longhand_tables
             .insert(hash, identity, RetainedLonghandTable { table: retained });
         identity
@@ -1290,8 +1301,7 @@ impl ComputedGroupSets {
             (Some(old_table), Some(parent_table)) => Some(
                 self.computed_longhand_tables[old_table]
                     .table()
-                    .with_inherited_values_from(self.computed_longhand_tables[parent_table].table())
-                    .into_raw_shared(),
+                    .with_inherited_values_from(self.computed_longhand_tables[parent_table].table()),
             ),
             (None, _) if current_color_dependencies & !INHERITED_GROUP_MASK == 0 => None,
             _ => return None,
@@ -1300,17 +1310,9 @@ impl ComputedGroupSets {
         let mut groups: SmallVec<[_; crate::css::table_group_builder::group_index::COUNT]> = parent_groups
             .iter()
             .copied()
-            .chain(
-                old_group_set
-                    .payloads
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .skip(INHERITED_GROUP_COUNT)
-                    .map(|(index, payload)| self.group_identity(index, payload)),
-            )
+            .chain(old_group_set.groups.iter().copied().skip(INHERITED_GROUP_COUNT))
             .collect();
-        if let Some(table) = swapped_table
+        if let Some(table) = &swapped_table
             && current_color_dependencies & !INHERITED_GROUP_MASK != 0
         {
             let inherited_text = unsafe {
@@ -1330,7 +1332,7 @@ impl ComputedGroupSets {
                 let old_payload = self.groups[*group_identity].payload;
                 let payload = unsafe {
                     crate::css::table_group_builder::rebuild_group_for_inherited_current_color(
-                        &*table,
+                        table,
                         group,
                         old_payload,
                         inherited_text.color,
@@ -1351,13 +1353,8 @@ impl ComputedGroupSets {
         // The swap is only taken for a fully inheriting element, so every
         // inherited-by-default longhand's value is the parent's; the swapped
         // table keeps the record a complete inheritance source for a child.
-        let longhand_table = swapped_table.map(|table| {
-            let identity = self.intern_longhand_table(unsafe { &*table }, old_record.longhand_table, None);
-            unsafe {
-                crate::css::computed_longhand_table::rust_computed_longhand_table_release(table.cast_mut());
-            }
-            identity
-        });
+        let longhand_table =
+            swapped_table.map(|table| self.intern_owned_longhand_table(table, old_record.longhand_table, None));
         let new_record = StyleRecord {
             groups: group_set,
             inherited_groups: parent_inherited,
@@ -1463,11 +1460,7 @@ impl ComputedGroupSets {
         // it, not what the old table held.
         let display_is_none = crate::css::style_compute::effective_display(&table, None).is_none();
         table.set_in_display_none_subtree(parent_in_display_none_subtree || display_is_none);
-        table.freeze();
-        let table = table.into_raw_shared();
-        let release_table = |table: *const ComputedLonghandTable| unsafe {
-            crate::css::computed_longhand_table::rust_computed_longhand_table_release(table.cast_mut());
-        };
+        table.finish_delta();
 
         let mut groups: SmallVec<[_; crate::css::table_group_builder::group_index::COUNT]> =
             self.group_identities(old_record.groups).collect();
@@ -1480,7 +1473,7 @@ impl ComputedGroupSets {
             let payload = if group == STYLE_GROUP_INDEX_FONT {
                 unsafe {
                     crate::css::table_group_builder::rebuild_font_group_from_table(
-                        &*table,
+                        &table,
                         font.expect("a font group rebuild carries the resolved font"),
                         old_payload,
                     )
@@ -1488,7 +1481,7 @@ impl ComputedGroupSets {
             } else {
                 unsafe {
                     crate::css::table_group_builder::rebuild_group_from_table(
-                        &*table,
+                        &table,
                         group,
                         old_payload,
                         current_color,
@@ -1497,10 +1490,7 @@ impl ComputedGroupSets {
                     )
                 }
             };
-            let Some(payload) = payload else {
-                release_table(table);
-                return None;
-            };
+            let payload = payload?;
             // An equal payload keeps the old identity, as a C++ build adopts its parent's and
             // predecessor's identical payloads.
             let identity = if payload == old_payload || style_group_payloads_equal(group, old_payload, payload) {
@@ -1518,9 +1508,9 @@ impl ComputedGroupSets {
             .get_index(group_set.0 as usize)
             .is_some_and(|set| style_group_payloads_hold_image_values(&set.payloads));
         let old_metadata = self.computed_fixed_metadata[old_record.fixed_metadata];
-        let swap_eligible = table_inherited_group_swap_eligible(unsafe { &*table });
+        let swap_eligible = table_inherited_group_swap_eligible(&table);
         let dependency_flags =
-            unsafe { &*table }.publication_dependency_flags() | (u8::from(holds_image_values) * HOLDS_IMAGE_VALUES);
+            table.publication_dependency_flags() | (u8::from(holds_image_values) * HOLDS_IMAGE_VALUES);
         let fixed_metadata = if dependency_flags == old_metadata.dependency_flags {
             old_record.fixed_metadata
         } else {
@@ -1530,8 +1520,7 @@ impl ComputedGroupSets {
             })
             .0
         };
-        let longhand_table = self.intern_longhand_table(unsafe { &*table }, Some(old_table), None);
-        release_table(table);
+        let longhand_table = self.intern_owned_longhand_table(table, Some(old_table), None);
         // The environment moves with the record when the node's custom declarations resolved to
         // another; a record keeps its environment otherwise.
         let custom_properties = match environment {
@@ -1699,15 +1688,17 @@ impl ComputedGroupSets {
         &mut self,
         base_style_record: StyleRecordID,
         source_identity: u64,
-        animated_overlay: &mut Option<Box<crate::css::animated_overlay::AnimatedOverlay>>,
+        animated_overlay: Option<&crate::css::animated_overlay::AnimatedOverlay>,
         payloads: &[*const c_void],
     ) -> (u32, FinalStyleRecordID, bool) {
         let record = self.make_animation_overlay_record(
             base_style_record,
             source_identity,
-            animated_overlay
-                .take()
-                .expect("animation overlay properties are missing"),
+            Box::new(
+                animated_overlay
+                    .expect("animation overlay properties are missing")
+                    .clone(),
+            ),
             payloads,
         );
         self.animation_overlay_nested_memory
@@ -1759,7 +1750,7 @@ impl ComputedGroupSets {
         current_slot: Option<u32>,
         base_style_record: StyleRecordID,
         source_identity: u64,
-        animated_overlay: &mut Option<Box<crate::css::animated_overlay::AnimatedOverlay>>,
+        animated_overlay: Option<&crate::css::animated_overlay::AnimatedOverlay>,
         payloads: &[*const c_void],
     ) -> AnimationOverlayPublication {
         if source_identity == 0 {
@@ -1797,9 +1788,11 @@ impl ComputedGroupSets {
                 let record = self.make_animation_overlay_record(
                     base_style_record,
                     source_identity,
-                    animated_overlay
-                        .take()
-                        .expect("animation overlay properties are missing"),
+                    Box::new(
+                        animated_overlay
+                            .expect("animation overlay properties are missing")
+                            .clone(),
+                    ),
                     payloads,
                 );
                 let new_payload_bytes = size_of_val(record.payloads.as_ref()) as u64;
@@ -1870,13 +1863,12 @@ impl ComputedGroupSets {
             )
         };
         let previous_style_record = self.final_style_record(base_style_record, current_slot);
-        let mut animated_overlay =
-            (!animated_overlay.is_null()).then(|| Box::new(unsafe { &*animated_overlay }.clone()));
+        let animated_overlay = unsafe { animated_overlay.as_ref() };
         let publication = self.update_animation_overlay(
             current_slot,
             base_style_record,
             source_identity,
-            &mut animated_overlay,
+            animated_overlay,
             payloads,
         );
         if target.is_pseudo() {
@@ -1915,11 +1907,7 @@ impl ComputedGroupSets {
             animation_overlay_payloads,
             longhand_table,
         } = metadata_input;
-        let mut animated_overlay = if animated_overlay.is_null() {
-            None
-        } else {
-            Some(Box::new(unsafe { &*animated_overlay }.clone()))
-        };
+        let animated_overlay = unsafe { animated_overlay.as_ref() };
         let longhand_table = unsafe { longhand_table.as_ref() };
         let inherited_group_swap_eligible = dependency_flags & INHERITED_GROUP_SWAP_ELIGIBLE != 0;
         let dependency_flags = (dependency_flags & COMPUTED_VALUE_DEPENDENCY_FLAGS)
@@ -1973,9 +1961,7 @@ impl ComputedGroupSets {
                 groups.push(identity);
                 continue;
             }
-            let previous_identity = previous_group_set
-                .and_then(|set| self.sets[set].payloads.get(index).copied())
-                .map(|payload| self.group_identity(index, payload));
+            let previous_identity = previous_group_set.and_then(|set| self.sets[set].groups.get(index).copied());
             let previous_equal_identity = previous_identity
                 .filter(|identity| style_group_payloads_equal(index, payload, self.groups[*identity].payload));
             let identity = match previous_equal_identity {
@@ -2060,7 +2046,7 @@ impl ComputedGroupSets {
                 previous.and_then(|previous| previous.animation_overlay_slot),
                 style_record_identity,
                 animation_overlay_identity,
-                &mut animated_overlay,
+                animated_overlay,
                 animation_overlay_payloads,
             );
             let row = self.ensure_pseudo_row(node, pseudo_kind);
@@ -2093,7 +2079,7 @@ impl ComputedGroupSets {
                 self.columns.animation_overlay_slot(index),
                 style_record_identity,
                 animation_overlay_identity,
-                &mut animated_overlay,
+                animated_overlay,
                 animation_overlay_payloads,
             );
             let changed = (
@@ -2228,12 +2214,11 @@ impl ComputedGroupSets {
                 .and_then(|row| row.assignment);
             let previous_style_record_identity = previous
                 .map(|previous| self.final_style_record(previous.style_record, previous.animation_overlay_slot));
-            let mut animated_overlay = None;
             let animation_overlay_publication = self.update_animation_overlay(
                 previous.and_then(|previous| previous.animation_overlay_slot),
                 style_record_identity,
                 0,
-                &mut animated_overlay,
+                None,
                 &[],
             );
             let row = self.ensure_pseudo_row(target.node, target.pseudo_kind);
@@ -2265,12 +2250,11 @@ impl ComputedGroupSets {
             }
             let previous_style_record_identity = self.style_record_column[index]
                 .map(|style_record| self.final_style_record(style_record, self.columns.animation_overlay_slot(index)));
-            let mut animated_overlay = None;
             let animation_overlay_publication = self.update_animation_overlay(
                 self.columns.animation_overlay_slot(index),
                 style_record_identity,
                 0,
-                &mut animated_overlay,
+                None,
                 &[],
             );
             let changed = (
@@ -3008,8 +2992,8 @@ impl ComputedGroupSets {
             if !is_reachable {
                 continue;
             }
-            for (group_index, &payload) in self.sets[index].payloads.iter().enumerate() {
-                ComputedReachability::mark(&mut reachable.groups, self.group_identity(group_index, payload));
+            for &group in &self.sets[index].groups {
+                ComputedReachability::mark(&mut reachable.groups, group);
             }
         }
         for (index, is_reachable) in reachable.inherited_sets.iter().copied().enumerate() {
@@ -3063,11 +3047,12 @@ impl ComputedGroupSets {
                 ComputedGroupSet {
                     identity_hash: 0,
                     payloads: Box::default(),
+                    groups: Box::default(),
                     canonical_longhand_table: None,
                 },
             );
             self.group_set_nested_memory
-                .shrink_committed(size_of_val(set.payloads.as_ref()) as u64);
+                .shrink_committed((size_of_val(set.payloads.as_ref()) + size_of_val(set.groups.as_ref())) as u64);
             self.sets.retire_identity(set.identity_hash, identity);
         }
         for identity in self
@@ -3115,7 +3100,7 @@ impl ComputedGroupSets {
                 },
             );
             self.longhand_table_nested_memory
-                .shrink_committed(size_of_val(table.value_view()) as u64);
+                .shrink_committed(table.table().publication_capacity_bytes());
             self.computed_longhand_tables.retire_identity(hash, identity);
         }
         for identity in self

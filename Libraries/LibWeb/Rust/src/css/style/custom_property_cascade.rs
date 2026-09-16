@@ -141,8 +141,11 @@ impl StyleEngineState {
         node: StyleNodeID,
         mut visit: impl FnMut(RuleID, TreeScopeID, Specificity, u32) -> ControlFlow<()>,
     ) -> Option<ControlFlow<()>> {
-        if let Some(answer) = self.published_match_answers.lookup(node)
-            && let Some(matches) = self.published_match_answers.matches_for(answer)
+        if let Some((published, answer)) = Self::published_answer_lookup(
+            &self.published_match_answers,
+            self.batch_matching_traversal.as_deref(),
+            node,
+        ) && let Some(matches) = published.matches_for(answer)
         {
             for entry in matches.iter().filter(|entry| entry.pseudo_element.is_none()) {
                 if visit(entry.rule, entry.tree_scope, entry.specificity, entry.scope_proximity).is_break() {
@@ -219,7 +222,7 @@ impl StyleEngineState {
             return true;
         }
         let Lookup::Known((_, state)) = self
-            .winner_groups
+            .current_winner_groups()
             .token_for(WinnerGroupKey::current(node, self.program.version()))
         else {
             return true;
@@ -248,8 +251,11 @@ impl StyleEngineState {
                     self.program.declarations_are_complete_but_for_custom_properties(rule)
                 }
         };
-        if let Some(answer) = self.published_match_answers.lookup(node)
-            && let Some(matches) = self.published_match_answers.matches_for(answer)
+        if let Some((published, answer)) = Self::published_answer_lookup(
+            &self.published_match_answers,
+            self.batch_matching_traversal.as_deref(),
+            node,
+        ) && let Some(matches) = published.matches_for(answer)
         {
             return matches
                 .iter()
@@ -501,7 +507,7 @@ impl StyleEngineState {
             }
             values.push((
                 name.raw.raw(),
-                name.text.to_vec(),
+                name.text.clone(),
                 declared.important,
                 value.pointer().cast(),
             ));
@@ -560,17 +566,18 @@ impl StyleEngineState {
     /// declaration, memoized by the written value. `None` when the value holds a substitution
     /// the engine does not resolve, or the environment is one the engine holds no store for.
     pub(super) fn substitute_written_value(
-        &mut self,
+        environments: &mut custom_property_environments::CustomPropertyEnvironments,
+        inputs: Option<bridge::FfiDocumentStyleComputationInputs>,
         environment: u64,
         property: u16,
-        written: &RetainedStyleValueData,
+        written: RetainedStyleValueData,
         counters: &mut Counters,
     ) -> Option<RetainedStyleValueData> {
         if !custom_property_value_is_engine_resolvable(written.data()) {
             counters.bump(Counter::EngineComputedRecordBailSubstitution);
             return None;
         }
-        let Some(inputs) = self.document_style_computation_inputs else {
+        let Some(inputs) = inputs else {
             counters.bump(Counter::EngineComputedRecordBailSubstitution);
             return None;
         };
@@ -579,17 +586,14 @@ impl StyleEngineState {
             counters.bump(Counter::EngineComputedRecordBailSubstitution);
             return None;
         }
-        if let Some(value) = self
-            .custom_property_environments
-            .substitution(written, property, environment)
-        {
+        if let Some(value) = environments.substitution(&written, property, environment) {
             counters.bump(Counter::EngineComputedRecordSubstitutionMemoHits);
             return Some(value);
         }
         let store = match environment {
             0 => std::ptr::null(),
             identity => {
-                let Some(store) = self.custom_property_environments.store(identity) else {
+                let Some(store) = environments.store(identity) else {
                     counters.bump(Counter::EngineComputedRecordBailSubstitution);
                     return None;
                 };
@@ -665,8 +669,7 @@ impl StyleEngineState {
             }
         };
         counters.bump(Counter::EngineComputedRecordSubstitutions);
-        self.custom_property_environments
-            .remember_substitution(written, property, environment, value.clone_retained());
+        environments.remember_substitution(written, property, environment, value.clone_retained());
         Some(value)
     }
 }

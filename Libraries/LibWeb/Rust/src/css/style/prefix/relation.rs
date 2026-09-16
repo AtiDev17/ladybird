@@ -160,19 +160,29 @@ pub(in crate::css::style) struct PrefixRelation {
 }
 
 impl PrefixRelation {
-    fn verify_answers(&self, evaluation: &PrefixEvaluation<'_, '_>) {
+    fn verify_answers(&self, evaluation: &mut PrefixEvaluation<'_, '_>) {
         if !cfg!(test) && !super::super::verification::prefix_relation_is_enabled() {
             return;
         }
         assert_eq!(self.nested_capacity_bytes, self.measure_nested_capacity_bytes());
-        let mut scalar = PrefixStates::new(evaluation.facts.row_count());
-        scalar.prepare_rows(evaluation.facts.generation(), evaluation.facts.row_count());
+        let mut scalar = PrefixStates::new();
         let mut counters = Counters::default();
+        let mut context = if evaluation.facts_are_composite() {
+            super::PrefixTransitionContext::new_composite(&mut scalar, evaluation.facts, &[], &mut counters)
+        } else {
+            super::PrefixTransitionContext::new(&mut scalar, evaluation.automaton, evaluation.facts, &mut counters)
+        };
         for (position, &node) in self.nodes.iter().enumerate() {
             if !self.live[position] {
                 continue;
             }
-            let PrefixTransitionLookup::Known(answer) = scalar.match_set_for(evaluation, node, &mut counters) else {
+            let PrefixTransitionLookup::Known(answer) = scalar.match_set_for(
+                &mut context.scratch,
+                &mut context.effects,
+                evaluation,
+                node,
+                &mut counters,
+            ) else {
                 panic!("a complete prefix relation must have a complete scalar answer");
             };
             assert_eq!(
@@ -261,7 +271,7 @@ impl PrefixRelation {
     pub(in crate::css::style) fn update_geometry(
         &mut self,
         automaton: &PrefixAutomaton,
-        evaluation: &PrefixEvaluation<'_, '_>,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
         changed: &[StyleNodeID],
         counters: &mut Counters,
     ) -> Vec<StyleNodeID> {
@@ -412,7 +422,7 @@ impl PrefixRelation {
     fn following_geometry_changes(
         &self,
         automaton: &PrefixAutomaton,
-        old_evaluation: &PrefixEvaluation<'_, '_>,
+        old_evaluation: &mut PrefixEvaluation<'_, '_>,
     ) -> HashMap<usize, Vec<usize>> {
         let mut result: HashMap<usize, Vec<usize>> = HashMap::default();
         if !self.sibling_order_is_preserved {
@@ -484,8 +494,8 @@ impl PrefixRelation {
     pub(in crate::css::style) fn update(
         &mut self,
         automaton: &PrefixAutomaton,
-        evaluation: &PrefixEvaluation<'_, '_>,
-        old_evaluation: &PrefixEvaluation<'_, '_>,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
+        old_evaluation: &mut PrefixEvaluation<'_, '_>,
         changed_nodes: &[StyleNodeID],
         counters: &mut Counters,
     ) {
@@ -977,7 +987,7 @@ impl PrefixAutomaton {
 
     pub(in crate::css::style) fn build_relation(
         &self,
-        evaluation: &PrefixEvaluation<'_, '_>,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
         root: StyleNodeID,
         counters: &mut Counters,
     ) -> PrefixRelation {

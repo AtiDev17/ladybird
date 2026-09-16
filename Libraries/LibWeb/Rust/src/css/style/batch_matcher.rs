@@ -11,6 +11,7 @@
 //! output is exact, but its accelerators make it unsuitable as the correctness reference. That role
 //! belongs to [`super::exact_matcher::ExactMatcher`].
 
+use super::prefix::PrefixTransitionContext;
 use smallvec::SmallVec;
 use std::mem::size_of;
 
@@ -40,11 +41,11 @@ use super::program::EntryID;
 use super::program::RuleID;
 use super::program::SelectorProgramID;
 use super::program::StyleSheetProgram;
-use super::relative_selector::RelationalWitnesses;
+use super::relative_selector::WitnessEffect;
 use super::selector::Incomplete;
 use super::selector::MatchEvaluationSide;
-use super::selector::MatchEvaluationWorkspace;
 use super::selector::MatchEvaluator;
+use super::selector::MatchScratch;
 use super::selector::SelectorEntry;
 use super::selector::SelectorProgram;
 use super::selector::SelectorPrograms;
@@ -736,13 +737,11 @@ pub struct BatchMatcher<'a> {
     /// outside the tree its own root opens and is featureless there, so only `:host` reaches it.
     node_is_the_host_of_this_tree: bool,
     ancestor_requirements: Option<&'a AncestorRequirements>,
-    match_workspace: Option<&'a MatchEvaluationWorkspace>,
     /// Evaluate only these rules, sorted by (rule, program). The retained-answer patch asks one
     /// node about exactly the rules a transaction reached, through the same machinery a full
     /// match uses.
     rule_filter: Option<&'a [(RuleID, SelectorProgramID)]>,
     cascade_only: bool,
-    witnesses: Option<&'a std::cell::RefCell<RelationalWitnesses>>,
 }
 
 /// Pruning remains relevant when an incomplete attempt retains completed candidates for a retry.
@@ -753,10 +752,12 @@ pub(super) struct BatchMatchOutcome {
 
 /// Reusable output-side state for one exact matching attempt.
 pub(super) struct BatchMatchState<'a> {
+    pub match_workspace: Option<&'a mut MatchScratch>,
+    pub witness_effects: Option<&'a mut Vec<WitnessEffect>>,
     pub dispatch_workspace: &'a mut DispatchCandidateWorkspace,
     pub requests: Option<&'a mut Vec<Incomplete>>,
     pub completed: Option<&'a mut [bool]>,
-    pub prefix_states: Option<&'a mut PrefixStates>,
+    pub prefix_states: Option<(&'a mut PrefixStates, &'a mut PrefixTransitionContext)>,
     pub deferred_prefix_matches: Option<&'a mut Option<PrefixMatchSetID>>,
 }
 
@@ -962,10 +963,8 @@ impl<'a> BatchMatcher<'a> {
             node_is_a_part_exposed_here: false,
             node_is_the_host_of_this_tree: false,
             ancestor_requirements: None,
-            match_workspace: None,
             rule_filter: None,
             cascade_only: false,
-            witnesses: None,
         }
     }
 
@@ -985,14 +984,6 @@ impl<'a> BatchMatcher<'a> {
     #[must_use]
     pub fn in_scope(mut self, scope: TreeScopeID) -> Self {
         self.scope = scope;
-        self
-    }
-
-    /// Record completed simple relational evaluations in `witnesses`. The batch matcher reads
-    /// the live tree and authoritative facts, which is exactly the evaluation retention trusts.
-    #[must_use]
-    pub fn observing_witnesses(mut self, witnesses: &'a std::cell::RefCell<RelationalWitnesses>) -> Self {
-        self.witnesses = Some(witnesses);
         self
     }
 
@@ -1030,12 +1021,6 @@ impl<'a> BatchMatcher<'a> {
         self
     }
 
-    #[must_use]
-    pub(super) fn with_match_workspace(mut self, workspace: &'a MatchEvaluationWorkspace) -> Self {
-        self.match_workspace = Some(workspace);
-        self
-    }
-
     /// Evaluate only these rules, sorted by (rule, program).
     #[must_use]
     pub(super) fn with_rule_filter(mut self, rules: &'a [(RuleID, SelectorProgramID)]) -> Self {
@@ -1057,7 +1042,7 @@ impl<'a> BatchMatcher<'a> {
             .is_none_or(|rules| rules.binary_search(&(rule, program)).is_ok())
     }
 
-    fn filtered_rules_are_narrow(&self, rules: &[(RuleID, SelectorProgramID)]) -> bool {
+    pub(super) fn filtered_rules_are_narrow(&self, rules: &[(RuleID, SelectorProgramID)]) -> bool {
         let mut entry_count = 0;
         for &(rule, program) in rules {
             if !self.program.rule_can_decide(rule) || self.program.rule_version(rule).selector_program != Some(program)
@@ -1080,7 +1065,7 @@ impl<'a> BatchMatcher<'a> {
         node: StyleNodeID,
         row: u32,
         rules: &[(RuleID, SelectorProgramID)],
-        evaluator: &MatchEvaluator<'_>,
+        evaluator: &mut MatchEvaluator<'_>,
         out: &mut RuleMatches,
         counters: &mut Counters,
     ) -> Result<(), Incomplete> {
@@ -1183,7 +1168,9 @@ impl<'a> BatchMatcher<'a> {
         let start = out.matches.len();
         let selector_truth_start = out.selector_truth_len();
         let mut dispatch_workspace = DispatchCandidateWorkspace::default();
-        let mut prefix_states = PrefixStates::new(self.facts.row_count());
+        let mut prefix_states = PrefixStates::new();
+        let mut prefix_context =
+            PrefixTransitionContext::new(&mut prefix_states, self.dispatch.prefixes(), self.facts, counters);
         for node in self.tree.preorder(root) {
             if let Err(incomplete) = self
                 .match_node_collecting_requests(
@@ -1191,10 +1178,12 @@ impl<'a> BatchMatcher<'a> {
                     out,
                     counters,
                     BatchMatchState {
+                        match_workspace: None,
+                        witness_effects: None,
                         dispatch_workspace: &mut dispatch_workspace,
                         requests: None,
                         completed: None,
-                        prefix_states: Some(&mut prefix_states),
+                        prefix_states: Some((&mut prefix_states, &mut prefix_context)),
                         deferred_prefix_matches: None,
                     },
                 )
@@ -1217,16 +1206,20 @@ impl<'a> BatchMatcher<'a> {
         counters: &mut Counters,
     ) -> Result<(), Incomplete> {
         let mut dispatch_workspace = DispatchCandidateWorkspace::default();
-        let mut prefix_states = PrefixStates::new(self.facts.row_count());
+        let mut prefix_states = PrefixStates::new();
+        let mut prefix_context =
+            PrefixTransitionContext::new(&mut prefix_states, self.dispatch.prefixes(), self.facts, counters);
         self.match_node_collecting_requests(
             node,
             out,
             counters,
             BatchMatchState {
+                match_workspace: None,
+                witness_effects: None,
                 dispatch_workspace: &mut dispatch_workspace,
                 requests: None,
                 completed: None,
-                prefix_states: Some(&mut prefix_states),
+                prefix_states: Some((&mut prefix_states, &mut prefix_context)),
                 deferred_prefix_matches: None,
             },
         )
@@ -1249,6 +1242,8 @@ impl<'a> BatchMatcher<'a> {
     ) -> BatchMatchOutcome {
         let mut answer_is_exact = true;
         let BatchMatchState {
+            match_workspace,
+            witness_effects,
             dispatch_workspace,
             mut requests,
             mut completed,
@@ -1267,7 +1262,7 @@ impl<'a> BatchMatcher<'a> {
         }
 
         let mut evaluator = MatchEvaluator::new(self.tree, self.facts);
-        if let Some(workspace) = self.match_workspace {
+        if let Some(workspace) = match_workspace {
             evaluator = evaluator.with_match_workspace(workspace, MatchEvaluationSide::Current);
         }
         if let Some(shadow_root) = self.shadow_root {
@@ -1276,12 +1271,12 @@ impl<'a> BatchMatcher<'a> {
         if self.node_is_a_part_exposed_here {
             evaluator = evaluator.for_a_part_exposed_in(self.scope);
         }
-        if let Some(witnesses) = self.witnesses {
+        if let Some(witnesses) = witness_effects {
             evaluator = evaluator.observing_witnesses(witnesses);
         }
         if let Some(rules) = self.rule_filter.filter(|rules| self.filtered_rules_are_narrow(rules)) {
             return BatchMatchOutcome {
-                result: self.match_filtered_rules_directly(node, row, rules, &evaluator, out, counters),
+                result: self.match_filtered_rules_directly(node, row, rules, &mut evaluator, out, counters),
                 answer_is_exact,
             };
         }
@@ -1292,17 +1287,23 @@ impl<'a> BatchMatcher<'a> {
         if !self.node_is_slotted_in && !self.node_is_a_part_exposed_here && !self.node_is_the_host_of_this_tree {
             let prefix_matches = match prefix_states {
                 None => None,
-                Some(states) => {
-                    let evaluation = PrefixEvaluation::new(
+                Some((states, context)) => {
+                    let mut evaluation = PrefixEvaluation::new(
                         self.dispatch.prefixes(),
                         self.tree,
                         self.facts,
                         self.programs,
-                        &evaluator,
+                        &mut evaluator,
                         self.shadow_root,
                         None,
                     );
-                    match states.match_set_for(&evaluation, node, counters) {
+                    match states.match_set_for(
+                        &mut context.scratch,
+                        &mut context.effects,
+                        &mut evaluation,
+                        node,
+                        counters,
+                    ) {
                         PrefixTransitionLookup::Known(matches) => Some((states, matches)),
                         // The sibling-aware walk reads the node's left context, which a selective
                         // batch may not have materialized yet. A missing row is answered the way
@@ -2079,7 +2080,13 @@ mod tests {
             &document.program,
         );
         let mut dispatch_workspace = DispatchCandidateWorkspace::default();
-        let mut prefix_states = PrefixStates::new(document.facts.row_count());
+        let mut prefix_states = PrefixStates::new();
+        let mut prefix_context = PrefixTransitionContext::new(
+            &mut prefix_states,
+            dispatch.prefixes(),
+            &document.facts,
+            &mut document.counters,
+        );
         let mut matches = RuleMatches::new();
         for _ in 0..2 {
             interpreter
@@ -2088,10 +2095,12 @@ mod tests {
                     &mut matches,
                     &mut document.counters,
                     BatchMatchState {
+                        match_workspace: None,
+                        witness_effects: None,
                         dispatch_workspace: &mut dispatch_workspace,
                         requests: None,
                         completed: None,
-                        prefix_states: Some(&mut prefix_states),
+                        prefix_states: Some((&mut prefix_states, &mut prefix_context)),
                         deferred_prefix_matches: None,
                     },
                 )

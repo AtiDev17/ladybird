@@ -19,7 +19,7 @@ impl StyleEngineState {
         use pseudo_kind::{AFTER, BACKDROP, BEFORE, FIRST_LETTER, MARKER, SELECTION};
 
         let mut available = 0_u64;
-        for (pseudo, version, _, priority_current) in self.winner_groups.pseudo_states(node) {
+        for (pseudo, version, _, priority_current) in self.current_winner_groups().pseudo_states(node) {
             if self.deferred_pseudo_element == Some(pseudo.kind) {
                 continue;
             }
@@ -54,7 +54,7 @@ impl StyleEngineState {
             explicit_kinds |= 1 << MARKER;
         }
         if let Lookup::Known((_, state)) = self
-            .winner_groups
+            .current_winner_groups()
             .token_for(WinnerGroupKey::current(node, self.program.version()))
             && let Some(winner) = self
                 .winner_groups
@@ -126,7 +126,7 @@ impl StyleEngineState {
         }
         let program_version = self.program.version();
         let mut states: [Option<CascadeStateID>; pseudo_kind::SYNTHETIC_COUNT] = [None; pseudo_kind::SYNTHETIC_COUNT];
-        for (pseudo, version, state, priority_current) in self.winner_groups.pseudo_states(node) {
+        for (pseudo, version, state, priority_current) in self.current_winner_groups().pseudo_states(node) {
             if self.deferred_pseudo_element == Some(pseudo.kind) {
                 continue;
             }
@@ -277,11 +277,8 @@ impl StyleEngineState {
             // The row has to hold the rules that flipped for this kind: one this flush published
             // holds the cascade of the node's current answer.
             if state.is_some()
-                && scratch
-                    .flipped_pseudo_rules
-                    .iter()
-                    .any(|flip| flip.pseudo_kind == Some(u16::from(kind)))
-                && self.winner_groups.pseudo_row_stamp(
+                && scratch.flipped_pseudo_rules & (1_u64 << kind) != 0
+                && self.current_winner_groups().pseudo_row_stamp(
                     node,
                     tree::PseudoElementTarget::new(tree::PseudoElementKind(u16::from(kind))),
                 ) != Some(self.flush_stamp)
@@ -347,15 +344,16 @@ impl StyleEngineState {
                         if substituted {
                             scratch.substituted_states.insert((state, environment));
                         }
+                        scratch.store_capacity_bytes += store.capacity_bytes();
                         scratch.pseudo_stores.insert((kind, state, environment), store.clone());
                         store
                     }
                 },
-                None => std::rc::Rc::new(CascadedPropertyStore::new()),
+                None => std::rc::Rc::new(WinnerStore::default()),
             };
             pseudo_uses_substitution |=
                 state.is_some_and(|state| scratch.substituted_states.contains(&(state, environment)));
-            if pseudo_content_generates_nothing(&store, kind) {
+            if pseudo_content_generates_nothing(&store.view(self), kind) {
                 remove(self, scratch, counters);
                 continue;
             }
@@ -557,11 +555,15 @@ impl StyleEngineState {
                 .filter(|&kind| kind <= bridge::LAST_SYNTHETIC_PSEUDO_ELEMENT_KIND)
                 .map_or(0, |kind| 1u64 << kind)
         };
-        if let Some(answer) = self.published_match_answers.lookup(node) {
+        if let Some((owner, answer)) = Self::published_answer_lookup(
+            &self.published_match_answers,
+            self.batch_matching_traversal.as_deref(),
+            node,
+        ) {
             if let Some(identity) = answer.cascade_input {
                 return self.match_answers.synthetic_pseudo_mask(identity);
             }
-            if let Some(matches) = self.published_match_answers.matches_for(answer) {
+            if let Some(matches) = owner.matches_for(answer) {
                 return Some(
                     matches
                         .iter()
@@ -569,17 +571,15 @@ impl StyleEngineState {
                 );
             }
         }
-        let Lookup::Known(&identity) = self.retained_match_answers.lookup(node) else {
-            return None;
-        };
-        self.match_answers.retained_answer(identity)?;
+        let identity = self.current_answer_identity(node)?;
+        self.match_answers.answer(identity)?;
         self.match_answers.synthetic_pseudo_mask(identity)
     }
 }
 
 /// Whether a pseudo-element's winning `content` generates no box: `none` for every kind, and
 /// `normal` (the initial value, so also an absent one) for ::before and ::after.
-fn pseudo_content_generates_nothing(store: &CascadedPropertyStore, kind: u8) -> bool {
+fn pseudo_content_generates_nothing(store: &impl crate::css::cascaded_properties::CascadedValues, kind: u8) -> bool {
     use crate::css::property_metadata::property_id as prop;
     use crate::css::style_compute::keyword;
     let generated = matches!(kind, pseudo_kind::BEFORE | pseudo_kind::AFTER);

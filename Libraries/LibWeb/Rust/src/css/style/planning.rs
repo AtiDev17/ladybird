@@ -1472,7 +1472,7 @@ impl ExactTreeEvaluation {
         node: StyleNodeID,
         old_matches: Option<bool>,
         transaction_fact_view: Option<&TransactionFactView>,
-        match_workspace: &MatchEvaluationWorkspace,
+        match_workspace: &mut MatchScratch,
         counters: &mut Counters,
     ) -> Result<ExactEntryResult, Incomplete> {
         let (compiled, entry) = program;
@@ -1480,25 +1480,24 @@ impl ExactTreeEvaluation {
         // shares. The workspace's current tree side was reset when the transaction began, so the
         // sibling positions it memoizes were all measured in this topology, and a sequence that
         // several positional entries ask about is counted once rather than once per candidate.
-        let evaluate_new = |counters: &mut Counters| {
+        let evaluate_new = |match_workspace: &mut MatchScratch, counters: &mut Counters| {
             MatchEvaluator::new(tree, facts)
                 .with_match_workspace(match_workspace, MatchEvaluationSide::Current)
                 .indexing_stepped_positions_only()
                 .matches_entry_without_program_caches(compiled, entry, node, counters)
         };
-        let evaluate_old = |view: &TransactionFactView, counters: &mut Counters| match view.is_present(
-            tree,
-            TransactionFactSide::Before,
-            node,
-        ) {
-            false => Ok(false),
-            true => MatchEvaluator::new(tree, facts)
-                .with_transaction_fact_view(view, TransactionFactSide::Before)
-                .with_match_workspace(match_workspace, MatchEvaluationSide::OldTree)
-                .matches_entry_without_program_caches(compiled, entry, node, counters),
-        };
+        let evaluate_old =
+            |match_workspace: &mut MatchScratch, view: &TransactionFactView, counters: &mut Counters| match view
+                .is_present(tree, TransactionFactSide::Before, node)
+            {
+                false => Ok(false),
+                true => MatchEvaluator::new(tree, facts)
+                    .with_transaction_fact_view(view, TransactionFactSide::Before)
+                    .with_match_workspace(match_workspace, MatchEvaluationSide::OldTree)
+                    .matches_entry_without_program_caches(compiled, entry, node, counters),
+            };
         match self {
-            Self::Arrival => match evaluate_new(counters)? {
+            Self::Arrival => match evaluate_new(match_workspace, counters)? {
                 true => Ok(Lookup::Known(SetChange::Added)),
                 false => Ok(Lookup::KnownAbsent),
             },
@@ -1510,10 +1509,10 @@ impl ExactTreeEvaluation {
                         else {
                             return Ok(Lookup::Missing(ExactEntryGap));
                         };
-                        evaluate_old(view, counters)?
+                        evaluate_old(match_workspace, view, counters)?
                     }
                 };
-                let new = evaluate_new(counters)?;
+                let new = evaluate_new(match_workspace, counters)?;
                 let change = match (old, new) {
                     (false, true) => Lookup::Known(SetChange::Added),
                     (true, false) => Lookup::Known(SetChange::Removed),
@@ -1538,9 +1537,10 @@ pub(super) fn mark_element_visited(visited: &mut Vec<bool>, node: StyleNodeID) -
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct PrefixAnswerKey {
+pub(super) struct PrefixAnswerKey<'a> {
     pub(super) prefix_contribution: MatchAnswerID,
-    pub(super) non_prefix_matches: MatchAnswerID,
+    pub(super) non_prefix_matches: &'a [RetainedRuleMatch],
+    pub(super) non_prefix_hash: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

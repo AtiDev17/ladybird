@@ -18,7 +18,7 @@
 //! sequence exactly as a descendant step persists down the tree, so the state representation, the
 //! interner, and the retained form serve both axes unchanged.
 
-use super::capacity::capacity_bytes;
+use super::capacity::{ShallowCapacityBytes, capacity_bytes};
 use super::fast_hash::FastMap as HashMap;
 use super::fast_hash::fast_hasher;
 use super::selector::SelectorPrefixPredicate;
@@ -1007,6 +1007,14 @@ struct PrefixTransition {
 
 const UNKNOWN_STATE: u32 = u32::MAX;
 
+/// Hand out one identity per arena of interned prefix states.
+fn next_prefix_states_identity() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 const UNKNOWN_TRANSITION: PrefixTransition = PrefixTransition {
     state: UNKNOWN_STATE,
     right: 0,
@@ -1115,15 +1123,15 @@ impl PrefixFactDependencies {
 }
 
 struct LocalFactInterner {
-    identities: super::intern_table::InternTable<LocalFactSlot, (u32, u32)>,
     next_identity: u32,
+    rows: super::intern_table::InternTable<LocalFactSlot, (u32, u32)>,
 }
 
 impl LocalFactInterner {
     fn new() -> Self {
         Self {
-            identities: super::intern_table::InternTable::default(),
             next_identity: 1,
+            rows: Default::default(),
         }
     }
 
@@ -1134,17 +1142,19 @@ impl LocalFactInterner {
         dependencies: &PrefixFactDependencies,
         counters: &mut Counters,
     ) -> u32 {
+        let identities = &mut self.rows;
         let hash = hash_local_facts(facts, row, dependencies);
-        if let Some(slot) = self.identities.find(hash, |_slot, &(_identity, representative)| {
+        if let Some(slot) = identities.find(hash, |_slot, &(_identity, representative)| {
             rows_have_equal_local_facts_between(facts, row, facts, representative, dependencies)
         }) {
             counters.bump(Counter::PrefixLocalFactIdentityHits);
-            return self.identities[slot].0;
+            return identities[slot].0;
         }
         counters.bump(Counter::PrefixLocalFactIdentityMisses);
         let identity = self.mint_identity();
-        let slot = LocalFactSlot(u32::try_from(self.identities.len()).expect("local fact table exceeds u32 indexing"));
-        self.identities.insert(hash, slot, (identity, row));
+        let identities = &mut self.rows;
+        let slot = LocalFactSlot(u32::try_from(identities.len()).expect("local fact table exceeds u32 indexing"));
+        identities.insert(hash, slot, (identity, row));
         identity
     }
 
@@ -1156,23 +1166,13 @@ impl LocalFactInterner {
             .expect("local fact identity space exhausted");
         identity
     }
-
-    fn clear_rows(&mut self) {
-        self.identities = super::intern_table::InternTable::default();
-    }
-
-    fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [self.identities];
-            cached [];
-            nested [];
-            skip [self.next_identity];
-        }
-    }
 }
 
 /// Retained prefix states for one immutable selector dispatch.
 pub(super) struct PrefixStates {
+    /// Which arena this is. Transitions name states and results by index, so answers memoized
+    /// outside the arena mean nothing once a released cache has rebuilt it.
+    identity: u64,
     pub(super) relation: Option<Box<PrefixRelation>>,
     relation_answers: Column<Option<PrefixMatchSetID>>,
     states: Vec<PrefixState>,
@@ -1188,9 +1188,7 @@ pub(super) struct PrefixStates {
     results: Vec<PrefixResult>,
     result_ids: super::intern_table::InternTable<PrefixResultID, PrefixResult>,
     match_sets_by_hash: super::intern_table::InternTable<PrefixMatchSetID, ()>,
-    transitions: HashMap<PrefixTransitionKey, PrefixTransition>,
     local_fact_interner: LocalFactInterner,
-    transition_by_row: Vec<PrefixTransition>,
     transition_by_element: Column<PrefixTransition>,
     entering_by_element: Column<EnteringStates>,
     local_facts_by_element: Column<u32>,
@@ -1225,10 +1223,6 @@ pub(super) struct PrefixStates {
     /// it has no expiring steps, lazily interned otherwise. This is the no-admission fast path,
     /// shared by downward and rightward states.
     descendant_only: Vec<u32>,
-    /// The batch row space `transition_by_row` and the local-fact representatives were built
-    /// against; see StyleNodeFacts::generation.
-    facts_generation: u64,
-    ancestor_chain: Vec<StyleNodeID>,
     epoch: u32,
     complete: bool,
     automaton_step_count: usize,
@@ -1236,8 +1230,245 @@ pub(super) struct PrefixStates {
     last_compacted_working_bytes: u64,
 }
 
-enum PrefixTransitionSurface<'a> {
-    Retained(&'a mut PrefixStates),
+/// Private memo and row domain for one prefix evaluation context.
+#[derive(Default)]
+pub(super) struct PrefixTransitionScratch {
+    transition_by_row: Vec<PrefixTransition>,
+    facts_generation: u64,
+    /// The `PrefixStates` every answer below names by index; see `PrefixStates::identity`.
+    states_identity: u64,
+    memo: HashMap<PrefixTransitionKey, PrefixTransition>,
+    by_node: HashMap<StyleNodeID, PrefixTransition>,
+    local_facts_by_row: Vec<u32>,
+    cohorts_unneeded: bool,
+    ancestor_chain: Vec<StyleNodeID>,
+}
+
+#[derive(Default)]
+pub(super) struct PrefixEffects {
+    writes: Vec<PrefixNodeWrite>,
+}
+
+struct PrefixNodeWrite {
+    node: StyleNodeID,
+    transition: PrefixTransition,
+    entering: EnteringStates,
+    positional_bits: Option<u32>,
+    local_facts: Option<u32>,
+}
+
+#[derive(Default)]
+pub(super) struct PrefixTransitionContext {
+    pub(super) scratch: PrefixTransitionScratch,
+    pub(super) effects: PrefixEffects,
+}
+
+impl PrefixTransitionContext {
+    pub(super) fn new(
+        states: &mut PrefixStates,
+        automaton: &PrefixAutomaton,
+        facts: &StyleNodeFacts,
+        counters: &mut Counters,
+    ) -> Self {
+        let mut context = Self::default();
+        context.prepare(states, automaton, facts, counters);
+        context
+    }
+
+    pub(super) fn prepare(
+        &mut self,
+        states: &mut PrefixStates,
+        automaton: &PrefixAutomaton,
+        facts: &StyleNodeFacts,
+        counters: &mut Counters,
+    ) {
+        // Memoized transitions, per-row answers and local-fact representatives all name one
+        // arena. A cache release rebuilds those arenas under whoever still owns a context, so
+        // nothing prepared against the previous one survives into this preparation.
+        if self.scratch.states_identity != states.identity {
+            *self = Self::default();
+            self.scratch.states_identity = states.identity;
+        }
+        self.scratch.prepare_rows(facts.generation(), facts.row_count());
+        if self.scratch.local_facts_by_row.len() == facts.row_count() {
+            return;
+        }
+        if self.scratch.cohorts_unneeded {
+            self.scratch.local_facts_by_row.clear();
+            self.scratch.cohorts_unneeded = false;
+        }
+        // NB: Complete retained answers bypass scalar transitions in both matching and
+        //     tail completion. Do not intern an unrelated document's facts for those reads.
+        //     If an appended row loses that coverage, prepare the whole domain below so
+        //     its scalar dependency walk also has cohorts for relation-backed ancestors.
+        if (0..facts.row_count()).all(|index| {
+            let row = u32::try_from(index).expect("fact row space exhausted");
+            !facts.has_row(row) || states.retained_matches_for(facts.node_at(row)).is_some()
+        }) {
+            self.scratch.cohorts_unneeded = true;
+            self.scratch.local_facts_by_row.resize(facts.row_count(), 0);
+            return;
+        }
+        // NB: Representatives borrow this row domain only during preparation. Nested adaptive
+        //     contexts may replace the table; suspended contexts retain their prepared IDs.
+        states.local_fact_interner.rows = Default::default();
+        for (index, &identity) in self.scratch.local_facts_by_row.iter().enumerate() {
+            let row = u32::try_from(index).expect("fact row space exhausted");
+            if identity != 0 && states.local_facts_of(facts.node_at(row)) != Some(identity) {
+                let hash = hash_local_facts(facts, row, &automaton.local_fact_dependencies);
+                let rows = &mut states.local_fact_interner.rows;
+                if rows.find(hash, |_, &(held, _)| held == identity).is_none() {
+                    let slot = LocalFactSlot(u32::try_from(rows.len()).expect("local fact table exceeds u32 indexing"));
+                    rows.insert(hash, slot, (identity, row));
+                }
+            }
+        }
+        for index in self.scratch.local_facts_by_row.len()..facts.row_count() {
+            let row = u32::try_from(index).expect("fact row space exhausted");
+            let identity = if facts.has_row(row) {
+                states.local_facts_of(facts.node_at(row)).unwrap_or_else(|| {
+                    states
+                        .local_fact_interner
+                        .intern(facts, row, &automaton.local_fact_dependencies, counters)
+                })
+            } else {
+                0
+            };
+            self.scratch.local_facts_by_row.push(identity);
+        }
+    }
+
+    pub(super) fn new_composite(
+        states: &mut PrefixStates,
+        facts: &StyleNodeFacts,
+        changed: &[StyleNodeID],
+        counters: &mut Counters,
+    ) -> Self {
+        let mut context = Self::default();
+        context.scratch.states_identity = states.identity;
+        context.scratch.prepare_rows(facts.generation(), facts.row_count());
+        for index in 0..facts.row_count() {
+            let row = u32::try_from(index).expect("fact row space exhausted");
+            let identity = if facts.has_row(row) {
+                let node = facts.node_at(row);
+                if changed.binary_search(&node).is_err()
+                    && let Some(identity) = states.local_facts_of(node)
+                {
+                    identity
+                } else {
+                    // NB: Composite fact views retain the existing conservative unique cohorts.
+                    counters.bump(Counter::PrefixLocalFactIdentityMisses);
+                    states.local_fact_interner.mint_identity()
+                }
+            } else {
+                0
+            };
+            context.scratch.local_facts_by_row.push(identity);
+        }
+        context
+    }
+
+    pub(super) fn capacity_bytes(&self) -> u64 {
+        self.scratch.capacity_bytes() + self.effects.capacity_bytes()
+    }
+}
+
+pub(super) struct PrefixTransitionContexts {
+    by_program: Column<Option<PrefixTransitionContext>>,
+    memory: MemoryLease,
+}
+
+impl Default for PrefixTransitionContexts {
+    fn default() -> Self {
+        Self {
+            by_program: Column::default(),
+            memory: MemoryLease::new(MemoryCategory::BatchScratch),
+        }
+    }
+}
+
+impl PrefixTransitionContexts {
+    pub(super) fn settle_memory(&mut self, memory: &mut MemoryController) {
+        self.memory.resize_required_to(memory, self.capacity_bytes());
+    }
+
+    pub(super) fn prepare(
+        &mut self,
+        program: ScopeProgramID,
+        states: &mut PrefixStates,
+        automaton: &PrefixAutomaton,
+        facts: &StyleNodeFacts,
+        counters: &mut Counters,
+    ) {
+        self.by_program
+            .entry(program.0 as usize)
+            .get_or_insert_with(PrefixTransitionContext::default)
+            .prepare(states, automaton, facts, counters);
+    }
+
+    /// Prepare one program's context again when the arena it was prepared against was replaced.
+    ///
+    /// A traversal owns its contexts for as long as it runs, while the states they name can be
+    /// released and rebuilt under it whenever the cache loses its residency. Every pairing of a
+    /// context with an arena therefore revalidates before reading memoized answers.
+    pub(super) fn rebind(
+        &mut self,
+        program: ScopeProgramID,
+        states: &mut PrefixStates,
+        automaton: &PrefixAutomaton,
+        facts: &StyleNodeFacts,
+        counters: &mut Counters,
+    ) {
+        let context = self
+            .by_program
+            .entry(program.0 as usize)
+            .get_or_insert_with(PrefixTransitionContext::default);
+        if context.scratch.states_identity == states.identity {
+            return;
+        }
+        context.prepare(states, automaton, facts, counters);
+    }
+
+    pub(super) fn get_mut(&mut self, program: ScopeProgramID) -> &mut PrefixTransitionContext {
+        self.by_program
+            .get_mut(program.0 as usize)
+            .and_then(Option::as_mut)
+            .expect("prefix context prepared")
+    }
+
+    pub(super) fn install(&mut self, states: &mut PrefixStateCache, memory: &mut MemoryController) {
+        let mut installed = false;
+        for (program, context) in self.by_program.iter_mut().enumerate() {
+            if let Some(context) = context
+                && !context.effects.writes.is_empty()
+                && let Lookup::Known(states) = states.lookup_mut(ScopeProgramID(
+                    u32::try_from(program).expect("scope program space exhausted"),
+                ))
+            {
+                states.install_prefix_effects(&mut context.effects);
+                installed = true;
+            }
+        }
+        if installed {
+            states.settle_memory(memory);
+        }
+    }
+
+    pub(super) fn capacity_bytes(&self) -> u64 {
+        (self.by_program.capacity() * size_of::<Option<PrefixTransitionContext>>()) as u64
+            + self
+                .by_program
+                .iter()
+                .flatten()
+                .map(PrefixTransitionContext::capacity_bytes)
+                .sum::<u64>()
+    }
+}
+
+struct PrefixTransitionSurface<'a> {
+    states: &'a mut PrefixStates,
+    scratch: &'a mut PrefixTransitionScratch,
+    effects: &'a mut PrefixEffects,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1280,7 +1511,7 @@ pub(super) struct PrefixEvaluation<'a, 'b> {
     tree: &'a StyleNodeTree,
     facts: &'a StyleNodeFacts,
     programs: &'a SelectorPrograms,
-    evaluator: &'a MatchEvaluator<'b>,
+    evaluator: &'a mut MatchEvaluator<'b>,
     shadow_root: Option<StyleNodeID>,
     selection: Option<&'a PrefixSelection>,
 }
@@ -1585,8 +1816,12 @@ impl PrefixDeltaArena {
 }
 
 impl<'a, 'b> PrefixEvaluation<'a, 'b> {
+    pub(super) fn match_scratch_capacity_bytes(&self) -> u64 {
+        self.evaluator.match_scratch_capacity_bytes()
+    }
+
     fn positional_test_matches(
-        &self,
+        &mut self,
         node: StyleNodeID,
         index: usize,
         counters: &mut Counters,
@@ -1605,7 +1840,7 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
     }
 
     pub(super) fn step_matches_direct(
-        &self,
+        &mut self,
         node: StyleNodeID,
         step: PrefixStepID,
         counters: &mut Counters,
@@ -1639,7 +1874,7 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
     }
 
     pub(super) fn step_matches(
-        &self,
+        &mut self,
         node: StyleNodeID,
         positional_bits: u32,
         step: PrefixStepID,
@@ -1668,7 +1903,7 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
 
     /// The per-node answers of the automaton's positional tests, one bit per test. Zero for
     /// automata without positional steps, so fact-cohort sharing is unchanged there.
-    pub(super) fn positional_bits(&self, node: StyleNodeID, counters: &mut Counters) -> Result<u32, Incomplete> {
+    pub(super) fn positional_bits(&mut self, node: StyleNodeID, counters: &mut Counters) -> Result<u32, Incomplete> {
         let tests = self.automaton.positional_tests();
         let mut bits = 0_u32;
         for index in 0..tests.len() {
@@ -1684,7 +1919,7 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
         tree: &'a StyleNodeTree,
         facts: &'a StyleNodeFacts,
         programs: &'a SelectorPrograms,
-        evaluator: &'a MatchEvaluator<'b>,
+        evaluator: &'a mut MatchEvaluator<'b>,
         shadow_root: Option<StyleNodeID>,
         selection: Option<&'a PrefixSelection>,
     ) -> Self {
@@ -1710,8 +1945,9 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
 
 impl PrefixStates {
     #[must_use]
-    pub(super) fn new(row_count: usize) -> Self {
+    pub(super) fn new() -> Self {
         Self {
+            identity: next_prefix_states_identity(),
             relation_answers: Column::default(),
             relation: None,
             states: vec![PrefixState::default()],
@@ -1729,9 +1965,7 @@ impl PrefixStates {
             }],
             result_ids: super::intern_table::InternTable::default(),
             match_sets_by_hash: super::intern_table::InternTable::default(),
-            transitions: HashMap::default(),
             local_fact_interner: LocalFactInterner::new(),
-            transition_by_row: vec![UNKNOWN_TRANSITION; row_count],
             transition_by_element: Column::new(|| UNKNOWN_TRANSITION),
             entering_by_element: Column::new(|| UNKNOWN_ENTERING_STATES),
             local_facts_by_element: Column::default(),
@@ -1759,8 +1993,6 @@ impl PrefixStates {
             new_following_hash: 0,
             new_adjacent_hash: 0,
             descendant_only: vec![0],
-            facts_generation: 0,
-            ancestor_chain: Vec::new(),
             epoch: 0,
             complete: false,
             automaton_step_count: 0,
@@ -1771,14 +2003,21 @@ impl PrefixStates {
 
     pub(super) fn match_set_for(
         &mut self,
-        evaluation: &PrefixEvaluation<'_, '_>,
+        scratch: &mut PrefixTransitionScratch,
+        effects: &mut PrefixEffects,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
         node: StyleNodeID,
         counters: &mut Counters,
     ) -> PrefixTransitionLookup<PrefixMatchSetID> {
         if let Some(matches) = self.relation_answer(node) {
             return PrefixTransitionLookup::Known(matches);
         }
-        match self.transition_of(node) {
+        match scratch
+            .by_node
+            .get(&node)
+            .copied()
+            .map_or_else(|| self.transition_of(node), PrefixTransitionLookup::Known)
+        {
             PrefixTransitionLookup::Known(transition) => {
                 counters.bump(Counter::PrefixTransitionCacheMatchHits);
                 return PrefixTransitionLookup::Known(self.matches_of(transition));
@@ -1786,7 +2025,7 @@ impl PrefixStates {
             PrefixTransitionLookup::Missing(_) => {}
         }
         counters.bump(Counter::PrefixTransitionCacheMatchMisses);
-        match self.transition_for(evaluation, node, counters) {
+        match self.transition_for(scratch, effects, evaluation, node, counters) {
             PrefixTransitionLookup::Known(transition) => PrefixTransitionLookup::Known(self.matches_of(transition)),
             PrefixTransitionLookup::Missing(gap) => PrefixTransitionLookup::Missing(gap),
         }
@@ -2206,8 +2445,8 @@ impl PrefixStates {
     #[allow(clippy::too_many_arguments)]
     fn emit_local_output_deltas(
         &self,
-        evaluation: &PrefixEvaluation<'_, '_>,
-        old_evaluation: &PrefixEvaluation<'_, '_>,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
+        old_evaluation: &mut PrefixEvaluation<'_, '_>,
         node: StyleNodeID,
         old: PrefixTransition,
         old_entering: EnteringStates,
@@ -2500,7 +2739,9 @@ impl PrefixStates {
     #[allow(clippy::too_many_arguments)]
     fn try_sparse_retained_local_transition(
         &mut self,
-        evaluation: &PrefixEvaluation<'_, '_>,
+        scratch: &mut PrefixTransitionScratch,
+        effects: &mut PrefixEffects,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
         node: StyleNodeID,
         row: MatchFactRow<'_>,
         old: PrefixTransition,
@@ -2554,7 +2795,7 @@ impl PrefixStates {
             false => old.result,
         };
         let transition = PrefixTransition { state, right, result };
-        self.transitions.insert(
+        scratch.memo.insert(
             PrefixTransitionKey {
                 parent: entering.parent,
                 previous: entering.previous,
@@ -2564,14 +2805,22 @@ impl PrefixStates {
             },
             transition,
         );
-        if !evaluation.automaton.positional_tests().is_empty() {
-            self.set_positional_bits(node, positional_bits);
-        }
-        self.set_entering(node, entering);
-        if !evaluation.facts_are_composite() {
-            self.transition_by_row[row.row as usize] = transition;
-        }
-        self.set_transition(node, transition);
+        let mut surface = PrefixTransitionSurface {
+            states: self,
+            scratch,
+            effects,
+        };
+        surface.remember_inputs(
+            evaluation,
+            node,
+            transition,
+            TransitionInputs {
+                entering,
+                local_facts,
+                positional_bits,
+            },
+        );
+        surface.remember_transition(evaluation, node, row, transition);
         Some(transition)
     }
 
@@ -2582,8 +2831,10 @@ impl PrefixStates {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn compare_and_update(
         &mut self,
-        evaluation: &PrefixEvaluation<'_, '_>,
-        old_evaluation: &PrefixEvaluation<'_, '_>,
+        scratch: &mut PrefixTransitionScratch,
+        effects: &mut PrefixEffects,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
+        old_evaluation: &mut PrefixEvaluation<'_, '_>,
         selection: Option<&PrefixSelection>,
         node: StyleNodeID,
         local_facts_changed: bool,
@@ -2599,12 +2850,14 @@ impl PrefixStates {
                 return PrefixTransitionLookup::Missing(PrefixTransitionGap::Incomplete(incomplete));
             }
         };
+        // NB: Compare against retained inputs throughout convergence. Current parent and
+        //     preceding-sibling outputs are read through the context scratch below.
         let old = match self.transition_of(node) {
             PrefixTransitionLookup::Known(transition) => Some(transition),
             PrefixTransitionLookup::Missing(_) => None,
         };
         let parent_state = match evaluation.tree.parent(node) {
-            Some(parent) => match self.transition_for(evaluation, parent, counters) {
+            Some(parent) => match self.transition_for(scratch, effects, evaluation, parent, counters) {
                 PrefixTransitionLookup::Known(transition) => transition.state,
                 PrefixTransitionLookup::Missing(gap) => return PrefixTransitionLookup::Missing(gap),
             },
@@ -2612,7 +2865,7 @@ impl PrefixStates {
         };
         let previous_state = if evaluation.automaton.has_sibling_steps() {
             match evaluation.tree.previous_element_sibling(node) {
-                Some(previous) => match self.transition_for(evaluation, previous, counters) {
+                Some(previous) => match self.transition_for(scratch, effects, evaluation, previous, counters) {
                     PrefixTransitionLookup::Known(transition) => transition.right,
                     PrefixTransitionLookup::Missing(gap) => return PrefixTransitionLookup::Missing(gap),
                 },
@@ -2642,6 +2895,8 @@ impl PrefixStates {
                 matches
             }
             && let Some(difference) = self.derive_dead_delta_transition(
+                scratch,
+                effects,
                 evaluation,
                 node,
                 row,
@@ -2655,27 +2910,7 @@ impl PrefixStates {
         {
             return PrefixTransitionLookup::Known(difference);
         }
-        let local_facts = if local_facts_changed || old.is_none() {
-            let identity = match evaluation.facts_are_composite() {
-                true => {
-                    counters.bump(Counter::PrefixLocalFactIdentityMisses);
-                    self.local_fact_interner.mint_identity()
-                }
-                false => self.local_fact_interner.intern(
-                    row.facts,
-                    row.row,
-                    &evaluation.automaton.local_fact_dependencies,
-                    counters,
-                ),
-            };
-            self.set_local_facts(node, identity);
-            identity
-        } else {
-            let Some(local_facts) = self.local_facts_of(node) else {
-                return PrefixTransitionLookup::Missing(PrefixTransitionGap::MissingTransition(node));
-            };
-            local_facts
-        };
+        let local_facts = scratch.local_fact_identity(evaluation.facts, node);
         let positional_bits = if positional_truth_stable && old.is_some() {
             self.positional_bits_of(node)
         } else {
@@ -2728,7 +2963,7 @@ impl PrefixStates {
             {
                 self.collect_active(active, &mut active_candidates);
             }
-            let mut append_roots = |evaluation: &PrefixEvaluation<'_, '_>| {
+            let mut append_roots = |evaluation: &mut PrefixEvaluation<'_, '_>| {
                 let Ok(row) = evaluation.row_of(node) else {
                     return;
                 };
@@ -2793,6 +3028,8 @@ impl PrefixStates {
         let sparse = if !local_facts_changed && selection.is_some() {
             match (old, local_output_deltas) {
                 (Some(old), Some(local_output_deltas)) => self.try_sparse_retained_local_transition(
+                    scratch,
+                    effects,
                     evaluation,
                     node,
                     row,
@@ -2814,7 +3051,11 @@ impl PrefixStates {
         let (new, use_admitted_new_truth) = if let Some(transition) = sparse {
             (transition, false)
         } else {
-            let mut surface = PrefixTransitionSurface::Retained(self);
+            let mut surface = PrefixTransitionSurface {
+                states: self,
+                scratch,
+                effects,
+            };
             let (transition, origin) = match surface.transition_from_inputs(
                 evaluation,
                 node,
@@ -3002,7 +3243,9 @@ impl PrefixStates {
     #[allow(clippy::too_many_arguments)]
     fn derive_dead_delta_transition(
         &mut self,
-        evaluation: &PrefixEvaluation<'_, '_>,
+        scratch: &mut PrefixTransitionScratch,
+        effects: &mut PrefixEffects,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
         node: StyleNodeID,
         row: MatchFactRow<'_>,
         old: PrefixTransition,
@@ -3114,17 +3357,25 @@ impl PrefixStates {
             right: old.right,
             result: old.result,
         };
-        if !evaluation.facts_are_composite() {
-            self.transition_by_row[row.row as usize] = new;
-        }
-        self.set_transition(node, new);
         let entering = EnteringStates {
             parent: new_parent,
             previous: old_entering.previous,
         };
-        self.set_entering(node, entering);
+        effects.writes.push(PrefixNodeWrite {
+            node,
+            transition: new,
+            entering,
+            positional_bits: None,
+            local_facts: None,
+        });
+        PrefixTransitionSurface {
+            states: self,
+            scratch,
+            effects,
+        }
+        .remember_transition(evaluation, node, row, new);
         if let Some(local_facts) = self.local_facts_of(node) {
-            self.transitions.insert(
+            scratch.memo.insert(
                 PrefixTransitionKey {
                     parent: new_parent,
                     previous: old_entering.previous,
@@ -3168,7 +3419,9 @@ impl PrefixStates {
 
     pub(super) fn complete_nodes_with_budget(
         &mut self,
-        evaluation: &PrefixEvaluation<'_, '_>,
+        scratch: &mut PrefixTransitionScratch,
+        effects: &mut PrefixEffects,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
         nodes: impl Iterator<Item = StyleNodeID>,
         completion_budget: usize,
         counters: &mut Counters,
@@ -3177,14 +3430,14 @@ impl PrefixStates {
         for node in nodes {
             // A relation answer already provides the complete prefix result. Building a
             // scalar transition for the same node duplicates work and retained state.
-            if self.retained_matches_for(node).is_some() {
+            if scratch.by_node.contains_key(&node) || self.retained_matches_for(node).is_some() {
                 continue;
             }
             if completions == completion_budget {
                 self.complete = false;
                 return false;
             }
-            match self.transition_for(evaluation, node, counters) {
+            match self.transition_for(scratch, effects, evaluation, node, counters) {
                 PrefixTransitionLookup::Known(_) => {}
                 PrefixTransitionLookup::Missing(_) => {
                     self.complete = false;
@@ -3195,23 +3448,6 @@ impl PrefixStates {
         }
         self.complete = true;
         true
-    }
-
-    /// Drop every row-indexed answer the moment the batch's row space moves.
-    ///
-    /// Per-row transitions and local-fact representatives hold raw row indices. A batch rebuild
-    /// renumbers rows, so holding them across generations reads the wrong element's facts, or
-    /// past the end of the batch. Appending keeps the generation and the held rows.
-    pub(super) fn prepare_rows(&mut self, generation: u64, row_count: usize) {
-        if self.facts_generation != generation || generation == 0 {
-            self.facts_generation = generation;
-            self.transition_by_row.clear();
-            self.local_fact_interner.clear_rows();
-        }
-        if self.transition_by_row.len() != row_count {
-            self.transition_by_row.clear();
-            self.transition_by_row.resize(row_count, UNKNOWN_TRANSITION);
-        }
     }
 
     fn rebuild_interners(&mut self) {
@@ -3245,17 +3481,28 @@ impl PrefixStates {
 
     fn transition_for(
         &mut self,
-        evaluation: &PrefixEvaluation<'_, '_>,
+        scratch: &mut PrefixTransitionScratch,
+        effects: &mut PrefixEffects,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
         node: StyleNodeID,
         counters: &mut Counters,
     ) -> PrefixTransitionLookup<PrefixTransition> {
-        transition_for(&mut PrefixTransitionSurface::Retained(self), evaluation, node, counters)
+        transition_for(
+            &mut PrefixTransitionSurface {
+                states: self,
+                scratch,
+                effects,
+            },
+            evaluation,
+            node,
+            counters,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn transition(
         &mut self,
-        evaluation: &PrefixEvaluation<'_, '_>,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
         entering: EnteringStates,
         row: MatchFactRow<'_>,
         node: StyleNodeID,
@@ -3851,8 +4098,6 @@ impl PrefixStates {
             }
         }
 
-        let old_transitions = std::mem::take(&mut self.transitions);
-
         let mut state_remap = vec![UNKNOWN_STATE; self.states.len()];
         let mut states = Vec::with_capacity(live_states.iter().filter(|&&live| live).count());
         let mut delta_steps = Vec::new();
@@ -3909,30 +4154,6 @@ impl PrefixStates {
         self.descendant_only = descendant_only;
         self.states_by_hash = HashMap::default();
         self.states_by_hash_collision_bytes = 0;
-        self.transitions = old_transitions
-            .into_iter()
-            .filter_map(|(key, transition)| {
-                let parent = *state_remap.get(key.parent as usize)?;
-                let previous = *state_remap.get(key.previous as usize)?;
-                let state = *state_remap.get(transition.state as usize)?;
-                let right = *state_remap.get(transition.right as usize)?;
-                if [parent, previous, state, right].contains(&UNKNOWN_STATE) {
-                    return None;
-                }
-                Some((
-                    PrefixTransitionKey {
-                        parent,
-                        previous,
-                        ..key
-                    },
-                    PrefixTransition {
-                        state,
-                        right,
-                        result: transition.result,
-                    },
-                ))
-            })
-            .collect();
         for entering in self.entering_by_element.iter_mut() {
             if entering.parent == UNKNOWN_STATE {
                 continue;
@@ -3973,7 +4194,6 @@ impl PrefixStates {
         // slack of its working vectors across that cycle: trimming them here makes the next flush
         // immediately allocate the same capacity again. Batch-local workspaces below still give
         // their complete allocations back because none of their contents cross this boundary.
-        self.transition_by_row = Vec::new();
         self.candidate_epoch = EpochColumn::default();
         self.comparison_marks = EpochColumn::default();
         self.compound_epoch = EpochColumn::default();
@@ -3991,7 +4211,6 @@ impl PrefixStates {
         self.new_child = Vec::new();
         self.new_following = Vec::new();
         self.new_adjacent = Vec::new();
-        self.ancestor_chain = Vec::new();
     }
 
     fn top_level_capacity_bytes(&self) -> u64 {
@@ -4009,8 +4228,6 @@ impl PrefixStates {
                 self.results,
                 self.result_ids,
                 self.match_sets_by_hash,
-                self.transitions,
-                self.transition_by_row,
                 self.transition_by_element,
                 self.entering_by_element,
                 self.local_facts_by_element,
@@ -4033,10 +4250,9 @@ impl PrefixStates {
                 self.descendant_only,
                 self.output_matches,
                 self.output_matched_steps,
-                self.ancestor_chain,
             ];
             cached [];
-            nested [self.states_by_hash_collision_bytes];
+            nested [self.states_by_hash_collision_bytes, self.local_fact_interner.rows.shallow_capacity_bytes()];
             skip [
                 self.local_fact_interner,
                 self.relation,
@@ -4046,7 +4262,6 @@ impl PrefixStates {
                 self.new_child_hash,
                 self.new_following_hash,
                 self.new_adjacent_hash,
-                self.facts_generation,
                 self.epoch,
                 self.complete,
                 self.automaton_step_count,
@@ -4060,7 +4275,7 @@ impl PrefixStates {
     pub(super) fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
             shallow [];
-            cached [self.local_fact_interner.capacity_bytes()];
+            cached [];
             nested [self.top_level_capacity_bytes()];
             skip [];
         }
@@ -4074,127 +4289,130 @@ impl PrefixStates {
     }
 }
 
+impl PrefixTransitionScratch {
+    fn local_fact_identity(&self, facts: &StyleNodeFacts, node: StyleNodeID) -> u32 {
+        self.local_facts_by_row[facts.row_of(node).expect("prepared fact row") as usize]
+    }
+
+    /// Drop every row-indexed answer the moment the batch's row space moves.
+    ///
+    /// Per-row transitions and local-fact representatives hold raw row indices. A batch rebuild
+    /// renumbers rows, so holding them across generations reads the wrong element's facts, or
+    /// past the end of the batch. Appending keeps the generation and the held rows.
+    pub(super) fn prepare_rows(&mut self, generation: u64, row_count: usize) {
+        if self.facts_generation != generation || generation == 0 {
+            self.facts_generation = generation;
+            self.transition_by_row.clear();
+            self.local_facts_by_row.clear();
+            self.cohorts_unneeded = false;
+        }
+        if self.transition_by_row.len() != row_count {
+            self.transition_by_row.clear();
+            self.transition_by_row.resize(row_count, UNKNOWN_TRANSITION);
+        }
+    }
+
+    pub(super) fn capacity_bytes(&self) -> u64 {
+        capacity_bytes! {
+            shallow [self.transition_by_row, self.memo, self.by_node, self.local_facts_by_row, self.ancestor_chain];
+            cached [];
+            nested [];
+            skip [self.facts_generation, self.states_identity, self.cohorts_unneeded];
+        }
+    }
+}
+
+impl PrefixEffects {
+    pub(super) fn capacity_bytes(&self) -> u64 {
+        (self.writes.capacity() * size_of::<PrefixNodeWrite>()) as u64
+    }
+}
+
+impl PrefixStates {
+    pub(super) fn install_prefix_effects(&mut self, effects: &mut PrefixEffects) {
+        for write in effects.writes.drain(..) {
+            self.set_transition(write.node, write.transition);
+            self.set_entering(write.node, write.entering);
+            if let Some(identity) = write.local_facts {
+                self.set_local_facts(write.node, identity);
+            }
+            if let Some(bits) = write.positional_bits {
+                self.set_positional_bits(write.node, bits);
+            }
+        }
+    }
+}
+
 impl PrefixTransitionSurface<'_> {
     fn ancestor_chain_is_empty(&self) -> bool {
-        match self {
-            Self::Retained(states) => states.ancestor_chain.is_empty(),
-        }
+        self.scratch.ancestor_chain.is_empty()
     }
-
     fn clear_ancestor_chain(&mut self) {
-        match self {
-            Self::Retained(states) => states.ancestor_chain.clear(),
-        }
+        self.scratch.ancestor_chain.clear();
     }
-
     fn push_ancestor(&mut self, node: StyleNodeID) {
-        match self {
-            Self::Retained(states) => states.ancestor_chain.push(node),
-        }
+        self.scratch.ancestor_chain.push(node);
     }
-
     fn pop_ancestor(&mut self) -> Option<StyleNodeID> {
-        match self {
-            Self::Retained(states) => states.ancestor_chain.pop(),
-        }
+        self.scratch.ancestor_chain.pop()
     }
 
-    fn known_transition(&self, evaluation: &PrefixEvaluation<'_, '_>, node: StyleNodeID) -> Option<PrefixTransition> {
+    fn known_transition(
+        &self,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
+        node: StyleNodeID,
+    ) -> Option<PrefixTransition> {
         if !evaluation.facts_are_composite() {
             let row = evaluation.facts.row_of(node)? as usize;
-            let known = match self {
-                Self::Retained(states) => states.transition_by_row[row],
-            };
+            let known = self.scratch.transition_by_row[row];
             if known.state != UNKNOWN_STATE {
                 return Some(known);
             }
         }
-        match self {
-            Self::Retained(states) => match states.transition_of(node) {
+        self.scratch
+            .by_node
+            .get(&node)
+            .copied()
+            .or_else(|| match self.states.transition_of(node) {
                 PrefixTransitionLookup::Known(known) => Some(known),
                 PrefixTransitionLookup::Missing(_) => None,
-            },
-        }
-    }
-
-    fn local_fact_identity(
-        &mut self,
-        evaluation: &PrefixEvaluation<'_, '_>,
-        node: StyleNodeID,
-        row: MatchFactRow<'_>,
-        counters: &mut Counters,
-    ) -> u32 {
-        match self {
-            Self::Retained(states) => match states.local_facts_of(node) {
-                Some(identity) => identity,
-                None => {
-                    let identity = match evaluation.facts_are_composite() {
-                        true => {
-                            counters.bump(Counter::PrefixLocalFactIdentityMisses);
-                            states.local_fact_interner.mint_identity()
-                        }
-                        false => states.local_fact_interner.intern(
-                            row.facts,
-                            row.row,
-                            &evaluation.automaton.local_fact_dependencies,
-                            counters,
-                        ),
-                    };
-                    states.set_local_facts(node, identity);
-                    identity
-                }
-            },
-        }
-    }
-
-    fn memoized_transition(&self, key: &PrefixTransitionKey) -> Option<PrefixTransition> {
-        match self {
-            Self::Retained(states) => states.transitions.get(key).copied(),
-        }
-    }
-
-    fn insert_transition(&mut self, key: PrefixTransitionKey, transition: PrefixTransition) {
-        match self {
-            Self::Retained(states) => {
-                states.transitions.insert(key, transition);
-            }
-        }
+            })
     }
 
     fn remember_transition(
         &mut self,
-        evaluation: &PrefixEvaluation<'_, '_>,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
         node: StyleNodeID,
         row: MatchFactRow<'_>,
         transition: PrefixTransition,
     ) {
-        match self {
-            Self::Retained(states) => {
-                if !evaluation.facts_are_composite() {
-                    states.transition_by_row[row.row as usize] = transition;
-                }
-                // Retained coverage is ancestor-closed: a missing parent therefore proves that no
-                // descendant below it can hold a transition that this update would leave stale.
-                states.set_transition(node, transition);
-            }
+        if !evaluation.facts_are_composite() {
+            self.scratch.transition_by_row[row.row as usize] = transition;
         }
+        self.scratch.by_node.insert(node, transition);
     }
 
-    fn remember_positional_bits(&mut self, node: StyleNodeID, bits: u32) {
-        match self {
-            Self::Retained(states) => states.set_positional_bits(node, bits),
-        }
-    }
-
-    fn remember_entering(&mut self, node: StyleNodeID, entering: EnteringStates) {
-        match self {
-            Self::Retained(states) => states.set_entering(node, entering),
-        }
+    fn remember_inputs(
+        &mut self,
+        evaluation: &PrefixEvaluation<'_, '_>,
+        node: StyleNodeID,
+        transition: PrefixTransition,
+        inputs: TransitionInputs,
+    ) {
+        // NB: The dependency walk produces ancestors before descendants. Preserve that
+        //     order when installing ancestor-closed retained coverage after the context.
+        self.effects.writes.push(PrefixNodeWrite {
+            node,
+            transition,
+            entering: inputs.entering,
+            positional_bits: (!evaluation.automaton.positional_tests().is_empty()).then_some(inputs.positional_bits),
+            local_facts: Some(inputs.local_facts),
+        });
     }
 
     fn transition_from_inputs(
         &mut self,
-        evaluation: &PrefixEvaluation<'_, '_>,
+        evaluation: &mut PrefixEvaluation<'_, '_>,
         node: StyleNodeID,
         row: MatchFactRow<'_>,
         inputs: TransitionInputs,
@@ -4207,35 +4425,27 @@ impl PrefixTransitionSurface<'_> {
             is_document_root: evaluation.tree.parent(node).is_none(),
             positional_bits: inputs.positional_bits,
         };
-        if let Some(transition) = self.memoized_transition(&key) {
+        if let Some(transition) = self.scratch.memo.get(&key).copied() {
             counters.bump(Counter::PrefixTransitionMemoHits);
-            if !evaluation.automaton.positional_tests().is_empty() {
-                self.remember_positional_bits(node, inputs.positional_bits);
-            }
-            self.remember_entering(node, inputs.entering);
+            self.remember_inputs(evaluation, node, transition, inputs);
             return PrefixTransitionLookup::Known((transition, PrefixTransitionOrigin::Memoized));
         }
         counters.bump(Counter::PrefixTransitionMemoMisses);
-        let transition = match self {
-            Self::Retained(states) => states.transition(
-                evaluation,
-                inputs.entering,
-                row,
-                node,
-                key.is_document_root,
-                key.positional_bits,
-                counters,
-            ),
-        };
+        let transition = self.states.transition(
+            evaluation,
+            inputs.entering,
+            row,
+            node,
+            key.is_document_root,
+            key.positional_bits,
+            counters,
+        );
         let transition = match transition {
             PrefixTransitionLookup::Known(transition) => transition,
             PrefixTransitionLookup::Missing(gap) => return PrefixTransitionLookup::Missing(gap),
         };
-        self.insert_transition(key, transition);
-        if !evaluation.automaton.positional_tests().is_empty() {
-            self.remember_positional_bits(node, inputs.positional_bits);
-        }
-        self.remember_entering(node, inputs.entering);
+        self.scratch.memo.insert(key, transition);
+        self.remember_inputs(evaluation, node, transition, inputs);
         PrefixTransitionLookup::Known((transition, PrefixTransitionOrigin::Computed))
     }
 }
@@ -4244,7 +4454,7 @@ impl PrefixTransitionSurface<'_> {
 /// same walk with the previous-sibling state pinned to zero.
 fn transition_for(
     surface: &mut PrefixTransitionSurface<'_>,
-    evaluation: &PrefixEvaluation<'_, '_>,
+    evaluation: &mut PrefixEvaluation<'_, '_>,
     node: StyleNodeID,
     counters: &mut Counters,
 ) -> PrefixTransitionLookup<PrefixTransition> {
@@ -4275,6 +4485,12 @@ fn transition_for(
         current = parent;
     }
 
+    // NB: Observe whether this ask can use completed selector-axis inputs without
+    //     producing any ancestor or preceding-sibling transition first.
+    counters.bump(Counter::PrefixTransitionInputAsks);
+    if surface.scratch.ancestor_chain.len() == 1 {
+        counters.bump(Counter::PrefixTransitionInputsReady);
+    }
     let mut result = UNKNOWN_TRANSITION;
     while let Some(node) = surface.pop_ancestor() {
         let row = match evaluation.row_of(node) {
@@ -4305,7 +4521,7 @@ fn transition_for(
         } else {
             0
         };
-        let local_facts = surface.local_fact_identity(evaluation, node, row, counters);
+        let local_facts = surface.scratch.local_fact_identity(evaluation.facts, node);
         let positional_bits = match evaluation.positional_bits(node, counters) {
             Ok(bits) => bits,
             Err(incomplete) => return PrefixTransitionLookup::Missing(PrefixTransitionGap::Incomplete(incomplete)),
@@ -4416,20 +4632,10 @@ impl PrefixStateCache {
         }
     }
 
-    pub(super) fn prepare_program_rows(
-        &mut self,
-        program: ScopeProgramID,
-        generation: u64,
-        row_count: usize,
-    ) -> &mut PrefixStates {
-        let entry = self.by_program.entry(program.0 as usize);
-        match entry {
-            Some(states) => {
-                states.prepare_rows(generation, row_count);
-                states
-            }
-            None => entry.insert(Box::new(PrefixStates::new(row_count))),
-        }
+    pub(super) fn prepare_program(&mut self, program: ScopeProgramID) -> &mut PrefixStates {
+        self.by_program
+            .entry(program.0 as usize)
+            .get_or_insert_with(|| Box::new(PrefixStates::new()))
     }
 
     pub(super) fn lookup_mut(&mut self, program: ScopeProgramID) -> Lookup<&mut PrefixStates, PrefixStateCacheGap> {
@@ -4485,7 +4691,7 @@ impl PrefixStateCache {
         for slot in self.by_program.iter_mut() {
             // The next installation restores the relation answers from the relation.
             *slot = slot.as_mut().and_then(|states| states.relation.take()).map(|relation| {
-                let mut states = PrefixStates::new(0);
+                let mut states = PrefixStates::new();
                 states.relation = Some(relation);
                 Box::new(states)
             });
@@ -4810,9 +5016,8 @@ mod tests {
                 case: AttributeCase::Sensitive,
             }));
             let mut interner = LocalFactInterner::new();
-            let mut counters = Counters::default();
             let identities: Vec<_> = (0..3)
-                .map(|row| interner.intern(&facts, row, &dependencies, &mut counters))
+                .map(|row| interner.intern(&facts, row, &dependencies, &mut Counters::default()))
                 .collect();
             match operator {
                 AttributeOperator::Presence => assert_eq!(identities, [1, 1, 1]),
@@ -4821,6 +5026,157 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn rebinding_a_context_drops_answers_naming_a_replaced_arena() {
+        use super::super::index::StateSet;
+
+        let mut facts = StyleNodeFacts::new();
+        for node in 1..=2 {
+            facts.push_row(
+                StyleNodeID::element(node),
+                StyleAtomID(10),
+                StyleAtomID::NONE,
+                StateSet(0),
+                &[],
+                &[],
+            );
+        }
+        let automaton = PrefixAutomaton::default();
+        let program = ScopeProgramID(0);
+        let node = StyleNodeID::element(1);
+        let memoized = PrefixTransition {
+            state: 7,
+            right: 0,
+            result: PrefixResultID(9),
+        };
+        let mut states = PrefixStates::new();
+        let mut contexts = PrefixTransitionContexts::default();
+        contexts.prepare(program, &mut states, &automaton, &facts, &mut Counters::default());
+        {
+            let context = contexts.get_mut(program);
+            context.scratch.by_node.insert(node, memoized);
+            context.scratch.transition_by_row[0] = memoized;
+            context.effects.writes.push(PrefixNodeWrite {
+                node,
+                transition: memoized,
+                entering: UNKNOWN_ENTERING_STATES,
+                positional_bits: None,
+                local_facts: None,
+            });
+        }
+
+        // Losing residency rebuilds the arena every answer above names by index.
+        let mut rebuilt = PrefixStates::new();
+        contexts.rebind(program, &mut rebuilt, &automaton, &facts, &mut Counters::default());
+        let context = contexts.get_mut(program);
+        assert!(context.scratch.by_node.is_empty());
+        assert!(context.scratch.memo.is_empty());
+        assert!(context.effects.writes.is_empty());
+        assert_eq!(context.scratch.transition_by_row, vec![UNKNOWN_TRANSITION; 2]);
+        assert_eq!(context.scratch.local_facts_by_row.len(), 2);
+
+        // The arena it now names keeps what the traversal memoizes against it.
+        contexts.get_mut(program).scratch.by_node.insert(node, memoized);
+        contexts.rebind(program, &mut rebuilt, &automaton, &facts, &mut Counters::default());
+        assert_eq!(contexts.get_mut(program).scratch.by_node.get(&node), Some(&memoized));
+    }
+
+    #[test]
+    fn prepared_local_facts_survive_nested_domains_and_appends() {
+        use super::super::index::StateSet;
+
+        let mut facts = StyleNodeFacts::new();
+        for (node, tag) in [(1, 10), (2, 20), (3, 10)] {
+            facts.push_row(
+                StyleNodeID::element(node),
+                StyleAtomID(tag),
+                StyleAtomID::NONE,
+                StateSet(0),
+                &[],
+                &[],
+            );
+        }
+        let mut states = PrefixStates::new();
+        let automaton = PrefixAutomaton::default();
+        let mut context = PrefixTransitionContext::new(&mut states, &automaton, &facts, &mut Counters::default());
+        let first = context.scratch.local_fact_identity(&facts, StyleNodeID::element(1));
+        let second = context.scratch.local_fact_identity(&facts, StyleNodeID::element(2));
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            context.scratch.local_fact_identity(&facts, StyleNodeID::element(3))
+        );
+
+        // A retry has a different row ordering and replaces the interner's representatives.
+        let mut retry_facts = StyleNodeFacts::new();
+        for (node, tag) in [(3, 10), (2, 20), (1, 10)] {
+            retry_facts.push_row(
+                StyleNodeID::element(node),
+                StyleAtomID(tag),
+                StyleAtomID::NONE,
+                StateSet(0),
+                &[],
+                &[],
+            );
+        }
+        let retry = PrefixTransitionContext::new(&mut states, &automaton, &retry_facts, &mut Counters::default());
+        assert_eq!(
+            retry.scratch.local_fact_identity(&retry_facts, StyleNodeID::element(1)),
+            retry.scratch.local_fact_identity(&retry_facts, StyleNodeID::element(3))
+        );
+        assert_ne!(
+            retry.scratch.local_fact_identity(&retry_facts, StyleNodeID::element(1)),
+            retry.scratch.local_fact_identity(&retry_facts, StyleNodeID::element(2))
+        );
+        drop(retry);
+        assert_eq!(
+            first,
+            context.scratch.local_fact_identity(&facts, StyleNodeID::element(1))
+        );
+        assert_eq!(
+            second,
+            context.scratch.local_fact_identity(&facts, StyleNodeID::element(2))
+        );
+
+        // Appending to the suspended domain retains its old cohorts, including new members.
+        facts.push_row(
+            StyleNodeID::element(4),
+            StyleAtomID(20),
+            StyleAtomID::NONE,
+            StateSet(0),
+            &[],
+            &[],
+        );
+        context.prepare(&mut states, &automaton, &facts, &mut Counters::default());
+        assert_eq!(
+            second,
+            context.scratch.local_fact_identity(&facts, StyleNodeID::element(4))
+        );
+        assert_eq!(
+            first,
+            context.scratch.local_fact_identity(&facts, StyleNodeID::element(3))
+        );
+
+        // Reusing scratch for a rebuilt domain must re-prepare every row.
+        context.prepare(&mut states, &automaton, &retry_facts, &mut Counters::default());
+        assert_eq!(
+            context
+                .scratch
+                .local_fact_identity(&retry_facts, StyleNodeID::element(1)),
+            context
+                .scratch
+                .local_fact_identity(&retry_facts, StyleNodeID::element(3))
+        );
+        assert_ne!(
+            context
+                .scratch
+                .local_fact_identity(&retry_facts, StyleNodeID::element(1)),
+            context
+                .scratch
+                .local_fact_identity(&retry_facts, StyleNodeID::element(2))
+        );
     }
 
     #[test]
@@ -4833,7 +5189,7 @@ mod tests {
                 output_len: 0,
             });
         }
-        let mut states = PrefixStates::new(0);
+        let mut states = PrefixStates::new();
         // Retention trims every column to empty; comparison and sparse-delta paths regrow
         // candidate_epoch alone. begin_transition must size the siblings regardless.
         states.candidate_epoch.resize(automaton.steps.len(), 0);
@@ -4850,23 +5206,26 @@ mod tests {
 
     #[test]
     fn a_forgotten_prefix_transition_is_a_typed_missing_node() {
-        let mut states = PrefixStates::new(0);
+        let mut states = PrefixStates::new();
         let node = StyleNodeID::element(1);
         assert!(matches!(
             states.transition_of(node),
             PrefixTransitionLookup::Missing(PrefixTransitionGap::MissingTransition(gap)) if gap == node
         ));
 
-        states.set_transition(
-            node,
-            PrefixTransition {
-                state: 0,
-                right: 0,
-                result: PrefixResultID::default(),
-            },
-        );
-        states.set_entering(node, EnteringStates { parent: 0, previous: 0 });
-        states.set_positional_bits(node, 0b11);
+        states.install_prefix_effects(&mut PrefixEffects {
+            writes: vec![PrefixNodeWrite {
+                node,
+                transition: PrefixTransition {
+                    state: 0,
+                    right: 0,
+                    result: PrefixResultID::default(),
+                },
+                entering: EnteringStates { parent: 0, previous: 0 },
+                positional_bits: Some(0b11),
+                local_facts: None,
+            }],
+        });
         assert!(matches!(states.transition_of(node), PrefixTransitionLookup::Known(_)));
         states.forget_transition(node);
         assert_eq!(
@@ -4885,7 +5244,7 @@ mod tests {
 
     #[test]
     fn sparse_rebase_shares_unchanged_local_payload() {
-        let mut states = PrefixStates::new(0);
+        let mut states = PrefixStates::new();
         let mut counters = Counters::new();
         let old_base_step = PrefixStepID(1);
         let local_step = PrefixStepID(2);
@@ -4919,7 +5278,7 @@ mod tests {
     fn equal_prefix_state_contents_share_an_identity_across_base_chains() {
         let first = PrefixStepID(1);
         let second = PrefixStepID(2);
-        let mut states = PrefixStates::new(0);
+        let mut states = PrefixStates::new();
         states.automaton_step_count = 3;
         let mut counters = Counters::new();
         let first_base = states.intern_extended_state(0, &[first], step_hash(first), &[], 0, &mut counters);
@@ -4939,7 +5298,7 @@ mod tests {
         let second = PrefixStepID(2);
         let third = PrefixStepID(3);
         let fourth = PrefixStepID(4);
-        let mut states = PrefixStates::new(0);
+        let mut states = PrefixStates::new();
         states.automaton_step_count = 5;
         let mut counters = Counters::new();
         let first_base = states.intern_extended_state(0, &[first], step_hash(first), &[], 0, &mut counters);
@@ -4967,7 +5326,7 @@ mod tests {
         let first = PrefixStepID(1);
         let second = PrefixStepID(2);
         let third = PrefixStepID(3);
-        let mut states = PrefixStates::new(0);
+        let mut states = PrefixStates::new();
         states.automaton_step_count = 4;
         states.candidate_epoch.resize(4, 0);
         states.delta_steps = [first, second, first, second, third]
@@ -5045,7 +5404,7 @@ mod tests {
 
     #[test]
     fn sparse_rebase_applies_signed_local_output_edits() {
-        let mut states = PrefixStates::new(0);
+        let mut states = PrefixStates::new();
         let mut counters = Counters::new();
         let old_base_step = PrefixStepID(0);
         let retained_step = PrefixStepID(1);
@@ -5198,7 +5557,7 @@ mod tests {
 
     #[test]
     fn sparse_match_delta_applies_additions_and_removals() {
-        let mut states = PrefixStates::new(0);
+        let mut states = PrefixStates::new();
         let removed = EntryID(0);
         let retained = EntryID(1);
         let added = EntryID(2);
@@ -5221,7 +5580,7 @@ mod tests {
 
     #[test]
     fn retention_compacts_prefix_states_from_element_roots() {
-        let mut states = PrefixStates::new(0);
+        let mut states = PrefixStates::new();
         states.delta_steps = vec![
             std::mem::MaybeUninit::new(PrefixStepID(1)),
             std::mem::MaybeUninit::new(PrefixStepID(2)),
@@ -5258,29 +5617,19 @@ mod tests {
         ]);
         states.descendant_only = vec![0, 1, 2, 3];
         let node = StyleNodeID::element(1);
-        states.set_transition(
-            node,
-            PrefixTransition {
-                state: 3,
-                right: 0,
-                result: PrefixResultID::default(),
-            },
-        );
-        states.set_entering(node, EnteringStates { parent: 3, previous: 0 });
-        let PrefixTransitionLookup::Known(transition) = states.transition_of(node) else {
-            panic!("the retained transition must be known");
-        };
-        states.transitions.insert(
-            PrefixTransitionKey {
-                parent: 3,
-                previous: 0,
-                local_facts: 1,
-                is_document_root: false,
-                positional_bits: 0,
-            },
-            transition,
-        );
-
+        states.install_prefix_effects(&mut PrefixEffects {
+            writes: vec![PrefixNodeWrite {
+                node,
+                transition: PrefixTransition {
+                    state: 3,
+                    right: 0,
+                    result: PrefixResultID::default(),
+                },
+                entering: EnteringStates { parent: 3, previous: 0 },
+                positional_bits: None,
+                local_facts: None,
+            }],
+        });
         states.compact_interned_states();
 
         assert_eq!(states.states.len(), 3);
@@ -5295,15 +5644,11 @@ mod tests {
             2
         );
         assert_eq!(states.states[transition.state as usize].base, 1);
-        assert_eq!(states.transitions.len(), 1);
-        let (key, memoized) = states.transitions.iter().next().unwrap();
-        assert_eq!(key.parent, 2);
-        assert_eq!(memoized.state, 2);
     }
 
     #[test]
     fn retention_preserves_working_vector_capacity() {
-        let mut states = PrefixStates::new(0);
+        let mut states = PrefixStates::new();
         states.last_compacted_working_bytes = states.interned_working_bytes();
         states.match_offsets.reserve(32);
         states.match_entries.reserve(32);
@@ -5341,7 +5686,6 @@ mod tests {
         use super::super::memory::DeviceClass;
 
         let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
-        let mut counters = Counters::new();
         let mut cache = PrefixStateCache::default();
         let mut facts = StyleNodeFacts::new();
         facts.push_row(
@@ -5352,20 +5696,19 @@ mod tests {
             &[],
             &[],
         );
-        {
-            let states = cache.prepare_program_rows(ScopeProgramID(0), facts.generation(), 1);
-            states
-                .local_fact_interner
-                .intern(&facts, 0, &PrefixFactDependencies::default(), &mut counters);
-        }
+        let mut context = PrefixTransitionContext::new(
+            cache.prepare_program(ScopeProgramID(0)),
+            &PrefixAutomaton::default(),
+            &facts,
+            &mut Counters::default(),
+        );
         cache.settle_memory(&mut memory);
         assert!(cache.retain(&mut memory));
         assert!(memory.bytes_in_category(MemoryCategory::PrefixTransitionCache) > 0);
 
-        // A generation change clears the entry's local-fact interner, shrinking its capacity. On a
-        // a retained cache that shrink must reconcile the residency lease at settlement; the
-        // scratch lease holds zero bytes here and would underflow if it were adjusted instead.
-        let _ = cache.prepare_program_rows(ScopeProgramID(0), facts.generation() + 1, 1);
+        // Preparing a fresh private row domain does not change retained cache accounting.
+        context.scratch.prepare_rows(facts.generation() + 1, 1);
+        let _ = cache.prepare_program(ScopeProgramID(0));
         cache.settle_memory(&mut memory);
         assert_eq!(memory.bytes_in_category(MemoryCategory::BatchScratch), 0);
     }

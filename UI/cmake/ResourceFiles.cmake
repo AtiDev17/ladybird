@@ -52,11 +52,11 @@ list(TRANSFORM ABOUT_PAGES PREPEND "${LADYBIRD_SOURCE_DIR}/Base/res/ladybird/abo
 
 set(ABOUT_SETTINGS_RESOURCES
     advanced.js
-    browsing-behavior.js
+    appearance.js
     blocking.js
-    default-zoom-level.js
+    browsing-behavior.js
+    content.js
     dialog-deep-link.js
-    force-dark.js
     geolocation.js
     languages.js
     network.js

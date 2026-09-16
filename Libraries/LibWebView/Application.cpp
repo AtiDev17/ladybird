@@ -100,6 +100,11 @@ static double sanitized_display_refresh_rate(double refresh_rate)
 }
 
 struct ApplicationSettingsObserver final : public SettingsObserver {
+    virtual void appearance_changed() override
+    {
+        Application::the().appearance_changed({});
+    }
+
     virtual void tab_settings_changed() override
     {
         Application::the().tab_settings_changed({});
@@ -2477,10 +2482,12 @@ void Application::initialize_actions()
     });
     update_vertical_tabs_action();
 
-    m_toggle_menu_bar_action = Action::create_checkable("Show Menubar"sv, ActionID::ToggleMenuBar, [this]() {
-        m_settings->set_show_menu_bar(!m_settings->show_menu_bar());
+    m_toggle_menu_bar_action = Action::create_checkable("Show Menu Bar"sv, ActionID::ToggleMenuBar, [this]() {
+        auto appearance = m_settings->appearance();
+        appearance.show_menu_bar = !appearance.show_menu_bar;
+        m_settings->set_appearance(appearance);
     });
-    m_toggle_menu_bar_action->set_checked(m_settings->show_menu_bar());
+    m_toggle_menu_bar_action->set_checked(m_settings->appearance().show_menu_bar);
 
     m_bookmarks_menu = Menu::create("Bookmarks"sv);
     m_bookmarks_menu->add_action(Action::create("Manage Bookmarks"sv, ActionID::ManageBookmarks, [this]() {
@@ -2513,9 +2520,11 @@ void Application::initialize_actions()
     }));
 
     m_toggle_bookmark_bar_action = Action::create_checkable("Show Bookmarks Bar"sv, ActionID::ToggleBookmarksBar, [this]() {
-        m_settings->set_show_bookmarks_bar(!m_settings->show_bookmarks_bar());
+        auto appearance = m_settings->appearance();
+        appearance.show_bookmarks_bar = !appearance.show_bookmarks_bar;
+        m_settings->set_appearance(appearance);
     });
-    m_toggle_bookmark_bar_action->set_checked(m_settings->show_bookmarks_bar());
+    m_toggle_bookmark_bar_action->set_checked(m_settings->appearance().show_bookmarks_bar);
     m_bookmarks_menu->add_action(*m_toggle_bookmark_bar_action);
 
     m_bookmarks_menu->add_separator();
@@ -2543,8 +2552,6 @@ void Application::initialize_actions()
             view->get_source();
     });
     m_inspect_menu->add_action(*m_view_source_action);
-
-    add_platform_inspect_menu_items();
 
     m_toggle_devtools_action = Action::create("Enable DevTools"sv, ActionID::ToggleDevTools, [this]() {
         if (auto result = toggle_devtools_enabled(); result.is_error())
@@ -2624,6 +2631,8 @@ void Application::initialize_actions()
     m_block_pop_ups_action = Action::create_checkable("Block Pop-ups"sv, ActionID::BlockPopUps, check(m_block_pop_ups_action, "block-pop-ups"sv));
     m_block_pop_ups_action->set_checked(m_browser_options.allow_popups == AllowPopups::No);
     m_debug_menu->add_action(*m_block_pop_ups_action);
+
+    create_platform_actions();
 }
 
 void Application::apply_view_options(Badge<ViewImplementation>, ViewImplementation& view)
@@ -2649,6 +2658,12 @@ void Application::update_vertical_tabs_action()
     m_toggle_vertical_tabs_expanded_action->set_visible(settings.vertical_tabs_enabled);
     m_toggle_vertical_tabs_expanded_action->set_engaged(settings.vertical_tabs_expanded);
     m_toggle_vertical_tabs_expanded_action->set_tooltip(settings.vertical_tabs_expanded ? "Minimize Tabs"sv : "Expand Tabs"sv);
+}
+
+void Application::appearance_changed(Badge<ApplicationSettingsObserver>)
+{
+    m_toggle_menu_bar_action->set_checked(m_settings->appearance().show_menu_bar);
+    m_toggle_bookmark_bar_action->set_checked(m_settings->appearance().show_bookmarks_bar);
 }
 
 void Application::tab_settings_changed(Badge<ApplicationSettingsObserver>)

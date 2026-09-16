@@ -18,15 +18,14 @@
 #include <UI/Qt/Tab.h>
 #include <UI/Qt/TabBar.h>
 
-#include <QIcon>
 #include <QMainWindow>
 #include <QPushButton>
-#include <QTabBar>
 
+class QIcon;
 class QPropertyAnimation;
-class QWindow;
 class QToolButton;
 class QWidget;
+class QWindow;
 
 namespace Ladybird {
 
@@ -149,9 +148,6 @@ public:
     QMenu& hamburger_menu() const { return *m_hamburger_menu; }
     static bool has_chrome_in_titlebar();
 
-    QAction& new_window_action() const { return *m_new_window_action; }
-    QAction& find_action() const { return *m_find_in_page_action; }
-
     template<typename Callback>
     void for_each_tab(Callback&& callback)
     {
@@ -162,7 +158,6 @@ public:
     void update_tabs_display();
 
     void rebuild_bookmarks_menu();
-    void update_reopen_recently_closed_action();
     void detach_tab_to_new_window(int index, QPoint global_position);
     void move_tab_to_window(int index, BrowserWindow& target_window, int target_index);
     void adopt_tab(Tab&, int index);
@@ -205,8 +200,7 @@ private:
     virtual void wheelEvent(QWheelEvent*) override;
     virtual void closeEvent(QCloseEvent*) override;
 
-    virtual void show_menu_bar_changed() override;
-    virtual void show_bookmarks_bar_changed() override;
+    virtual void appearance_changed() override;
     virtual void config_variable_changed(WebView::ConfigVariableID) override;
 
     Tab& create_new_tab(Web::HTML::ActivateTab, Tab& parent, Optional<Web::PageId> page_index);
@@ -225,6 +219,10 @@ private:
     void clear_resize_cursor();
     bool should_draw_window_border() const;
     void update_window_border();
+
+    void initialize_application_actions();
+    void initialize_application_menu();
+    void initialize_hamburger_menu();
 
     void initialize_tab_buttons(Tab*);
     void create_menu_bar_window_controls();
@@ -259,19 +257,12 @@ private:
     Tab* m_current_tab { nullptr };
     DevToolsBanner* m_devtools_banner { nullptr };
 
-    QMenu* m_hamburger_menu { nullptr };
-    QMenu* m_bookmarks_menu { nullptr };
-    QMenu* m_history_menu { nullptr };
     QWidget* m_menu_bar_window_controls { nullptr };
     QToolButton* m_menu_bar_minimize_window_button { nullptr };
     QToolButton* m_menu_bar_maximize_window_button { nullptr };
     QToolButton* m_menu_bar_close_window_button { nullptr };
 
-    QAction* m_new_tab_action { nullptr };
-    QAction* m_new_window_action { nullptr };
-    QAction* m_new_private_window_action { nullptr };
-    QAction* m_reopen_recently_closed_tab_action { nullptr };
-    QAction* m_find_in_page_action { nullptr };
+    QMenu* m_hamburger_menu { nullptr };
 
     IsPopupWindow m_is_popup_window { IsPopupWindow::No };
 

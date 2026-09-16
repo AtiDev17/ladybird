@@ -66,8 +66,8 @@ impl StyleEngineState {
             sheets_excluded_from_routing: BitColumn::default(),
             routing_needs_detachment_sweep: false,
             sheet_rule_replacement: None,
-            match_workspace: MatchEvaluationWorkspace::default(),
-            query_match_workspace: MatchEvaluationWorkspace::for_selector_query(),
+            match_workspace: MatchScratch::default(),
+            query_match_workspace: MatchScratch::for_selector_query(),
             selector_query_generation: 0,
             query_workspace_generation: 0,
             query_settled_transaction_version: StyleTransactionVersion(0),
@@ -134,7 +134,9 @@ impl StyleEngineState {
             selector_truth_changes: SelectorTruthChanges::default(),
             already_planned_selector_truth: DeltaBatch::default(),
             selector_truth_changes_active: false,
-            relational_witnesses: RefCell::new(RelationalWitnesses::default()),
+            relational_witnesses: RelationalWitnesses::default(),
+            pending_witness_effects: Vec::new(),
+            witness_effect_scratch: MemoryLease::new(MemoryCategory::BatchScratch),
             relational_witness_residency: MemoryLease::new(MemoryCategory::RetainedWitness),
             scope_roots: Column::default(),
             scope_by_root: SegmentedNodeColumn::default(),
@@ -1149,6 +1151,7 @@ impl StyleEngineState {
     }
 
     pub(crate) fn settle_batched_inputs(&mut self, counters: &mut Counters) {
+        self.install_pending_matching_context();
         if !self.journal.contains_only_element_style_inputs() {
             self.discard_prepared_batch_matching_traversal();
         }
@@ -2148,12 +2151,13 @@ impl StyleEngineState {
         let repair_inputs = (declarations_are_complete && current_declarations_are_complete)
             .then(|| {
                 let previous = self
-                    .winner_groups
+                    .current_winner_groups()
                     .token_for(WinnerGroupKey::current(node, self.program.version()))
                     .sparse()
                     .ok()
                     .map(|(_, state)| state)?;
-                let retained = Rc::clone(self.retained_match_answer(node).sparse().ok()?);
+                let retained = self.current_answer_identity(node)?;
+                self.match_answers.answer(retained)?;
                 Some((previous, retained, current_declared.to_vec()))
             })
             .flatten();
@@ -2196,10 +2200,13 @@ impl StyleEngineState {
         &mut self,
         node: StyleNodeID,
         previous: CascadeStateID,
-        retained: Rc<[RetainedRuleMatch]>,
+        retained: MatchAnswerID,
         properties: &[u16],
         counters: &mut Counters,
     ) {
+        let Some(retained) = self.match_answers.answer(retained) else {
+            return;
+        };
         let matches = retained
             .iter()
             .copied()
@@ -2222,7 +2229,26 @@ impl StyleEngineState {
         };
         let (state, _) =
             self.with_cascade_interning_counters(|groups| groups.apply_property_updates(previous, &updates), counters);
-        let published = self.winner_groups.set(node, state, self.program.version());
+        let published = if let Some(traversal) = self.batch_matching_traversal.as_mut() {
+            traversal.answer_effects.winners.set(
+                &mut self.winner_groups,
+                node,
+                state,
+                self.program.version(),
+                &mut self.memory,
+            )
+        } else {
+            let mut effects = super::cascade::WinnerEffects::default();
+            let published = effects.set(
+                &mut self.winner_groups,
+                node,
+                state,
+                self.program.version(),
+                &mut self.memory,
+            );
+            self.install_winner_effects(effects);
+            published
+        };
         self.winner_groups.settle_memory(&mut self.memory);
         if published {
             counters.bump(Counter::CascadeNodeHandlesPublished);

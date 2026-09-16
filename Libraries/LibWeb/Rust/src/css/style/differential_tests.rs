@@ -15,6 +15,7 @@ use super::batch_matcher::BatchMatcher;
 use super::batch_matcher::RuleMatch;
 use super::batch_matcher::RuleMatches;
 use super::cascade::PropertyWinner;
+use super::cascade::WinnerGroupKey;
 use super::computed::ComputedMetadataInput;
 use super::fast_hash::fast_hasher;
 use super::index::DispatchCandidateWorkspace;
@@ -30,6 +31,7 @@ use super::program::RuleID;
 use super::program::RuleKind;
 use super::program::StyleSheetObjectID;
 use super::selector::FeatureTest;
+use super::selector::MatchScratch;
 use super::selector::SelectorOp;
 use super::selector::SelectorProgramBuilder;
 use super::transaction::InputKey;
@@ -344,7 +346,12 @@ fn retained_matches(engine: &mut StyleEngine, node: StyleNodeID) -> Option<Vec<R
     Some(engine.in_cascade_order(materialized, false))
 }
 
-fn batch_matches(engine: &mut StyleEngine, node: StyleNodeID, ancestor_cache: bool) -> Vec<RuleMatch> {
+fn batch_matches(
+    engine: &mut StyleEngine,
+    node: StyleNodeID,
+    ancestor_cache: bool,
+    scratch: Option<&mut MatchScratch>,
+) -> Vec<RuleMatch> {
     let (_, dispatch) = engine.prepare_scope_program(TreeScopeID::DOCUMENT);
     let requirements =
         ancestor_cache.then(|| AncestorRequirements::build(&engine.tree, engine.facts.primary(), &dispatch));
@@ -365,6 +372,8 @@ fn batch_matches(engine: &mut StyleEngine, node: StyleNodeID, ancestor_cache: bo
             &mut matches,
             &mut Counters::new(),
             BatchMatchState {
+                match_workspace: scratch,
+                witness_effects: None,
                 dispatch_workspace: &mut DispatchCandidateWorkspace::default(),
                 requests: None,
                 completed: None,
@@ -481,6 +490,34 @@ fn verify_step(
     }
     workload.engine.end_cold_matching_batch();
 
+    // Reuse private scratch in both orders. In reverse order the sibling cursor
+    // must restart exactly; cache presence and the asking order cannot change truth.
+    for reverse in [false, true] {
+        let mut scratch = MatchScratch::default();
+        for index in 0..workload.nodes.len() {
+            let index = if reverse {
+                workload.nodes.len() - 1 - index
+            } else {
+                index
+            };
+            let node = workload.nodes[index];
+            let actual = batch_matches(&mut workload.engine, node, true, Some(&mut scratch));
+            compare_mode(
+                &mut workload.engine,
+                node,
+                &incremental[index],
+                actual,
+                "private scratch with reordered asks",
+                seed,
+                step,
+            );
+        }
+        assert!(
+            scratch.capacity_bytes() > 0,
+            "generated selectors must exercise scratch"
+        );
+    }
+
     for (&node, incremental) in workload.nodes.iter().zip(incremental) {
         let exact = exact_matches(&mut workload.engine, node);
         compare_mode(
@@ -492,9 +529,9 @@ fn verify_step(
             seed,
             step,
         );
-        let prefix_off = batch_matches(&mut workload.engine, node, true);
+        let prefix_off = batch_matches(&mut workload.engine, node, true, None);
         compare_mode(&mut workload.engine, node, &exact, prefix_off, "prefix-off", seed, step);
-        let caches_off = batch_matches(&mut workload.engine, node, false);
+        let caches_off = batch_matches(&mut workload.engine, node, false, None);
         compare_mode(
             &mut workload.engine,
             node,
@@ -624,4 +661,106 @@ fn budget_histories_preserve_answers_winners_and_records_across_mutations() {
         saw_retention_difference,
         "both histories retained the same acceleration"
     );
+}
+
+#[test]
+fn incomplete_answer_batches_preserve_pending_lookups_and_release_ownership() {
+    for discard in [false, true] {
+        let mut workload = Workload::new(19);
+        let transaction = workload.engine.take_transaction();
+        workload.engine.release_transaction(transaction);
+        let len = workload.nodes.len();
+        let nodes = [
+            workload.nodes[len - 2],
+            workload.nodes[len - 3],
+            workload.nodes[len - 1],
+        ];
+        let expected: Vec<_> = nodes
+            .iter()
+            .map(|&node| {
+                let exact = exact_matches(&mut workload.engine, node);
+                normalized_rows(workload.engine.matches_for_cascade(exact, false, Some(node)))
+            })
+            .collect();
+        for &node in &nodes {
+            let state = &mut workload.engine.state;
+            state.retained_match_answers.forget(&mut state.match_answers, node);
+            state.winner_groups.remove(node);
+        }
+        // NB: Deliberately leave the final subject's fact row unavailable. Earlier
+        //     subjects can complete without it, in descending identity order.
+        workload.engine.facts.forget(nodes[2]);
+        workload.engine.begin_adaptive_cold_matching_batch(workload.root);
+        assert!(
+            workload
+                .engine
+                .complete_published_match_answers_for_closure(&nodes)
+                .is_err()
+        );
+        assert!(workload.engine.match_answers.pending_reference_count() > 0);
+        assert!(workload.engine.winner_groups.pending_reference_count() > 0);
+        for index in 0..2 {
+            assert!(
+                workload
+                    .engine
+                    .retained_match_answers
+                    .answer_identity(nodes[index])
+                    .is_none()
+            );
+            assert_eq!(
+                normalized_rows(workload.engine.consume_published_match_answer(nodes[index]).unwrap()),
+                expected[index]
+            );
+            assert!(workload.engine.published_match_answer_signature(nodes[index]).is_some());
+            let key = WinnerGroupKey::current(nodes[index], workload.engine.program.version());
+            assert!(matches!(workload.engine.winner_groups.lookup(key), Lookup::Missing(_)));
+            assert!(matches!(
+                workload.engine.current_winner_groups().lookup(key),
+                Lookup::Known(_)
+            ));
+        }
+        if discard {
+            workload
+                .engine
+                .state
+                .discard_published_match_answers(&mut workload.engine.counters);
+            assert_eq!(workload.engine.match_answers.pending_reference_count(), 0);
+            assert_eq!(workload.engine.winner_groups.pending_reference_count(), 0);
+            for &node in &nodes[..2] {
+                assert!(workload.engine.state.current_published_answer(node).is_none());
+                assert!(workload.engine.retained_match_answers.answer_identity(node).is_none());
+            }
+        } else {
+            // NB: Refill the same facts without starting another transaction or
+            //     installing the pending prefix before this completion call resumes it.
+            let node = nodes[2];
+            let node_index = workload.nodes.iter().position(|&candidate| candidate == node).unwrap();
+            let state = &mut workload.engine.state;
+            state.facts.set_tag(node, tag_atom(node), &mut state.memory);
+            for &class in &workload.classes[node_index] {
+                state.facts.set_class(node, class_atom(class), true, &mut state.memory);
+            }
+            state.facts.apply_staged(&mut state.memory);
+            workload
+                .engine
+                .complete_published_match_answers_for_closure(&nodes)
+                .unwrap();
+            assert!(workload.engine.match_answers.pending_reference_count() > 0);
+            for &node in &nodes {
+                assert!(workload.engine.retained_match_answers.answer_identity(node).is_none());
+            }
+        }
+        workload.engine.end_cold_matching_batch();
+        assert_eq!(workload.engine.match_answers.pending_reference_count(), 0);
+        assert_eq!(workload.engine.winner_groups.pending_reference_count(), 0);
+        if !discard {
+            for &node in &nodes {
+                assert!(workload.engine.retained_match_answers.answer_identity(node).is_some());
+                assert_eq!(
+                    normalized_rows(retained_matches(&mut workload.engine, node).unwrap()),
+                    normalized_rows(exact_matches(&mut workload.engine, node))
+                );
+            }
+        }
+    }
 }

@@ -725,12 +725,64 @@ selected primary rows for other topologies. An adaptive retry prepares its
 extended facts and primary ancestor summary before matching. Unbounded ancestry
 rejects nothing, and secondary scope projections do not use primary ancestry.
 
-Prefix row storage is prepared against the fact batch's generation and row
-count before matching, answer patching or convergence. Adaptive retries
-prepare their rebuilt packed rows and restore a suspended batch's row domain
-before returning. Prepared allocation charges are settled even when no node
-uses the rows before retention. Transition evaluation and interning remain
-mutable; row preparation does not change their ownership.
+Prefix transition rows and memoization belong to each caller's evaluation
+context. Rows are prepared against the fact generation and count before
+matching. Adaptive retries own separate row domains; a failed attempt drops
+its effects. The ordinary child ask reads private rows and completed node
+transitions before retained columns, computing missing selector ancestors
+and preceding siblings into its own scratch. Completed ordinary transitions
+return ordered effects installed at context completion, before retention
+compacts IDs. Local-fact cohort IDs are prepared per fact batch before matching;
+only preparation mutates their interner. Representative rows belong to the
+preparation's fact domain, while contexts keep independent ID columns across
+nested adaptive attempts. Appending rows preserves the existing cohorts.
+Composite convergence preserves conservative unique cohorts for changed facts.
+Local-fact column publication joins the transition effects. Persistent
+state, match-set, truth and result interning remains eager during matching;
+its overlay and remapping wait until prefix discovery moves into the
+evaluation walk. Sparse convergence uses the same private scratch
+and ordered effects, keeping retained old-comparison inputs distinct from
+new parent and preceding-sibling outputs until convergence completes.
+
+Same-flush prefix answer probes normalize non-prefix matches into a borrowed
+slice and hash. Cache entries own that key content and confirm exact equality
+on lookup, including hash collisions; keys no longer allocate or retain a
+match-answer identity. Ordinary retained-answer reads borrow catalog slices,
+reacquiring them after mutable operations rather than cloning their Rc owners.
+Prefix contributions and answer-result identities remain eagerly interned for
+a later completed-payload and canonical installation step.
+Retained answer and cascade-input replacements, exact-cache discoveries,
+publication and observation are owned effects. Node and content lookups consult
+pending outputs before retained columns, including across an incomplete host
+batch. Before-change comparisons continue reading the unchanged old columns.
+
+The catalog's pending reference category pins numeric identities and charges
+payloads to BatchScratch. Completed transaction and host-batch boundaries transfer
+those references and install columns before retention, prefix release or catalog
+sweeping. Input handoff finishes the previous host context before discarding
+its publication; transaction entry does the same before committing new inputs.
+Those boundaries also finish prefix effects and drop private transition IDs
+before their arenas can be reset. Explicit abandonment releases pending
+references; incomplete batches keep them until resumption or teardown.
+Host consumers read pending publications without requiring their vector to have
+been sorted. Deferred-pseudo comparisons borrow the before-change answer from
+the old column, which owns it until installation, and the new answer from effects.
+
+Match-program relation answers, sibling cursors, sibling sequences, type ranks
+and positional answers live in caller-owned `MatchScratch`. An evaluator borrows
+it exclusively; recursive matching cannot mutate another evaluator's scratch.
+Sibling geometry is computed only on demand, and readers borrow sequence slices.
+Current and old-fact evaluations share current geometry but keep distinct type
+ranks and answers. Old-tree evaluation uses separate geometry. Prefix convergence
+holds separate old/current scratch while both evaluators are live.
+
+Completed current-fact relational queries return owned witness retain/clear
+effects. Matching never reads the retained witness table. Transaction, document
+matching and host-batch boundaries install those effects in evaluation order;
+a following transaction installs pending host observations before routing reads
+the table. Routing still revalidates retained witnesses against current facts;
+stale-witness clears join the same ordered effects.
+Ephemeral queries and before-side evaluators produce no witness effects.
 
 ### 9.2 Cascade priority
 
@@ -771,6 +823,23 @@ Candidate access is exact in each mutation direction:
 *Database counterpart:* a winner is a top-1 aggregate per (style node, property) under the priority order, and top-1 is the classic non-invertible aggregate: insertions and losing deletions repair in place by comparison, but deleting the current winner cannot be repaired from the aggregate alone. That is exactly why a deleted winner falls back to exact cold cascade reconstruction, the same rescan MIN/MAX maintenance performs under deletion.
 
 The exact cold cascade gathers all active declarations for one node and property and runs the same priority comparison program as the incremental path, depending on no winner caches, tournament nodes, or retained state. It is both the eviction path and the reference implementation.
+
+Winner state, group, provenance and continuation identities remain eagerly
+interned during resolution. Canonical identity installation is deferred to a
+later step. Per-node winner rows, program versions, flush
+stamps, inventory-current flags and rule-to-node postings are owned effects.
+The transaction, matching traversal or host batch owns these alongside its
+answer effects. A pending-first view supplies same-loop stopping checks,
+cohort donors and host computation reads without installing a donor's rows.
+Before-change comparisons continue reading unchanged retained state.
+
+Each queued write owns a pending state reference. Installation consumes writes
+in production order and transfers accepted references into retained rows;
+refused or abandoned writes release their references explicitly. Donor reuse
+captures completed state handles and pseudo inventory facts, so later changes
+to the producer cannot alter its consumer's output. Input handoff installs the
+old context before a new transaction can invalidate its identities. Winner
+installation precedes the same boundary admission decision as answer effects.
 
 ### 9.4 Winner stopping keys
 
@@ -889,6 +958,19 @@ Environment lifetimes are reference-driven: a live style record or input record 
 The engine interns computed style as a 32-bit base record: the tuple of a computed-group set, custom-property environment, fixed metadata, and reconstruction metadata, each itself an interned handle. What an element carries is the 64-bit final record identity: the base record plus a tag bit and generation distinguishing animation overlays, so an animated element's identity changes with its overlay while sharing the base. Sharing comes from hash-consing at publication; the group payloads reuse the existing Rust computed-value group representation, and no second complete style layout exists.
 
 Layout and paint consume the same style handle rather than retaining redundant complete style objects, where lifetime and threading permit.
+
+Engine drives use cached winner locations and borrow their original declaration
+spellings through an immutable view of program and element inputs. Canonical
+specified-value identities do not replace those spellings. Only substitution
+outputs need value ownership in the winner recipe. Cascade order remains the
+logical/physical property tie breaker. Recipe capacity is charged to scratch;
+program inputs remain stable for the context's lifetime.
+
+Group sets retain their ordered group IDs alongside the contiguous host payload
+view, so reconstruction and liveness do not hash payload pointers back to IDs.
+Unchanged animation overlays are borrowed through the reuse check; only a new
+retained overlay clones their owned contents. Custom-property name text is
+shared across environment/store owners.
 
 ### 9.9 Inheritance
 
@@ -1356,11 +1438,13 @@ Physical-work counts distinguish attempted work from accepted output:
 * The C++ ledger's `computedLonghandDrivesStarted` and
   `computedLonghandEvaluations` count the host-driven computation lane. Add its
   evaluations to Rust's physical evaluations for both lanes together.
-* `engineDriveCopiedTableSlots` counts full-width seeds and partial-drive copies,
-  including empty slots, plus required-input slots restored from an old table in
-  the Rust record drives. It does not count inherited-group swaps or host table
-  copies; `styleFfiCounters()` additionally reports table clone operations across
-  both lanes. Slot copies are distinct from retains and allocated bytes.
+* `engineDriveCopiedTableSlots` reports drive-boundary slot copies, now zero:
+  full and partial drives borrow unchanged slots through a flat base owner.
+  `styleFfiCounters()` reports `longhandTableCopiedSlots`,
+  `longhandTableCopyRetains` and `longhandTableStorageAllocations` across
+  seed, inherited-swap, durable materialization and host boundaries. Copy
+  retains include the single base-owner retain. A new unique result is
+  materialized once; no durable table retains a delta chain.
 
 These additions use the existing plain-integer document ledgers. The shared
 driver counts locally and each Rust phase folds its work immediately, before
