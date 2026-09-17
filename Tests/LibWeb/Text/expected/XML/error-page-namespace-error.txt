@@ -1,0 +1,4 @@
+Got load event
+[object HTMLDocument]
+html
+true

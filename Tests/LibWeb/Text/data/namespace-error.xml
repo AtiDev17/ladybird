@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE root [<!ATTLIST root xmlns:xmlns CDATA "urn:x">]>
+<root>the xmlns prefix must never be declared, not even from the DTD</root>
