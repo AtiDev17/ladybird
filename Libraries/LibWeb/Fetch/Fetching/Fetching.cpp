@@ -67,10 +67,13 @@
 #include <LibWeb/ResourceTiming/PerformanceResourceTiming.h>
 #include <LibWeb/SRI/SRI.h>
 #include <LibWeb/SecureContexts/AbstractOperations.h>
+#include <LibWeb/Streams/ReadableStream.h>
+#include <LibWeb/Streams/ReadableStreamDefaultReader.h>
 #include <LibWeb/Streams/TransformStream.h>
 #include <LibWeb/Streams/TransformStreamDefaultController.h>
 #include <LibWeb/Streams/TransformStreamOperations.h>
 #include <LibWeb/WebIDL/DOMException.h>
+#include <LibWeb/WebIDL/ExceptionOrUtils.h>
 
 namespace Web::Fetch::Fetching {
 
@@ -264,7 +267,8 @@ GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure:
             request.mode(),
             request.credentials_mode(),
             request.integrity_metadata(),
-            on_preloaded_response_available);
+            on_preloaded_response_available,
+            fetch_params->task_destination());
 
         // 4. If foundPreloadedResource is true and fetchParams’s preloaded response candidate is null, then set
         //    fetchParams’s preloaded response candidate to "pending".
@@ -618,6 +622,13 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
         }
         pending_response->when_loaded([&realm, &fetch_params, request, response, response_was_null = !response](GC::Ref<Infrastructure::Response> resolved_response) mutable {
             dbgln_if(WEB_FETCH_DEBUG, "Fetch: Running 'main fetch' pending_response load callback");
+
+            // AD-HOC: From here on, response processing captures fetchParams's task destination as it schedules work
+            //         (the fully-read in step 22, and fetch response handover's tasks, body pipe and body read). Record
+            //         that the response has arrived (a network response was recorded as its headers came in) — so
+            //         consume_a_preloaded_resource() re-targets an in-flight preload's fetch only til then.
+            fetch_params.controller()->set_response_arrived();
+
             if (response_was_null)
                 response = resolved_response;
             // 14. If response is not a network error and response is not a filtered response, then:
@@ -912,12 +923,39 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
     // 5. Let internalResponse be response, if response is a network error; otherwise response’s internal response.
     auto internal_response = response.is_network_error() ? GC::Ref { response } : response.unsafe_response();
 
+    auto algorithms = fetch_params.algorithms();
+
+    // AD-HOC: A parallel-queue task destination with a process-response-consume-body algorithm is a sync XHR send()
+    //         (https://xhr.spec.whatwg.org/#the-send()-method, step 12) — or a preload fetch that "consume a preloaded
+    //         resource" re-targeted onto a parallel queue for one. While that send() is blocked, the HTML event loop is
+    //         paused (https://html.spec.whatwg.org/multipage/#pause): It runs no tasks and performs no microtask
+    //         checkpoints. But the identity-TransformStream pipe in step 7 and Body::fully_read() in step 8.4 progress
+    //         only thru promise-reaction microtasks — so they'd never complete. Nor could they when send() was invoked
+    //         from within a microtask: Performing a microtask checkpoint is non-reentrant. The spec runs all of this in
+    //         parallel, off the event loop. So, for such a fetch, read the internal response's stream directly (chunk
+    //         delivery and stream close fulfill pending read requests synchronously), and once the read completes, run
+    //         processResponseEndOfBody — which the pipe's flush algorithm would otherwise have — and then processBody,
+    //         in the order the parallel queue would have run them.
+    bool read_body_in_parallel = fetch_params.task_destination().has<NonnullRefPtr<HTML::ParallelQueue>>() && algorithms->process_response_consume_body();
+
+    // AD-HOC: That direct read runs processResponseEndOfBody and processBody itself. processResponse (step 4 above)
+    //         and processResponseEndOfBody's task (step 3) are queued either way — onto a parallel queue backed by the
+    //         event loop's task queue (ParallelQueue::enqueue) — so they'd stay frozen til send() unpauses the loop,
+    //         and run after the body they precede was consumed. No caller sets either; assert it, so that adding one
+    //         fails here instead of silently reordering the algorithms.
+    if (read_body_in_parallel) {
+        VERIFY(!algorithms->process_response());
+        VERIFY(!algorithms->process_response_end_of_body());
+    }
+
     // 6. If internalResponse’s body is null, then run processResponseEndOfBody.
     if (!internal_response->body()) {
         process_response_end_of_body();
     }
     // 7. Otherwise:
-    else {
+    // AD-HOC: Not when the body is read in parallel (see read_body_in_parallel above): processResponseEndOfBody then
+    //         runs once the direct read of the stream below completes.
+    else if (!read_body_in_parallel) {
         HTML::TemporaryExecutionContext const execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
         // 1. Let transformStream be a new TransformStream.
@@ -942,7 +980,6 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
     }
 
     // 8. If fetchParams’s process response consume body is non-null, then:
-    auto algorithms = fetch_params.algorithms();
     if (algorithms->process_response_consume_body()) {
         // 1. Let processBody given nullOrBytes be this step: run fetchParams’s process response consume body given
         //    response and nullOrBytes.
@@ -967,15 +1004,57 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
         // 3. If internalResponse's body is null, then queue a fetch task to run processBody given null, with
         //    fetchParams’s task destination.
         if (!internal_response->body()) {
-            Infrastructure::queue_fetch_task(fetch_params.controller(), fetch_params.task_destination(), GC::create_function(GC::Heap::the(), [algorithms, &response]() {
-                // NOTE: We have to provide `fully_read` a callback which accepts a ByteBuffer. Since that is not
-                //       nullable, we just invoke `process_response_consume_body` with a null value manually here.
+            // AD-HOC: On a parallel-queue task destination, run processBody directly (see read_body_in_parallel above;
+            //         processResponseEndOfBody already ran, right after it).
+            if (read_body_in_parallel) {
                 (algorithms->process_response_consume_body())(response, Empty {});
-            }));
+            } else {
+                Infrastructure::queue_fetch_task(fetch_params.controller(), fetch_params.task_destination(), GC::create_function(GC::Heap::the(), [algorithms, &response]() {
+                    // NB: We have to provide fully_read a callback which accepts a ByteBuffer. Since that's not
+                    //     nullable, we just invoke process_response_consume_body with a null value manually here.
+                    (algorithms->process_response_consume_body())(response, Empty {});
+                }));
+            }
         }
         // 4. Otherwise, fully read internalResponse body given processBody, processBodyError, and fetchParams’s task
         //    destination.
-        else {
+        // AD-HOC: On a parallel-queue task destination, read the stream directly, without the event loop (see the
+        //         comment at read_body_in_parallel above).
+        else if (read_body_in_parallel) {
+            HTML::TemporaryExecutionContext const execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+
+            auto success_steps = GC::create_function(GC::Heap::the(), [process_body, process_response_end_of_body](ByteBuffer bytes) {
+                // NB: processResponseEndOfBody runs first, as step 7's flush algorithm would have: It sets up the fetch
+                //     controller's report timing steps, which the caller may invoke as soon as processBody has run.
+                process_response_end_of_body();
+                process_body->function()(move(bytes));
+            });
+
+            // NB: A body that carries its full contents as an in-memory source (data: URLs, cached responses, and such)
+            //     is read from that directly: Its stream may be populated thru the event loop (Blob::get_stream()
+            //     enqueues from a queued global task, e.g.) — which can't happen while the loop is paused.
+            if (auto const& source = internal_response->body()->source(); !source.has<Empty>()) {
+                // NB: process_body() re-reads response.body()->source() and, when it is Core::ImmutableBytes, uses
+                //     that directly and ignores the bytes passed here — so copying it would be pure waste.
+                if (source.has<Core::ImmutableBytes>()) {
+                    success_steps->function()({});
+                } else {
+                    auto bytes = source.visit(
+                        [](ByteBuffer const& byte_buffer) { return MUST(ByteBuffer::copy(byte_buffer)); },
+                        [](GC::Ref<FileAPI::Blob> const& blob) { return MUST(ByteBuffer::copy(blob->raw_bytes())); },
+                        [](auto const&) -> ByteBuffer { VERIFY_NOT_REACHED(); });
+                    success_steps->function()(move(bytes));
+                }
+            } else {
+                auto reader = internal_response->body()->stream()->get_a_reader();
+                if (reader.is_exception()) {
+                    auto throw_completion = WebIDL::exception_to_throw_completion(realm.vm(), realm, reader.release_error());
+                    process_body_error->function()(throw_completion.release_value());
+                } else {
+                    reader.value()->read_all_bytes(success_steps, process_body_error);
+                }
+            }
+        } else {
             internal_response->body()->fully_read(realm, process_body, process_body_error, fetch_params.task_destination());
         }
     }
@@ -2264,12 +2343,16 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
     // 13. Set up stream with byte reading support with pullAlgorithm set to pullAlgorithm, cancelAlgorithm set to cancelAlgorithm.
     stream->set_up_with_byte_reading_support(realm, pull_algorithm, cancel_algorithm);
 
-    auto on_headers_received = GC::create_function(GC::Heap::the(), [pending_response, stream, request, fetched_data_receiver](Requests::Request* request_server_request, HTTP::HeaderList const& response_headers, Optional<u32> status_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, Requests::CameFromCache) {
+    auto on_headers_received = GC::create_function(GC::Heap::the(), [&fetch_params, pending_response, stream, request, fetched_data_receiver](Requests::Request* request_server_request, HTTP::HeaderList const& response_headers, Optional<u32> status_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, Requests::CameFromCache) {
         if (pending_response->is_resolved()) {
             // RequestServer will send us the response headers twice, the second time being for HTTP trailers. This
             // fetch algorithm is not interested in trailers, so just drop them here.
             return;
         }
+
+        // AD-HOC: From here on, the response's body delivery is scheduled against the event loop (see
+        //         FetchedDataReceiver::queue_delivery_task()); record that, for consume_a_preloaded_resource().
+        fetch_params.controller()->set_response_arrived();
 
         auto response = Infrastructure::Response::create();
         response->set_status(status_code.value_or(200));

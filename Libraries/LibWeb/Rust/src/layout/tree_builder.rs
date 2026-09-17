@@ -1876,21 +1876,36 @@ pub unsafe extern "C" fn rust_build_layout_tree(
 
     if rebuilt_subtrees_were_updated_individually {
         let layout_host = host.layout();
-        layout_host.arena().recompute_containing_blocks_after_tree_update(
+        let attached_roots = layout_host.arena().recompute_containing_blocks_after_tree_update(
             &state.rebuilt_subtree_roots,
             layout_host.callbacks.inline_containing_block_lookup,
         );
+        layout_host
+            .arena()
+            .resolve_deferred_child_list_insertions(&attached_roots);
     } else {
         // NB: The full layout entry must initialize containing blocks for this tree.
         host.layout().arena().record_partial_relayout_escape();
+        host.layout()
+            .arena()
+            .resolve_deferred_child_list_insertions(&Default::default());
     }
 
+    // Table fixup can free a rebuilt root after it was recorded, such as whitespace at the edge of a
+    // row group. Its shell is gone with it, so only the roots that are still live are reported.
+    let live_rebuilt_subtree_root_shells: Vec<*mut c_void> = state
+        .rebuilt_subtree_roots
+        .iter()
+        .zip(&state.rebuilt_subtree_root_shells)
+        .filter(|(root, _)| host.layout().arena().slot_is_live(**root))
+        .map(|(_, shell)| *shell)
+        .collect();
     // SAFETY: The builder remains live and copies the reported shell pointers before returning.
     unsafe {
         (host.callbacks.report_rebuild_outcome)(
             host.callbacks.builder,
-            state.rebuilt_subtree_root_shells.as_ptr(),
-            state.rebuilt_subtree_root_shells.len(),
+            live_rebuilt_subtree_root_shells.as_ptr(),
+            live_rebuilt_subtree_root_shells.len(),
             state.layout_tree_update_escaped_rebuild_roots,
         );
     }

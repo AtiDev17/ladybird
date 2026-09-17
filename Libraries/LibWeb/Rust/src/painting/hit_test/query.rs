@@ -10,6 +10,7 @@ use crate::painting::chrome_geometry::{ChromeGeometry, scrollbar_is_enlarged};
 use crate::painting::ffi::ScrollDirection;
 use crate::painting::host::FfiHitTestQueryCallbacks;
 use crate::painting::visual_context::{NO_SORTING_CONTEXT, SortingContexts, SpatialNodeIndex, VisualContextTree};
+use std::collections::HashMap;
 
 struct DepthSortingState<'a> {
     tree: &'a VisualContextTree,
@@ -190,7 +191,7 @@ impl HitTestList {
         point: CssPixelPoint,
         with_caret_item: bool,
     ) -> (Option<TopmostItem>, Option<TopmostItem>) {
-        debug_assert!(self.derived_structures_built);
+        debug_assert!(self.spatial_indexes_built);
         let mut topmost_hit: Option<TopmostItem> = None;
         let mut topmost_caret: Option<TopmostItem> = None;
         let mut topmost_hit_index: Option<usize> = None;
@@ -328,7 +329,7 @@ impl HitTestList {
         callbacks: &FfiHitTestQueryCallbacks,
         point: CssPixelPoint,
     ) -> Vec<usize> {
-        debug_assert!(self.derived_structures_built);
+        debug_assert!(self.spatial_indexes_built);
         let mut hit_item_indices: Vec<usize> = Vec::new();
         for (context, spatial_index) in &self.spatial_indexes_by_context {
             let Some(local) = local_float_point(visual_context_tree, callbacks, *context, point, true) else {
