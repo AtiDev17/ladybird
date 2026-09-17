@@ -6,10 +6,13 @@
 
 use super::abspos_inputs::AbsposLayoutInputs;
 use super::formatting_context::DerivedBaselines;
+use super::formatting_context::FfiLayoutHostCallbacks;
 use super::formatting_context::LayoutMode;
 use super::geometry::AvailableSize;
 use super::geometry::AvailableSpace;
 use super::rendered_text::{FfiTextSource, FfiTextSourceRange, RenderedTextBoundary, TextContent, TextFragments};
+use super::tree_builder::FfiLayoutTreeBuildOutcome;
+use super::update_layout::{FfiLayoutTreeBuildStats, FfiLayoutUpdateHostCallbacks};
 use super::used_values::SizeConstraint;
 use super::used_values::UsedValues;
 use crate::css::style::fast_hash::{FastMap as HashMap, FastSet as HashSet};
@@ -491,6 +494,24 @@ pub(crate) struct LayoutNodeArena {
     style_records_pinned_by_arena: Vec<Cell<bool>>,
     style_record_host: Cell<Option<FfiStyleRecordHostCallbacks>>,
     shell_factory: Cell<Option<ShellFactory>>,
+    layout_host: Cell<Option<FfiLayoutHostCallbacks>>,
+    /// Depth of synchronous layout passes, including their commits, on the stack.
+    active_layout_pass_depth: Cell<u32>,
+    /// The viewport the last layout tree build placed, invalid once that box is freed.
+    layout_root: Cell<NodeSlotId>,
+    /// The subtree roots the last layout tree build rebuilt, waiting for the partial relayout
+    /// plan that follows it. A full layout pass covers every one of them, so its commit clears
+    /// them.
+    pending_rebuilt_subtree_roots: RefCell<Vec<NodeSlotId>>,
+    pending_layout_tree_update_escaped_rebuild_roots: Cell<bool>,
+    layout_update_host: Cell<Option<FfiLayoutUpdateHostCallbacks>>,
+    update_layout_running: Cell<bool>,
+    /// Every box must be recreated by the next layout tree build; set when the tree is torn down
+    /// or a build finds a box it cannot place among rebuilt roots, cleared by the full pass.
+    needs_full_layout_tree_update: Cell<bool>,
+    partial_layout_count: Cell<u64>,
+    full_layout_count: Cell<u64>,
+    layout_tree_build_stats: Cell<FfiLayoutTreeBuildStats>,
     pre_order_labels: Vec<Cell<u64>>,
     pre_order_relabel_count: Cell<u64>,
     free_list: Vec<u32>,
@@ -559,6 +580,17 @@ impl LayoutNodeArena {
             style_records_pinned_by_arena: Vec::new(),
             style_record_host: Cell::new(None),
             shell_factory: Cell::new(None),
+            layout_host: Cell::new(None),
+            active_layout_pass_depth: Cell::new(0),
+            layout_root: Cell::new(NodeSlotId::INVALID),
+            pending_rebuilt_subtree_roots: RefCell::new(Vec::new()),
+            pending_layout_tree_update_escaped_rebuild_roots: Cell::new(false),
+            layout_update_host: Cell::new(None),
+            update_layout_running: Cell::new(false),
+            needs_full_layout_tree_update: Cell::new(false),
+            partial_layout_count: Cell::new(0),
+            full_layout_count: Cell::new(0),
+            layout_tree_build_stats: Cell::new(FfiLayoutTreeBuildStats::default()),
             pre_order_labels: Vec::new(),
             pre_order_relabel_count: Cell::new(0),
             free_list: Vec::new(),
@@ -780,6 +812,11 @@ impl LayoutNodeArena {
 
         assert!(!root.is_invalid(), "invalid layout node arena slot ID");
         self.assert_node_is_unlinked_from_parent(root);
+        if self.layout_root.get() == root {
+            self.layout_root.set(NodeSlotId::INVALID);
+            self.pending_rebuilt_subtree_roots.get_mut().clear();
+            self.pending_layout_tree_update_escaped_rebuild_roots.set(false);
+        }
         if !self.scrollable_overflow.non_child_boxes.borrow().is_empty() {
             self.scrollable_overflow.contained_boxes_dirty.set(true);
         }
@@ -1039,6 +1076,125 @@ impl LayoutNodeArena {
 
     pub(crate) fn set_style_record_host(&self, host: Option<FfiStyleRecordHostCallbacks>) {
         self.style_record_host.set(host);
+    }
+
+    pub(crate) fn set_layout_host(&self, host: Option<FfiLayoutHostCallbacks>) {
+        self.layout_host.set(host);
+    }
+
+    pub(crate) fn layout_host(&self) -> FfiLayoutHostCallbacks {
+        self.layout_host.get().expect("layout node arena has no layout host")
+    }
+
+    /// True while a synchronous layout pass, including its commit, is on the stack. Computed
+    /// values must never be replaced in that window: the pass caches decoded style and borrows
+    /// payload pointers that a replacement would invalidate under it.
+    pub(crate) fn layout_pass_is_running(&self) -> bool {
+        self.active_layout_pass_depth.get() > 0
+    }
+
+    pub(crate) fn begin_active_layout_pass(&self) {
+        self.active_layout_pass_depth
+            .set(self.active_layout_pass_depth.get() + 1);
+    }
+
+    pub(crate) fn end_active_layout_pass(&self) {
+        let depth = self.active_layout_pass_depth.get();
+        assert!(depth > 0, "layout pass depth underflow");
+        self.active_layout_pass_depth.set(depth - 1);
+    }
+
+    pub(crate) fn set_layout_root(&self, viewport: NodeSlotId) {
+        self.layout_root.set(viewport);
+    }
+
+    pub(crate) fn layout_root(&self) -> NodeSlotId {
+        self.layout_root.get()
+    }
+
+    pub(crate) fn set_pending_rebuilt_subtree_roots(
+        &self,
+        roots: Vec<NodeSlotId>,
+        layout_tree_update_escaped_rebuild_roots: bool,
+    ) {
+        *self.pending_rebuilt_subtree_roots.borrow_mut() = roots;
+        self.pending_layout_tree_update_escaped_rebuild_roots
+            .set(layout_tree_update_escaped_rebuild_roots);
+    }
+
+    pub(crate) fn take_pending_rebuilt_subtree_roots(&self) -> (Vec<NodeSlotId>, bool) {
+        (
+            std::mem::take(&mut *self.pending_rebuilt_subtree_roots.borrow_mut()),
+            self.pending_layout_tree_update_escaped_rebuild_roots.replace(false),
+        )
+    }
+
+    pub(crate) fn clear_pending_rebuilt_subtree_roots(&self) {
+        self.pending_rebuilt_subtree_roots.borrow_mut().clear();
+        self.pending_layout_tree_update_escaped_rebuild_roots.set(false);
+    }
+
+    pub(crate) fn set_layout_update_host(&self, host: Option<FfiLayoutUpdateHostCallbacks>) {
+        self.layout_update_host.set(host);
+    }
+
+    pub(crate) fn layout_update_host(&self) -> FfiLayoutUpdateHostCallbacks {
+        self.layout_update_host
+            .get()
+            .expect("layout node arena has no layout update host")
+    }
+
+    /// A document runs one layout update at a time; a nested request is a caller bug.
+    pub(crate) fn begin_update_layout(&self) {
+        assert!(
+            !self.update_layout_running.replace(true),
+            "a layout update is already running"
+        );
+    }
+
+    pub(crate) fn end_update_layout(&self) {
+        assert!(self.update_layout_running.replace(false), "no layout update is running");
+    }
+
+    pub(crate) fn update_layout_is_running(&self) -> bool {
+        self.update_layout_running.get()
+    }
+
+    pub(crate) fn note_partial_layout(&self) {
+        self.partial_layout_count.set(self.partial_layout_count.get() + 1);
+    }
+
+    pub(crate) fn note_full_layout(&self) {
+        self.full_layout_count.set(self.full_layout_count.get() + 1);
+    }
+
+    pub(crate) fn partial_layout_count(&self) -> u64 {
+        self.partial_layout_count.get()
+    }
+
+    pub(crate) fn full_layout_count(&self) -> u64 {
+        self.full_layout_count.get()
+    }
+
+    pub(crate) fn record_layout_tree_build(&self, outcome: &FfiLayoutTreeBuildOutcome) {
+        let stats = self.layout_tree_build_stats.get();
+        self.layout_tree_build_stats.set(FfiLayoutTreeBuildStats {
+            builds: stats.builds + 1,
+            last_build_rebuilt_subtree_roots: outcome.rebuilt_subtree_root_count as u64,
+            last_build_escaped_rebuild_roots: outcome.layout_tree_update_escaped_rebuild_roots,
+        });
+    }
+
+    pub(crate) fn layout_tree_build_stats(&self) -> FfiLayoutTreeBuildStats {
+        self.layout_tree_build_stats.get()
+    }
+
+    pub(crate) fn needs_full_layout_tree_update(&self) -> bool {
+        self.needs_full_layout_tree_update.get()
+    }
+
+    pub(crate) fn set_needs_full_layout_tree_update(&self, value: bool) {
+        self.needs_full_layout_tree_update.set(value);
     }
 
     fn style_record_host(&self) -> FfiStyleRecordHostCallbacks {
@@ -3418,14 +3574,87 @@ pub unsafe extern "C" fn layout_arena_clear_style_record_host_callbacks(arena: *
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_sync_enrolled_content_for_layout(
+pub unsafe extern "C" fn layout_arena_layout_pass_is_running(arena: *mut c_void) -> bool {
+    assert!(!arena.is_null(), "layout node arena handle is null");
+    // SAFETY: As above.
+    unsafe { &*arena.cast::<LayoutNodeArena>() }.layout_pass_is_running()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_needs_full_layout_tree_update(arena: *mut c_void) -> bool {
+    assert!(!arena.is_null(), "layout node arena handle is null");
+    // SAFETY: As above.
+    unsafe { &*arena.cast::<LayoutNodeArena>() }.needs_full_layout_tree_update()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_set_needs_full_layout_tree_update(arena: *mut c_void, value: bool) {
+    assert!(!arena.is_null(), "layout node arena handle is null");
+    // SAFETY: As above.
+    unsafe { &*arena.cast::<LayoutNodeArena>() }.set_needs_full_layout_tree_update(value);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_layout_root(arena: *mut c_void) -> NodeSlotId {
+    assert!(!arena.is_null(), "layout node arena handle is null");
+    // SAFETY: As above.
+    unsafe { &*arena.cast::<LayoutNodeArena>() }.layout_root()
+}
+
+/// Visits the DOM node of every subtree root the last layout tree build rebuilt and left live.
+/// Anonymous roots have no DOM node and are skipped.
+///
+/// # Safety
+///
+/// `arena` must be a live handle on the document thread, and `visit` must return synchronously
+/// without entering the arena.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_for_each_pending_rebuilt_subtree_root_dom_node(
     arena: *mut c_void,
     context: *mut c_void,
-    build_replaced_content_facts: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut FfiReplacedContentFacts),
+    visit: unsafe extern "C" fn(*mut c_void, *mut c_void),
 ) {
     assert!(!arena.is_null(), "layout node arena handle is null");
-    // SAFETY (for every derive below): the C++ wrapper keeps the arena alive for this call
-    // and serializes all access on the document thread; no shared borrow outlives a callback.
+    // SAFETY: As above; the roots are copied out so no borrow spans the callback.
+    let roots = unsafe { &*arena.cast::<LayoutNodeArena>() }
+        .pending_rebuilt_subtree_roots
+        .borrow()
+        .clone();
+    for root in roots {
+        // SAFETY: As above.
+        let dom_node = unsafe { &*arena.cast::<LayoutNodeArena>() }.node_dom_node(root);
+        if dom_node.is_null() {
+            continue;
+        }
+        // SAFETY: The callback receives a DOM node the arena keeps alive.
+        unsafe { visit(context, dom_node) };
+    }
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle with a registered layout host, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_sync_enrolled_content_for_layout(arena: *mut c_void) {
+    // SAFETY: Guaranteed by the entry point's contract.
+    unsafe { sync_enrolled_content_for_layout(arena) }
+}
+
+/// Refreshes the text content and replaced-content facts of every node enrolled since the last
+/// sync, ahead of a pass that caches them. A pass already on the stack owns those caches, so a
+/// request nested inside one is a no-op.
+///
+/// # Safety
+///
+/// `arena` must be a live handle with a registered layout host, used on the document thread.
+pub(crate) unsafe fn sync_enrolled_content_for_layout(arena: *mut c_void) {
+    assert!(!arena.is_null(), "layout node arena handle is null");
+    // SAFETY (for every derive below): the caller keeps the arena alive for this call and
+    // serializes all access on the document thread; no shared borrow outlives a callback.
+    if unsafe { &*arena.cast::<LayoutNodeArena>() }.layout_pass_is_running() {
+        return;
+    }
+    let host = unsafe { &*arena.cast::<LayoutNodeArena>() }.layout_host();
     let enrolled_text_nodes = unsafe { &*arena.cast::<LayoutNodeArena>() }.pending_text_nodes_for_content_sync();
     for node in enrolled_text_nodes {
         let shell = unsafe { &*arena.cast::<LayoutNodeArena>() }.shell_if_live(node);
@@ -3454,7 +3683,7 @@ pub unsafe extern "C" fn layout_arena_sync_enrolled_content_for_layout(
         live_replaced_nodes.push(node);
         let mut facts = FfiReplacedContentFacts::default();
         // SAFETY: The callback receives a live shell and a valid out-pointer.
-        unsafe { build_replaced_content_facts(context, shell, &raw mut facts) };
+        unsafe { (host.build_replaced_content_facts)(host.context, shell, &raw mut facts) };
         // Changed facts invalidate cached formatting-context runs regardless of which
         // channel produced the change, including sources with no invalidation of their own.
         // SAFETY: As above; the shared borrows ended with their statements.
@@ -3549,6 +3778,25 @@ mod tests {
         assert_eq!(arena.data(slot).kind.get(), NodeKind::Box);
         assert!(arena.data(slot).flags.get() & NodeFlag::HasStyle as u32 != 0);
         arena.free_subtree(slot).destroy_shells_and_invoke_callbacks();
+    }
+
+    #[test]
+    fn freeing_the_layout_root_forgets_it_and_the_pending_rebuilt_roots() {
+        let mut arena = LayoutNodeArena::new();
+        let viewport = arena.allocate_unbound(std::ptr::null_mut());
+        let rebuilt = arena.allocate_unbound(std::ptr::null_mut());
+        arena.set_layout_root(viewport);
+        arena.set_pending_rebuilt_subtree_roots(vec![rebuilt], true);
+        assert_eq!(arena.layout_root(), viewport);
+
+        arena.free_subtree(rebuilt).destroy_shells_and_invoke_callbacks();
+        assert_eq!(arena.layout_root(), viewport);
+        assert_eq!(arena.take_pending_rebuilt_subtree_roots(), (vec![rebuilt], true));
+
+        arena.set_pending_rebuilt_subtree_roots(vec![viewport], false);
+        arena.free_subtree(viewport).destroy_shells_and_invoke_callbacks();
+        assert!(arena.layout_root().is_invalid());
+        assert_eq!(arena.take_pending_rebuilt_subtree_roots(), (Vec::new(), false));
     }
 
     #[test]

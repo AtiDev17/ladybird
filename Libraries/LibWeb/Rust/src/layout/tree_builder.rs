@@ -23,7 +23,6 @@ pub(crate) struct TreeBuilderState {
     // Partial-rebuild bookkeeping: boxes replaced in place become rebuild roots, and any tree
     // restructuring that reaches outside every rebuild root downgrades the update to a full one.
     current_rebuild_root: LayoutNode,
-    rebuilt_subtree_root_shells: Vec<*mut c_void>,
     rebuilt_subtree_roots: Vec<LayoutNode>,
     reused_child_list_update_roots: Vec<LayoutNode>,
     additional_table_fixup_roots: Vec<LayoutNode>,
@@ -38,7 +37,6 @@ impl Default for TreeBuilderState {
             ancestor_stack: Vec::new(),
             quote_nesting_level: 0,
             current_rebuild_root: NodeSlotId::INVALID,
-            rebuilt_subtree_root_shells: Vec::new(),
             rebuilt_subtree_roots: Vec::new(),
             reused_child_list_update_roots: Vec::new(),
             additional_table_fixup_roots: Vec::new(),
@@ -53,6 +51,8 @@ impl Default for TreeBuilderState {
 pub(crate) struct TreeBuilderContext {
     pub(crate) has_svg_root: bool,
     pub(crate) layout_top_layer: bool,
+    /// The document asked for every box to be recreated, read from the arena once per build.
+    pub(crate) document_needs_full_layout_tree_update: bool,
     layout_svg_mask_or_clip_path: bool,
     layout_svg_pattern: bool,
 }
@@ -123,10 +123,8 @@ pub struct FfiDomTreeBuilderCallbacks {
     pub reuse_principal_layout: unsafe extern "C" fn(*mut c_void, *mut c_void),
     pub principal_layout_node: unsafe extern "C" fn(*mut c_void) -> NodeSlotId,
     pub attach_principal_style_resources: unsafe extern "C" fn(*mut c_void),
-    pub set_layout_root: unsafe extern "C" fn(*mut c_void, *mut c_void),
     pub document_layout_node: unsafe extern "C" fn(*mut c_void) -> NodeSlotId,
     pub document_element_layout_node: unsafe extern "C" fn(*mut c_void) -> NodeSlotId,
-    pub report_rebuild_outcome: unsafe extern "C" fn(*mut c_void, *const *mut c_void, usize, bool),
     pub layout: FfiTreeBuilderCallbacks,
     pub pseudo: FfiPseudoTreeBuilderCallbacks,
 }
@@ -202,7 +200,6 @@ pub struct FfiPrincipalNodeEntryFacts {
     pub needs_layout_tree_update: bool,
     pub may_reuse_layout_node_for_child_list_insertion: bool,
     pub may_update_pseudo_elements_in_place: bool,
-    pub document_needs_full_layout_tree_update: bool,
     pub is_document: bool,
     pub has_layout_node: bool,
     pub is_element: bool,
@@ -572,7 +569,7 @@ pub(crate) fn principal_node_entry_decision(
             || (facts.needs_layout_tree_update
                 && !facts.may_reuse_layout_node_for_child_list_insertion
                 && !facts.may_update_pseudo_elements_in_place)
-            || facts.document_needs_full_layout_tree_update
+            || context.document_needs_full_layout_tree_update
             || (facts.is_document && !facts.has_layout_node);
 
         let top_layer = if facts.is_element && facts.rendered_in_top_layer && !context.layout_top_layer {
@@ -1589,12 +1586,6 @@ fn update_principal_node_after_entry(
         if placement.start_rebuild_root {
             prior_rebuild_root = update.state.current_rebuild_root;
             update.state.current_rebuild_root = layout_node;
-            // The shell pointer is captured now, while the box is known to be live; the reported
-            // list mirrors what the bridge used to append at this exact point.
-            update
-                .state
-                .rebuilt_subtree_root_shells
-                .push(host.layout().shell(layout_node));
             update.state.rebuilt_subtree_roots.push(layout_node);
         } else if placement.mark_update_escaped_rebuild_roots {
             update.state.layout_tree_update_escaped_rebuild_roots = true;
@@ -1687,8 +1678,7 @@ fn update_principal_node_after_entry(
                 layout_host.free_subtree(replaced_old_box);
             }
             FfiPrincipalBoxPlacement::DocumentRoot => {
-                // SAFETY: The builder and frame remain live; the frame retains the viewport.
-                unsafe { (host.callbacks.set_layout_root)(host.callbacks.builder, frame) };
+                host.layout().arena().set_layout_root(layout_node);
                 if let Some(viewport) = created_box.take() {
                     viewport.placed_as_layout_root();
                 }
@@ -1802,6 +1792,18 @@ fn update_layout_tree(
     });
 }
 
+/// What a layout tree build leaves for its caller: the viewport the tree hangs from and how
+/// confined the rebuild stayed. The rebuilt subtree roots themselves wait in the arena for the
+/// partial relayout plan that follows the build.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiLayoutTreeBuildOutcome {
+    pub viewport: NodeSlotId,
+    pub rebuilt_subtree_root_count: usize,
+    pub layout_tree_update_escaped_rebuild_roots: bool,
+    pub needs_another_build_pass: bool,
+}
+
 /// Builds or incrementally updates a document's layout tree and applies table fixup.
 ///
 /// # Safety
@@ -1812,12 +1814,15 @@ pub unsafe extern "C" fn rust_build_layout_tree(
     callbacks: *const FfiDomTreeBuilderCallbacks,
     arena: *mut c_void,
     document: *mut c_void,
-) {
+) -> FfiLayoutTreeBuildOutcome {
     assert!(!document.is_null());
     // SAFETY: Guaranteed by the entry point's contract.
     let host = unsafe { dom_tree_builder_host(callbacks, arena) };
     let mut state = TreeBuilderState::default();
-    let mut context = TreeBuilderContext::default();
+    let mut context = TreeBuilderContext {
+        document_needs_full_layout_tree_update: host.layout().arena().needs_full_layout_tree_update(),
+        ..Default::default()
+    };
     // SAFETY: All pointers remain live throughout the build.
     let entry_facts = unsafe { (host.callbacks.principal_node_entry_facts)(host.callbacks.builder, document, false) };
     assert!(entry_facts.is_document);
@@ -1834,8 +1839,9 @@ pub unsafe extern "C" fn rust_build_layout_tree(
     // NB: Called during layout tree construction.
     // SAFETY: The document remains live and any attached layout root is owned by it and the builder.
     let document_layout_node = unsafe { (host.callbacks.document_layout_node)(document) };
+    debug_assert_eq!(host.layout().arena().layout_root(), document_layout_node);
     let rebuilt_subtrees_were_updated_individually = !document_layout_node.is_invalid()
-        && !(entry_facts.document_needs_full_layout_tree_update
+        && !(context.document_needs_full_layout_tree_update
             || !entry_facts.has_layout_node
             || state.layout_tree_update_escaped_rebuild_roots);
     if !document_layout_node.is_invalid() {
@@ -1870,6 +1876,11 @@ pub unsafe extern "C" fn rust_build_layout_tree(
     }
 
     for &element in &state.layout_tree_rebuild_requests {
+        // A request that names no element asks for the whole tree.
+        if element.is_null() {
+            host.layout().arena().set_needs_full_layout_tree_update(true);
+            continue;
+        }
         // SAFETY: The builder remains live, and the walk that could clear DOM update flags is complete.
         unsafe { (host.callbacks.request_layout_tree_rebuild)(host.callbacks.builder, element) };
     }
@@ -1892,22 +1903,27 @@ pub unsafe extern "C" fn rust_build_layout_tree(
     }
 
     // Table fixup can free a rebuilt root after it was recorded, such as whitespace at the edge of a
-    // row group. Its shell is gone with it, so only the roots that are still live are reported.
-    let live_rebuilt_subtree_root_shells: Vec<*mut c_void> = state
+    // row group, so only the roots that are still live wait for the partial relayout plan.
+    let layout_host = host.layout();
+    let arena = layout_host.arena();
+    let live_rebuilt_subtree_roots: Vec<NodeSlotId> = state
         .rebuilt_subtree_roots
         .iter()
-        .zip(&state.rebuilt_subtree_root_shells)
-        .filter(|(root, _)| host.layout().arena().slot_is_live(**root))
-        .map(|(_, shell)| *shell)
+        .copied()
+        .filter(|root| arena.slot_is_live(*root))
         .collect();
-    // SAFETY: The builder remains live and copies the reported shell pointers before returning.
-    unsafe {
-        (host.callbacks.report_rebuild_outcome)(
-            host.callbacks.builder,
-            live_rebuilt_subtree_root_shells.as_ptr(),
-            live_rebuilt_subtree_root_shells.len(),
-            state.layout_tree_update_escaped_rebuild_roots,
-        );
+    let rebuilt_subtree_root_count = live_rebuilt_subtree_roots.len();
+    arena.set_pending_rebuilt_subtree_roots(
+        live_rebuilt_subtree_roots,
+        state.layout_tree_update_escaped_rebuild_roots,
+    );
+    let viewport = arena.layout_root();
+    assert!(!viewport.is_invalid(), "a layout tree build places the viewport");
+    FfiLayoutTreeBuildOutcome {
+        viewport,
+        rebuilt_subtree_root_count,
+        layout_tree_update_escaped_rebuild_roots: state.layout_tree_update_escaped_rebuild_roots,
+        needs_another_build_pass: !state.layout_tree_rebuild_requests.is_empty(),
     }
 }
 
@@ -4266,7 +4282,6 @@ mod tests {
             needs_layout_tree_update: false,
             may_reuse_layout_node_for_child_list_insertion: false,
             may_update_pseudo_elements_in_place: false,
-            document_needs_full_layout_tree_update: false,
             is_document: false,
             has_layout_node: true,
             is_element: true,

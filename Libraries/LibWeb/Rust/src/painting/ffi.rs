@@ -516,17 +516,22 @@ pub(crate) unsafe fn tree_from_handle<'a>(
 /// # Safety
 ///
 /// Both trees must be live retained tree handles and every pointer must address the stated number of
-/// bytes or points for the call. Writes the damage rect through `out_damage_rect` and returns whether
-/// the damage is bounded; unbounded damage means the whole viewport must repaint.
+/// bytes, runs or points for the call; each run table must be the validated table of its tape.
+/// Writes the damage rect through `out_damage_rect` and returns whether the damage is bounded;
+/// unbounded damage means the whole viewport must repaint.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn display_list_compute_damage(
     old_command_bytes: *const u8,
     old_command_bytes_length: usize,
+    old_command_runs: *const crate::painting::display_list::commands::DisplayListCommandRun,
+    old_command_run_count: usize,
     old_tree: *const c_void,
     old_scroll_offsets: *const libgfx_rust::FloatPoint,
     old_scroll_offsets_len: usize,
     new_command_bytes: *const u8,
     new_command_bytes_length: usize,
+    new_command_runs: *const crate::painting::display_list::commands::DisplayListCommandRun,
+    new_command_run_count: usize,
     new_tree: *const c_void,
     new_scroll_offsets: *const libgfx_rust::FloatPoint,
     new_scroll_offsets_len: usize,
@@ -535,21 +540,34 @@ pub unsafe extern "C" fn display_list_compute_damage(
 ) -> bool {
     let (old_tree, new_tree) = unsafe { (tree_from_handle(old_tree), tree_from_handle(new_tree)) };
     // SAFETY: The caller guarantees the slices address the stated number of values.
-    let (old_command_bytes, old_scroll_offsets, new_command_bytes, new_scroll_offsets) = unsafe {
+    let (old_command_bytes, old_command_runs, old_scroll_offsets) = unsafe {
         (
             ffi_slice(old_command_bytes, old_command_bytes_length),
+            ffi_slice(old_command_runs, old_command_run_count),
             ffi_slice(old_scroll_offsets, old_scroll_offsets_len),
+        )
+    };
+    // SAFETY: As above, for the new frame's inputs.
+    let (new_command_bytes, new_command_runs, new_scroll_offsets) = unsafe {
+        (
             ffi_slice(new_command_bytes, new_command_bytes_length),
+            ffi_slice(new_command_runs, new_command_run_count),
             ffi_slice(new_scroll_offsets, new_scroll_offsets_len),
         )
     };
     let damage = crate::painting::display_list::damage::compute_display_list_damage(
-        old_command_bytes,
-        old_tree,
-        old_scroll_offsets,
-        new_command_bytes,
-        new_tree,
-        new_scroll_offsets,
+        crate::painting::display_list::damage::DisplayListFrame {
+            command_bytes: old_command_bytes,
+            command_runs: old_command_runs,
+            visual_context_tree: old_tree,
+            scroll_offsets: old_scroll_offsets,
+        },
+        crate::painting::display_list::damage::DisplayListFrame {
+            command_bytes: new_command_bytes,
+            command_runs: new_command_runs,
+            visual_context_tree: new_tree,
+            scroll_offsets: new_scroll_offsets,
+        },
         viewport_rect,
     );
     match damage {
@@ -1422,6 +1440,26 @@ pub unsafe extern "C" fn layout_arena_invalidate_scroll_state(arena: *mut c_void
         .borrow_mut()
         .visual_context
         .needs_to_refresh_scroll_state = true;
+}
+
+/// The index of the sticky node the accumulated visual context tree holds for `paintable`, which
+/// is where the scroll state snapshot keeps its resolved sticky offset, or `u32::MAX` when the tree
+/// holds none.
+///
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_sticky_spatial_node_index(arena: *mut c_void, paintable: NodeSlotId) -> u32 {
+    let arena = unsafe { arena_from_handle(arena) };
+    let paint_state = arena.paint_state().borrow();
+    paint_state
+        .visual_context
+        .scroll_state
+        .states
+        .iter()
+        .find(|state| state.is_sticky && state.paintable == paintable)
+        .map_or(u32::MAX, |state| state.node_index.0)
 }
 
 /// Re-reads the scroll containers' offsets when something invalidated them since the last

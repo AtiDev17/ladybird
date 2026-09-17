@@ -660,6 +660,8 @@ Layout::NodeArena& Document::layout_node_arena()
     if (!m_layout_node_arena) {
         m_layout_node_arena = make_ref_counted<Layout::NodeArena>();
         m_layout_node_arena->set_document({}, this);
+        Layout::register_layout_host(*m_layout_node_arena, *this);
+        Layout::RustFFI::layout_arena_set_layout_update_host_callbacks(m_layout_node_arena->handle(), layout_update_host_callbacks());
         Layout::RustFFI::FfiStyleRecordHostCallbacks style_record_host_callbacks {
             .style_engine = style_computer().style_engine().rust_handle(),
             .context = this,
@@ -705,11 +707,36 @@ void Document::reset_style_invalidation_counters() const
     CSS::reset_longhand_wrappers_minted();
 }
 
-void Document::record_layout_tree_build(u64 rebuilt_subtree_root_count, bool escaped_rebuild_roots)
+bool Document::needs_full_layout_tree_update() const
 {
-    ++m_layout_tree_build_stats.builds;
-    m_layout_tree_build_stats.last_build_rebuilt_subtree_roots = rebuilt_subtree_root_count;
-    m_layout_tree_build_stats.last_build_escaped_rebuild_roots = escaped_rebuild_roots;
+    return m_layout_node_arena && Layout::RustFFI::layout_arena_needs_full_layout_tree_update(m_layout_node_arena->handle());
+}
+
+// A document without an arena has no layout nodes, so its next build creates every box anyway.
+void Document::set_needs_full_layout_tree_update(bool value)
+{
+    if (m_layout_node_arena)
+        Layout::RustFFI::layout_arena_set_needs_full_layout_tree_update(m_layout_node_arena->handle(), value);
+}
+
+bool Document::is_running_update_layout() const
+{
+    return m_layout_node_arena && Layout::RustFFI::layout_arena_update_layout_is_running(m_layout_node_arena->handle());
+}
+
+u64 Document::partial_layout_count() const
+{
+    return m_layout_node_arena ? Layout::RustFFI::layout_arena_partial_layout_count(m_layout_node_arena->handle()) : 0;
+}
+
+u64 Document::full_layout_count() const
+{
+    return m_layout_node_arena ? Layout::RustFFI::layout_arena_full_layout_count(m_layout_node_arena->handle()) : 0;
+}
+
+Layout::RustFFI::FfiLayoutTreeBuildStats Document::layout_tree_build_stats() const
+{
+    return m_layout_node_arena ? Layout::RustFFI::layout_arena_layout_tree_build_stats(m_layout_node_arena->handle()) : Layout::RustFFI::FfiLayoutTreeBuildStats {};
 }
 
 void Document::finalize()
@@ -719,6 +746,8 @@ void Document::finalize()
     if (m_layout_node_arena) {
         Layout::RustFFI::layout_arena_clear_chrome_state_callback(m_layout_node_arena->handle());
         Layout::RustFFI::layout_arena_clear_style_record_host_callbacks(m_layout_node_arena->handle());
+        Layout::RustFFI::layout_arena_clear_layout_host_callbacks(m_layout_node_arena->handle());
+        Layout::RustFFI::layout_arena_clear_layout_update_host_callbacks(m_layout_node_arena->handle());
         Layout::RustFFI::layout_arena_clear_shell_factory(m_layout_node_arena->handle());
         VERIFY(Layout::RustFFI::layout_arena_live_slot_count(m_layout_node_arena->handle()) == 0);
         m_layout_node_arena->set_document({}, nullptr);
@@ -824,6 +853,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     for (auto& pending_scroll_event : m_pending_scroll_events)
         visitor.visit(pending_scroll_event.event_target);
     visitor.visit(m_query_containers_needing_container_query_evaluation_after_layout);
+    m_scroll_state_query_containers.visit_edges(visitor);
     visitor.visit(m_list_owners_pending_item_renumber);
     visitor.visit(m_list_owners_with_stale_item_counters);
 
@@ -1500,8 +1530,11 @@ WebIDL::ExceptionOr<void> Document::set_title(Utf16View title)
     return {};
 }
 
-void Document::set_layout_root(Layout::Viewport& viewport)
+void Document::set_layout_root(Layout::RustFFI::NodeSlotId viewport_slot)
 {
+    auto* viewport_shell = static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_node_shell_if_live(layout_node_arena().handle(), viewport_slot));
+    VERIFY(viewport_shell);
+    auto& viewport = as<Layout::Viewport>(*viewport_shell);
     if (m_layout_root == &viewport)
         return;
     if (auto* replaced_layout_root = exchange(m_layout_root, nullptr)) {
@@ -1521,7 +1554,7 @@ void Document::tear_down_layout_tree()
     if (auto* layout_root = exchange(m_layout_root, nullptr))
         layout_node_arena().free_subtree(Layout::Node::slot_id(layout_root));
     m_paint_state = nullptr;
-    m_needs_full_layout_tree_update = true;
+    set_needs_full_layout_tree_update(true);
 }
 
 void Document::tear_down_layout_tree_for_svg_image_document(Badge<SVG::SVGDecodedImageData>)
@@ -2045,7 +2078,7 @@ void Document::did_render_list_item_counter_value(Element& element)
     }
 }
 
-bool Document::reconcile_stale_list_item_counters_after_tree_build(Vector<Layout::Node*> const& rebuilt_subtree_roots)
+bool Document::reconcile_stale_list_item_counters_after_tree_build()
 {
     if (m_list_owners_with_stale_item_counters.is_empty()) {
         m_stale_list_item_counter_rendered = false;
@@ -2055,10 +2088,11 @@ bool Document::reconcile_stale_list_item_counters_after_tree_build(Vector<Layout
     // A rebuilt subtree has re-resolved the counters sets of any stale owner inside it, and an owner that has left
     // the document renders nothing.
     HashTable<Node const*> rebuilt_dom_roots;
-    for (auto const* rebuilt_root : rebuilt_subtree_roots) {
-        if (auto const* dom_node = rebuilt_root->dom_node())
-            rebuilt_dom_roots.set(dom_node);
-    }
+    Layout::RustFFI::layout_arena_for_each_pending_rebuilt_subtree_root_dom_node(
+        layout_node_arena().handle(), &rebuilt_dom_roots,
+        [](void* context, void* dom_node) {
+            static_cast<HashTable<Node const*>*>(context)->set(static_cast<Node const*>(dom_node));
+        });
     m_list_owners_with_stale_item_counters.remove_all_matching([&](GC::Ref<Element> const& list_owner) {
         if (!list_owner->is_connected())
             return true;
@@ -2085,242 +2119,6 @@ bool Document::needs_style_update_after_layout()
     return !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
         || m_needs_animated_style_update
         || style_computer().style_engine().has_pending_transaction();
-}
-
-// Attempts to satisfy the pending layout update by re-laying out only the registered partial
-// relayout boundary subtrees. Runs the incremental layout tree build itself when tree updates
-// are pending (consuming `needs_layout_tree_rebuild`), so an ineligible update continues to
-// the full layout path without rebuilding again.
-Document::PartialRelayoutResult Document::try_partial_relayout(Vector<Layout::RustFFI::NodeSlotId> registered_partial_relayout_root_slots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data)
-{
-    Layout::RustFFI::FfiPartialRelayoutHostFacts host_facts {
-        .document_needs_full_layout_tree_update = needs_full_layout_tree_update(),
-        .container_query_evaluation_is_pending = !m_query_containers_needing_container_query_evaluation_after_layout.is_empty(),
-        .should_collect_devtools_layout_data = should_collect_devtools_layout_data,
-    };
-    if (!Layout::RustFFI::layout_arena_partial_relayout_may_be_attempted(
-            layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root),
-            registered_partial_relayout_root_slots.data(), registered_partial_relayout_root_slots.size(),
-            host_facts))
-        return PartialRelayoutResult::NotEligible;
-
-    bool layout_tree_was_built_in_partial_branch = false;
-    bool layout_tree_update_escaped_rebuild_roots = false;
-    Vector<Layout::Node*> rebuilt_subtree_roots;
-    if (needs_layout_tree_rebuild) {
-        auto tree_build_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
-        auto tree_build_result = Layout::build_layout_tree(*this);
-        set_layout_root(*tree_build_result.root);
-        record_layout_tree_build(tree_build_result.rebuilt_subtree_roots.size(), tree_build_result.layout_tree_update_escaped_rebuild_roots);
-        needs_layout_tree_rebuild = false;
-        if (reconcile_stale_list_item_counters_after_tree_build(tree_build_result.rebuilt_subtree_roots) || tree_build_result.needs_another_build_pass)
-            return PartialRelayoutResult::NeedsAnotherLayoutPass;
-        layout_tree_was_built_in_partial_branch = true;
-        layout_tree_update_escaped_rebuild_roots = tree_build_result.layout_tree_update_escaped_rebuild_roots;
-        rebuilt_subtree_roots = move(tree_build_result.rebuilt_subtree_roots);
-
-        // The build invalidates what deferred child list insertions reach, which can register more boundaries.
-        Layout::RustFFI::layout_arena_take_partial_relayout_boundary_roots(
-            layout_node_arena().handle(), &registered_partial_relayout_root_slots,
-            [](void* context, Layout::RustFFI::NodeSlotId slot) {
-                static_cast<Vector<Layout::RustFFI::NodeSlotId>*>(context)->append(slot);
-            });
-
-        if constexpr (UPDATE_LAYOUT_DEBUG) {
-            dbgln("TREEBUILD {} µs", tree_build_timer.elapsed_time().to_microseconds());
-        }
-    }
-
-    Vector<Layout::RustFFI::NodeSlotId> rebuilt_subtree_root_slots;
-    rebuilt_subtree_root_slots.ensure_capacity(rebuilt_subtree_roots.size());
-    for (auto* rebuilt_root : rebuilt_subtree_roots)
-        rebuilt_subtree_root_slots.unchecked_append(Layout::Node::slot_id(rebuilt_root));
-
-    Vector<Layout::RustFFI::NodeSlotId> partial_relayout_root_slots;
-    bool boundary_set_supports_partial_relayout = Layout::RustFFI::layout_arena_plan_partial_relayout(
-        layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root),
-        registered_partial_relayout_root_slots.data(), registered_partial_relayout_root_slots.size(),
-        rebuilt_subtree_root_slots.data(), rebuilt_subtree_root_slots.size(),
-        layout_tree_update_escaped_rebuild_roots,
-        &partial_relayout_root_slots,
-        [](void* context, Layout::RustFFI::NodeSlotId root) {
-            static_cast<Vector<Layout::RustFFI::NodeSlotId>*>(context)->append(root);
-        });
-    if (!boundary_set_supports_partial_relayout)
-        return PartialRelayoutResult::NotEligible;
-
-    Vector<Layout::Box*> partial_relayout_roots;
-    partial_relayout_roots.ensure_capacity(partial_relayout_root_slots.size());
-    for (auto slot : partial_relayout_root_slots) {
-        auto* root = static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_node_shell_if_live(layout_node_arena().handle(), slot));
-        partial_relayout_roots.unchecked_append(&as<Layout::Box>(*root));
-    }
-
-    layout_node_arena().sync_enrolled_content_for_layout();
-    Layout::LayoutRustBridge bridge;
-    for (auto* root : partial_relayout_roots)
-        bridge.compute_subtree_layout(*root);
-
-    ++m_partial_layout_count;
-
-    after_layout_commit(layout_tree_was_built_in_partial_branch ? LayoutTreeChanged::Yes : LayoutTreeChanged::No);
-    if (needs_style_update_after_layout() || !layout_is_up_to_date())
-        return PartialRelayoutResult::NeedsAnotherLayoutPass;
-    return PartialRelayoutResult::Done;
-}
-
-void Document::update_layout(UpdateLayoutReason reason)
-{
-    update_layout(reason, ThrottledAnimationSamplingScope::Document);
-}
-
-void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSamplingScope animation_sampling_scope)
-{
-    auto navigable = this->navigable();
-    if (!navigable || navigable->active_document().ptr() != this)
-        return;
-
-    // Internal layout dependencies do not observe compositor animation values.
-    if (reason != UpdateLayoutReason::HTMLEventLoopRenderingUpdate
-        && reason != UpdateLayoutReason::ChildDocumentStyleUpdate
-        && animation_sampling_scope == ThrottledAnimationSamplingScope::Document)
-        flush_throttled_animation_style_update();
-
-    VERIFY(!m_is_running_update_layout);
-    m_is_running_update_layout = true;
-    ScopeGuard guard = [&] {
-        m_is_running_update_layout = false;
-
-        if (m_needs_scroll_container_resnap) {
-            if (auto navigable = this->navigable(); navigable && navigable->active_document().ptr() == this)
-                navigable->re_snap_scroll_containers_after_layout_change();
-        }
-
-        page().client().flush_pending_dom_mutations();
-    };
-
-    begin_style_stabilization_epoch();
-    ScopeGuard end_stabilization_epoch = [&] {
-        end_style_stabilization_epoch();
-    };
-
-    // Keep shared style records alive across both style and layout, so temporary views
-    // during layout tree construction and layout do not need individual record pins.
-    style_computer().begin_style_record_view_epoch();
-    ScopeGuard end_style_record_view_epoch = [&] {
-        style_computer().end_style_record_view_epoch();
-    };
-
-    constexpr u64 ordinary_stabilization_round_limit = 8;
-    // Size-query dependencies point from a descendant to an ancestor query container. They are
-    // therefore acyclic, and a coherent style/layout pass can settle at least one more level of
-    // a nested dependency chain. One pass per connected element is a conservative exact bound.
-    // Recompute it after each pass because an initial style update can enroll the elements of a
-    // freshly parsed document after update_layout() has already started.
-    for (u64 layout_pass = 0; layout_pass < ordinary_stabilization_round_limit + static_cast<u64>(style_computer().style_engine().connected_element_count()) + 1; ++layout_pass) {
-        update_style();
-        process_pending_list_item_renumbers();
-        process_pending_top_layer_layout_changes();
-
-        auto const should_collect_devtools_layout_data = page().client().has_active_devtools_client();
-        auto const force_devtools_layout_data_collection = should_collect_devtools_layout_data
-            && reason == UpdateLayoutReason::InspectDevToolsLayoutData;
-
-        if (layout_is_up_to_date() && !force_devtools_layout_data_collection) {
-            prepare_for_rendering();
-            return;
-        }
-
-        Vector<Layout::RustFFI::NodeSlotId> registered_partial_relayout_root_slots;
-        Layout::RustFFI::layout_arena_take_partial_relayout_boundary_roots(
-            layout_node_arena().handle(), &registered_partial_relayout_root_slots,
-            [](void* context, Layout::RustFFI::NodeSlotId slot) {
-                static_cast<Vector<Layout::RustFFI::NodeSlotId>*>(context)->append(slot);
-            });
-
-        // NOTE: If this is a document hosting <template> contents, layout is unnecessary.
-        if (m_created_for_appropriate_template_contents)
-            return;
-
-        auto needs_layout_tree_rebuild = !m_layout_root || needs_layout_tree_update() || child_needs_layout_tree_update() || needs_full_layout_tree_update();
-
-        switch (try_partial_relayout(move(registered_partial_relayout_root_slots), needs_layout_tree_rebuild, should_collect_devtools_layout_data)) {
-        case PartialRelayoutResult::Done:
-            return;
-        case PartialRelayoutResult::NeedsAnotherLayoutPass:
-            continue;
-        case PartialRelayoutResult::NotEligible:
-            break;
-        }
-
-        auto viewport_rect = navigable->viewport_rect();
-
-        auto timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
-
-        if (needs_layout_tree_rebuild) {
-            auto tree_build_result = Layout::build_layout_tree(*this);
-            set_layout_root(*tree_build_result.root);
-            record_layout_tree_build(tree_build_result.rebuilt_subtree_roots.size(), tree_build_result.layout_tree_update_escaped_rebuild_roots);
-
-            if (tree_build_result.needs_another_build_pass)
-                continue;
-
-            // The full layout below covers every boundary the build's invalidation registered.
-            Layout::RustFFI::layout_arena_take_partial_relayout_boundary_roots(
-                layout_node_arena().handle(), nullptr, [](void*, Layout::RustFFI::NodeSlotId) { });
-
-            set_needs_full_layout_tree_update(false);
-
-            if constexpr (UPDATE_LAYOUT_DEBUG) {
-                dbgln("TREEBUILD {} µs", timer.elapsed_time().to_microseconds());
-            }
-
-            if (reconcile_stale_list_item_counters_after_tree_build(tree_build_result.rebuilt_subtree_roots))
-                continue;
-        }
-
-        Layout::LayoutRustBridge bridge;
-        bridge.run_root_layout(
-            *m_layout_root,
-            viewport_rect.width(),
-            viewport_rect.height(),
-            should_collect_devtools_layout_data);
-
-        style_invalidation_counters().relayouts_performed++;
-        ++m_full_layout_count;
-
-        after_layout_commit(LayoutTreeChanged::Yes);
-
-        if constexpr (UPDATE_LAYOUT_DEBUG) {
-            dbgln("LAYOUT {} {} µs", to_string(reason), timer.elapsed_time().to_microseconds());
-        }
-
-        if (!m_query_containers_needing_container_query_evaluation_after_layout.is_empty()) {
-            auto query_containers = exchange(m_query_containers_needing_container_query_evaluation_after_layout, {});
-            for (auto& query_container : query_containers) {
-                if (!query_container->is_connected())
-                    continue;
-
-                CSS::Invalidation::invalidate_descendant_styles_depending_on_size_container_query(query_container);
-            }
-        }
-
-        if (needs_style_update_after_layout())
-            continue;
-
-        // A zone rebuild requested during layout tree construction runs as another pass.
-        if (m_top_layer_needs_layout_zone_rebuild || !m_elements_with_pending_top_layer_membership_change.is_empty())
-            continue;
-
-        // Layout-only invalidations still need to be flushed before we can exit.
-        if (layout_is_up_to_date())
-            break;
-    }
-
-    if (needs_style_update_after_layout() || !layout_is_up_to_date()) {
-        ++m_style_invalidation_counters.style_stabilization_bound_failures;
-        VERIFY_NOT_REACHED();
-    }
 }
 
 // Collect elements with content-visibility: auto. This is used in the HTML event loop to avoid traversing the whole tree every time.

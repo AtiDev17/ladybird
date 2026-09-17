@@ -34,6 +34,7 @@
 #include <LibWeb/Bindings/NavigationType.h>
 #include <LibWeb/CSS/CustomPropertyRegistration.h>
 #include <LibWeb/CSS/PreferredColorScheme.h>
+#include <LibWeb/CSS/ScrollStateContainerQuery.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/Compositor/AsyncScrollingState.h>
 #include <LibWeb/DOM/AnchorNameMap.h>
@@ -493,15 +494,11 @@ public:
     };
     void update_layout(UpdateLayoutReason);
     void update_layout(UpdateLayoutReason, ThrottledAnimationSamplingScope);
+    void update_style_and_layout_once(UpdateLayoutReason, ThrottledAnimationSamplingScope);
     void note_content_visibility_auto_style() { m_may_have_content_visibility_auto_style = true; }
-    enum class PartialRelayoutResult : u8 {
-        NotEligible,
-        Done,
-        NeedsAnotherLayoutPass,
-    };
     void update_layout_if_needed_for_node(Node const&, UpdateLayoutReason);
-    [[nodiscard]] u64 partial_layout_count() const { return m_partial_layout_count; }
-    [[nodiscard]] u64 full_layout_count() const { return m_full_layout_count; }
+    [[nodiscard]] u64 partial_layout_count() const;
+    [[nodiscard]] u64 full_layout_count() const;
     [[nodiscard]] bool layout_is_up_to_date() const;
     void clear_devtools_layout_inspection_data();
     void prepare_for_rendering();
@@ -515,7 +512,7 @@ public:
         m_effects_needing_animated_style_update.clear();
         m_effects_needing_animated_style_update_after_current_update.clear();
     }
-    bool is_running_update_layout() const { return m_is_running_update_layout; }
+    [[nodiscard]] bool is_running_update_layout() const;
 
     void invalidate_layout_tree(InvalidateLayoutTreeReason);
 
@@ -848,8 +845,10 @@ public:
     void set_needs_registered_properties_cache_update() { m_needs_registered_properties_cache_update = true; }
     void set_needs_container_query_evaluation_after_layout(Element const& query_container);
 
-    [[nodiscard]] bool needs_full_layout_tree_update() const { return m_needs_full_layout_tree_update; }
-    void set_needs_full_layout_tree_update(bool b) { m_needs_full_layout_tree_update = b; }
+    [[nodiscard]] bool needs_full_layout_tree_update() const;
+    void set_needs_full_layout_tree_update(bool);
+
+    CSS::ScrollStateQueryContainers& scroll_state_query_containers() { return m_scroll_state_query_containers; }
 
     [[nodiscard]] Layout::NodeArena& layout_node_arena();
     Painting::ChromeWidgetRegistry& chrome_widget_registry() { return *m_chrome_widget_registry; }
@@ -1170,13 +1169,7 @@ public:
 
     // Confinement report of the most recent layout tree build, for tests observing whether a
     // partial rebuild stayed inside its rebuilt subtrees.
-    struct LayoutTreeBuildStats {
-        u64 builds { 0 };
-        u64 last_build_rebuilt_subtree_roots { 0 };
-        bool last_build_escaped_rebuild_roots { false };
-    };
-    LayoutTreeBuildStats const& layout_tree_build_stats() const { return m_layout_tree_build_stats; }
-    void record_layout_tree_build(u64 rebuilt_subtree_root_count, bool escaped_rebuild_roots);
+    [[nodiscard]] Layout::RustFFI::FfiLayoutTreeBuildStats layout_tree_build_stats() const;
 
     enum class AccumulatedVisualContextUpdateScope : u8 {
         Values,
@@ -1509,17 +1502,17 @@ private:
     virtual void finalize() override final;
 
     void tear_down_layout_tree_for_inactive_document();
-    void set_layout_root(Layout::Viewport&);
+    void set_layout_root(Layout::RustFFI::NodeSlotId viewport_slot);
     void tear_down_layout_tree();
     void process_pending_top_layer_layout_changes();
 
     void update_active_element();
     void collect_boxes_with_auto_content_visibility();
     bool needs_style_update_after_layout();
-    PartialRelayoutResult try_partial_relayout(Vector<Layout::RustFFI::NodeSlotId> registered_partial_relayout_root_slots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data);
+    Layout::RustFFI::FfiLayoutUpdateHostCallbacks layout_update_host_callbacks();
 
     void process_pending_list_item_renumbers();
-    bool reconcile_stale_list_item_counters_after_tree_build(Vector<Layout::Node*> const& rebuilt_subtree_roots);
+    bool reconcile_stale_list_item_counters_after_tree_build();
     enum class LayoutTreeChanged : u8 {
         No,
         Yes,
@@ -1740,14 +1733,9 @@ private:
     GC::WeakHashSet<Element> m_elements_with_dirty_style_attributes;
     bool m_suppresses_attribute_style_invalidation { false };
     HashTable<GC::Ref<Element>> m_query_containers_needing_container_query_evaluation_after_layout;
-    bool m_needs_full_layout_tree_update { false };
+    CSS::ScrollStateQueryContainers m_scroll_state_query_containers;
 
     bool m_is_decoded_svg { false };
-
-    bool m_is_running_update_layout { false };
-
-    u64 m_partial_layout_count { 0 };
-    u64 m_full_layout_count { 0 };
 
     bool m_needs_animated_style_update { false };
     GC::WeakHashSet<Animations::KeyframeEffect> m_effects_needing_animated_style_update;
@@ -1943,7 +1931,6 @@ private:
     Optional<CSSPixelRect> m_caret_hit_test_debug_rect;
 
     mutable StyleInvalidationCounters m_style_invalidation_counters;
-    LayoutTreeBuildStats m_layout_tree_build_stats;
 
     mutable GC::Ptr<WebIDL::ObservableArray> m_adopted_style_sheets;
 
