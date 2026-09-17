@@ -159,17 +159,6 @@ static ErrorOr<void> skip_async_scrolling_tests_unless_enabled(Application const
     return enumerate_test_files_recursively(path, s_skipped_tests);
 }
 
-static ErrorOr<void> skip_out_of_process_iframe_tests_unless_enabled(Application const& app)
-{
-    if (WebView::Application::web_content_options().site_isolation_mode == WebView::SiteIsolationMode::IFrame)
-        return {};
-
-    auto path = LexicalPath::join(app.test_root_path, "Text/input/SiteIsolation/iframe/"sv).string();
-    if (!FileSystem::exists(path))
-        return {};
-    return enumerate_test_files_recursively(path, s_skipped_tests);
-}
-
 static ErrorOr<void> skip_ui_process_session_history_tests_unless_enabled(Application const& app)
 {
     if (app.run_ui_process_session_history_tests)
@@ -978,7 +967,7 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
 
             // Append variant query string if present (variant is "?foo=bar", set_query expects "foo=bar")
             if (test.variant.has_value())
-                url->set_query(MUST(test.variant->substring_from_byte_offset_with_shared_superstring(1)));
+                url->set_query(test.variant->bytes_as_string_view().substring_view(1));
 
             switch (test.mode) {
             case TestMode::Crash:
@@ -1072,7 +1061,6 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
 
     TRY(load_test_config(app.test_root_path));
     TRY(skip_async_scrolling_tests_unless_enabled(app));
-    TRY(skip_out_of_process_iframe_tests_unless_enabled(app));
     TRY(skip_ui_process_session_history_tests_unless_enabled(app));
     TRY(skip_aia_tests_on_apple(app));
 

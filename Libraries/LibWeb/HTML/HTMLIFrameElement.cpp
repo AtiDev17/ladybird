@@ -78,6 +78,11 @@ void HTMLIFrameElement::attribute_changed(Utf16FlyString const& name, Optional<U
                 m_iframe_sandboxing_flag_set = {};
             }
         }
+
+        // A content navigable whose document another process hosts reads the sandbox and referrerpolicy attributes
+        // through its replicated state, which the UI process keeps current from these reports.
+        if (name == AttributeNames::sandbox || name == AttributeNames::referrerpolicy)
+            document().page().client().page_did_change_navigable_container_state(m_content_navigable->id(), replicated_container_state());
     }
 
     if (name == HTML::AttributeNames::width || name == HTML::AttributeNames::height)
@@ -121,7 +126,7 @@ void HTMLIFrameElement::process_the_iframe_attributes(InitialInsertion initial_i
         return;
 
     // 1. If element's srcdoc attribute is specified, then:
-    if (has_attribute(HTML::AttributeNames::srcdoc)) {
+    if (has_attribute_ns({}, HTML::AttributeNames::srcdoc)) {
         // 1. Set element's current navigation was lazy loaded boolean to false.
         set_current_navigation_was_lazy_loaded(false);
 
@@ -130,7 +135,7 @@ void HTMLIFrameElement::process_the_iframe_attributes(InitialInsertion initial_i
             // 1. Set element's lazy load resumption steps to the rest of this algorithm starting with the step labeled navigate to the srcdoc resource.
             set_lazy_load_resumption_steps([this]() {
                 // 3. Navigate to the srcdoc resource: navigate an iframe or frame given element, about:srcdoc, the empty string, and the value of element's srcdoc attribute.
-                navigate_an_iframe_or_frame(URL::about_srcdoc(), ReferrerPolicy::ReferrerPolicy::EmptyString, get_attribute(HTML::AttributeNames::srcdoc));
+                navigate_an_iframe_or_frame(URL::about_srcdoc(), ReferrerPolicy::ReferrerPolicy::EmptyString, get_attribute_ns({}, HTML::AttributeNames::srcdoc));
 
                 // FIXME: The resulting Document must be considered an iframe srcdoc document.
             });
@@ -146,7 +151,7 @@ void HTMLIFrameElement::process_the_iframe_attributes(InitialInsertion initial_i
         }
 
         // 3. Navigate to the srcdoc resource: navigate an iframe or frame given element, about:srcdoc, the empty string, and the value of element's srcdoc attribute.
-        navigate_an_iframe_or_frame(URL::about_srcdoc(), ReferrerPolicy::ReferrerPolicy::EmptyString, get_attribute(HTML::AttributeNames::srcdoc));
+        navigate_an_iframe_or_frame(URL::about_srcdoc(), ReferrerPolicy::ReferrerPolicy::EmptyString, get_attribute_ns({}, HTML::AttributeNames::srcdoc));
 
         // FIXME: The resulting Document must be considered an iframe srcdoc document.
 
@@ -222,13 +227,16 @@ void run_iframe_load_event_steps(HTMLIFrameElement& element)
     // child document (including a replacement parser created by document.open()) delays
     // that document's load event. The task may already be queued when a descendant is
     // reopened, so check again when the task runs and try again after the child unblocks.
-    auto& local_navigable = as<LocalNavigable>(*element.content_navigable());
-    if (auto active_document = local_navigable.active_document(); active_document && active_document->anything_is_delaying_the_load_event()) {
-        auto element_ref = GC::Ref(element);
-        element.queue_an_element_task(HTML::Task::Source::DOMManipulation, [element_ref] {
-            run_iframe_load_event_steps(element_ref);
-        });
-        return;
+    // NB: The steps for a navigable hosted by another process run once its replicated state says its document is
+    //     completely loaded, which is after anything delaying that document's load event.
+    if (auto* local_navigable = as_if<LocalNavigable>(*element.content_navigable())) {
+        if (auto active_document = local_navigable->active_document(); active_document && active_document->anything_is_delaying_the_load_event()) {
+            auto element_ref = GC::Ref(element);
+            element.queue_an_element_task(HTML::Task::Source::DOMManipulation, [element_ref] {
+                run_iframe_load_event_steps(element_ref);
+            });
+            return;
+        }
     }
 
     // FIXME: 2. Let childDocument be element's content navigable's active document.

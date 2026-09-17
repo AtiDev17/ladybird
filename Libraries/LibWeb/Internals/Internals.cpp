@@ -78,7 +78,6 @@
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/Internals/InternalGamepad.h>
 #include <LibWeb/Internals/Internals.h>
@@ -127,6 +126,13 @@ static ScrollGesturePhase scroll_gesture_phase_from(Bindings::ScrollGesturePhase
 }
 
 GC_DEFINE_ALLOCATOR(Internals);
+
+static GC::Ptr<HTML::LocalNavigable> local_root_of(HTML::Window const& window)
+{
+    if (auto navigable = window.navigable())
+        return navigable->local_root();
+    return {};
+}
 
 Internals::Internals(HTML::Window& window)
     : InternalsBase(window)
@@ -293,7 +299,8 @@ WebIDL::ExceptionOr<void> Internals::load_reference_test_metadata()
     auto& vm = window().principal_realm().vm();
     auto& page = this->page();
 
-    auto* document = page.top_level_browsing_context().active_document();
+    auto local_root = local_root_of(window());
+    auto document = local_root ? local_root->active_document() : nullptr;
     if (!document)
         return vm.throw_completion<JS::InternalError>("No active document available"_utf16);
 
@@ -641,7 +648,8 @@ void Internals::pinch(double x, double y, double scale_delta, WebIDL::UnsignedSh
 
 void Internals::reset_zoom()
 {
-    page().local_root_navigable()->reset_zoom();
+    if (auto local_root = local_root_of(window()))
+        local_root->reset_zoom();
 }
 
 Utf16String Internals::current_cursor()
@@ -724,10 +732,14 @@ void Internals::load_url(Utf16String const& url_string)
 
     VERIFY(url.has_value());
 
-    Core::deferred_invoke([page = GC::make_root(page()), url = url.release_value()] {
+    auto local_root = local_root_of(window());
+    if (!local_root)
+        return;
+
+    Core::deferred_invoke([local_root = GC::make_root(*local_root), url = url.release_value()] {
         // This navigation originates inside WebContent, so it has no UI-recorded navigation id;
         // the navigate algorithm generates one.
-        (void)page->local_root_navigable()->navigate({ .url = url,
+        (void)local_root->navigate({ .url = url,
             .history_handling = Web::Bindings::NavigationHistoryBehavior::Auto,
             .user_involvement = HTML::UserNavigationInvolvement::BrowserUI });
     });
@@ -874,12 +886,6 @@ WebIDL::ExceptionOr<void> Internals::set_site_compatibility_data(Utf16String con
 
     ResourceLoader::the().set_site_compatibility_data(data.release_value());
     return {};
-}
-
-// Tests run with every [Experimental] interface exposed, so this is the only way one can watch the gate itself.
-void Internals::set_experimental_interfaces_exposed(bool exposed)
-{
-    HTML::WindowOrWorkerGlobalScopeMixin::set_experimental_interfaces_exposed(exposed);
 }
 
 void Internals::set_content_blocking_enabled(bool enabled)
@@ -1062,12 +1068,14 @@ bool Internals::headless()
 
 bool Internals::needs_repaint()
 {
-    return page().local_root_navigable()->needs_repaint();
+    auto local_root = local_root_of(window());
+    return local_root && local_root->needs_repaint();
 }
 
 bool Internals::needs_display_list_record()
 {
-    return page().local_root_navigable()->needs_to_record_display_list();
+    auto local_root = local_root_of(window());
+    return local_root && local_root->needs_to_record_display_list();
 }
 
 bool Internals::screen_wake_lock_active()
@@ -1334,7 +1342,8 @@ void Internals::perform_per_test_cleanup()
     m_gamepads.clear();
 
     // Clear any input state
-    page().local_root_navigable()->event_handler().clear_per_test_input_state({});
+    if (auto local_root = local_root_of(window()))
+        local_root->event_handler().clear_per_test_input_state({});
 
     // Restore the page to the visible state.
     page().client().page_did_request_set_system_visibility_state(HTML::VisibilityState::Visible);

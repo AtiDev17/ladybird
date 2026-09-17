@@ -10,6 +10,14 @@ use super::prefix::PrefixTransitionContext;
 use super::sorted_merge::{SortedMergeEntry, merge_sorted_by};
 use super::*;
 
+/// The elements that left in one transaction, and which dispatch keys any of them carried as it
+/// left. Relational sequence routing asks the same few keys once per touched parent. Without a
+/// complete list of the elements that left, any of them may have been a witness.
+pub(super) struct DepartedWitnessKeys<'a> {
+    departed: Option<&'a [StyleNodeID]>,
+    keys: Vec<(DispatchKey, bool)>,
+}
+
 impl RetainedState {
     /// Whether the locally evaluable compound containing an input changed truth on that element.
     fn route_origin_truth_flipped(
@@ -549,6 +557,7 @@ impl RetainedState {
     pub(super) fn route_relational_sequence_changes(
         &mut self,
         sequences: &SequenceChanges,
+        departed: Option<&[StyleNodeID]>,
         regions: &mut ImpactRegions,
         counters: &mut Counters,
     ) {
@@ -573,22 +582,72 @@ impl RetainedState {
             }
         }
 
+        let mut departed_witnesses = DepartedWitnessKeys {
+            departed,
+            keys: Vec::new(),
+        };
         for (parent, change) in sequences.iter() {
             if change.relational_records.is_empty() {
                 continue;
             }
-            self.route_relational_sequence_change(parent, change, live, &routing, regions, counters);
+            self.route_relational_sequence_change(
+                parent,
+                change,
+                live,
+                &routing,
+                &mut departed_witnesses,
+                regions,
+                counters,
+            );
         }
+    }
+
+    /// Whether an element that left in this transaction could have been a witness of `anchor`'s
+    /// query.
+    ///
+    /// A departure removes a witness only by taking one with it: every element under it leaves
+    /// too, so a witness that stays is not one whose answer moved - as long as the query reads
+    /// nothing but the witness's own facts. Those facts are still in the store until the
+    /// transaction is released, and the witness has to have carried the query's dispatch key.
+    /// The departure check has to look at the key before the transaction as well, since a witness
+    /// can lose its class and leave in the same one.
+    fn departure_can_remove_a_witness(
+        &self,
+        program: SelectorProgramID,
+        anchor: RelativeAnchor,
+        departed_witnesses: &mut DepartedWitnessKeys<'_>,
+    ) -> bool {
+        const MAX_DEPARTED_ELEMENTS_TO_PROVE: usize = 256;
+        let key = anchor.witness_dispatch;
+        if anchor.witness_is_featureless || !key.has_selector_posting() {
+            return true;
+        }
+        let program = self.programs.get(program);
+        if !program.selector_node_reads_only_local_facts(program.relative_query(anchor.query).compound) {
+            return true;
+        }
+        if let Some(&(_, carried)) = departed_witnesses.keys.iter().find(|(known, _)| *known == key) {
+            return carried;
+        }
+        let Some(departed) = departed_witnesses.departed else {
+            return true;
+        };
+        let carried = departed.len() > MAX_DEPARTED_ELEMENTS_TO_PROVE
+            || departed.iter().any(|&node| self.node_carries(key, node, None));
+        departed_witnesses.keys.push((key, carried));
+        carried
     }
 
     /// One parent's share of the relational sequence routing: the candidate anchors each live
     /// route can reach from this sequence's seams, filtered by the anchor compound's own feature.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn route_relational_sequence_change(
         &mut self,
         parent: StyleNodeID,
         change: &SequenceChange,
         live: &[LiveRelationalRoute],
         routing: &RoutingRegistry,
+        departed_witnesses: &mut DepartedWitnessKeys<'_>,
         regions: &mut ImpactRegions,
         counters: &mut Counters,
     ) {
@@ -670,13 +729,18 @@ impl RetainedState {
                 // inside one sequence changes no ancestor at all, so these reach only through the
                 // element being a witness that arrived, or one that left and cannot say so.
                 RelativeAxis::Descendant | RelativeAxis::Child => {
-                    if !any_departed && !witnessing_arrival {
+                    let departure_reaches =
+                        any_departed && self.departure_can_remove_a_witness(program, anchor, departed_witnesses);
+                    if !departure_reaches && !witnessing_arrival {
                         continue;
                     }
                     let anchors_above = above
                         .get_or_insert_with(|| std::iter::once(parent).chain(self.tree.ancestors(parent)).collect());
-                    let candidates: &[StyleNodeID] = match (anchor.axis, any_departed) {
-                        (RelativeAxis::Child, false) => &anchors_above[..1],
+                    let candidates: &[StyleNodeID] = match anchor.axis {
+                        // A witness of a child query is a child of its anchor. One that left from under
+                        // this parent was this parent's, and one that left from deeper took its anchor
+                        // with it.
+                        RelativeAxis::Child => &anchors_above[..1],
                         _ => anchors_above,
                     };
                     for &candidate in candidates {
@@ -1802,26 +1866,39 @@ impl RetainedState {
         counters.add(Counter::RelationalAnchorsConsidered, considered);
 
         for candidate in anchors {
-            // An anchor whose retained witness still witnesses it was true and stays true: only
-            // zero/nonzero witness transitions can affect selector truth, so nothing reached
-            // through this anchor has moved and it drops out of the plan. A position-testing
-            // argument is excluded: a sibling mutation can flip such a witness without ever
-            // touching it, so its retained record proves nothing here.
-            if !self
-                .programs
-                .get(program)
-                .subtree_tests_position(self.programs.get(program).relative_query(anchor.query).compound)
-                && matches!(
-                    self.retained_witness_for_anchor(program, anchor.query, candidate, counters),
-                    Lookup::Known(_)
-                )
-            {
-                counters.bump(Counter::RelationalAnchorsSkippedByWitness);
-                continue;
-            }
-            let region = ImpactRegion::follow(candidate, site.path, &self.tree);
-            self.add_narrowed_region(region, site, regions, counters);
+            self.route_possible_anchor(candidate, program, anchor, site, regions, counters);
         }
+    }
+
+    /// Route one element that may be an anchor whose relational truth moved.
+    fn route_possible_anchor(
+        &mut self,
+        candidate: StyleNodeID,
+        program: SelectorProgramID,
+        anchor: RelativeAnchor,
+        site: &RoutingSite<'_>,
+        regions: &mut ImpactRegions,
+        counters: &mut Counters,
+    ) {
+        // An anchor whose retained witness still witnesses it was true and stays true: only
+        // zero/nonzero witness transitions can affect selector truth, so nothing reached
+        // through this anchor has moved and it drops out of the plan. A position-testing
+        // argument is excluded: a sibling mutation can flip such a witness without ever
+        // touching it, so its retained record proves nothing here.
+        if !self
+            .programs
+            .get(program)
+            .subtree_tests_position(self.programs.get(program).relative_query(anchor.query).compound)
+            && matches!(
+                self.retained_witness_for_anchor(program, anchor.query, candidate, counters),
+                Lookup::Known(_)
+            )
+        {
+            counters.bump(Counter::RelationalAnchorsSkippedByWitness);
+            return;
+        }
+        let region = ImpactRegion::follow(candidate, site.path, &self.tree);
+        self.add_narrowed_region(region, site, regions, counters);
     }
 
     /// Route a relational query from every element that could witness it.
@@ -1838,6 +1915,39 @@ impl RetainedState {
         regions: &mut ImpactRegions,
         counters: &mut Counters,
     ) {
+        // Every anchor a witness walk can find carries the anchor compound's own feature, so when
+        // fewer elements carry that than could be witnesses, the anchors are the cheaper side to
+        // enumerate. `.item:has(+ .divider + [data-selected])` names a handful of items and every
+        // cell of a table as a possible witness.
+        if anchor.anchor_dispatch.has_selector_posting() {
+            let witness_count = match anchor.witness_dispatch.has_selector_posting() {
+                true => match self.facts.postings().lookup(anchor.witness_dispatch) {
+                    Lookup::Known(posting) => Some(posting.len()),
+                    Lookup::KnownAbsent => Some(0),
+                    Lookup::Missing(_) => None,
+                },
+                false => None,
+            };
+            match self.facts.postings().lookup(anchor.anchor_dispatch) {
+                Lookup::KnownAbsent => return,
+                Lookup::Known(posting)
+                    if witness_count.is_none_or(|count| posting.len() < count)
+                        && (posting.len() <= SMALL_CANDIDATE_SOURCE
+                            || posting.len() * SELECTIVE_SHARE_DIVISOR
+                                <= self.tree.connected_element_count().max(1) as usize) =>
+                {
+                    let anchors: Vec<StyleNodeID> = posting.candidates().collect();
+                    counters.add(Counter::RelationalAnchorsConsidered, anchors.len() as u64);
+                    for candidate in anchors {
+                        if self.tree.is_live(candidate) {
+                            self.route_possible_anchor(candidate, program, anchor, site, regions, counters);
+                        }
+                    }
+                    return;
+                }
+                Lookup::Known(_) | Lookup::Missing(_) => {}
+            }
+        }
         if !anchor.witness_dispatch.has_selector_posting() {
             self.add_narrowed_region(ImpactRegion::Document, site, regions, counters);
             return;

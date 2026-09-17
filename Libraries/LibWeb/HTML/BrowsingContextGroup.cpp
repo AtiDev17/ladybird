@@ -5,6 +5,7 @@
  */
 
 #include <AK/NeverDestroyed.h>
+#include <AK/Random.h>
 #include <LibGC/Heap.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/BrowsingContextGroup.h>
@@ -57,6 +58,21 @@ BrowsingContextGroup::BrowsingContextGroupAndDocument BrowsingContextGroup::crea
     return BrowsingContextGroupAndDocument { group, document };
 }
 
+// https://html.spec.whatwg.org/multipage/webappapis.html#agent-cluster-map
+u64 BrowsingContextGroup::agent_cluster_id(URL::Origin const& origin, CanUseCrossOriginIsolatedAPIs cross_origin_isolated)
+{
+    for (auto const& agent_cluster : m_agent_clusters) {
+        if (agent_cluster.cross_origin_isolated == cross_origin_isolated && agent_cluster.origin == origin)
+            return agent_cluster.id;
+    }
+
+    // Drawn at random, so that no cluster named in another process — a shared worker's, or one in a group in another
+    // tab — can collide with it.
+    auto id = get_random<u64>();
+    m_agent_clusters.append({ origin, cross_origin_isolated, id });
+    return id;
+}
+
 // https://html.spec.whatwg.org/multipage/browsers.html#bcg-append
 void BrowsingContextGroup::append(BrowsingContext& browsing_context)
 {
@@ -65,6 +81,10 @@ void BrowsingContextGroup::append(BrowsingContext& browsing_context)
 
     // 2. Set browsingContext's group to group.
     browsing_context.set_group(this);
+
+    // NB: The page holding a top-level browsing context knows the tab's group by it: the group of the tab it displays,
+    //     which the tab's opener may have created in another page.
+    browsing_context.page().set_browsing_context_group({}, *this);
 }
 
 }

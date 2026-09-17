@@ -28,6 +28,7 @@
 #include <LibWeb/HTML/MimeType.h>
 #include <LibWeb/HTML/Plugin.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
+#include <LibWeb/HTML/UserActivationConsumption.h>
 #include <LibWeb/HTML/WindowEventHandlers.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/HTML/WindowType.h>
@@ -55,6 +56,7 @@ WEB_API PlatformObject& platform_object_for_window(HTML::Window&, JS::Realm&);
 WEB_API WebIDL::ExceptionOr<void> initialize_window_web_interfaces(HTML::Window&);
 WEB_API WebIDL::ExceptionOr<void> initialize_window_web_interfaces(HTML::Window&, JS::Realm&);
 WEB_API WebIDL::ExceptionOr<void> post_message(JS::Realm&, HTML::Window&, JS::Value, WindowPostMessageOptions const&);
+WEB_API WebIDL::ExceptionOr<void> post_message(JS::Realm&, HTML::RemoteWindow&, JS::Value, WindowPostMessageOptions const&);
 WEB_API WebIDL::UnsignedLong request_animation_frame(HTML::Window&, WebIDL::CallbackType&);
 WEB_API WebIDL::ExceptionOr<WebIDL::UnsignedLong> request_animation_frame(HTML::DedicatedWorkerGlobalScope&, WebIDL::CallbackType&);
 WEB_API WebIDL::UnsignedLong request_idle_callback(HTML::Window&, WebIDL::CallbackType&, IdleRequestOptions const&);
@@ -125,6 +127,7 @@ public:
     // https://html.spec.whatwg.org/multipage/window-object.html#concept-document-window
     DOM::Document const& associated_document() const { return *m_associated_document; }
     DOM::Document& associated_document() { return *m_associated_document; }
+    GC::Ptr<DOM::Document> associated_document_if_any() const { return m_associated_document; }
     void set_associated_document(DOM::Document&);
 
     // https://html.spec.whatwg.org/multipage/window-object.html#window-bc
@@ -228,7 +231,7 @@ public:
         GC::Ref<WindowProxy> source;
     };
     static WebIDL::ExceptionOr<PreparedPostMessage> prepare_post_message(JS::Realm&, JS::Value message, PostMessageOptions const&);
-    void deliver_posted_message(SerializedTransferRecord, Variant<Utf16String, URL::Origin> const& target_origin, URL::Origin const& source_origin, GC::Ref<WindowProxy> source);
+    void deliver_posted_message(SerializedTransferRecord, Variant<Utf16String, URL::Origin> const& target_origin, URL::Origin const& source_origin, GC::Ptr<WindowProxy> source);
 
     Variant<GC::Ref<DOM::Event>, Empty> event() const;
 
@@ -288,6 +291,10 @@ public:
     void set_last_history_action_activation_timestamp(HighResolutionTime::DOMHighResTimeStamp timestamp) { m_last_history_action_activation_timestamp = timestamp; }
 
     void consume_history_action_user_activation();
+
+    // Steps 4 and 5 of both consumptions for the windows a page hosts. The UI process runs this in every page of the
+    // tab, since the navigables of top's active document span its pages.
+    static void consume_user_activation_of_windows_hosted_by(Page&, UserActivationConsumption);
 
     static bool in_test_mode();
     static void set_enable_test_mode(bool);

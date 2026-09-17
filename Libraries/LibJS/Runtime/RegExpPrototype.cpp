@@ -413,7 +413,7 @@ ThrowCompletionOr<Value> regexp_exec(VM& vm, Object& regexp_object, GC::Ref<Prim
 
     // 2. If IsCallable(exec) is true, then
     if (auto exec_function = exec.as_if<FunctionObject>()) {
-        if (typed_regexp_object && exec_function->builtin() == Bytecode::Builtin::RegExpPrototypeExec)
+        if (typed_regexp_object && exec_function->realm() == vm.current_realm() && exec_function->builtin() == Bytecode::Builtin::RegExpPrototypeExec)
             return regexp_builtin_exec(vm, *typed_regexp_object, string);
 
         // a. Let result be ? Call(exec, R, « S »).
@@ -713,6 +713,7 @@ ThrowCompletionOr<Value> RegExpPrototype::symbol_replace_impl(VM& vm, Object& re
             && static_cast<Object const&>(regexp_object).prototype() == regexp_prototype
             && !regexp_object.storage_has(vm.names.global)
             && !regexp_object.storage_has(vm.names.unicode)
+            && !regexp_object.storage_has(vm.names.unicodeSets)
             && !regexp_object.storage_has(vm.names.flags)) {
             auto replace_string = TRY(replace_value.to_utf16_string(vm));
             bool has_dollar = replace_string.utf16_view().contains('$');
@@ -1474,7 +1475,7 @@ JS_DEFINE_NATIVE_FUNCTION(RegExpPrototype::test)
             static auto& exec_cache = *new Bytecode::StaticPropertyLookupCache;
             auto exec_val = TRY(regexp_object->get(vm.names.exec, exec_cache));
             if (auto exec_fn = exec_val.as_if<FunctionObject>())
-                exec_is_builtin = exec_fn->builtin() == Bytecode::Builtin::RegExpPrototypeExec;
+                exec_is_builtin = exec_fn->realm() == &realm && exec_fn->builtin() == Bytecode::Builtin::RegExpPrototypeExec;
         }
         if (typed_regexp
             && exec_is_builtin
