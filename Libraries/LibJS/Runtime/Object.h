@@ -84,6 +84,8 @@ class JS_API Object : public Cell {
     GC_DECLARE_ALLOCATOR(Object);
 
 public:
+    static constexpr GC::CellKind cell_kind_for_class = GC::CellKind::Object;
+
     static GC::Ref<Object> create_prototype(Realm&, GC::Ptr<Object> prototype);
     static GC::Ref<Object> create(Realm&, GC::Ptr<Object> prototype);
     static GC::Ref<Object> create_with_premade_shape(Shape&);
@@ -323,8 +325,20 @@ public:
     virtual void visit_edges(Cell::Visitor&) override;
     virtual size_t external_memory_size() const override;
 
-    Value get_direct(size_t index) const { return m_named_properties[index]; }
-    void put_direct(size_t index, Value value) { m_named_properties[index] = value; }
+    // Named-property slot offsets come from shape lookups and from inline caches. A corrupted cache
+    // can hand us an offset past the allocation, so we bound every direct slot access by the storage
+    // capacity. This turns an out-of-bounds slot into a controlled crash instead of a memory
+    // read/write primitive.
+    Value get_direct(size_t index) const
+    {
+        VERIFY(index < named_storage_capacity());
+        return m_named_properties[index];
+    }
+    void put_direct(size_t index, Value value)
+    {
+        VERIFY(index < named_storage_capacity());
+        m_named_properties[index] = value;
+    }
 
     // Indexed property storage
     Optional<ValueAndAttributes> indexed_get(u32 index) const;
@@ -332,6 +346,16 @@ public:
     bool indexed_has(u32 index) const;
     void indexed_delete(u32 index);
     u32 indexed_array_like_size() const { return m_indexed_array_like_size; }
+    // The number of packed elements that are really in the buffer. The logical size sits on the
+    // Object while the capacity sits with the allocation, so the two can drift apart if the size
+    // field is corrupted. Packed indexing goes through this, which keeps such a drift a wrong
+    // answer rather than an access past the allocation.
+    u32 indexed_packed_element_count() const;
+
+    // The indexed elements buffer keeps its capacity in a header word right in front of the first
+    // element. The interpreter's layout generator emits this offset so the interpreter can read
+    // the same capacity the C++ side reads.
+    static constexpr size_t indexed_elements_header_size = sizeof(Value);
     bool set_indexed_array_like_size(size_t new_size);
     void indexed_append(Value value, PropertyAttributes attributes = default_attributes);
     void indexed_append(ReadonlySpan<Value> values);
@@ -474,6 +498,14 @@ private:
     void free_indexed_elements();
     void ensure_named_storage_capacity(u32 needed);
     bool named_storage_is_inline() const { return m_named_properties == m_inline_named_storage; }
+    // Capacity of the current named-property storage in Values. Heap storage keeps its capacity in a
+    // u32 just before the first element (see HeapValueStorage in Object.cpp); inline storage is fixed.
+    ALWAYS_INLINE u32 named_storage_capacity() const
+    {
+        if (named_storage_is_inline())
+            return INLINE_NAMED_PROPERTY_CAPACITY;
+        return *reinterpret_cast<u32 const*>(reinterpret_cast<u8 const*>(m_named_properties.data()) - indexed_elements_header_size);
+    }
     size_t named_storage_external_memory_size() const;
     size_t indexed_storage_external_memory_size() const;
 

@@ -691,6 +691,11 @@ bool Node::is_closed_shadow_hidden_from(Node const& b) const
     return false;
 }
 
+bool Node::is_tracked_by_style_engine() const
+{
+    return is_connected() && document().style_engine_tracks_tree();
+}
+
 // https://html.spec.whatwg.org/multipage/infrastructure.html#browsing-context-connected
 bool Node::is_browsing_context_connected() const
 {
@@ -871,25 +876,96 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
     insert_nodes_before(nodes, child, suppress_observers, node, affects_elements);
 }
 
+// https://dom.spec.whatwg.org/#concept-node-insert
+void Node::adjust_live_ranges_for_insertion(Node& child, size_t count)
+{
+    // 1. For each live range whose start node is parent and start offset is greater than child’s index:
+    //    increase its start offset by count.
+    // 2. For each live range whose end node is parent and end offset is greater than child’s index:
+    //    increase its end offset by count.
+    // OPTIMIZATION: These steps are independent between ranges, so traverse the live ranges only once.
+    auto child_index = child.index();
+    for (auto& range : document().live_ranges()) {
+        if (range.start_container().ptr() == this && range.start_offset() > child_index)
+            range.increase_start_offset(count);
+        if (range.end_container().ptr() == this && range.end_offset() > child_index)
+            range.increase_end_offset(count);
+    }
+}
+
+// https://dom.spec.whatwg.org/#concept-node-insert
+void Node::insert_node_into_children(GC::Ref<Node> node, GC::Ptr<Node> child)
+{
+    // 1. Adopt node into parent’s node document.
+    document().adopt_node_steps(node);
+
+    // 2. If child is null, then append node to parent’s children.
+    // 3. Otherwise, insert node into parent’s children before child’s index.
+    insert_before_impl(node, child);
+
+    // 4. If parent is a shadow host whose shadow root’s slot assignment is "named" and node is a slottable, then
+    //    assign a slot for node.
+    if (auto* element = as_if<DOM::Element>(*this)) {
+        auto is_named_shadow_host = element->is_shadow_host()
+            && element->shadow_root()->slot_assignment() == SlotAssignmentMode::Named;
+
+        if (is_named_shadow_host && node->is_slottable())
+            assign_a_slot(node->as_slottable());
+    }
+
+    // 5. If parent’s root is a shadow root, and parent is a slot whose assigned nodes is the empty list, then run
+    //    signal a slot change for parent.
+    if (auto* this_slot_element = as_if<HTML::HTMLSlotElement>(*this); this_slot_element && root().is_shadow_root()) {
+        if (this_slot_element->assigned_nodes_internal().is_empty())
+            signal_a_slot_change(*this_slot_element);
+    }
+
+    // AD-HOC: Register any slot elements in the inserted subtree with the shadow root’s slot registry
+    //         before running assign_slottables_for_a_tree, so the registry is up-to-date.
+    if (auto* shadow_root = as_if<ShadowRoot>(node->root())) {
+        node->for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
+            shadow_root->register_slot(slot);
+            return TraversalDecision::Continue;
+        });
+    }
+
+    // 6. Run assign slottables for a tree with node’s root.
+    assign_slottables_for_a_tree(node->root());
+}
+
+// https://dom.spec.whatwg.org/#concept-node-insert
+template<typename Nodes>
+static void run_post_connection_steps(Nodes const& nodes)
+{
+    // 10. Let staticNodeList be a list of nodes, initially « ».
+    // NOTE: We collect all nodes before calling the post-connection steps on any one of them, instead of calling the
+    //       post-connection steps while we’re traversing the node tree. This is because the post-connection steps can
+    //       modify the tree’s structure, making live traversal unsafe, possibly leading to the post-connection steps
+    //       being called multiple times on the same node.
+    GC::ConservativeVector<GC::Ref<Node>, 1> static_node_list;
+
+    // 11. For each node of nodes, in tree order:
+    for (auto& node : nodes) {
+        // 1. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree
+        //    order: append inclusiveDescendant to staticNodeList.
+        node->for_each_shadow_including_inclusive_descendant([&static_node_list](Node& inclusive_descendant) {
+            static_node_list.append(inclusive_descendant);
+            return TraversalDecision::Continue;
+        });
+    }
+
+    // 12. For each node of staticNodeList: if node is connected, then run the post-connection steps with node.
+    for (auto& node : static_node_list) {
+        if (node->is_connected())
+            node->post_connection();
+    }
+}
+
 void Node::insert_nodes_before(ReadonlySpan<GC::Root<Node>> nodes, GC::Ptr<Node> child, bool suppress_observers, GC::Ref<Node> metadata_node, ChildrenChangedMetadata::AffectsElements affects_elements)
 {
-    auto count = nodes.size();
-
     // 5. If child is non-null:
-    if (child) {
-        // 1. For each live range whose start node is parent and start offset is greater than child’s index:
-        //    increase its start offset by count.
-        // 2. For each live range whose end node is parent and end offset is greater than child’s index:
-        //    increase its end offset by count.
-        // OPTIMIZATION: These steps are independent between ranges, so traverse the live ranges only once.
-        auto child_index = child->index();
-        for (auto& range : document().live_ranges()) {
-            if (range.start_container().ptr() == this && range.start_offset() > child_index)
-                range.increase_start_offset(count);
-            if (range.end_container().ptr() == this && range.end_offset() > child_index)
-                range.increase_end_offset(count);
-        }
-    }
+    if (child)
+        adjust_live_ranges_for_insertion(*child, nodes.size());
 
     // 6. Let previousSibling be child’s previous sibling or parent’s last child if child is null.
     GC::Ptr<Node> previous_sibling;
@@ -901,44 +977,7 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Root<Node>> nodes, GC::Ptr<Node>
     // 7. For each node in nodes, in tree order:
     // FIXME: In tree order
     for (auto& node_to_insert : nodes) {
-        // 1. Adopt node into parent’s node document.
-        document().adopt_node_steps(*node_to_insert);
-
-        // 2. If child is null, then append node to parent’s children.
-        if (!child)
-            append_child_impl(*node_to_insert);
-        // 3. Otherwise, insert node into parent’s children before child’s index.
-        else
-            insert_before_impl(*node_to_insert, child);
-
-        // 4. If parent is a shadow host whose shadow root’s slot assignment is "named" and node is a slottable, then
-        //    assign a slot for node.
-        if (auto* element = as_if<DOM::Element>(*this)) {
-            auto is_named_shadow_host = element->is_shadow_host()
-                && element->shadow_root()->slot_assignment() == SlotAssignmentMode::Named;
-
-            if (is_named_shadow_host && node_to_insert->is_slottable())
-                assign_a_slot(node_to_insert->as_slottable());
-        }
-
-        // 5. If parent’s root is a shadow root, and parent is a slot whose assigned nodes is the empty list, then run
-        //    signal a slot change for parent.
-        if (auto* this_slot_element = as_if<HTML::HTMLSlotElement>(*this); this_slot_element && root().is_shadow_root()) {
-            if (this_slot_element->assigned_nodes_internal().is_empty())
-                signal_a_slot_change(*this_slot_element);
-        }
-
-        // AD-HOC: Register any slot elements in the inserted subtree with the shadow root’s slot registry
-        //         before running assign_slottables_for_a_tree, so the registry is up-to-date.
-        if (auto* shadow_root = as_if<ShadowRoot>(node_to_insert->root())) {
-            node_to_insert->for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
-                shadow_root->register_slot(slot);
-                return TraversalDecision::Continue;
-            });
-        }
-
-        // 6. Run assign slottables for a tree with node’s root.
-        assign_slottables_for_a_tree(node_to_insert->root());
+        insert_node_into_children(*node_to_insert, child);
 
         // And a subtree holding the focused or hovered node brings `:focus-within` and `:hover` to
         // the chain it lands under.
@@ -1002,30 +1041,8 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Root<Node>> nodes, GC::Ptr<Node>
 
     // OPTIMIZATION: Disconnected subtrees cannot have post-connection steps to run. If any root is connected,
     //               collect all nodes, since a callback could connect one of the initially detached subtrees.
-    if (any_of(nodes, [](auto const& node) { return node->is_connected(); })) {
-        // 10. Let staticNodeList be a list of nodes, initially « ».
-        // NOTE: We collect all nodes before calling the post-connection steps on any one of them, instead of calling the
-        //       post-connection steps while we’re traversing the node tree. This is because the post-connection steps can
-        //       modify the tree’s structure, making live traversal unsafe, possibly leading to the post-connection steps
-        //       being called multiple times on the same node.
-        GC::RootVector<GC::Ref<Node>> static_node_list;
-
-        // 11. For each node of nodes, in tree order:
-        for (auto& node : nodes) {
-            // 1. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree
-            //    order: append inclusiveDescendant to staticNodeList.
-            node->for_each_shadow_including_inclusive_descendant([&static_node_list](Node& inclusive_descendant) {
-                static_node_list.append(inclusive_descendant);
-                return TraversalDecision::Continue;
-            });
-        }
-
-        // 12. For each node of staticNodeList: if node is connected, then run the post-connection steps with node.
-        for (auto& node : static_node_list) {
-            if (node->is_connected())
-                node->post_connection();
-        }
-    }
+    if (any_of(nodes, [](auto const& node) { return node->is_connected(); }))
+        run_post_connection_steps(nodes);
 
     auto is_boxless_style_element = (is_html_style_element() || is_svg_style_element()) && !unsafe_layout_node();
     if (is_connected() && !is_boxless_style_element) {
@@ -1062,66 +1079,21 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Root<Node>> nodes, GC::Ptr<Node>
 // https://dom.spec.whatwg.org/#concept-node-insert
 void Node::parser_insert_before(GC::Ref<Node> node, GC::Ptr<Node> child)
 {
-    // AD-HOC: The insertion of one node the parser has just created into a tree that is not connected. Script can
-    //         hold such a tree, so observers, live ranges and collection caches are served, but style, layout, custom
-    //         element reactions and the post-connection steps have nothing to do until the tree is connected.
+    // AD-HOC: The insertion of one node the parser has just created into a tree the style engine does not track.
+    //         Script can hold such a tree, so observers, live ranges, collection caches and the post-connection steps
+    //         are served, but style, layout and custom element reactions have nothing to do until the tree is tracked.
 
-    VERIFY(!is_connected());
+    VERIFY(!is_tracked_by_style_engine());
 
     // 5. If child is non-null:
-    if (child) {
-        // 1. For each live range whose start node is parent and start offset is greater than child’s index:
-        //    increase its start offset by count.
-        // 2. For each live range whose end node is parent and end offset is greater than child’s index:
-        //    increase its end offset by count.
-        auto child_index = child->index();
-        for (auto& range : document().live_ranges()) {
-            if (range.start_container().ptr() == this && range.start_offset() > child_index)
-                range.increase_start_offset(1);
-            if (range.end_container().ptr() == this && range.end_offset() > child_index)
-                range.increase_end_offset(1);
-        }
-    }
+    if (child)
+        adjust_live_ranges_for_insertion(*child, 1);
 
     // 6. Let previousSibling be child’s previous sibling or parent’s last child if child is null.
     GC::Ptr<Node> previous_sibling = child ? child->previous_sibling() : last_child();
 
     // 7. For each node in nodes, in tree order:
-    // 1. Adopt node into parent’s node document.
-    document().adopt_node_steps(*node);
-
-    // 2. If child is null, then append node to parent’s children.
-    // 3. Otherwise, insert node into parent’s children before child’s index.
-    insert_before_impl(node, child);
-
-    // 4. If parent is a shadow host whose shadow root’s slot assignment is "named" and node is a slottable, then
-    //    assign a slot for node.
-    if (auto* element = as_if<DOM::Element>(*this)) {
-        auto is_named_shadow_host = element->is_shadow_host()
-            && element->shadow_root()->slot_assignment() == SlotAssignmentMode::Named;
-
-        if (is_named_shadow_host && node->is_slottable())
-            assign_a_slot(node->as_slottable());
-    }
-
-    // 5. If parent’s root is a shadow root, and parent is a slot whose assigned nodes is the empty list, then run
-    //    signal a slot change for parent.
-    if (auto* this_slot_element = as_if<HTML::HTMLSlotElement>(*this); this_slot_element && root().is_shadow_root()) {
-        if (this_slot_element->assigned_nodes_internal().is_empty())
-            signal_a_slot_change(*this_slot_element);
-    }
-
-    // AD-HOC: Register any slot elements in the inserted subtree with the shadow root’s slot registry
-    //         before running assign_slottables_for_a_tree, so the registry is up-to-date.
-    if (auto* shadow_root = as_if<ShadowRoot>(node->root())) {
-        node->for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
-            shadow_root->register_slot(slot);
-            return TraversalDecision::Continue;
-        });
-    }
-
-    // 6. Run assign slottables for a tree with node’s root.
-    assign_slottables_for_a_tree(node->root());
+    insert_node_into_children(node, child);
 
     // 7. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree order:
     //    1. Run the insertion steps with inclusiveDescendant.
@@ -1144,6 +1116,10 @@ void Node::parser_insert_before(GC::Ref<Node> node, GC::Ptr<Node> child)
     ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Inserted, node, affects_elements };
     children_changed(metadata);
     invalidate_html_collection_caches_in_ancestors(affects_elements);
+
+    // OPTIMIZATION: Disconnected subtrees cannot have post-connection steps to run.
+    if (is_connected())
+        run_post_connection_steps(Array { node });
 
     bump_dom_tree_version();
 }
@@ -1543,9 +1519,9 @@ void Node::assign_slottables_after_removal(Node& parent, Node& parent_root)
     }
 }
 
-void Node::run_removing_steps(Node& parent, Node& parent_root, bool was_connected)
+void Node::run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine)
 {
-    if (was_connected) {
+    if (was_tracked_by_style_engine) {
         if (auto* element = as_if<Element>(*this))
             element->cancel_css_animations_and_transitions();
     }
@@ -1559,7 +1535,7 @@ void Node::run_removing_steps(Node& parent, Node& parent_root, bool was_connecte
     }
 
     for_each_shadow_including_descendant([&](Node& descendant) {
-        if (was_connected) {
+        if (was_tracked_by_style_engine) {
             if (auto* element = as_if<Element>(descendant))
                 element->cancel_css_animations_and_transitions();
         }
@@ -1615,6 +1591,7 @@ void Node::remove(bool suppress_observers)
 
     document().flush_deferred_style_change_event();
     bool const was_connected = is_connected();
+    bool const was_tracked_by_style_engine = is_tracked_by_style_engine();
     if (was_connected)
         document().page().keyboard_scroll_dom_tree_changed(*this);
 
@@ -1634,8 +1611,8 @@ void Node::remove(bool suppress_observers)
     schedule_list_item_renumber_for_removal();
 
     RemovalStyleRecordPins removal_style_record_pins { document().style_computer() };
-    removal_style_record_pins.pin_style_records_before_removal(*this, was_connected);
-    if (was_connected) {
+    removal_style_record_pins.pin_style_records_before_removal(*this, was_tracked_by_style_engine);
+    if (was_tracked_by_style_engine) {
         report_removal_to_style_engine(*parent);
         // A suppressed-observer removal may be the first half of a compound mutation that immediately reinserts
         // this node. Keep the old parent on the conservative rebuild path so the later insertion can relocate it.
@@ -1660,7 +1637,7 @@ void Node::remove(bool suppress_observers)
     // 13. If node is custom and isParentConnected is true, then enqueue a custom element callback reaction with node,
     //     callback name "disconnectedCallback", and an empty argument list.
     // 14. For each shadow-including descendant descendant of node, in shadow-including tree order:
-    run_removing_steps(*parent, parent_root, was_connected);
+    run_removing_steps(*parent, parent_root, was_tracked_by_style_engine);
 
     removal_style_record_pins.release_dom_style_records();
 
@@ -2275,8 +2252,8 @@ void Node::set_document(Document& document)
     auto& old_document = *m_document;
     m_document = &document;
 
-    if (auto* animatable = as_if<Animations::Animatable>(*this))
-        animatable->on_document_changed(old_document, document);
+    if (auto* element = as_if<Element>(*this))
+        element->on_document_changed(old_document, document);
 }
 
 bool Node::recompute_editable_subtree_flag()
@@ -2828,6 +2805,7 @@ void Node::remove_all_children(bool suppress_observers)
 
     document().flush_deferred_style_change_event();
     bool const was_connected = is_connected();
+    bool const was_tracked_by_style_engine = is_tracked_by_style_engine();
 
     // 1. Let parent be node’s parent
     // NB: This node is the parent of every child removed here.
@@ -2844,7 +2822,7 @@ void Node::remove_all_children(bool suppress_observers)
 
     // Whether a removed box carries an ancestor's first letter is only a question when an ancestor has one.
     auto ancestors_may_have_first_letter = AncestorsMayHaveFirstLetter::No;
-    if (was_connected) {
+    if (was_tracked_by_style_engine) {
         for (auto const* ancestor = this; ancestor; ancestor = ancestor->parent_or_shadow_host_node()) {
             auto const* element = as_if<Element>(*ancestor);
             if (element && element->has_style(CSS::PseudoElement::FirstLetter)) {
@@ -2880,8 +2858,8 @@ void Node::remove_all_children(bool suppress_observers)
             list_owner_renumber_scheduled = child->schedule_list_item_renumber_for_removal();
 
         RemovalStyleRecordPins removal_style_record_pins { document().style_computer() };
-        removal_style_record_pins.pin_style_records_before_removal(*child, was_connected);
-        if (was_connected) {
+        removal_style_record_pins.pin_style_records_before_removal(*child, was_tracked_by_style_engine);
+        if (was_tracked_by_style_engine) {
             child->report_removal_to_style_engine(*this);
             child->update_layout_tree_for_removal(*this, LayoutSubtreeRemoval::RebuildParent, ancestors_may_have_first_letter);
         }
@@ -2902,7 +2880,7 @@ void Node::remove_all_children(bool suppress_observers)
         // 13. If node is custom and isParentConnected is true, then enqueue a custom element callback reaction with
         //     node, callback name "disconnectedCallback", and an empty argument list.
         // 14. For each shadow-including descendant descendant of node, in shadow-including tree order:
-        child->run_removing_steps(*this, parent_root, was_connected);
+        child->run_removing_steps(*this, parent_root, was_tracked_by_style_engine);
 
         removal_style_record_pins.release_dom_style_records();
 

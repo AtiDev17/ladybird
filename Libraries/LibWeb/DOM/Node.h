@@ -351,6 +351,7 @@ public:
 
     bool is_connected() const { return m_is_connected; }
     void set_is_connected(bool is_connected) { m_is_connected = is_connected; }
+    bool is_tracked_by_style_engine() const;
 
     // Mirrors the slottable's assigned slot; see SlottableMixin::set_assigned_slot().
     bool has_assigned_slot() const { return m_has_assigned_slot; }
@@ -645,7 +646,7 @@ private:
     void report_removal_to_style_engine(Node& parent);
     void update_layout_tree_for_removal(Node& parent, LayoutSubtreeRemoval, AncestorsMayHaveFirstLetter);
     void assign_slottables_after_removal(Node& parent, Node& parent_root);
-    void run_removing_steps(Node& parent, Node& parent_root, bool was_connected);
+    void run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine);
     void add_transient_registered_observers_for_removal(Node& parent);
     void queue_tree_mutation_record_for_removal(Node& parent, GC::Ptr<Node> old_previous_sibling, GC::Ptr<Node> old_next_sibling);
 
@@ -655,6 +656,8 @@ private:
     void live_range_pre_remove_all_children();
 
     void insert_before_impl(GC::Ref<Node>, GC::Ptr<Node> child);
+    void adjust_live_ranges_for_insertion(Node& child, size_t count);
+    void insert_node_into_children(GC::Ref<Node>, GC::Ptr<Node> child);
     void insert_nodes_before(ReadonlySpan<GC::Root<Node>>, GC::Ptr<Node> child, bool suppress_observers, GC::Ref<Node> metadata_node, ChildrenChangedMetadata::AffectsElements);
     void append_child_impl(GC::Ref<Node>);
     void remove_child_impl(GC::Ref<Node>);
