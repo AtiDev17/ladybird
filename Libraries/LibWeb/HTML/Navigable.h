@@ -78,6 +78,8 @@ public:
     virtual Optional<URL::Origin> active_document_top_level_origin() const = 0;
     virtual bool active_document_has_cross_site_ancestor() const = 0;
     virtual OpenerPolicy const& active_document_opener_policy() const = 0;
+    virtual bool active_browsing_context_is_auxiliary() const = 0;
+    virtual GC::Ptr<WindowProxy> active_browsing_context_opener_window_proxy() const = 0;
 
     virtual ReplicatedContainerState container_state() const = 0;
     bool container_is_in_document_tree() const { return container_state().is_in_document_tree; }
@@ -88,6 +90,10 @@ public:
 
     virtual bool has_session_history_entry_and_ready_for_navigation() const = 0;
     virtual bool delays_the_load_event_of_its_container() const = 0;
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#currently-focused-area-of-a-top-level-traversable
+    virtual GC::Ptr<DOM::Node> currently_focused_area() = 0;
+    GC::Ptr<DOM::Node> currently_focused_area_shown_by_focused_navigable();
 
     WebIDL::ExceptionOr<void> navigate(NavigateParams);
 

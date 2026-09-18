@@ -29,6 +29,7 @@
 #include <LibWebView/Export.h>
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/SessionHistoryTraversalQueue.h>
+#include <LibWebView/WebContentPage.h>
 
 namespace WebView {
 
@@ -46,7 +47,7 @@ public:
 
     virtual bool is_top_level_traversable() const override { return true; }
     virtual void clear_ongoing_navigation() override;
-    CanonicalBrowsingContext& browsing_context_for_document_creation(WebContentClient const&, Web::PageId page_id) const;
+    CanonicalBrowsingContext& browsing_context_for_document_creation(WebContentPage const&) const;
 
     // Apply-the-history-step coordination. Operations serialize on the traversable's session history traversal
     // queue; the algorithm runs here and dispatches its per-navigable jobs to the processes hosting the documents.
@@ -64,57 +65,57 @@ public:
         Stage stage { Stage::ApplyingInWebContent };
     };
 
-    void enqueue_history_operation(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters, WebContentClient& requesting_client, Web::PageId requesting_page_id, u64 sequence_number, OnHistoryOperationComplete = nullptr);
+    void enqueue_history_operation(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters, WebContentPage requesting_page, u64 sequence_number, OnHistoryOperationComplete = nullptr);
     // Appends plain algorithm steps; a requested traversal defers its target resolution to its queued position, the
     // way the specification's queued steps do, and then starts its operation at that position.
     void append_history_queue_steps(SessionHistoryTraversalSteps);
-    void run_history_operation_at_queue_position(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters, WebContentClient* requesting_client, Web::PageId requesting_page_id, u64 sequence_number, OnHistoryOperationComplete, NonnullRefPtr<Core::Promise<Empty>>);
+    void run_history_operation_at_queue_position(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters, WebContentPage requesting_page, u64 sequence_number, OnHistoryOperationComplete, NonnullRefPtr<Core::Promise<Empty>>);
     u64 next_sequence_number() { return m_next_sequence_number++; }
     void abandon_history_operations();
 
-    struct HistoryJobEndpoint {
-        RefPtr<WebContentClient> client;
-        Web::PageId page_id { 0 };
-    };
-    HistoryJobEndpoint history_job_endpoint_for(CanonicalNavigable const&) const;
-    bool history_job_endpoint_is_available(HistoryJobEndpoint const&) const;
+    WebContentPage page_hosting(CanonicalNavigable const&) const;
 
-    void did_receive_history_operation_ready(WebContentClient&, Web::PageId source_page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationReadyResult);
-    void did_receive_history_step_unload_cancelation_result(WebContentClient&, Web::PageId source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult, Web::HTML::UnloadPromptShown);
-    void did_receive_beforeunload_check_result(WebContentClient&, Web::PageId source_page_id, Web::HTML::CrossProcessId check_id, Web::HTML::HistoryStepResult, Web::HTML::UnloadPromptShown);
+    void did_receive_history_operation_ready(WebContentPage const& source_page, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationReadyResult);
+    void did_receive_history_step_unload_cancelation_result(WebContentPage const& source_page, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult, Web::HTML::UnloadPromptShown);
+    void did_receive_beforeunload_check_result(WebContentPage const& source_page, Web::HTML::CrossProcessId check_id, Web::HTML::HistoryStepResult, Web::HTML::UnloadPromptShown);
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#checking-if-unloading-is-canceled
-    void check_if_unloading_is_canceled(Vector<Web::HTML::CrossProcessId> navigable_ids, Optional<HistoryJobEndpoint> skipped_endpoint, Web::HTML::UnloadPromptShown, Function<void(Web::HTML::HistoryStepResult, Web::HTML::UnloadPromptShown)> on_complete);
-    void did_receive_changing_navigable_history_job_ready(WebContentClient&, Web::PageId source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition, Web::HTML::UnloadDisplayedDocument);
-    void did_finish_history_navigation_params_creation(WebContentClient&, Web::PageId source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation);
-    void did_receive_changing_navigable_unload_preparation_complete(WebContentClient&, Web::PageId source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id);
-    void did_receive_descendant_unload_task_complete(WebContentClient&, Web::PageId source_page_id, Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id);
-    void did_receive_child_navigable_unload_request(WebContentClient&, Web::PageId source_page_id, Web::HTML::CrossProcessId navigable_id);
-    void did_receive_changing_navigable_continuation_applied(WebContentClient&, Web::PageId source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::ReplicatedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state);
-    void did_receive_nonchanging_navigable_history_state_updated(WebContentClient&, Web::PageId source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id);
+    void check_if_unloading_is_canceled(Vector<Web::HTML::CrossProcessId> navigable_ids, Optional<WebContentPage> skipped_endpoint, Web::HTML::UnloadPromptShown, Function<void(Web::HTML::HistoryStepResult, Web::HTML::UnloadPromptShown)> on_complete);
+    void did_receive_changing_navigable_history_job_ready(WebContentPage const& source_page, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition, Web::HTML::UnloadDisplayedDocument);
+    void did_finish_history_navigation_params_creation(WebContentPage const& source_page, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation);
+    void did_receive_changing_navigable_unload_preparation_complete(WebContentPage const& source_page, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id);
+    void did_receive_descendant_unload_task_complete(WebContentPage const& source_page, Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id);
+    void did_receive_child_navigable_unload_request(WebContentPage const& source_page, Web::HTML::CrossProcessId navigable_id);
+    void did_receive_changing_navigable_continuation_applied(WebContentPage const& source_page, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::ReplicatedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state);
+    void did_receive_nonchanging_navigable_history_state_updated(WebContentPage const& source_page, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id);
 
-    CanonicalNavigable& insert(WebContentClient& reporting_client, Web::PageId page_id, Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::ReplicatedNavigableState, NonnullRefPtr<CanonicalBrowsingContext>, CanonicalNavigable& fallback_parent);
+    CanonicalNavigable& insert(WebContentPage reporting_page, Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::ReplicatedNavigableState, NonnullRefPtr<CanonicalBrowsingContext>, CanonicalNavigable& fallback_parent);
     Optional<CanonicalNavigable&> find(Web::HTML::CrossProcessId navigable_id);
     Optional<CanonicalNavigable const&> find(Web::HTML::CrossProcessId navigable_id) const;
     void remove(CanonicalNavigable&);
 
     Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigable_graph() const;
 
-    void for_each_hosting_page(Function<void(WebContentClient&, Web::PageId page_id)> const&) const;
-    void for_each_page_representing(CanonicalNavigable const&, Function<void(WebContentClient&, Web::PageId page_id)> const&) const;
-    bool hosts(CanonicalNavigable const&, WebContentClient const&, Web::PageId page_id) const;
-    bool represents(CanonicalNavigable const&, WebContentClient const&, Web::PageId page_id) const;
-    bool page_hosts_any(WebContentClient const&, Web::PageId page_id) const;
-    void stop_hosting_in_page(CanonicalNavigable&, WebContentClient&, Web::PageId page_id);
-    void release_page_if_unused(WebContentClient&, Web::PageId page_id);
+    void for_each_hosting_page(Function<void(WebContentPage const&)> const&) const;
+    void for_each_opener_traversable(Function<void(CanonicalTraversable&)> const&) const;
+    void represent_openers_in(WebContentClient&);
+    bool is_opener_page(WebContentPage const& page) const { return m_opener_pages.contains_slow(page); }
+    void forget_opener_page(WebContentPage const&);
+    void discard_opener_pages();
+    void for_each_page_representing(CanonicalNavigable const&, Function<void(WebContentPage const&)> const&) const;
+    bool hosts(CanonicalNavigable const&, WebContentPage const&) const;
+    bool represents(CanonicalNavigable const&, WebContentPage const&) const;
+    bool page_hosts_any(WebContentPage const&) const;
+    void stop_hosting_in_page(CanonicalNavigable&, WebContentPage);
+    void release_page_if_unused(WebContentPage);
 
-    void set_displaced_document_host(WebContentClient&, Web::PageId page_id);
-    Optional<HistoryJobEndpoint> const& displaced_document_host() const { return m_displaced_document_host; }
-    bool is_displaced_document_host(WebContentClient const&, Web::PageId page_id) const;
+    void set_displaced_document_host(WebContentPage);
+    Optional<WebContentPage> const& displaced_document_host() const { return m_displaced_document_host; }
+    bool is_displaced_document_host(WebContentPage const& page) const { return m_displaced_document_host == page; }
     void release_displaced_document_host();
     void discard_displaced_document_host();
     void forget_displaced_document_host(Badge<SiteIsolationManager>);
-    void did_lose_history_job_endpoint(WebContentClient&, Web::PageId page_id);
+    void did_lose_page(WebContentPage const&);
 
     TraversableSessionHistory const& session_history() const { return m_session_history; }
     Optional<size_t> effective_current_session_history_step_index() const;
@@ -127,6 +128,14 @@ public:
 
     Web::HTML::VisibilityState system_visibility_state() const { return m_system_visibility_state; }
     void set_system_visibility_state(Web::HTML::VisibilityState);
+
+    bool has_system_focus() const { return m_has_system_focus; }
+    void set_has_system_focus(bool, Optional<WebContentPage> requesting_page);
+
+    Optional<Web::HTML::CrossProcessId> const& focused_navigable_id() const { return m_focused_navigable_id; }
+    void set_focused_navigable(CanonicalNavigable&, WebContentPage const& requesting_page);
+    WebContentPage focused_navigable_host() const;
+    Web::DevicePixelPoint focused_navigable_host_offset() const;
 
     Optional<BrowserHistoryTraversalDiagnostic> browser_history_traversal_for_testing() const;
     Web::HTML::SessionHistoryEntryDescriptor const* ongoing_browser_history_traversal_target_entry() const;
@@ -145,7 +154,7 @@ public:
     void reconstruct_the_history_to_step(i32 step);
     ErrorOr<URL::URL> restore_session_history_from_ui_snapshot(SessionHistorySnapshot);
     void abandon_after_web_content_process_crash();
-    void recover_from_web_content_process_crash(Optional<HistoryJobEndpoint> crashed_endpoint, OnHistoryOperationComplete);
+    void recover_from_web_content_process_crash(Optional<WebContentPage> crashed_endpoint, OnHistoryOperationComplete);
     void reset_session_history_for_testing(Web::HTML::SessionHistoryEntryDescriptor);
     bool initialize_session_history_for_testing(Vector<TraversableSessionHistory::Entry>, Vector<i32> used_steps, size_t current_used_step_index);
 
@@ -155,10 +164,10 @@ private:
     struct HistoryOperation;
     void session_history_changed();
     HistoryOperation* find_history_operation(Web::HTML::CrossProcessId operation_id);
-    bool navigation_transaction_matches(HistoryOperation const&, WebContentClient const&, Web::PageId page_id, Optional<Web::HTML::CrossProcessId> reply_navigable_id = {}) const;
+    bool navigation_transaction_matches(HistoryOperation const&, WebContentPage const&, Optional<Web::HTML::CrossProcessId> reply_navigable_id = {}) const;
     bool update_session_history_entry_persisted_state(CanonicalNavigable&, Web::HTML::SessionHistoryEntryPersistedState const&);
     bool discard_pending_same_document_session_history_entries_for_operation(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters const&);
-    void add_history_operation_completion_endpoint(HistoryOperation&, HistoryJobEndpoint);
+    void add_history_operation_completion_endpoint(HistoryOperation&, WebContentPage);
     bool select_changing_navigable_history_step_job_endpoint(HistoryOperation&, ApplyHistoryStepJobs::ChangingNavigableHistoryStepJob&);
     void dispatch_changing_navigable_history_step_job(HistoryOperation&, Web::HTML::CrossProcessId navigable_id);
     void continue_history_navigation_population(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id);
@@ -166,19 +175,19 @@ private:
     void send_changing_navigable_continuation_task(HistoryOperation&, Web::HTML::CrossProcessId navigable_id, Web::HTML::UnloadDisplayedDocument);
     void deactivate_a_document_for_cross_document_navigation(HistoryOperation&, Web::HTML::CrossProcessId navigable_id);
     void unload_displayed_document_for_cross_document_navigation(HistoryOperation&, Web::HTML::CrossProcessId navigable_id);
-    void did_activate_history_entry(HistoryOperation&, Web::HTML::CrossProcessId navigable_id, WebContentClient& source_client, Web::PageId source_page_id, Web::HTML::SessionHistoryEntryDescriptor const& target_entry, CanonicalNavigable::DidPopulateDocument, RefPtr<CanonicalBrowsingContext> destination_browsing_context, Web::HTML::ReplicatedNavigableState activated_navigable_state);
+    void did_activate_history_entry(HistoryOperation&, Web::HTML::CrossProcessId navigable_id, WebContentPage source_page, Web::HTML::SessionHistoryEntryDescriptor const& target_entry, CanonicalNavigable::DidPopulateDocument, RefPtr<CanonicalBrowsingContext> destination_browsing_context, Web::HTML::ReplicatedNavigableState activated_navigable_state);
     enum class UnloadedInItsHost : bool {
         No,
         Yes,
     };
-    void unload_a_document_and_its_descendants(Optional<Web::HTML::CrossProcessId> operation_id, Web::HTML::CrossProcessId navigable_id, HistoryJobEndpoint continuing_endpoint, Web::HTML::ChildNavigableDestruction, Function<void(UnloadedInItsHost)> queue_document_unload_task);
-    void unload_document_in_its_host(Optional<Web::HTML::CrossProcessId> operation_id, HistoryJobEndpoint, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChildNavigableDestruction, Function<void()> after_unload);
-    void discard_pending_host_at(Web::HTML::CrossProcessId navigable_id, HistoryJobEndpoint const&);
+    void unload_a_document_and_its_descendants(Optional<Web::HTML::CrossProcessId> operation_id, Web::HTML::CrossProcessId navigable_id, WebContentPage continuing_endpoint, Web::HTML::ChildNavigableDestruction, Function<void(UnloadedInItsHost)> queue_document_unload_task);
+    void unload_document_in_its_host(Optional<Web::HTML::CrossProcessId> operation_id, WebContentPage, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChildNavigableDestruction, Function<void()> after_unload);
+    void discard_pending_host_at(Web::HTML::CrossProcessId navigable_id, WebContentPage const&);
     void dispatch_next_beforeunload_group(HistoryOperation&);
     void complete_unload_cancelation(HistoryOperation&, Web::HTML::HistoryStepResult);
     void dispatch_descendant_unload_task(Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id);
     void complete_descendant_unload_task(Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id);
-    void dispatch_crash_recovery_changing_job(HistoryOperation&, HistoryJobEndpoint, Web::HTML::HistoryObjectLengthAndIndex, Function<void()> on_complete);
+    void dispatch_crash_recovery_changing_job(HistoryOperation&, WebContentPage, Web::HTML::HistoryObjectLengthAndIndex, Function<void()> on_complete);
     void complete_history_jobs_after_crash(HistoryOperation&, Vector<Web::HTML::CrossProcessId> changing_jobs, Vector<Web::HTML::CrossProcessId> nonchanging_updates);
     void finish_deferred_history_operation_after_crash_recovery(Web::HTML::CrossProcessId operation_id);
     ApplyHistoryStepJobs create_apply_history_step_jobs(Web::HTML::CrossProcessId operation_id);
@@ -252,7 +261,7 @@ private:
         struct Node {
             Optional<Web::HTML::CrossProcessId> parent_id;
             size_t remaining_children { 0 };
-            HistoryJobEndpoint endpoint;
+            WebContentPage endpoint;
             Web::HTML::ChildNavigableDestruction child_navigable_destruction { Web::HTML::ChildNavigableDestruction::No };
             Web::HTML::StopHostingAfterUnload stop_hosting_after_unload { Web::HTML::StopHostingAfterUnload::No };
         };
@@ -264,15 +273,18 @@ private:
     };
     HashMap<Web::HTML::CrossProcessId, PendingUnload> m_pending_unloads;
 
-    Optional<HistoryJobEndpoint> m_displaced_document_host;
+    Optional<WebContentPage> m_displaced_document_host;
+
+    // Pages that hold this tab, and host none of it, in a process holding part of a tab this tab opened.
+    Vector<WebContentPage> m_opener_pages;
 
     struct BeforeunloadGroup {
-        HistoryJobEndpoint endpoint;
+        WebContentPage endpoint;
         Vector<Web::HTML::CrossProcessId> navigable_ids;
     };
     struct PendingBeforeunloadCheck {
         Vector<BeforeunloadGroup> groups;
-        Optional<HistoryJobEndpoint> dispatched_endpoint;
+        Optional<WebContentPage> dispatched_endpoint;
         Web::HTML::UnloadPromptShown unload_prompt_shown { Web::HTML::UnloadPromptShown::No };
         Function<void(Web::HTML::HistoryStepResult, Web::HTML::UnloadPromptShown)> on_complete;
     };
@@ -283,6 +295,11 @@ private:
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#system-visibility-state
     Web::HTML::VisibilityState m_system_visibility_state { Web::HTML::VisibilityState::Hidden };
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#system-focus
+    bool m_has_system_focus { true };
+
+    Optional<Web::HTML::CrossProcessId> m_focused_navigable_id;
 };
 
 }

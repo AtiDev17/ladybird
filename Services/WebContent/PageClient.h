@@ -66,7 +66,7 @@ public:
 
     virtual Queue<Web::QueuedInputEvent>& input_event_queue() override;
     virtual void did_handle_input_event(Web::PageId page_id, Web::InputEvent const&) override;
-    virtual void report_finished_handling_input_event(Web::PageId page_id, Web::EventResult event_was_handled) override;
+    virtual void report_finished_handling_input_event(Web::PageId page_id, u64 event_id, Web::EventResult event_was_handled) override;
     virtual Web::Compositor::CompositorContextId allocate_compositor_context_id(Web::Compositor::PagePresentationRegistration) override;
     virtual Web::HTML::CrossProcessId allocate_cross_process_id() override;
     virtual Web::HTML::CrossProcessId allocate_navigable_id() override;
@@ -184,6 +184,9 @@ private:
     virtual void request_navigation_of_remote_navigable(Web::HTML::RemoteNavigable&, Web::HTML::PreparedNavigationDescriptor) override;
     virtual void request_post_message_to_remote_navigable(Web::HTML::RemoteNavigable&, Web::HTML::PostedMessageDescriptor) override;
     virtual void request_close_of_remote_traversable(Web::HTML::RemoteNavigable&, Web::HTML::LocalNavigable const& source) override;
+    virtual void request_focusing_steps_for_remote_navigable(Web::HTML::RemoteNavigable&, Web::HTML::FocusTrigger) override;
+    virtual void request_window_focus_of_remote_navigable(Web::HTML::RemoteNavigable&) override;
+    virtual void request_set_opener_of_remote_navigable(Web::HTML::RemoteNavigable&, Web::HTML::Navigable const& opener) override;
     virtual void navigation_params_creation_finished(Web::HTML::LocalNavigable&, Web::HTML::NavigationPopulationRequest, Web::HTML::NavigationPopulationResult) override;
     virtual void history_navigation_params_creation_finished(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation) override;
     virtual void navigation_population_failed(Web::HTML::CrossProcessId, Utf16String const&) override;
@@ -286,6 +289,9 @@ private:
     virtual void page_did_update_session_history_entry_scroll_restoration_mode(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity const& entry_identity, Web::HTML::ScrollRestorationMode scroll_restoration_mode) override;
     virtual void page_did_update_session_history_entry_document_state_navigable_target_name(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity const& entry_identity, Utf16String const& navigable_target_name) override;
     virtual void page_did_set_session_history_entry_document_state_reload_pending(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_api_key, bool reload_pending) override;
+    virtual void page_did_request_set_system_focus(bool) override;
+    virtual void page_did_change_focused_navigable(Web::HTML::CrossProcessId) override;
+    virtual void page_did_request_key_event_for_testing(Web::KeyEvent) override;
     virtual void page_did_request_set_system_visibility_state(Web::HTML::VisibilityState) override;
     virtual void page_did_request_history_operation(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters) override;
     virtual void page_did_request_child_navigable_unload(Web::HTML::CrossProcessId navigable_id) override;

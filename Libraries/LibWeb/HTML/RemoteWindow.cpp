@@ -116,15 +116,13 @@ GC::Ptr<WindowProxy const> RemoteWindow::opener() const
 {
     // 1. Let current be this's browsing context.
     // 2. If current is null, then return null.
-    // 3. If current's opener browsing context is null, then return null.
-    // NB: The browsing context lives in the process hosting the Window. Only a top-level one has an opener.
     auto navigable = this->navigable();
-    if (!navigable || !navigable->is_top_level_traversable())
+    if (!navigable)
         return {};
 
+    // 3. If current's opener browsing context is null, then return null.
     // 4. Return current's opener browsing context's WindowProxy object.
-    // FIXME: The opener of a traversable hosted by another process is canonical in the UI process.
-    TODO();
+    return navigable->active_browsing_context_opener_window_proxy();
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-parent
@@ -188,8 +186,12 @@ void RemoteWindow::focus()
     if (!current)
         return;
 
-    // FIXME: Focusing a navigable hosted by another process is a request to the UI process.
-    TODO();
+    // 3. If the allow focus steps given current's active document return false, then return.
+    // 4. Run the focusing steps with current.
+    // 5. If current is a top-level traversable, user agents are encouraged to trigger some sort of notification to
+    //    indicate to the user that the page is attempting to gain focus.
+    // NB: current's active document is in the process hosting it, which runs these steps.
+    m_navigable->page().client().request_window_focus_of_remote_navigable(*current);
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#dom-window-blur

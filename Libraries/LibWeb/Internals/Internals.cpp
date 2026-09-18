@@ -533,6 +533,20 @@ void Internals::send_text(HTML::HTMLElement& target, Utf16String const& text, We
     }
 }
 
+void Internals::send_text_through_ui_process(Utf16String const& text)
+{
+    for (auto code_point : text) {
+        for (auto type : { KeyEvent::Type::KeyDown, KeyEvent::Type::KeyUp }) {
+            KeyEvent event;
+            event.type = type;
+            event.key = UIEvents::code_point_to_key_code(code_point);
+            event.code_point = code_point;
+            event.should_insert_text = type == KeyEvent::Type::KeyDown;
+            page().client().page_did_request_key_event_for_testing(move(event));
+        }
+    }
+}
+
 void Internals::send_key(HTML::HTMLElement& target, Utf16String const& key_name, WebIDL::UnsignedShort modifiers, WebIDL::UnsignedLong repeat_count)
 {
     if (repeat_count == 0)
@@ -551,12 +565,14 @@ void Internals::paste(HTML::HTMLElement& target, Utf16String const& text)
     auto& page = this->page();
     target.focus();
 
-    page.focused_navigable().paste(text);
+    if (auto navigable = page.hosted_focused_navigable())
+        navigable->paste(text);
 }
 
 void Internals::paste_from_clipboard()
 {
-    page().focused_navigable().paste_from_clipboard();
+    if (auto navigable = page().hosted_focused_navigable())
+        navigable->paste_from_clipboard();
 }
 
 void Internals::commit_text()
@@ -667,7 +683,9 @@ Utf16String Internals::current_cursor()
 
 Utf16String Internals::selected_text_for_clipboard()
 {
-    return page().focused_navigable().selected_text();
+    if (auto navigable = page().hosted_focused_navigable())
+        return navigable->selected_text();
+    return {};
 }
 
 WebIDL::ExceptionOr<void> Internals::set_clipboard_file(Utf16String const& name, Utf16String const& mime_type, Utf16String const& data)
@@ -684,17 +702,20 @@ WebIDL::ExceptionOr<void> Internals::set_clipboard_file(Utf16String const& name,
 
 void Internals::set_marked_text_from_input_method(Utf16String const& text)
 {
-    page().focused_navigable().set_marked_text_from_input_method(text);
+    if (auto navigable = page().hosted_focused_navigable())
+        navigable->set_marked_text_from_input_method(text);
 }
 
 void Internals::commit_text_from_input_method(Utf16String const& text, WebIDL::Long replacement_start, WebIDL::Long replacement_length)
 {
-    page().focused_navigable().commit_text_from_input_method(text, replacement_start, replacement_length);
+    if (auto navigable = page().hosted_focused_navigable())
+        navigable->commit_text_from_input_method(text, replacement_start, replacement_length);
 }
 
 void Internals::unmark_text_from_input_method()
 {
-    page().focused_navigable().unmark_text_from_input_method();
+    if (auto navigable = page().hosted_focused_navigable())
+        navigable->unmark_text_from_input_method();
 }
 
 GC::Ptr<Geometry::DOMRect> Internals::current_caret_rect()
@@ -1842,6 +1863,7 @@ void Internals::set_preferred_color_scheme(Utf16String const& color_scheme)
 void Internals::set_page_focus(bool has_focus)
 {
     page().client().set_has_focus(has_focus);
+    page().client().page_did_request_set_system_focus(has_focus);
 }
 
 void Internals::set_system_visibility_state(Utf16String const& state)

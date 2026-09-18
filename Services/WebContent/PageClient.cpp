@@ -267,6 +267,21 @@ void PageClient::request_close_of_remote_traversable(Web::HTML::RemoteNavigable&
     client().async_did_request_close_of_traversable(m_id, navigable.id(), source.id());
 }
 
+void PageClient::request_focusing_steps_for_remote_navigable(Web::HTML::RemoteNavigable& navigable, Web::HTML::FocusTrigger focus_trigger)
+{
+    client().async_did_request_focusing_steps_for_navigable(m_id, navigable.id(), focus_trigger);
+}
+
+void PageClient::request_window_focus_of_remote_navigable(Web::HTML::RemoteNavigable& navigable)
+{
+    client().async_did_request_window_focus_of_navigable(m_id, navigable.id());
+}
+
+void PageClient::request_set_opener_of_remote_navigable(Web::HTML::RemoteNavigable& navigable, Web::HTML::Navigable const& opener)
+{
+    client().async_did_request_set_opener_of_navigable(m_id, navigable.id(), opener.id());
+}
+
 void PageClient::navigate_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::PreparedNavigationDescriptor navigation)
 {
     // A navigable the page represents without hosting its document is addressed by the page hosting it.
@@ -478,9 +493,9 @@ void PageClient::did_handle_input_event(Web::PageId page_id, Web::InputEvent con
         client().update_input_method_state(page_id);
 }
 
-void PageClient::report_finished_handling_input_event(Web::PageId page_id, Web::EventResult event_was_handled)
+void PageClient::report_finished_handling_input_event(Web::PageId page_id, u64 event_id, Web::EventResult event_was_handled)
 {
-    client().async_did_finish_handling_input_event(page_id, event_was_handled);
+    client().async_did_finish_handling_input_event(page_id, event_id, event_was_handled);
 }
 
 Web::Compositor::CompositorContextId PageClient::allocate_compositor_context_id(Web::Compositor::PagePresentationRegistration page_presentation_registration)
@@ -1490,6 +1505,21 @@ void PageClient::page_did_update_session_history_entry_document_state_navigable_
 void PageClient::page_did_set_session_history_entry_document_state_reload_pending(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_api_key, bool reload_pending)
 {
     client().async_did_set_session_history_entry_document_state_reload_pending(m_id, navigable_id, navigation_api_key, reload_pending);
+}
+
+void PageClient::page_did_request_set_system_focus(bool has_system_focus)
+{
+    client().async_did_request_set_system_focus(m_id, has_system_focus);
+}
+
+void PageClient::page_did_change_focused_navigable(Web::HTML::CrossProcessId navigable_id)
+{
+    client().async_did_change_focused_navigable(m_id, navigable_id);
+}
+
+void PageClient::page_did_request_key_event_for_testing(Web::KeyEvent event)
+{
+    client().async_did_request_key_event_for_testing(m_id, move(event));
 }
 
 void PageClient::page_did_request_set_system_visibility_state(Web::HTML::VisibilityState visibility_state)

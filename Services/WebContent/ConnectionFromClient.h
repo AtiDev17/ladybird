@@ -91,6 +91,7 @@ private:
     virtual Messages::WebContentServer::InitTransportResponse init_transport(int peer_pid) override;
     virtual void set_font_catalog(IPC::File, u64 size, u64 generation) override;
     virtual void initialize(Web::PageId initial_page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator cross_process_id_allocator, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state) override;
+    virtual void create_representing_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables) override;
     virtual void create_embedded_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state) override;
     virtual void continue_history_navigation_population(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Optional<Web::Bindings::NavigationType>, Web::HTML::HistoryNavigationPopulation) override;
     virtual void insert_remote_navigable(Web::PageId page_id, Web::HTML::RemoteNavigableDescriptor) override;
@@ -126,6 +127,9 @@ private:
     virtual void navigate_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::PreparedNavigationDescriptor) override;
     virtual void deliver_posted_message(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor) override;
     virtual void close_traversable_from_script(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id) override;
+    virtual void run_focusing_steps_for_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::FocusTrigger) override;
+    virtual void focus_window_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
+    virtual void set_opener_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId opener_navigable_id) override;
     virtual void begin_hosting_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor, Web::HTML::VisibilityState) override;
     virtual void discard_provisional_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void stop_hosting_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedNavigableState) override;
@@ -224,6 +228,7 @@ private:
     virtual void set_geolocation_emulated_position(Web::PageId page_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void geolocation_position_response(Web::PageId page_id, u64 request_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void set_has_focus(Web::PageId page_id, bool) override;
+    virtual void set_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption) override;
     virtual void set_is_scripting_enabled(Web::PageId page_id, bool) override;
     virtual void set_zoom_level(Web::PageId page_id, double zoom_level) override;

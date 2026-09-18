@@ -344,17 +344,20 @@ void EventLoop::process_input_events() const
                 continue;
             }
 
-            // The local root given by the event's navigable ID, or the page's traversable if it has none.
+            // A key event goes to the tab's focused navigable. Other events go to the local root given by the event's
+            // navigable ID, or the page's traversable if it has none.
             GC::Ptr<LocalNavigable> root;
-            if (event.navigable_id.has_value())
+            if (event.event.has<KeyEvent>())
+                root = page.hosted_focused_navigable();
+            else if (event.navigable_id.has_value())
                 root = as_if<LocalNavigable>(page.navigable_with_id(*event.navigable_id).ptr());
             else if (page.has_local_traversable())
                 root = page.local_traversable();
 
             if (!root) {
-                for (size_t i = 0; i < event.coalesced_event_count; ++i)
-                    page_client.report_finished_handling_input_event(event.page_id, EventResult::Dropped);
-                page_client.report_finished_handling_input_event(event.page_id, EventResult::Dropped);
+                for (auto coalesced_event_id : event.coalesced_event_ids)
+                    page_client.report_finished_handling_input_event(event.page_id, coalesced_event_id, EventResult::Dropped);
+                page_client.report_finished_handling_input_event(event.page_id, input_event_id(event.event), EventResult::Dropped);
                 continue;
             }
 
@@ -394,10 +397,10 @@ void EventLoop::process_input_events() const
                     return page.handle_pinch_event(*root, pinch_event.position, pinch_event.modifiers, pinch_event.scale_delta);
                 });
 
-            for (size_t i = 0; i < event.coalesced_event_count; ++i)
-                page_client.report_finished_handling_input_event(event.page_id, EventResult::Dropped);
+            for (auto coalesced_event_id : event.coalesced_event_ids)
+                page_client.report_finished_handling_input_event(event.page_id, coalesced_event_id, EventResult::Dropped);
             page_client.did_handle_input_event(event.page_id, event.event);
-            page_client.report_finished_handling_input_event(event.page_id, result);
+            page_client.report_finished_handling_input_event(event.page_id, input_event_id(event.event), result);
         }
 
         // Re-enqueue events for other pages

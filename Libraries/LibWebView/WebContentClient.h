@@ -115,6 +115,8 @@ public:
     void keep_view_page_for_displaced_document(Web::PageId page_id, CanonicalTraversable&);
     Optional<Web::PageId> page_id_for_traversable(CanonicalTraversable const&) const;
     bool is_view_page(Web::PageId page_id) const { return m_views.contains(page_id); }
+    bool holds_part_of_a_tab_opened_by(CanonicalTraversable const&);
+    void release_unneeded_opener_pages();
     bool page_needs_beforeunload_check(Web::PageId page_id) const { return m_needs_beforeunload_check_by_page.get(page_id).value_or(true); }
 
     CanonicalTraversable* traversable_for_page(Web::PageId page_id);
@@ -197,6 +199,9 @@ private:
     virtual void did_request_navigation_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::PreparedNavigationDescriptor) override;
     virtual void did_post_message_to_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor) override;
     virtual void did_request_close_of_traversable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id) override;
+    virtual void did_request_focusing_steps_for_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::FocusTrigger) override;
+    virtual void did_request_window_focus_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
+    virtual void did_request_set_opener_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId opener_navigable_id) override;
     virtual void did_finish_navigation_params_creation(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, Optional<Web::HTML::NavigationPopulationResult>) override;
     virtual void did_finish_history_navigation_params_creation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation) override;
     virtual void did_fail_navigation_population(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id) override;
@@ -318,7 +323,7 @@ private:
     virtual void did_stop_geolocation_position_watch(Web::PageId page_id, u64 request_id) override;
     virtual void did_request_file_picker(Web::PageId page_id, Web::HTML::FileFilter accepted_file_types, Web::HTML::AllowMultipleFiles) override;
     virtual void did_request_select_dropdown(Web::PageId page_id, Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) override;
-    virtual void did_finish_handling_input_event(Web::PageId page_id, Web::EventResult event_result) override;
+    virtual void did_finish_handling_input_event(Web::PageId page_id, u64 event_id, Web::EventResult event_result) override;
     virtual void did_update_input_method_state(Web::PageId page_id, Optional<Web::DevicePixelRect> caret_rect, bool is_enabled, i32 cursor_position, i32 anchor_position, Utf16String text_before_cursor, Utf16String text_after_cursor) override;
     virtual void did_set_browser_zoom(Web::PageId page_id, double factor) override;
     virtual void did_find_in_page(Web::PageId page_id, size_t current_match_index, Optional<size_t> total_match_count) override;
@@ -334,6 +339,9 @@ private:
     virtual void did_update_session_history_entry_scroll_restoration_mode(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Web::HTML::ScrollRestorationMode scroll_restoration_mode) override;
     virtual void did_update_session_history_entry_document_state_navigable_target_name(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Utf16String navigable_target_name) override;
     virtual void did_set_session_history_entry_document_state_reload_pending(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, bool reload_pending) override;
+    virtual void did_request_set_system_focus(Web::PageId page_id, bool has_system_focus) override;
+    virtual void did_change_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
+    virtual void did_request_key_event_for_testing(Web::PageId page_id, Web::KeyEvent) override;
     virtual void did_request_set_system_visibility_state(Web::PageId page_id, Web::HTML::VisibilityState) override;
     virtual void request_history_operation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters) override;
     virtual void history_operation_ready(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationReadyResult) override;
