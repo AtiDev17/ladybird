@@ -1019,8 +1019,7 @@ ContextState::ContextUpdateResult ContextState::async_scroll_by(Gfx::FloatPoint 
 Web::Compositor::PendingAsyncScrollUpdates ContextState::take_pending_async_scroll_updates()
 {
     Web::Compositor::PendingAsyncScrollUpdates updates;
-    if (auto viewport_scroll_node_id = m_async_scroll_tree.viewport_scroll_node_id(); viewport_scroll_node_id.has_value())
-        updates.document_id = viewport_scroll_node_id->document_id;
+    updates.document_id = m_async_scroll_tree.document_id();
     updates.sequence = ++m_next_async_scroll_update_sequence;
     AK::swap(updates.scroll_offsets, m_pending_async_scroll_offsets);
     for (auto const& scroll_offset : updates.scroll_offsets) {
@@ -1170,7 +1169,7 @@ Optional<BackingStoreManager::Publication> ContextState::resize_backing_stores_i
     return m_backing_store_manager.allocate_backing_stores(*allocation, skia_backend_context, presents_to_client(), gpu_sharing);
 }
 
-bool ContextState::update_composited_raster_transform(Gfx::IntRect destination_rect, Gfx::FloatMatrix4x4 const& transform)
+bool ContextState::update_composited_raster_transform(Gfx::FloatRect destination_rect, Gfx::FloatMatrix4x4 const& transform)
 {
     if (presents_to_client() || m_gpu_present_bitmap_id_awaiting_completion.has_value() || m_viewport_size.is_empty() || destination_rect.is_empty())
         return false;
