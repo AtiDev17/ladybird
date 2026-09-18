@@ -21,6 +21,12 @@
 
 #ifdef AK_USE_SYSTEM_ALLOCATOR_INSTRUMENTED
 
+#    ifdef AK_OS_MACOS
+#        include <malloc/malloc.h>
+#    else
+#        include <malloc.h>
+#    endif
+
 void* ak_kcalloc(size_t count, size_t size)
 {
     return calloc(count, size);
@@ -46,9 +52,13 @@ void* ak_krealloc(HeapPartition, void* ptr, size_t size)
     return ak_krealloc(ptr, size);
 }
 
-size_t ak_kmalloc_good_size(size_t size)
+size_t ak_kmalloc_usable_size(void const* ptr)
 {
-    return size;
+#    ifdef AK_OS_MACOS
+    return malloc_size(ptr);
+#    else
+    return malloc_usable_size(const_cast<void*>(ptr));
+#    endif
 }
 
 void ak_kfree(void* ptr)
@@ -87,6 +97,7 @@ void* ak_kmalloc(size_t size)
     return mi_malloc(size);
 }
 
+static thread_local mi_heap_t* s_buffer_heap = nullptr;
 static thread_local mi_heap_t* s_string_heap = nullptr;
 
 static mi_heap_t* heap_for_partition(HeapPartition partition)
@@ -103,6 +114,10 @@ static mi_heap_t* heap_for_partition(HeapPartition partition)
     case HeapPartition::Layout:
         static mi_heap_t* layout_heap = mi_heap_new();
         return layout_heap;
+    case HeapPartition::Buffer:
+        if (!s_buffer_heap)
+            s_buffer_heap = mi_heap_new();
+        return s_buffer_heap;
     case HeapPartition::String:
         if (!s_string_heap)
             s_string_heap = mi_heap_new();
@@ -126,9 +141,9 @@ void* ak_krealloc(HeapPartition partition, void* ptr, size_t size)
     return mi_heap_realloc(heap_for_partition(partition), ptr, size);
 }
 
-size_t ak_kmalloc_good_size(size_t size)
+size_t ak_kmalloc_usable_size(void const* ptr)
 {
-    return mi_good_size(size);
+    return mi_usable_size(ptr);
 }
 
 void ak_kfree(void* ptr)
@@ -138,8 +153,10 @@ void ak_kfree(void* ptr)
 
 void ak_kmalloc_collect()
 {
-    // mi_collect() only visits the calling thread's default heap, so the string heap has to be collected separately.
-    // The remaining partitions are shared between threads and are left to their owners.
+    // mi_collect() only visits the calling thread's default heap, so the thread-local partitions have to be collected
+    // separately. The remaining partitions are shared between threads and are left to their owners.
+    if (s_buffer_heap)
+        mi_heap_collect(s_buffer_heap, true);
     if (s_string_heap)
         mi_heap_collect(s_string_heap, true);
 
