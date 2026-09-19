@@ -1167,7 +1167,7 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> RSAOAEP::import_key(JS::Realm& realm, We
             // 1. If jwk does not meet the requirements of Section 6.3.2 of JSON Web Algorithms [JWA], then throw a DataError.
             bool meets_requirements = jwk.e.has_value() && jwk.n.has_value() && jwk.d.has_value();
             if (jwk.p.has_value() || jwk.q.has_value() || jwk.dp.has_value() || jwk.dq.has_value() || jwk.qi.has_value())
-                meets_requirements |= jwk.p.has_value() && jwk.q.has_value() && jwk.dp.has_value() && jwk.dq.has_value() && jwk.qi.has_value();
+                meets_requirements &= jwk.p.has_value() && jwk.q.has_value() && jwk.dp.has_value() && jwk.dq.has_value() && jwk.qi.has_value();
 
             if (jwk.oth.has_value()) {
                 // FIXME: We don't support > 2 primes in RSA keys
@@ -1743,7 +1743,7 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> RSAPSS::import_key(JS::Realm& realm, Alg
             // 1. If jwk does not meet the requirements of Section 6.3.2 of JSON Web Algorithms [JWA], then throw a DataError.
             bool meets_requirements = jwk.e.has_value() && jwk.n.has_value() && jwk.d.has_value();
             if (jwk.p.has_value() || jwk.q.has_value() || jwk.dp.has_value() || jwk.dq.has_value() || jwk.qi.has_value())
-                meets_requirements |= jwk.p.has_value() && jwk.q.has_value() && jwk.dp.has_value() && jwk.dq.has_value() && jwk.qi.has_value();
+                meets_requirements &= jwk.p.has_value() && jwk.q.has_value() && jwk.dp.has_value() && jwk.dq.has_value() && jwk.qi.has_value();
 
             if (jwk.oth.has_value()) {
                 // FIXME: We don't support > 2 primes in RSA keys
@@ -2314,7 +2314,7 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> RSASSAPKCS1::import_key(JS::Realm& realm
             // 1. If jwk does not meet the requirements of Section 6.3.2 of JSON Web Algorithms [JWA], then throw a DataError.
             bool meets_requirements = jwk.e.has_value() && jwk.n.has_value() && jwk.d.has_value();
             if (jwk.p.has_value() || jwk.q.has_value() || jwk.dp.has_value() || jwk.dq.has_value() || jwk.qi.has_value())
-                meets_requirements |= jwk.p.has_value() && jwk.q.has_value() && jwk.dp.has_value() && jwk.dq.has_value() && jwk.qi.has_value();
+                meets_requirements &= jwk.p.has_value() && jwk.q.has_value() && jwk.dp.has_value() && jwk.dq.has_value() && jwk.qi.has_value();
 
             if (jwk.oth.has_value()) {
                 // FIXME: We don't support > 2 primes in RSA keys
@@ -4091,7 +4091,9 @@ WebIDL::ExceptionOr<bool> ECDSA::verify(JS::Realm& realm, AlgorithmParams const&
         // with M as the received message, signature as the received signature
         // and using params as the EC domain parameters, and Q as the public key.
 
-        auto half_size = signature.size() / 2;
+        auto half_size = Q.scalar_size();
+        if (signature.size() != half_size * 2)
+            return false;
         auto r = ::Crypto::UnsignedBigInteger::import_data(signature.bytes().slice(0, half_size));
         auto s = ::Crypto::UnsignedBigInteger::import_data(signature.bytes().slice(half_size, half_size));
 
@@ -8661,7 +8663,7 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> MLDSA::import_key(JS::Realm& realm, Algo
             return WebIDL::DataError::create("Invalid algorithm"_utf16);
 
         // 5. If usages is non-empty and the use field of jwk is present and is not equal to "sig", then throw a DataError.
-        if (!usages.is_empty() && jwk->use.has_value() && jwk->use == "sig"_utf16)
+        if (!usages.is_empty() && jwk->use.has_value() && jwk->use != "sig"_utf16)
             return WebIDL::DataError::create("Invalid usage type"_utf16);
 
         // 6. If the key_ops field of jwk is present, and is invalid according to the requirements of JSON Web
