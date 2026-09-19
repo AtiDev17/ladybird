@@ -57,6 +57,9 @@
 #    include <QAbstractNativeEventFilter>
 #endif
 
+template<>
+constexpr bool AllocatedWithSystemAllocator<QWidget> = true;
+
 namespace Ladybird {
 
 #if defined(AK_OS_WINDOWS)
@@ -99,6 +102,8 @@ static bool has_visible_browser_window()
 
 class LadybirdQApplication : public QApplication {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit LadybirdQApplication(Main::Arguments& arguments)
         : QApplication(arguments.argc, arguments.argv)
         , m_application_widget(make<QWidget>())
@@ -393,10 +398,9 @@ void Application::show_process_manager()
     m_process_manager_window->activateWindow();
 }
 
-void Application::create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions& web_content_options)
+void Application::create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions&)
 {
     Settings::initialize(profile().paths().config);
-    web_content_options.config_path = Settings::the()->directory();
 }
 
 void Application::create_platform_actions()

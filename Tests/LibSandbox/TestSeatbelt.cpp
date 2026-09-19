@@ -1,0 +1,847 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/Platform.h>
+
+#if defined(AK_OS_MACOS)
+
+#    include <AK/Array.h>
+#    include <AK/ByteString.h>
+#    include <AK/Function.h>
+#    include <AK/Vector.h>
+#    include <CoreServices/CoreServices.h>
+#    include <IOKit/IOKitLib.h>
+#    include <IOKit/kext/KextManager.h>
+#    include <IOSurface/IOSurface.h>
+#    include <LibCore/MachPort.h>
+#    include <LibCore/System.h>
+#    include <LibSandbox/Sandbox.h>
+#    include <LibTest/TestCase.h>
+#    include <errno.h>
+#    include <fcntl.h>
+#    include <libproc.h>
+#    include <limits.h>
+#    include <mach-o/dyld.h>
+#    include <mach-o/loader.h>
+#    include <mach/mach.h>
+#    include <net/route.h>
+#    include <netinet/in.h>
+#    include <pthread.h>
+#    include <servers/bootstrap.h>
+#    include <signal.h>
+#    include <spawn.h>
+#    include <stdlib.h>
+#    include <sys/attr.h>
+#    include <sys/event.h>
+#    include <sys/file.h>
+#    include <sys/mman.h>
+#    include <sys/mount.h>
+#    include <sys/socket.h>
+#    include <sys/stat.h>
+#    include <sys/syscall.h>
+#    include <sys/sysctl.h>
+#    include <sys/ttycom.h>
+#    include <sys/un.h>
+#    include <sys/wait.h>
+#    include <unistd.h>
+
+enum class Outcome {
+    Allowed,
+    Denied,
+};
+
+// Runs the operation in a child process after applying the profile. The operation returns whether it succeeded. A
+// child that dies from a signal counts as denied: the syscall filter kills with SIGKILL, and some system frameworks
+// crash when the sandbox refuses them.
+static Outcome run_sandboxed(Sandbox::SeatbeltProfile const& profile, Function<bool()> const& operation)
+{
+    auto child = fork();
+    VERIFY(child >= 0);
+    if (child == 0) {
+        if (Sandbox::apply_macos_sandbox(profile).is_error())
+            _exit(2);
+        _exit(operation() ? 0 : 1);
+    }
+
+    int status = 0;
+    VERIFY(waitpid(child, &status, 0) == child);
+    if (WIFSIGNALED(status))
+        return Outcome::Denied;
+    VERIFY(WIFEXITED(status));
+    VERIFY(WEXITSTATUS(status) == 0 || WEXITSTATUS(status) == 1);
+    return WEXITSTATUS(status) == 0 ? Outcome::Allowed : Outcome::Denied;
+}
+
+static Outcome run_sandboxed(Function<bool()> const& operation)
+{
+    return run_sandboxed({}, operation);
+}
+
+// A scratch directory with one directory that the tests grant to the sandbox and one that they do not.
+struct Fixture {
+    Fixture()
+    {
+        char path_template[] = "/tmp/TestSeatbelt.XXXXXX";
+        VERIFY(mkdtemp(path_template));
+        char resolved[PATH_MAX];
+        VERIFY(realpath(path_template, resolved));
+        root = resolved;
+        granted = ByteString::formatted("{}/granted", root);
+        outside = ByteString::formatted("{}/outside", root);
+        VERIFY(mkdir(granted.characters(), 0700) == 0);
+        VERIFY(mkdir(outside.characters(), 0700) == 0);
+        granted_file = create_file(granted, "file", "granted"sv);
+        outside_file = create_file(outside, "file", "outside"sv);
+    }
+
+    ~Fixture()
+    {
+        auto command = ByteString::formatted("rm -rf '{}'", root);
+        (void)system(command.characters());
+    }
+
+    static ByteString create_file(ByteString const& directory, char const* name, StringView contents)
+    {
+        auto path = ByteString::formatted("{}/{}", directory, name);
+        auto fd = open(path.characters(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+        VERIFY(fd >= 0);
+        VERIFY(write(fd, contents.characters_without_null_termination(), contents.length()) == static_cast<ssize_t>(contents.length()));
+        VERIFY(close(fd) == 0);
+        return path;
+    }
+
+    Vector<Sandbox::SeatbeltPath> granted_paths(Sandbox::SeatbeltPath::Access access = Sandbox::SeatbeltPath::Access::ReadOnly) const
+    {
+        Vector<Sandbox::SeatbeltPath> paths;
+        MUST(Sandbox::add_seatbelt_path_if_exists(paths, granted, access));
+        return paths;
+    }
+
+    ByteString root;
+    ByteString granted;
+    ByteString outside;
+    ByteString granted_file;
+    ByteString outside_file;
+};
+
+static bool can_open_for_reading(ByteString const& path)
+{
+    auto fd = open(path.characters(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    close(fd);
+    return true;
+}
+
+TEST_CASE(sandboxed_process_can_do_ordinary_work)
+{
+    EXPECT_EQ(run_sandboxed([] {
+        pthread_t thread;
+        if (pthread_create(&thread, nullptr, [](void*) -> void* { return nullptr; }, nullptr) != 0)
+            return false;
+        pthread_join(thread, nullptr);
+
+        auto* memory = static_cast<u8*>(malloc(16 * MiB));
+        if (!memory)
+            return false;
+        memset(memory, 1, 16 * MiB);
+        free(memory);
+
+        int sockets[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0)
+            return false;
+        return write(sockets[0], "x", 1) == 1;
+    }),
+        Outcome::Allowed);
+}
+
+TEST_CASE(sandboxed_process_can_create_anonymous_shared_memory)
+{
+    EXPECT_EQ(run_sandboxed([] {
+        auto buffer = Core::System::anon_create(64 * KiB, O_CLOEXEC);
+        if (buffer.is_error())
+            return false;
+        auto* mapping = mmap(nullptr, 64 * KiB, PROT_READ | PROT_WRITE, MAP_SHARED, buffer.value(), 0);
+        return mapping != MAP_FAILED;
+    }),
+        Outcome::Allowed);
+}
+
+TEST_CASE(sandboxed_process_reads_only_granted_paths)
+{
+    Fixture fixture;
+    auto paths = fixture.granted_paths();
+
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] { return can_open_for_reading(fixture.granted_file); }), Outcome::Allowed);
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] { return can_open_for_reading(fixture.outside_file); }), Outcome::Denied);
+}
+
+// Registers a bootstrap service in the test process, standing in for the Browser endpoint or for an unrelated service.
+static ByteString register_bootstrap_service(StringView purpose)
+{
+    auto name = ByteString::formatted("org.ladybird.TestSeatbelt.{}.{}", purpose, getpid());
+    auto port = MUST(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
+    auto send_right = MUST(port.insert_right(Core::MachPort::MessageRight::MakeSend));
+    MUST(send_right.register_with_bootstrap_server(name));
+    (void)port.release();
+    (void)send_right.release();
+    return name;
+}
+
+static bool can_look_up_bootstrap_service(ByteString const& name)
+{
+    mach_port_t port = MACH_PORT_NULL;
+    return bootstrap_look_up(bootstrap_port, name.characters(), &port) == KERN_SUCCESS;
+}
+
+TEST_CASE(sandboxed_process_looks_up_only_its_own_mach_server)
+{
+    static auto browser_endpoint = register_bootstrap_service("browser"sv);
+    static auto unrelated_service = register_bootstrap_service("unrelated"sv);
+
+    EXPECT_EQ(run_sandboxed({ .mach_server_name = browser_endpoint }, [&] { return can_look_up_bootstrap_service(browser_endpoint); }), Outcome::Allowed);
+    EXPECT_EQ(run_sandboxed({ .mach_server_name = browser_endpoint }, [&] { return can_look_up_bootstrap_service(unrelated_service); }), Outcome::Denied);
+    EXPECT_EQ(run_sandboxed({ .mach_server_name = browser_endpoint }, [&] { return can_look_up_bootstrap_service("com.apple.pasteboard.1"); }), Outcome::Denied);
+}
+
+TEST_CASE(sandboxed_process_cannot_obtain_task_ports_for_other_processes)
+{
+    auto parent = getpid();
+    EXPECT_EQ(run_sandboxed([&] {
+        mach_port_t task = MACH_PORT_NULL;
+        return task_name_for_pid(mach_task_self(), parent, &task) == KERN_SUCCESS;
+    }),
+        Outcome::Denied);
+    EXPECT_EQ(run_sandboxed([&] {
+        mach_port_t task = MACH_PORT_NULL;
+        return task_for_pid(mach_task_self(), parent, &task) == KERN_SUCCESS;
+    }),
+        Outcome::Denied);
+}
+
+TEST_CASE(sandboxed_process_inspects_only_itself)
+{
+    auto parent = getpid();
+
+    EXPECT_EQ(run_sandboxed([] {
+        proc_bsdinfo info {};
+        return proc_pidinfo(getpid(), PROC_PIDTBSDINFO, 0, &info, sizeof(info)) == sizeof(info);
+    }),
+        Outcome::Allowed);
+    EXPECT_EQ(run_sandboxed([&] {
+        proc_bsdinfo info {};
+        return proc_pidinfo(parent, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) == sizeof(info);
+    }),
+        Outcome::Denied);
+    EXPECT_EQ(run_sandboxed([] {
+        pid_t pids[1024];
+        return proc_listallpids(pids, sizeof(pids)) > 0;
+    }),
+        Outcome::Denied);
+}
+
+static bool can_read_sysctl(StringView name)
+{
+    char value[4096];
+    size_t size = sizeof(value);
+    return sysctlbyname(ByteString(name).characters(), value, &size, nullptr, 0) == 0;
+}
+
+TEST_CASE(sandboxed_process_reads_only_allowed_sysctls)
+{
+    EXPECT_EQ(run_sandboxed([] { return can_read_sysctl("hw.ncpu"sv) && can_read_sysctl("hw.optional.arm64"sv); }), Outcome::Allowed);
+
+    // Another process's arguments and environment.
+    auto parent = getpid();
+    EXPECT_EQ(run_sandboxed([&] {
+        int mib[] = { CTL_KERN, KERN_PROCARGS2, parent };
+        char arguments[4096];
+        size_t size = sizeof(arguments);
+        return sysctl(mib, 3, arguments, &size, nullptr, 0) == 0;
+    }),
+        Outcome::Denied);
+
+    // The system-wide TCP connection table.
+    EXPECT_EQ(run_sandboxed([] {
+        size_t size = 0;
+        return sysctlbyname("net.inet.tcp.pcblist64", nullptr, &size, nullptr, 0) == 0;
+    }),
+        Outcome::Denied);
+}
+
+TEST_CASE(sandboxed_process_cannot_open_route_sockets)
+{
+    EXPECT_EQ(run_sandboxed([] {
+        auto fd = socket(PF_ROUTE, SOCK_RAW, 0);
+        return fd >= 0;
+    }),
+        Outcome::Denied);
+}
+
+TEST_CASE(sandboxed_process_cannot_query_loaded_kernel_extensions)
+{
+    EXPECT_EQ(run_sandboxed([] {
+        auto info = KextManagerCopyLoadedKextInfo(nullptr, nullptr);
+        if (!info)
+            return false;
+        auto count = CFDictionaryGetCount(info);
+        CFRelease(info);
+        return count > 0;
+    }),
+        Outcome::Denied);
+}
+
+// NECP descriptors answer questions about network interfaces, such as their private addresses.
+static int open_necp_descriptor()
+{
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return syscall(SYS_necp_open, 0);
+#    pragma clang diagnostic pop
+}
+
+TEST_CASE(sandboxed_process_without_network_cannot_query_interface_addresses)
+{
+    EXPECT_EQ(run_sandboxed([] { return open_necp_descriptor() >= 0; }),
+        Outcome::Denied);
+}
+
+TEST_CASE(sandboxed_process_cannot_open_existing_shared_memory)
+{
+    // One object with an arbitrary name, and one that matches the names used by Core::System::anon_create().
+    auto unrelated_name = ByteString::formatted("/TestSeatbelt-{}", getpid());
+    auto anonymous_name = ByteString::formatted("/shm-{:016x}-{:08x}", static_cast<u64>(getpid()), 0u);
+    for (auto const& name : { unrelated_name, anonymous_name }) {
+        auto fd = shm_open(name.characters(), O_RDWR | O_CREAT | O_EXCL, 0600);
+        VERIFY(fd >= 0);
+        VERIFY(ftruncate(fd, 4096) == 0);
+        close(fd);
+    }
+
+    for (auto const& name : { unrelated_name, anonymous_name }) {
+        EXPECT_EQ(run_sandboxed([&] { return shm_open(name.characters(), O_RDWR) >= 0; }), Outcome::Denied);
+        EXPECT_EQ(run_sandboxed([&] { return shm_open(name.characters(), O_RDWR | O_CREAT, 0600) >= 0; }), Outcome::Denied);
+        shm_unlink(name.characters());
+    }
+}
+
+TEST_CASE(sandboxed_process_cannot_change_shared_file_state_through_fcntl)
+{
+    Fixture fixture;
+    auto paths = fixture.granted_paths();
+    auto run_fcntl = [&](int command, auto argument) {
+        return run_sandboxed({ .paths = paths }, [&] {
+            auto fd = open(fixture.granted_file.characters(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0)
+                return false;
+            return fcntl(fd, command, argument) != -1;
+        });
+    };
+
+    EXPECT_EQ(run_fcntl(F_GETFL, 0), Outcome::Allowed);
+    EXPECT_EQ(run_fcntl(F_SETFD, FD_CLOEXEC), Outcome::Allowed);
+
+    // Changes caching for every descriptor of the file.
+    EXPECT_EQ(run_fcntl(F_GLOBAL_NOCACHE, 1), Outcome::Denied);
+    // Changes the file's data protection class.
+    EXPECT_EQ(run_fcntl(F_SETPROTECTIONCLASS, 3), Outcome::Denied);
+    // Reveals the path of a descriptor that was handed over without one.
+    char path[PATH_MAX];
+    EXPECT_EQ(run_fcntl(F_GETPATH, path), Outcome::Denied);
+
+    // The GPU service needs F_GETPATH, and it never receives files from the Browser.
+    EXPECT_EQ(run_sandboxed({ .paths = paths, .system_services = Sandbox::SystemService::GPU }, [&] {
+        auto fd = open(fixture.granted_file.characters(), O_RDONLY | O_CLOEXEC);
+        char path[PATH_MAX];
+        return fd >= 0 && fcntl(fd, F_GETPATH, path) != -1;
+    }),
+        Outcome::Allowed);
+}
+
+TEST_CASE(sandboxed_process_cannot_preallocate_disk_space_through_inherited_files)
+{
+    Fixture fixture;
+    auto fd = open(fixture.outside_file.characters(), O_RDWR | O_CLOEXEC);
+    VERIFY(fd >= 0);
+
+    EXPECT_EQ(run_sandboxed([&] {
+        fstore_t store { .fst_flags = F_ALLOCATEALL | F_ALLOCATEPERSIST, .fst_posmode = F_PEOFPOSMODE, .fst_offset = 0, .fst_length = 1 * MiB, .fst_bytesalloc = 0 };
+        return fcntl(fd, F_PREALLOCATE, &store) != -1;
+    }),
+        Outcome::Denied);
+    close(fd);
+}
+
+#    ifndef F_TRANSFEREXTENTS
+#        define F_TRANSFEREXTENTS 110
+#    endif
+
+TEST_CASE(sandboxed_process_cannot_move_disk_reservations_out_of_readonly_files)
+{
+    Fixture fixture;
+    auto source = open(fixture.granted_file.characters(), O_RDWR | O_CLOEXEC);
+    VERIFY(source >= 0);
+    fstore_t store { .fst_flags = F_ALLOCATEALL, .fst_posmode = F_PEOFPOSMODE, .fst_offset = 0, .fst_length = 1 * MiB, .fst_bytesalloc = 0 };
+    VERIFY(fcntl(source, F_PREALLOCATE, &store) == 0);
+    close(source);
+    auto target_path = Fixture::create_file(fixture.outside, "target", ""sv);
+
+    Vector<Sandbox::SeatbeltPath> paths;
+    MUST(Sandbox::add_seatbelt_path_if_exists(paths, fixture.granted, Sandbox::SeatbeltPath::Access::ReadOnly));
+    MUST(Sandbox::add_seatbelt_path_if_exists(paths, fixture.outside, Sandbox::SeatbeltPath::Access::ReadWrite));
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] {
+        auto source = open(fixture.granted_file.characters(), O_RDONLY | O_CLOEXEC);
+        auto target = open(target_path.characters(), O_RDWR | O_CLOEXEC);
+        if (source < 0 || target < 0)
+            return false;
+        return fcntl(source, F_TRANSFEREXTENTS, target) != -1;
+    }),
+        Outcome::Denied);
+}
+
+TEST_CASE(sandboxed_process_cannot_redirect_sigio_to_another_process)
+{
+    auto parent = getpid();
+    EXPECT_EQ(run_sandboxed([&] {
+        int sockets[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0)
+            return false;
+        return fcntl(sockets[0], F_SETOWN, parent) != -1;
+    }),
+        Outcome::Denied);
+}
+
+// Finds the embedded code signature of the running executable, so a test can try to attach it to the file's vnode.
+static Optional<fsignatures_t> code_signature_of_executable()
+{
+    auto const* header = reinterpret_cast<mach_header_64 const*>(_dyld_get_image_header(0));
+    auto const* command = reinterpret_cast<load_command const*>(header + 1);
+    for (u32 i = 0; i < header->ncmds; ++i) {
+        if (command->cmd == LC_CODE_SIGNATURE) {
+            auto const* signature = reinterpret_cast<linkedit_data_command const*>(command);
+            fsignatures_t request {};
+            request.fs_file_start = 0;
+            request.fs_blob_start = reinterpret_cast<void*>(static_cast<uintptr_t>(signature->dataoff));
+            request.fs_blob_size = signature->datasize;
+            return request;
+        }
+        command = reinterpret_cast<load_command const*>(reinterpret_cast<u8 const*>(command) + command->cmdsize);
+    }
+    return {};
+}
+
+TEST_CASE(sandboxed_process_cannot_attach_code_signatures_to_readonly_files)
+{
+    auto executable = MUST(Core::System::current_executable_path());
+    auto signature = code_signature_of_executable();
+    VERIFY(signature.has_value());
+
+    Vector<Sandbox::SeatbeltPath> paths;
+    MUST(Sandbox::add_seatbelt_path_if_exists(paths, executable, Sandbox::SeatbeltPath::Access::ReadOnly));
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] {
+        auto fd = open(executable.characters(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            return false;
+        auto request = *signature;
+        return fcntl(fd, F_ADDFILESIGS, &request) != -1;
+    }),
+        Outcome::Denied);
+}
+
+// fcntl() forwards unknown commands to the descriptor's ioctl handler, which the libc wrapper would not pass through.
+static int raw_fcntl(int fd, unsigned long command)
+{
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return syscall(SYS_fcntl, fd, static_cast<int>(command), 0);
+#    pragma clang diagnostic pop
+}
+
+TEST_CASE(sandboxed_process_cannot_control_a_terminal_through_fcntl)
+{
+    auto controller = posix_openpt(O_RDWR | O_NOCTTY);
+    VERIFY(controller >= 0);
+    VERIFY(grantpt(controller) == 0 && unlockpt(controller) == 0);
+    auto terminal = open(ptsname(controller), O_RDWR | O_NOCTTY);
+    VERIFY(terminal >= 0);
+
+    EXPECT_EQ(run_sandboxed([&] { return raw_fcntl(terminal, TIOCSTOP) != -1; }), Outcome::Denied);
+
+    close(terminal);
+    close(controller);
+}
+
+TEST_CASE(sandboxed_process_locks_only_writable_files)
+{
+    Fixture fixture;
+    auto locks = [&](Sandbox::SeatbeltPath::Access access, bool use_flock) {
+        auto paths = fixture.granted_paths(access);
+        return run_sandboxed({ .paths = paths }, [&] {
+            auto fd = open(fixture.granted_file.characters(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0)
+                return false;
+            if (use_flock)
+                return flock(fd, LOCK_EX | LOCK_NB) == 0;
+            struct flock lock {};
+            lock.l_type = F_RDLCK;
+            lock.l_whence = SEEK_SET;
+            return fcntl(fd, F_SETLK, &lock) == 0;
+        });
+    };
+
+    EXPECT_EQ(locks(Sandbox::SeatbeltPath::Access::ReadWrite, true), Outcome::Allowed);
+    EXPECT_EQ(locks(Sandbox::SeatbeltPath::Access::ReadWrite, false), Outcome::Allowed);
+    EXPECT_EQ(locks(Sandbox::SeatbeltPath::Access::ReadOnly, true), Outcome::Denied);
+    EXPECT_EQ(locks(Sandbox::SeatbeltPath::Access::ReadOnly, false), Outcome::Denied);
+}
+
+TEST_CASE(sandboxed_process_resolves_granted_paths)
+{
+    Fixture fixture;
+    auto paths = fixture.granted_paths();
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] {
+        char resolved[PATH_MAX];
+        struct stat metadata {};
+        return realpath(fixture.granted_file.characters(), resolved) && stat(fixture.granted_file.characters(), &metadata) == 0;
+    }),
+        Outcome::Allowed);
+
+    // The fixture lives in /private/tmp, which is also reachable as /tmp.
+    VERIFY(fixture.granted_file.starts_with("/private/tmp/"sv));
+    auto short_path = fixture.granted_file.substring("/private"sv.length());
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] { return access(short_path.characters(), F_OK) == 0 && can_open_for_reading(short_path); }), Outcome::Allowed);
+}
+
+TEST_CASE(sandboxed_process_cannot_read_metadata_outside_granted_paths)
+{
+    Fixture fixture;
+    auto paths = fixture.granted_paths();
+    auto link_path = ByteString::formatted("{}/link", fixture.outside);
+    VERIFY(symlink("/secret/link/target", link_path.characters()) == 0);
+
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] {
+        struct stat metadata {};
+        return stat(fixture.outside_file.characters(), &metadata) == 0;
+    }),
+        Outcome::Denied);
+
+    // The target of a symbolic link.
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] {
+        char target[PATH_MAX];
+        return readlink(link_path.characters(), target, sizeof(target)) >= 0;
+    }),
+        Outcome::Denied);
+
+    // Finder information, an extended attribute that getattrlist() reports as metadata.
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] {
+        attrlist attributes {};
+        attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
+        attributes.commonattr = ATTR_CMN_FNDRINFO;
+        u8 buffer[64];
+        return getattrlist(fixture.outside_file.characters(), &attributes, buffer, sizeof(buffer), 0) == 0;
+    }),
+        Outcome::Denied);
+}
+
+TEST_CASE(sandboxed_process_cannot_watch_directories_outside_granted_paths)
+{
+    Fixture fixture;
+    auto paths = fixture.granted_paths();
+
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] {
+        auto directory = open(fixture.outside.characters(), O_SEARCH | O_CLOEXEC);
+        if (directory < 0)
+            return false;
+        auto queue = kqueue();
+        struct kevent change {};
+        EV_SET(&change, directory, EVFILT_VNODE, EV_ADD | EV_CLEAR, NOTE_WRITE, 0, nullptr);
+        return kevent(queue, &change, 1, nullptr, 0, nullptr) == 0;
+    }),
+        Outcome::Denied);
+
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] {
+        auto directory = CFStringCreateWithCString(nullptr, fixture.outside.characters(), kCFStringEncodingUTF8);
+        auto directories = CFArrayCreate(nullptr, reinterpret_cast<void const**>(&directory), 1, &kCFTypeArrayCallBacks);
+        FSEventStreamContext context {};
+        auto stream = FSEventStreamCreate(nullptr, [](ConstFSEventStreamRef, void*, size_t, void*, FSEventStreamEventFlags const*, FSEventStreamEventId const*) { }, &context, directories, kFSEventStreamEventIdSinceNow, 0.01, kFSEventStreamCreateFlagFileEvents);
+        if (!stream)
+            return false;
+        FSEventStreamSetDispatchQueue(stream, dispatch_get_main_queue());
+        return FSEventStreamStart(stream) != false;
+    }),
+        Outcome::Denied);
+}
+
+TEST_CASE(sandboxed_process_cannot_map_execute_only_files_outside_granted_paths)
+{
+    Fixture fixture;
+    auto paths = fixture.granted_paths();
+    VERIFY(chmod(fixture.outside_file.characters(), 0100) == 0);
+
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] {
+        auto fd = open(fixture.outside_file.characters(), O_EXEC | O_CLOEXEC);
+        if (fd < 0)
+            return false;
+        auto* mapping = mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE, fd, 0);
+        if (mapping == MAP_FAILED)
+            return false;
+        return mprotect(mapping, 4096, PROT_READ) == 0;
+    }),
+        Outcome::Denied);
+}
+
+extern "C" char* sandbox_extension_issue_file(char const* extension_class, char const* path, u32 flags);
+
+TEST_CASE(sandboxed_process_issues_extensions_for_granted_paths)
+{
+    // System services such as the Metal compiler get access to a helper's files through extensions that it issues. The
+    // fixture lives in /private/tmp, whose paths also have a /tmp form in the profile.
+    Fixture fixture;
+    auto paths = fixture.granted_paths(Sandbox::SeatbeltPath::Access::ReadWrite);
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] { return sandbox_extension_issue_file("com.apple.app-sandbox.read-write", fixture.granted_file.characters(), 0) != nullptr; }), Outcome::Allowed);
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [&] { return sandbox_extension_issue_file("com.apple.app-sandbox.read-write", fixture.outside_file.characters(), 0) != nullptr; }), Outcome::Denied);
+}
+
+extern "C" int csr_get_active_config(u32*);
+
+TEST_CASE(sandboxed_process_cannot_read_host_identity_or_system_state)
+{
+    EXPECT_EQ(run_sandboxed([] {
+        uuid_t uuid;
+        timespec timeout {};
+        return gethostuuid(uuid, &timeout) == 0;
+    }),
+        Outcome::Denied);
+    EXPECT_EQ(run_sandboxed([] {
+        u32 configuration = 0;
+        return csr_get_active_config(&configuration) == 0;
+    }),
+        Outcome::Denied);
+    EXPECT_EQ(run_sandboxed([] { return getfsstat(nullptr, 0, MNT_NOWAIT) > 0; }), Outcome::Denied);
+
+    // These must fail with an error rather than kill the process, since system frameworks call them.
+    EXPECT_EQ(run_sandboxed([] {
+        uuid_t uuid;
+        timespec timeout {};
+        return gethostuuid(uuid, &timeout) == -1 && errno == EPERM && getfsstat(nullptr, 0, MNT_NOWAIT) == -1 && errno == EPERM;
+    }),
+        Outcome::Allowed);
+}
+
+TEST_CASE(sandboxed_process_cannot_register_dtrace_probes)
+{
+    EXPECT_EQ(run_sandboxed([] { return open("/dev/dtracehelper", O_RDWR | O_CLOEXEC) >= 0; }), Outcome::Denied);
+}
+
+TEST_CASE(sandboxed_process_cannot_read_global_preferences)
+{
+    // Every user has AppleLanguages in the global preferences domain. Read it only in child processes, since
+    // CoreFoundation caches preferences and a forked child would inherit the cache.
+    auto read_global_preference = [] {
+        auto value = CFPreferencesCopyValue(CFSTR("AppleLanguages"), kCFPreferencesAnyApplication, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        if (!value)
+            return false;
+        CFRelease(value);
+        return true;
+    };
+
+    auto child = fork();
+    VERIFY(child >= 0);
+    if (child == 0)
+        _exit(read_global_preference() ? 0 : 1);
+    int status = 0;
+    VERIFY(waitpid(child, &status, 0) == child);
+    VERIFY(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    EXPECT_EQ(run_sandboxed([&] { return read_global_preference(); }), Outcome::Denied);
+}
+
+static bool can_read_platform_property(CFStringRef name)
+{
+    auto platform = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPlatformExpertDevice"));
+    if (!platform)
+        return false;
+    auto value = IORegistryEntryCreateCFProperty(platform, name, nullptr, 0);
+    IOObjectRelease(platform);
+    if (!value)
+        return false;
+    CFRelease(value);
+    return true;
+}
+
+TEST_CASE(sandboxed_process_cannot_read_machine_identifiers)
+{
+    EXPECT_EQ(run_sandboxed([] { return can_read_platform_property(CFSTR("IOPlatformSerialNumber")); }), Outcome::Denied);
+    EXPECT_EQ(run_sandboxed([] { return can_read_platform_property(CFSTR("model")); }), Outcome::Denied);
+
+    // Services that talk to devices may read ordinary properties, but still not the identifiers.
+    auto gpu = Sandbox::SeatbeltProfile { .system_services = Sandbox::SystemService::GPU };
+    EXPECT_EQ(run_sandboxed(gpu, [] { return can_read_platform_property(CFSTR("model")); }), Outcome::Allowed);
+    EXPECT_EQ(run_sandboxed(gpu, [] { return can_read_platform_property(CFSTR("IOPlatformSerialNumber")); }), Outcome::Denied);
+    EXPECT_EQ(run_sandboxed(gpu, [] { return can_read_platform_property(CFSTR("IOPlatformUUID")); }), Outcome::Denied);
+}
+
+TEST_CASE(sandboxed_process_cannot_read_nvram)
+{
+    EXPECT_EQ(run_sandboxed([] {
+        auto options = IORegistryEntryFromPath(kIOMainPortDefault, "IODeviceTree:/options");
+        if (!options)
+            return false;
+        CFMutableDictionaryRef properties = nullptr;
+        auto result = IORegistryEntryCreateCFProperties(options, &properties, nullptr, 0);
+        IOObjectRelease(options);
+        if (result != KERN_SUCCESS || !properties)
+            return false;
+        auto count = CFDictionaryGetCount(properties);
+        CFRelease(properties);
+        return count > 0;
+    }),
+        Outcome::Denied);
+}
+
+static bool can_create_iosurface()
+{
+    int width = 16;
+    int height = 16;
+    int bytes_per_element = 4;
+    auto width_number = CFNumberCreate(nullptr, kCFNumberIntType, &width);
+    auto height_number = CFNumberCreate(nullptr, kCFNumberIntType, &height);
+    auto bytes_per_element_number = CFNumberCreate(nullptr, kCFNumberIntType, &bytes_per_element);
+    void const* keys[] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement };
+    void const* values[] = { width_number, height_number, bytes_per_element_number };
+    auto properties = CFDictionaryCreate(nullptr, keys, values, 3, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    auto surface = IOSurfaceCreate(properties);
+    if (!surface)
+        return false;
+    CFRelease(surface);
+    return true;
+}
+
+TEST_CASE(sandboxed_process_uses_iosurfaces_only_when_granted)
+{
+    // CoreFoundation looks up the main executable when IOSurface sets itself up. Helpers may read their executable.
+    Vector<Sandbox::SeatbeltPath> paths;
+    MUST(Sandbox::add_seatbelt_path_if_exists(paths, MUST(Core::System::current_executable_path()), Sandbox::SeatbeltPath::Access::ReadOnly));
+
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [] { return can_create_iosurface(); }), Outcome::Denied);
+    EXPECT_EQ(run_sandboxed({ .paths = paths, .system_services = Sandbox::SystemService::IOSurface }, [] { return can_create_iosurface(); }), Outcome::Allowed);
+}
+
+TEST_CASE(sandboxed_process_spawns_only_allowed_executables_and_cannot_fork)
+{
+    Fixture fixture;
+    ByteString executable = "/usr/bin/true";
+    Vector<Sandbox::SeatbeltPath> paths;
+    MUST(Sandbox::add_seatbelt_path_if_exists(paths, executable, Sandbox::SeatbeltPath::Access::ReadAndExecute));
+    Array executables { executable };
+    auto profile = Sandbox::SeatbeltProfile { .paths = paths, .executable_paths = executables };
+
+    EXPECT_EQ(run_sandboxed(profile, [&] {
+        pid_t pid = 0;
+        char* arguments[] = { const_cast<char*>(executable.characters()), nullptr };
+        if (posix_spawn(&pid, executable.characters(), nullptr, nullptr, arguments, nullptr) != 0)
+            return false;
+        int status = 0;
+        return waitpid(pid, &status, 0) == pid;
+    }),
+        Outcome::Allowed);
+
+    // A forked copy of a compromised helper would keep running with all of its capabilities.
+    EXPECT_EQ(run_sandboxed(profile, [] {
+        auto pid = fork();
+        if (pid == 0)
+            _exit(0);
+        return pid > 0;
+    }),
+        Outcome::Denied);
+}
+
+TEST_CASE(application_bundle_is_found_only_for_bundled_executables)
+{
+    EXPECT_EQ(Sandbox::application_bundle_for_executable("/Applications/Ladybird.app/Contents/MacOS/WebContent"sv), "/Applications/Ladybird.app"sv);
+    EXPECT_EQ(Sandbox::application_bundle_for_executable("/Users/user/Applications/Ladybird.app/Contents/MacOS/Compositor"sv), "/Users/user/Applications/Ladybird.app"sv);
+    EXPECT_EQ(Sandbox::application_bundle_for_executable("/src/Build/release/bin/Ladybird.app/Contents/MacOS/WebContent"sv), "/src/Build/release/bin/Ladybird.app"sv);
+
+    EXPECT(!Sandbox::application_bundle_for_executable("/src/Build/release/bin/TestSeatbelt"sv).has_value());
+    EXPECT(!Sandbox::application_bundle_for_executable("/Users/user/Ladybird/Contents/MacOS/WebContent"sv).has_value());
+    EXPECT(!Sandbox::application_bundle_for_executable("/Contents/MacOS/WebContent"sv).has_value());
+    EXPECT(!Sandbox::application_bundle_for_executable("WebContent"sv).has_value());
+}
+
+TEST_CASE(sandboxed_process_with_network_connects_only_to_network_hosts)
+{
+    auto network = Sandbox::SeatbeltProfile { .network_access = Sandbox::NetworkAccess::Allowed };
+
+    // A TCP listener on the loopback interface stands in for a web server.
+    auto listener = socket(AF_INET, SOCK_STREAM, 0);
+    VERIFY(listener >= 0);
+    sockaddr_in address {};
+    address.sin_len = sizeof(address);
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    VERIFY(bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    VERIFY(listen(listener, 4) == 0);
+    socklen_t address_length = sizeof(address);
+    VERIFY(getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_length) == 0);
+
+    EXPECT_EQ(run_sandboxed(network, [&] {
+        auto fd = socket(AF_INET, SOCK_STREAM, 0);
+        return fd >= 0 && connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
+    }),
+        Outcome::Allowed);
+
+    // A UNIX socket of another local process.
+    Fixture fixture;
+    auto socket_path = ByteString::formatted("{}/socket", fixture.outside);
+    auto local_listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un local_address {};
+    local_address.sun_family = AF_UNIX;
+    VERIFY(socket_path.length() < sizeof(local_address.sun_path));
+    memcpy(local_address.sun_path, socket_path.characters(), socket_path.length() + 1);
+    VERIFY(bind(local_listener, reinterpret_cast<sockaddr*>(&local_address), sizeof(local_address)) == 0);
+    VERIFY(listen(local_listener, 4) == 0);
+
+    EXPECT_EQ(run_sandboxed(network, [&] {
+        auto fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        return fd >= 0 && connect(fd, reinterpret_cast<sockaddr*>(&local_address), sizeof(local_address)) == 0;
+    }),
+        Outcome::Denied);
+
+    // Port sharing, which would let the helper take over another process's port.
+    EXPECT_EQ(run_sandboxed(network, [] {
+        auto fd = socket(AF_INET, SOCK_DGRAM, 0);
+        int enable = 1;
+        return fd >= 0 && setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(enable)) == 0;
+    }),
+        Outcome::Denied);
+
+    close(local_listener);
+    close(listener);
+}
+
+TEST_CASE(sandboxed_process_maps_jit_memory_only_when_granted)
+{
+    auto map_jit = [] {
+        auto* mapping = mmap(nullptr, 16 * KiB, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        return mapping != MAP_FAILED;
+    };
+    EXPECT_EQ(run_sandboxed([&] { return map_jit(); }), Outcome::Denied);
+    EXPECT_EQ(run_sandboxed({ .system_services = Sandbox::SystemService::JIT }, [&] { return map_jit(); }), Outcome::Allowed);
+}
+
+TEST_CASE(sandboxed_process_cannot_create_mach_vouchers)
+{
+    EXPECT_EQ(run_sandboxed([] {
+        mach_voucher_attr_recipe_data_t recipe {};
+        recipe.key = MACH_VOUCHER_ATTR_KEY_USER_DATA;
+        recipe.command = MACH_VOUCHER_ATTR_USER_DATA_STORE;
+        mach_port_t voucher = MACH_PORT_NULL;
+        return host_create_mach_voucher(mach_host_self(), reinterpret_cast<mach_voucher_attr_raw_recipe_array_t>(&recipe), sizeof(recipe), &voucher) == KERN_SUCCESS;
+    }),
+        Outcome::Denied);
+}
+
+#endif

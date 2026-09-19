@@ -14,7 +14,7 @@
 
 namespace WasmCompiler {
 
-ErrorOr<void> apply_sandbox()
+ErrorOr<void> apply_sandbox(StringView mach_server_name)
 {
     TRY(Sandbox::configure_runtime());
 
@@ -23,7 +23,11 @@ ErrorOr<void> apply_sandbox()
     Vector<Sandbox::SeatbeltPath> paths;
     TRY(Sandbox::add_seatbelt_path_if_exists(paths, compiler_path, Sandbox::SeatbeltPath::Access::ReadAndExecute));
 
-    return Sandbox::apply_macos_sandbox(paths.span(), Sandbox::NetworkAccess::Denied, { { compiler_path } });
+    return Sandbox::apply_macos_sandbox({
+        .paths = paths.span(),
+        .executable_paths = { { compiler_path } },
+        .mach_server_name = mach_server_name,
+    });
 }
 
 }

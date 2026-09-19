@@ -10,6 +10,7 @@ set(TEST_SOURCES
     TestExternalURLHandler.cpp
     TestFaviconStore.cpp
     TestHistoryStore.cpp
+    TestHelperProcessEnvironment.cpp
     TestHSTSStore.cpp
     TestNavigationLoader.cpp
     TestOmnibox.cpp
@@ -26,7 +27,11 @@ set(TEST_SOURCES
 )
 
 if (APPLE OR LINUX)
-    list(APPEND TEST_SOURCES TestCrashReport.cpp)
+    list(APPEND TEST_SOURCES TestCrashReport.cpp TestFontService.cpp)
+endif()
+
+if (APPLE)
+    list(APPEND TEST_SOURCES TestProcessReaper.cpp)
 endif()
 
 foreach(source IN LISTS TEST_SOURCES)
@@ -34,8 +39,15 @@ foreach(source IN LISTS TEST_SOURCES)
     if (source STREQUAL "TestProfile.cpp" OR source STREQUAL "TestDownloadSegmentation.cpp")
         list(APPEND test_libraries LibHTTP)
     endif()
+    if (source STREQUAL "TestFontService.cpp")
+        list(APPEND test_libraries LibIPC)
+    endif()
     ladybird_test("${source}" LibWebView LIBS ${test_libraries})
 endforeach()
+
+if (TARGET TestProcessReaper)
+    add_dependencies(TestProcessReaper ProcessReaper)
+endif()
 
 if (TARGET TestCrashReport AND cpptrace_FOUND AND LADYBIRD_ENABLE_CPPTRACE)
     target_compile_definitions(TestCrashReport PRIVATE TEST_HAS_CPPTRACE=1)

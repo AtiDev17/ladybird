@@ -13,9 +13,9 @@
 
 namespace Core::Environment {
 
-char** raw_environ();
+CORE_API char** raw_environ();
 
-struct Entry {
+struct CORE_API Entry {
     StringView full_entry;
     StringView name;
     StringView value;
@@ -71,7 +71,7 @@ enum class Overwrite {
     Yes,
 };
 CORE_API ErrorOr<void> set(StringView name, StringView value, Overwrite);
-ErrorOr<void> unset(StringView name);
+CORE_API ErrorOr<void> unset(StringView name);
 ErrorOr<void> put(StringView env);
 
 ErrorOr<void> clear();

@@ -14,6 +14,7 @@
 #include <AK/StdLibExtras.h>
 #include <AK/Traits.h>
 #include <AK/Types.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
 
@@ -27,6 +28,8 @@ class [[nodiscard]] RefPtr {
     friend class NonnullRefPtr;
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     enum AdoptTag {
         Adopt
     };
@@ -336,6 +339,7 @@ inline void swap(RefPtr<T>& a, RefPtr<U>& b)
 template<typename T>
 inline RefPtr<T> adopt_ref_if_nonnull(T* object)
 {
+    static_assert(AllocatedWithKmalloc<T>, "T must allocate with AK_ALLOC_WITH_KMALLOC");
     if (object)
         return RefPtr<T>(RefPtr<T>::Adopt, *object);
     return {};

@@ -83,6 +83,7 @@ if (APPLE)
     list(APPEND SOURCES
         CrashReportPOSIX.cpp
         PlatformColorsMacOS.cpp
+        ProcessReaper.cpp
     )
 elseif (LINUX)
     list(APPEND SOURCES CrashReportPOSIX.cpp)
@@ -165,6 +166,7 @@ add_custom_target(generate_build_information DEPENDS ${build_information_stamp})
 
 ladybird_lib(LibWebView webview EXPLICIT_SYMBOL_EXPORT)
 add_dependencies(LibWebView generate_build_information)
+target_link_libraries(LibWebView PUBLIC LibSandbox)
 target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGC LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibJS LibMedia LibWeb LibUnicode LibURL LibSyntax LibTextCodec LibThreading)
 
 if (ENABLE_CRANELIFT_JIT)
