@@ -172,6 +172,8 @@ void PageClient::visit_edges(JS::Cell::Visitor& visitor)
 
     if (m_webdriver)
         m_webdriver->visit_edges(visitor);
+    for (auto& pending_mouse_event : m_pending_webdriver_mouse_events)
+        visitor.visit(pending_mouse_event.value);
     if (m_web_ui)
         m_web_ui->visit_edges(visitor);
 }
@@ -1522,6 +1524,19 @@ void PageClient::page_did_request_key_event_for_testing(Web::KeyEvent event)
     client().async_did_request_key_event_for_testing(m_id, move(event));
 }
 
+void PageClient::page_did_request_webdriver_mouse_event(Web::HTML::CrossProcessId root_navigable_id, Web::MouseEvent event, GC::Ref<GC::Function<void()>> on_handled)
+{
+    auto request_id = m_next_webdriver_mouse_event_request_id++;
+    m_pending_webdriver_mouse_events.set(request_id, on_handled);
+    client().async_did_request_webdriver_mouse_event(m_id, request_id, root_navigable_id, move(event));
+}
+
+void PageClient::did_handle_webdriver_mouse_event(u64 request_id)
+{
+    if (auto on_handled = m_pending_webdriver_mouse_events.take(request_id); on_handled.has_value())
+        (*on_handled)->function()();
+}
+
 void PageClient::page_did_request_set_system_visibility_state(Web::HTML::VisibilityState visibility_state)
 {
     client().async_did_request_set_system_visibility_state(m_id, visibility_state);
@@ -1819,9 +1834,14 @@ WebDriverConnection& PageClient::ensure_webdriver_session()
     return *m_webdriver;
 }
 
-void PageClient::run_webdriver_command(u64 command_id, String const& name, JsonValue payload, Vector<String> arguments)
+void PageClient::run_webdriver_command(u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String const& name, JsonValue payload, Vector<String> arguments)
 {
-    ensure_webdriver_session().run_command(command_id, name, move(payload), move(arguments));
+    ensure_webdriver_session().run_command(command_id, navigable_id, name, move(payload), move(arguments));
+}
+
+void PageClient::webdriver_did_set_current_browsing_context(u64 command_id, Web::HTML::CrossProcessId navigable_id)
+{
+    client().async_webdriver_did_set_current_browsing_context(m_id, command_id, navigable_id);
 }
 
 void PageClient::webdriver_command_complete(u64 command_id, Web::WebDriver::Response response)

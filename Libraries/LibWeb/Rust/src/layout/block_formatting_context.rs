@@ -397,7 +397,7 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     fn compute_and_store_baselines(&self, node: Node) {
-        let baselines = formatting_context::derive_baselines(self.records, &self.callbacks, node, false);
+        let baselines = formatting_context::derive_baselines(self.records, &self.callbacks, node);
         if node == self.root {
             self.record_derived_baselines_of_root_box(baselines);
         } else {
@@ -1700,6 +1700,13 @@ impl<'pass> BlockFormattingContext<'pass> {
         let used = self.create_used_values(node, input.containing_block_constraints);
         used.is_invisible_for_line_clamp
             .set(self.laying_out_invisible_line_clamp_content.get());
+        if self.sizing().is_anonymous_button_content_wrapper(node) {
+            used.has_definite_block_size_only_for_button_content_alignment.set(
+                self.used(block_container)
+                    .has_definite_block_size_only_for_button_content_alignment
+                    .get(),
+            );
+        }
 
         self.resolve_vertical_box_model_metrics(node, block_container_inline_size);
         assert_eq!(self.containing_block(node), block_container);
@@ -2017,6 +2024,27 @@ impl<'pass> BlockFormattingContext<'pass> {
                 available_space_for_block_size_resolution,
                 input.containing_block_constraints,
                 None,
+            );
+        }
+        if !has_independent_formatting_context
+            && self.sizing().block_size_is_ratio_dependent(
+                node,
+                available_space_for_block_size_resolution,
+                input.containing_block_constraints,
+            )
+        {
+            let content_block_size = self.compute_automatic_block_size_for_block_level_element(
+                node,
+                self.used(node)
+                    .available_inner_space_or_constraints_from(available_space_for_block_size_resolution),
+                input.containing_block_constraints,
+                None,
+            );
+            self.sizing().apply_automatic_minimum_block_size_from_aspect_ratio(
+                node,
+                available_space_for_block_size_resolution,
+                input.containing_block_constraints,
+                Some(content_block_size),
             );
         }
 

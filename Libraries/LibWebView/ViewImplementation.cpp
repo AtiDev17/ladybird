@@ -47,16 +47,16 @@ static HashMap<u64, ViewImplementation*>& all_views()
     return *views;
 }
 
-static void fail_webdriver_content_commands_after_process_replacement(HashTable<u64> const& command_ids)
+static void fail_webdriver_content_commands_after_process_replacement(HashMap<u64, WebContentPage> const& commands)
 {
-    for (auto command_id : command_ids)
-        Application::the().complete_webdriver_content_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "WebContent was replaced while executing the command"sv));
+    for (auto const& command : commands)
+        Application::the().complete_webdriver_content_command(command.key, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "WebContent was replaced while executing the command"sv));
 }
 
-static void fail_webdriver_content_commands_after_window_close(HashTable<u64> const& command_ids)
+static void fail_webdriver_content_commands_after_window_close(HashMap<u64, WebContentPage> const& commands)
 {
-    for (auto command_id : command_ids)
-        Application::the().complete_webdriver_content_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window closed while executing the command"sv));
+    for (auto const& command : commands)
+        Application::the().complete_webdriver_content_command(command.key, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window closed while executing the command"sv));
 }
 
 static u64 s_view_count = 1; // This has to start at 1 for Firefox DevTools.
@@ -142,8 +142,8 @@ ViewImplementation::~ViewImplementation()
 
     // A headless parent can own and destroy its child view without the child receiving a browsing-context-close
     // notification. Do not strand a WebDriver command which raced with that teardown.
-    fail_webdriver_content_commands_after_window_close(m_pending_webdriver_command_ids);
-    fail_webdriver_content_commands_after_window_close(m_pending_webdriver_crash_command_ids);
+    fail_webdriver_content_commands_after_window_close(m_pending_webdriver_commands);
+    fail_webdriver_content_commands_after_window_close(m_pending_webdriver_crash_commands);
 }
 
 WebContentClient& ViewImplementation::client()
@@ -220,11 +220,11 @@ bool ViewImplementation::create_new_process_for_cross_site_navigation(Utf16Strin
     auto url = request.history_entry.url;
     ongoing_navigation->url = url;
 
-    auto pending_webdriver_command_ids = move(m_pending_webdriver_command_ids);
-    auto pending_webdriver_crash_command_ids = move(m_pending_webdriver_crash_command_ids);
+    auto pending_webdriver_commands = move(m_pending_webdriver_commands);
+    auto pending_webdriver_crash_commands = move(m_pending_webdriver_crash_commands);
     auto fail_pending_webdriver_commands = ScopeGuard([&] {
-        fail_webdriver_content_commands_after_process_replacement(pending_webdriver_command_ids);
-        fail_webdriver_content_commands_after_process_replacement(pending_webdriver_crash_command_ids);
+        fail_webdriver_content_commands_after_process_replacement(pending_webdriver_commands);
+        fail_webdriver_content_commands_after_process_replacement(pending_webdriver_crash_commands);
     });
 
     dump_session_history("before-process-swap"sv);
@@ -297,8 +297,8 @@ bool ViewImplementation::create_new_process_for_cross_site_navigation(Utf16Strin
 
 void ViewImplementation::replace_web_content_process_for_history_traversal(Web::HTML::CrossProcessId target_document_state_id)
 {
-    auto pending_webdriver_command_ids = move(m_pending_webdriver_command_ids);
-    auto pending_webdriver_crash_command_ids = move(m_pending_webdriver_crash_command_ids);
+    auto pending_webdriver_commands = move(m_pending_webdriver_commands);
+    auto pending_webdriver_crash_commands = move(m_pending_webdriver_crash_commands);
 
     dump_session_history("before-history-traversal-process-swap"sv);
 
@@ -326,8 +326,8 @@ void ViewImplementation::replace_web_content_process_for_history_traversal(Web::
     handle_resize();
     dump_session_history("after-history-traversal-process-swap"sv);
 
-    fail_webdriver_content_commands_after_process_replacement(pending_webdriver_command_ids);
-    fail_webdriver_content_commands_after_process_replacement(pending_webdriver_crash_command_ids);
+    fail_webdriver_content_commands_after_process_replacement(pending_webdriver_commands);
+    fail_webdriver_content_commands_after_process_replacement(pending_webdriver_crash_commands);
 }
 
 void ViewImplementation::server_did_paint(Badge<WebContentClient>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect)
@@ -746,6 +746,24 @@ void ViewImplementation::reset_zoom()
 
     if (m_is_private == IsPrivate::No)
         Application::settings().set_zoom_for_host(current_host_for_settings(), m_zoom_level);
+}
+
+// NB: The event is handled once it leaves the queue of pending input events, or when it never enters it.
+struct WebDriverInputData final : public Web::BrowserInputData {
+    explicit WebDriverInputData(Function<void()> on_handled)
+        : on_handled(move(on_handled))
+    {
+    }
+
+    virtual ~WebDriverInputData() override { on_handled(); }
+
+    Function<void()> on_handled;
+};
+
+void ViewImplementation::enqueue_webdriver_mouse_event(Badge<WebContentClient>, Web::MouseEvent event, Function<void()> on_handled)
+{
+    event.browser_data = make<WebDriverInputData>(move(on_handled));
+    enqueue_input_event(move(event));
 }
 
 void ViewImplementation::enqueue_input_event(Web::InputEvent event)
@@ -1977,19 +1995,26 @@ void ViewImplementation::set_is_fullscreen(Web::ViewportIsFullscreen is_fullscre
     handle_resize();
 }
 
+// NB: Every page of the tab holds the dialog a document of one of them opened.
 void ViewImplementation::alert_closed()
 {
-    client().async_alert_closed(page_id());
+    m_top_level_traversable.for_each_hosting_page([&](WebContentPage const& page) {
+        page.client->async_alert_closed(page.id);
+    });
 }
 
 void ViewImplementation::confirm_closed(bool accepted)
 {
-    client().async_confirm_closed(page_id(), accepted);
+    m_top_level_traversable.for_each_hosting_page([&](WebContentPage const& page) {
+        page.client->async_confirm_closed(page.id, accepted);
+    });
 }
 
 void ViewImplementation::prompt_closed(Optional<Utf16String> const& response)
 {
-    client().async_prompt_closed(page_id(), response);
+    m_top_level_traversable.for_each_hosting_page([&](WebContentPage const& page) {
+        page.client->async_prompt_closed(page.id, response);
+    });
 }
 
 void ViewImplementation::color_picker_update(Optional<Color> picked_color, Web::HTML::ColorPickerUpdateState state)
@@ -2567,38 +2592,134 @@ bool ViewImplementation::cancel_uncommitted_top_level_navigation(StringView reas
     return true;
 }
 
-void ViewImplementation::apply_webdriver_session_config(WebDriverSessionConfig const& config)
-{
-    client().async_set_webdriver_session_config(page_id(), config.user_prompt_handler, config.page_load_strategy, config.strict_file_interactability, config.timeouts);
-}
-
-void ViewImplementation::run_webdriver_content_command(u64 command_id, String const& name, JsonValue payload, Vector<String> arguments)
+void ViewImplementation::run_webdriver_content_command(u64 command_id, Web::WebDriver::SessionBrowsingContext browsing_context, String const& name, JsonValue payload, Vector<String> arguments)
 {
     if (m_crash_state.has_value() && !m_crash_state->recovery_started) {
         Application::the().complete_webdriver_content_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "WebContent has crashed"sv));
         return;
     }
 
+    Optional<Web::HTML::CrossProcessId> navigable_id;
+    if (browsing_context == Web::WebDriver::SessionBrowsingContext::Current)
+        navigable_id = m_webdriver_current_navigable_id;
+
+    // NB: A command runs in the process hosting the browsing context it runs against.
+    auto page = web_content_page();
+    if (navigable_id.has_value()) {
+        // https://w3c.github.io/webdriver/#dfn-no-longer-open
+        // A browsing context is said to be no longer open if its navigable has been destroyed.
+        auto navigable = m_top_level_traversable.find(*navigable_id);
+        if (navigable.has_value())
+            page = m_top_level_traversable.page_hosting(*navigable);
+        if (!navigable.has_value() || !page.is_open()) {
+            Application::the().complete_webdriver_content_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window not found"sv));
+            return;
+        }
+    }
+
     if (name == "crash_current_page"sv)
-        m_pending_webdriver_crash_command_ids.set(command_id);
+        m_pending_webdriver_crash_commands.set(command_id, page);
     else
-        m_pending_webdriver_command_ids.set(command_id);
-    client().async_run_webdriver_command(page_id(), command_id, name, move(payload), move(arguments));
+        m_pending_webdriver_commands.set(command_id, page);
+    page.client->async_run_webdriver_command(page.id, command_id, navigable_id, name, move(payload), move(arguments));
+}
+
+void ViewImplementation::did_lose_page(Badge<CanonicalTraversable>, WebContentPage const& page)
+{
+    // NB: The view fails the commands of its own page when it replaces the process or recovers from its crash.
+    if (page == web_content_page())
+        return;
+
+    m_pending_webdriver_commands.remove_all_matching([&](u64 command_id, WebContentPage const& command_page) {
+        if (command_page != page)
+            return false;
+        Application::the().complete_webdriver_content_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Browsing context was discarded while executing the command"sv));
+        return true;
+    });
+}
+
+void ViewImplementation::did_set_webdriver_current_browsing_context(Badge<WebContentClient>, u64 command_id, Web::HTML::CrossProcessId navigable_id)
+{
+    if (!m_pending_webdriver_commands.contains(command_id))
+        return;
+
+    if (auto navigable = m_top_level_traversable.find(navigable_id); navigable.has_value())
+        set_webdriver_current_browsing_context(*navigable);
+}
+
+void ViewImplementation::set_webdriver_current_browsing_context_to_top_level()
+{
+    set_webdriver_current_browsing_context(m_top_level_traversable);
+}
+
+// https://w3c.github.io/webdriver/#dfn-set-the-current-browsing-context
+void ViewImplementation::set_webdriver_current_browsing_context(CanonicalNavigable const& navigable)
+{
+    if (!navigable.parent()) {
+        m_webdriver_current_navigable_id = {};
+        m_webdriver_current_parent_navigable_id = {};
+        return;
+    }
+
+    // 1. Set session's current browsing context to context.
+    m_webdriver_current_navigable_id = navigable.id();
+
+    // 2. Set the session's current parent browsing context to the parent browsing context of context, if that context
+    //    exists, or null otherwise.
+    m_webdriver_current_parent_navigable_id = navigable.parent()->id();
+}
+
+// 11.7 Switch To Parent Frame, https://w3c.github.io/webdriver/#dfn-switch-to-parent-frame
+void ViewImplementation::switch_webdriver_to_parent_frame(Function<void(Web::WebDriver::Response)> on_complete)
+{
+    // 1. If session's current browsing context is already the top-level browsing context:
+    if (!m_webdriver_current_navigable_id.has_value()) {
+        // 1. If session's current browsing context is no longer open, return error with error code no such window.
+        // NB: The view is the current top-level browsing context, so it is open.
+
+        // 2. Return success with data null.
+        on_complete(JsonValue {});
+        return;
+    }
+
+    // 2. If session's current parent browsing context is no longer open, return error with error code no such window.
+    if (!m_webdriver_current_parent_navigable_id.has_value() || !m_top_level_traversable.find(*m_webdriver_current_parent_navigable_id).has_value()) {
+        on_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window not found"sv));
+        return;
+    }
+
+    // 3. Try to handle any user prompts with session.
+    run_webdriver_user_prompt_handling([weak_this = make_weak_ptr(), on_complete = move(on_complete)](Web::WebDriver::Response response) mutable {
+        if (response.is_error() || !weak_this) {
+            on_complete(move(response));
+            return;
+        }
+
+        // 4. If session's current parent browsing context is not null, set the current browsing context with session and
+        //    current parent browsing context.
+        if (auto parent = weak_this->m_top_level_traversable.find(*weak_this->m_webdriver_current_parent_navigable_id); parent.has_value())
+            weak_this->set_webdriver_current_browsing_context(*parent);
+
+        // FIXME: 5. Update any implementation-specific state that would result from the user selecting session's current browsing context for interaction, without altering OS-level focus.
+
+        // 6. Return success with data null.
+        on_complete(JsonValue {});
+    });
 }
 
 void ViewImplementation::did_complete_webdriver_content_command(Badge<WebContentClient>, u64 command_id, Web::WebDriver::Response response)
 {
-    if (m_pending_webdriver_crash_command_ids.contains(command_id)) {
+    if (m_pending_webdriver_crash_commands.contains(command_id)) {
         // WebContent acknowledges the command before its deferred process exit. Keep the command pending until the
         // crash handler has created the replacement process and started session-history recovery.
         if (response.is_error()) {
-            m_pending_webdriver_crash_command_ids.remove(command_id);
+            m_pending_webdriver_crash_commands.remove(command_id);
             Application::the().complete_webdriver_content_command(command_id, move(response));
         }
         return;
     }
 
-    if (m_pending_webdriver_command_ids.remove(command_id))
+    if (m_pending_webdriver_commands.remove(command_id))
         Application::the().complete_webdriver_content_command(command_id, move(response));
 }
 
@@ -2625,10 +2746,10 @@ void ViewImplementation::did_close_browsing_context(Badge<WebContentClient>)
     for (auto& request : pending_user_prompt_requests)
         request.value(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window closed while handling user prompts"sv));
 
-    auto pending_command_ids = move(m_pending_webdriver_command_ids);
-    fail_webdriver_content_commands_after_window_close(pending_command_ids);
-    auto pending_crash_command_ids = move(m_pending_webdriver_crash_command_ids);
-    fail_webdriver_content_commands_after_window_close(pending_crash_command_ids);
+    auto pending_commands = move(m_pending_webdriver_commands);
+    fail_webdriver_content_commands_after_window_close(pending_commands);
+    auto pending_crash_commands = move(m_pending_webdriver_crash_commands);
+    fail_webdriver_content_commands_after_window_close(pending_crash_commands);
 
     auto pending_navigation_completion_requests = move(m_pending_webdriver_navigation_completion_requests);
     for (auto& request : pending_navigation_completion_requests) {
@@ -3107,10 +3228,10 @@ void ViewImplementation::handle_web_content_process_crash()
     for (auto& request : pending_user_prompt_requests)
         request.value(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "WebContent crashed while handling user prompts"sv));
 
-    auto pending_command_ids = move(m_pending_webdriver_command_ids);
-    auto pending_crash_command_ids = move(m_pending_webdriver_crash_command_ids);
-    for (auto command_id : pending_command_ids)
-        Application::the().complete_webdriver_content_command(command_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "WebContent crashed while executing the command"sv));
+    auto pending_commands = move(m_pending_webdriver_commands);
+    auto pending_crash_commands = move(m_pending_webdriver_crash_commands);
+    for (auto const& command : pending_commands)
+        Application::the().complete_webdriver_content_command(command.key, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "WebContent crashed while executing the command"sv));
 
     auto crashed_during_recovery = m_webdriver_navigation_observation.has_value()
         && m_webdriver_navigation_observation->completion_source == WebDriverNavigationCompletionSource::CrashRecovery;
@@ -3171,8 +3292,8 @@ void ViewImplementation::handle_web_content_process_crash()
         m_top_level_traversable.abandon_after_web_content_process_crash();
     }
 
-    for (auto command_id : pending_crash_command_ids)
-        Application::the().complete_webdriver_content_command(command_id, JsonValue {});
+    for (auto const& command : pending_crash_commands)
+        Application::the().complete_webdriver_content_command(command.key, JsonValue {});
 }
 
 void ViewImplementation::respawn_web_content_process_after_crash()

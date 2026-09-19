@@ -306,6 +306,7 @@ private:
     virtual void did_change_needs_beforeunload_check(Web::PageId page_id, bool needs_beforeunload_check) override;
     virtual void did_consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption) override;
     virtual void webdriver_user_prompt_handling_complete(Web::PageId page_id, u64 request_id, Web::WebDriver::Response response) override;
+    virtual void webdriver_did_set_current_browsing_context(Web::PageId page_id, u64 command_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void webdriver_command_complete(Web::PageId page_id, u64 command_id, Web::WebDriver::Response response) override;
     virtual void did_update_resource_count(Web::PageId page_id, i32 count_waiting) override;
     virtual void did_request_restore_window(Web::PageId page_id) override;
@@ -342,6 +343,7 @@ private:
     virtual void did_request_set_system_focus(Web::PageId page_id, bool has_system_focus) override;
     virtual void did_change_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void did_request_key_event_for_testing(Web::PageId page_id, Web::KeyEvent) override;
+    virtual void did_request_webdriver_mouse_event(Web::PageId page_id, u64 request_id, Web::HTML::CrossProcessId root_navigable_id, Web::MouseEvent) override;
     virtual void did_request_set_system_visibility_state(Web::PageId page_id, Web::HTML::VisibilityState) override;
     virtual void request_history_operation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters) override;
     virtual void history_operation_ready(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationReadyResult) override;
@@ -361,6 +363,7 @@ private:
 
     Optional<ViewImplementation&> view_for_page_id(Web::PageId, SourceLocation = SourceLocation::current());
     Optional<ViewImplementation&> owning_view_for_page_id(Web::PageId);
+    void did_open_dialog(ViewImplementation&, Web::PageId, Web::Page::PendingDialog, Utf16String const& message);
 
     void remember_compositor_context(Web::Compositor::CompositorContextId, Optional<Web::PageId> page_id);
     bool is_renderer_owned_download(Web::PageId page_id, u64 download_id) const;

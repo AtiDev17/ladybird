@@ -41,12 +41,9 @@ namespace Web::HTML {
 GC_DEFINE_ALLOCATOR(Navigation);
 GC_DEFINE_ALLOCATOR(NavigationAPIMethodTracker);
 
-static NavigationResult navigation_api_method_tracker_derived_result(GC::Ref<NavigationAPIMethodTracker> api_method_tracker);
-
-static GC::Ref<WebIDL::Promise> invoke_navigation_intercept_handler(JS::Realm& realm, WebIDL::CallbackType& handler)
+static GC::Ref<WebIDL::Promise> invoke_navigation_intercept_handler(WebIDL::CallbackType& handler)
 {
-    auto result = WebIDL::invoke_callback(handler, {}, {});
-    return WebIDL::create_resolved_promise(realm, result.value());
+    return WebIDL::invoke_promise_callback(handler, {}, {});
 }
 
 static void resolve_navigation_history_entry_promise(JS::Realm& realm, WebIDL::Promise& promise, GC::Ref<NavigationHistoryEntry> entry)
@@ -69,7 +66,8 @@ NavigationAPIMethodTracker::NavigationAPIMethodTracker(GC::Ref<Navigation> navig
     Optional<StorageSerializationRecord> serialized_state,
     GC::Ptr<NavigationHistoryEntry> committed_to_entry,
     GC::Ref<WebIDL::Promise> committed_promise,
-    GC::Ref<WebIDL::Promise> finished_promise)
+    GC::Ref<WebIDL::Promise> finished_promise,
+    Pending pending)
     : navigation(navigation)
     , key(move(key))
     , info(info)
@@ -77,6 +75,7 @@ NavigationAPIMethodTracker::NavigationAPIMethodTracker(GC::Ref<Navigation> navig
     , committed_to_entry(committed_to_entry)
     , committed_promise(committed_promise)
     , finished_promise(finished_promise)
+    , pending(pending)
 {
 }
 
@@ -117,7 +116,6 @@ void Navigation::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_ongoing_navigate_event);
     visitor.visit(m_window);
     visitor.visit(m_ongoing_api_method_tracker);
-    visitor.visit(m_upcoming_non_traverse_api_method_tracker);
     visitor.visit(m_upcoming_traverse_api_method_trackers);
 }
 
@@ -301,31 +299,21 @@ WebIDL::ExceptionOr<NavigationResult> Navigation::navigate(Utf16String url, Bind
     // 10. Let info be options["info"], if it exists; otherwise, undefined.
     auto info = options.info.value_or(JS::js_undefined());
 
-    // 11. Let apiMethodTracker be the result of maybe setting the upcoming non-traverse API method tracker for this
-    //     given info and serializedState.
-    auto api_method_tracker = maybe_set_the_upcoming_non_traverse_api_method_tracker(info, serialized_state);
+    // 11. Let apiMethodTracker be the result of setting up a navigate/reload API method tracker for this given info
+    //     and serializedState.
+    auto api_method_tracker = set_up_a_navigate_reload_api_method_tracker(info, serialized_state);
 
-    // 12. Navigate document's node navigable to urlRecord using document,
-    //     with historyHandling set to options["history"] and navigationAPIState set to serializedState.
-    // FIXME: Fix spec typo here
+    // 12. Navigate document's node navigable to urlRecord using document, with historyHandling set to
+    //     options["history"], navigationAPIState set to serializedState, and apiMethodTracker set to apiMethodTracker.
     // NOTE: Unlike location.assign() and friends, which are exposed across origin-domain boundaries,
     //       navigation.navigate() can only be accessed by code with direct synchronous access to the
     //       window.navigation property. Thus, we avoid the complications about attributing the source document
     //       of the navigation, and we don't need to deal with the allowed by sandboxing to navigate check and its
     //       acccompanying exceptionsEnabled flag. We just treat all navigations as if they come from the Document
     //       corresponding to this Navigation object itself (i.e., document).
-    TRY(document.navigable()->navigate({ .url = url_record.release_value(), .source_document = document, .history_handling = options.history, .navigation_api_state = move(serialized_state) }));
+    TRY(document.navigable()->navigate({ .url = url_record.release_value(), .source_document = document, .history_handling = options.history, .navigation_api_state = move(serialized_state), .api_method_tracker = api_method_tracker }));
 
-    // 13. If this's upcoming non-traverse API method tracker is apiMethodTracker, then:
-    // NOTE: If the upcoming non-traverse API method tracker is still apiMethodTracker, this means that the navigate
-    //       algorithm bailed out before ever getting to the inner navigate event firing algorithm which would promote
-    //       that upcoming API method tracker to ongoing.
-    if (m_upcoming_non_traverse_api_method_tracker == api_method_tracker) {
-        m_upcoming_non_traverse_api_method_tracker = nullptr;
-        return early_error_result(WebIDL::AbortError::create("Navigation aborted"_utf16));
-    }
-
-    // 14. Return a navigation API method tracker-derived result for apiMethodTracker.
+    // 13. Return a navigation API method tracker-derived result for apiMethodTracker.
     return navigation_api_method_tracker_derived_result(api_method_tracker);
 }
 
@@ -378,12 +366,15 @@ WebIDL::ExceptionOr<NavigationResult> Navigation::reload_internal(NavigationRelo
     // 7. Let info be options["info"], if it exists; otherwise, undefined.
     auto info = options.info.value_or(JS::js_undefined());
 
-    // 8. Let apiMethodTracker be the result of maybe setting the upcoming non-traverse API method tracker for this given info and serializedState.
-    auto api_method_tracker = maybe_set_the_upcoming_non_traverse_api_method_tracker(info, serialized_state);
+    // 8. Let apiMethodTracker be the result of setting up a navigate/reload API method tracker for this given info
+    //    and serializedState.
+    auto api_method_tracker = set_up_a_navigate_reload_api_method_tracker(info, serialized_state);
 
-    // 9. Reload document's node navigable with navigationAPIState set to serializedState.
-    document.navigable()->reload(move(serialized_state));
+    // 9. Reload document's node navigable with navigationAPIState set to serializedState and apiMethodTracker set to
+    //    apiMethodTracker.
+    document.navigable()->reload(move(serialized_state), UserNavigationInvolvement::None, api_method_tracker);
 
+    // 10. Return a navigation API method tracker-derived result for apiMethodTracker.
     return navigation_api_method_tracker_derived_result(api_method_tracker);
 }
 
@@ -565,18 +556,25 @@ NavigationResult Navigation::early_error_result(GC::Ref<WebIDL::DOMException> ex
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#navigation-api-method-tracker-derived-result
-NavigationResult navigation_api_method_tracker_derived_result(GC::Ref<NavigationAPIMethodTracker> api_method_tracker)
+NavigationResult Navigation::navigation_api_method_tracker_derived_result(GC::Ref<NavigationAPIMethodTracker> api_method_tracker)
 {
-    // A navigation API method tracker-derived result for a navigation API method tracker is a NavigationResult
-    /// dictionary instance given by «[ "committed" apiMethodTracker's committed promise, "finished" → apiMethodTracker's finished promise ]».
+    // To compute the navigation API method tracker-derived result for a navigation API method tracker-or-null
+    // apiMethodTracker:
+
+    // 1. If apiMethodTracker is pending, then return an early error result for an "AbortError" DOMException.
+    if (api_method_tracker->pending == NavigationAPIMethodTracker::Pending::Yes)
+        return early_error_result(WebIDL::AbortError::create("Navigation aborted"_utf16));
+
+    // 2. Return a NavigationResult dictionary instance given by «[ "committed" → apiMethodTracker's committed
+    //    promise, "finished" → apiMethodTracker's finished promise ]».
     return NavigationResult::from_promises(api_method_tracker->committed_promise, api_method_tracker->finished_promise);
 }
 
-// https://html.spec.whatwg.org/multipage/nav-history-apis.html#upcoming-non-traverse-api-method-tracker
-GC::Ref<NavigationAPIMethodTracker> Navigation::maybe_set_the_upcoming_non_traverse_api_method_tracker(JS::Value info, Optional<StorageSerializationRecord> serialized_state)
+// https://html.spec.whatwg.org/multipage/nav-history-apis.html#set-up-a-navigate/reload-api-method-tracker
+GC::Ref<NavigationAPIMethodTracker> Navigation::set_up_a_navigate_reload_api_method_tracker(JS::Value info, Optional<StorageSerializationRecord> serialized_state)
 {
-    // To maybe set the upcoming non-traverse API method tracker given a Navigation navigation,
-    // a JavaScript value info, and a serialized state-or-null serializedState:
+    // To set up a navigate/reload API method tracker given a Navigation navigation, a JavaScript value info, and a
+    // serialized state-or-null serializedState:
 
     // 1. Let committedPromise and finishedPromise be new promises created in navigation's relevant realm.
     auto committed_promise = WebIDL::create_promise_for(window());
@@ -594,37 +592,24 @@ GC::Ref<NavigationAPIMethodTracker> Navigation::maybe_set_the_upcoming_non_trave
     //       As such, we mark it as handled to ensure that it never triggers unhandledrejection events.
     WebIDL::mark_promise_as_handled(finished_promise);
 
-    // 3. Let apiMethodTracker be a new navigation API method tracker with:
-    //     navigation object: navigation
-    //     key:               null
-    //     info:              info
-    //     serialized state:  serializedState
+    // 3. Return a new navigation API method tracker with:
+    //     navigation object:  navigation
+    //     key:                null
+    //     info:               info
+    //     serialized state:   serializedState
     //     committed-to entry: null
     //     committed promise:  committedPromise
-    //     finished promise:  finishedPromise
-    auto api_method_tracker = GC::Heap::the().allocate<NavigationAPIMethodTracker>(
+    //     finished promise:   finishedPromise
+    //     pending:            false if navigation has entries and events disabled; otherwise true
+    return GC::Heap::the().allocate<NavigationAPIMethodTracker>(
         /* .navigation = */ *this,
         /* .key = */ OptionalNone {},
         /* .info = */ info,
         /* .serialized_state = */ move(serialized_state),
         /* .committed_to_entry = */ nullptr,
         /* .committed_promise = */ committed_promise,
-        /* .finished_promise = */ finished_promise);
-
-    // 4. Assert: navigation's upcoming non-traverse API method tracker is null.
-    VERIFY(m_upcoming_non_traverse_api_method_tracker == nullptr);
-
-    // 5. If navigation does not have entries and events disabled,
-    //    then set navigation's upcoming non-traverse API method tracker to apiMethodTracker.
-    // NOTE: If navigation has entries and events disabled, then committedPromise and finishedPromise will never fulfill
-    //      (since we never create a NavigationHistoryEntry object for such Documents, and so we have nothing to resolve them with);
-    //      there is no NavigationHistoryEntry to apply serializedState to; and there is no navigate event to include info with.
-    //      So, we don't need to track this API method call after all.
-    if (!has_entries_and_events_disabled())
-        m_upcoming_non_traverse_api_method_tracker = api_method_tracker;
-
-    // 6. Return apiMethodTracker.
-    return api_method_tracker;
+        /* .finished_promise = */ finished_promise,
+        /* .pending = */ has_entries_and_events_disabled() ? NavigationAPIMethodTracker::Pending::No : NavigationAPIMethodTracker::Pending::Yes);
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#add-an-upcoming-traverse-api-method-tracker
@@ -649,6 +634,7 @@ GC::Ref<NavigationAPIMethodTracker> Navigation::add_an_upcoming_traverse_api_met
     //     committed-to entry: null
     //     committed promise:  committedPromise
     //     finished promise:  finishedPromise
+    //     pending:           false
     auto api_method_tracker = GC::Heap::the().allocate<NavigationAPIMethodTracker>(
         /* .navigation = */ *this,
         /* .key = */ destination_key,
@@ -656,7 +642,8 @@ GC::Ref<NavigationAPIMethodTracker> Navigation::add_an_upcoming_traverse_api_met
         /* .serialized_state = */ OptionalNone {},
         /* .committed_to_entry = */ nullptr,
         /* .committed_promise = */ committed_promise,
-        /* .finished_promise = */ finished_promise);
+        /* .finished_promise = */ finished_promise,
+        /* .pending = */ NavigationAPIMethodTracker::Pending::No);
 
     // 4. Set navigation's upcoming traverse API method trackers[destinationKey] to apiMethodTracker.
     m_upcoming_traverse_api_method_trackers.set(destination_key, api_method_tracker);
@@ -807,11 +794,15 @@ void Navigation::abort_the_ongoing_navigation(GC::Ptr<WebIDL::DOMException> erro
     abort_a_navigate_event(*event, *error);
 }
 
-// https://html.spec.whatwg.org/multipage/nav-history-apis.html#abort-a-navigateevent
 void Navigation::abort_a_navigate_event(GC::Ref<NavigateEvent> event, GC::Ref<WebIDL::DOMException> reason)
 {
+    abort_a_navigate_event(event, throw_completion(window().principal_realm(), reason).value());
+}
+
+// https://html.spec.whatwg.org/multipage/nav-history-apis.html#abort-a-navigateevent
+void Navigation::abort_a_navigate_event(GC::Ref<NavigateEvent> event, JS::Value reason_value)
+{
     auto& realm = window().principal_realm();
-    auto reason_value = throw_completion(realm, reason).value();
 
     // 1. Let navigation be event's relevant global object's navigation API.
     // NB: Navigation is `this`.
@@ -820,19 +811,22 @@ void Navigation::abort_a_navigate_event(GC::Ref<NavigateEvent> event, GC::Ref<We
     //         both the abort signal and the promise rejections below run script.
     TemporaryExecutionContext execution_context { window().principal_realm(), TemporaryExecutionContext::CallbacksEnabled::Yes };
 
-    // 2. Signal abort on event's abort controller given reason.
-    event->abort_controller()->abort(realm, reason_value);
-
-    // 3. Let errorInfo be the result of extracting error information from reason.
-    auto error_info = extract_error_information(vm(), reason_value);
-
-    // 4. Set navigation's ongoing navigate event to null.
+    // 2. Set navigation's ongoing navigate event to null.
     m_ongoing_navigate_event = nullptr;
 
     // 5. If navigation's ongoing API method tracker is non-null, then reject the finished promise for apiMethodTracker
     //    with reason.
+    // AD-HOC: This runs before signaling abort, since an abort handler can start a new navigation. Its inner navigate
+    //         event firing algorithm asserts that no API method tracker is ongoing, and leaving this one in place would
+    //         reject the new navigation's tracker instead.
     if (m_ongoing_api_method_tracker)
-        reject_the_finished_promise(*m_ongoing_api_method_tracker, reason);
+        reject_the_finished_promise(*m_ongoing_api_method_tracker, reason_value);
+
+    // 3. Signal abort on event's abort controller given reason.
+    event->abort_controller()->abort(realm, reason_value);
+
+    // 4. Let errorInfo be the result of extracting error information from reason.
+    auto error_info = extract_error_information(vm(), reason_value);
 
     // 6. Fire an event named navigateerror at navigation using ErrorEvent, with additional attributes initialized
     //    according to errorInfo.
@@ -849,7 +843,7 @@ void Navigation::abort_a_navigate_event(GC::Ref<NavigateEvent> event, GC::Ref<We
     if (!m_transition)
         return;
 
-    // 8. Reject navigation's transition's committed promise with error.
+    // 8. Reject navigation's transition's committed promise with reason.
     WebIDL::reject_promise(m_transition->committed(), reason_value);
 
     // 9. Reject navigation's transition's finished promise with reason.
@@ -857,37 +851,6 @@ void Navigation::abort_a_navigate_event(GC::Ref<NavigateEvent> event, GC::Ref<We
 
     // 10. Set navigation's transition to null.
     m_transition = nullptr;
-}
-
-// https://html.spec.whatwg.org/multipage/nav-history-apis.html#promote-an-upcoming-api-method-tracker-to-ongoing
-void Navigation::promote_an_upcoming_api_method_tracker_to_ongoing(Optional<Utf16String> destination_key)
-{
-    // 1. Assert: navigation's ongoing API method tracker is null.
-    VERIFY(m_ongoing_api_method_tracker == nullptr);
-
-    // 2. If destinationKey is not null, then:
-    if (destination_key.has_value()) {
-        // 1. Assert: navigation's upcoming non-traverse API method tracker is null.
-        VERIFY(m_upcoming_non_traverse_api_method_tracker == nullptr);
-
-        // 2. If navigation's upcoming traverse API method trackers[destinationKey] exists, then:
-        if (auto tracker = m_upcoming_traverse_api_method_trackers.get(destination_key.value()); tracker.has_value()) {
-            // 1. Set navigation's ongoing API method tracker to navigation's upcoming traverse API method trackers[destinationKey].
-            m_ongoing_api_method_tracker = tracker.value();
-
-            // 2. Remove navigation's upcoming traverse API method trackers[destinationKey].
-            m_upcoming_traverse_api_method_trackers.remove(destination_key.value());
-        }
-    }
-
-    // 3. Otherwise:
-    else {
-        // 1. Set navigation's ongoing API method tracker to navigation's upcoming non-traverse API method tracker.
-        m_ongoing_api_method_tracker = m_upcoming_non_traverse_api_method_tracker;
-
-        // 2. Set navigation's upcoming non-traverse API method tracker to null.
-        m_upcoming_non_traverse_api_method_tracker = nullptr;
-    }
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#navigation-api-method-tracker-clean-up
@@ -987,7 +950,7 @@ void Navigation::run_the_navigate_event_intercept_commit_handler_steps(GC::Ref<N
     // 2. For each handler of event's navigation handler list:
     for (auto const& handler : event->navigation_handler_list()) {
         // 1. Append the result of invoking handler with an empty arguments list to promisesList.
-        promises_list.append(invoke_navigation_intercept_handler(realm, handler));
+        promises_list.append(invoke_navigation_intercept_handler(handler));
     }
 
     // 3. If promisesList's size is 0, then set promisesList to « a promise resolved with undefined ».
@@ -1019,12 +982,15 @@ void Navigation::run_the_navigate_event_intercept_commit_handler_steps(GC::Ref<N
             // 4. Set navigation's ongoing navigate event to null.
             m_ongoing_navigate_event = nullptr;
 
-            // 5. Finish event given true.
-            event->finish(true);
-
             // 6. If apiMethodTracker is non-null, then resolve the finished promise for apiMethodTracker.
+            // AD-HOC: This runs before finishing the event, since resetting the focus can start a new navigation
+            //         from a blur handler, and its inner navigate event firing algorithm asserts that no API method
+            //         tracker is ongoing.
             if (api_method_tracker != nullptr)
                 resolve_the_finished_promise(*api_method_tracker);
+
+            // 5. Finish event given true.
+            event->finish(true);
 
             // FIXME: Implement https://dom.spec.whatwg.org/#concept-event-fire somewhere
             // 7. Fire an event named navigatesuccess at navigation.
@@ -1038,42 +1004,37 @@ void Navigation::run_the_navigate_event_intercept_commit_handler_steps(GC::Ref<N
 
             // 9. Set navigation's transition to null.
             m_transition = nullptr; },
-        // and the following failure step given reason:
-        [event, this, api_method_tracker](JS::Value rejection_reason) -> void {
-            // NB: This inlines "process navigate event handler failure" using the rejected JavaScript value directly.
-            auto& window = event->relevant_window();
-            auto& realm = window.principal_realm();
-            if (!window.associated_document().is_fully_active())
-                return;
-
-            if (event->abort_controller()->signal()->aborted())
-                return;
-
-            VERIFY(event == m_ongoing_navigate_event);
-
-            m_ongoing_navigate_event = nullptr;
-
-            event->finish(false);
-
-            auto error_info = extract_error_information(vm(), rejection_reason);
-
-            if (api_method_tracker != nullptr)
-                reject_the_finished_promise(*api_method_tracker, rejection_reason);
-
-            ErrorEventInit event_init = {};
-            event_init.message = error_info.message;
-            event_init.filename = error_info.filename;
-            event_init.lineno = error_info.lineno;
-            event_init.colno = error_info.colno;
-            event_init.error = error_info.error;
-
-            dispatch_event(ErrorEvent::create(EventNames::navigateerror, event_init, HighResolutionTime::current_high_resolution_time(realm.global_object())));
-
-            if (m_transition)
-                WebIDL::reject_promise(m_transition->finished(), rejection_reason);
-
-            m_transition = nullptr;
+        // and the following failure step given reason: process navigate event handler failure given event and reason.
+        [event, this](JS::Value reason) -> void {
+            process_navigate_event_handler_failure(event, reason);
         });
+}
+
+// https://html.spec.whatwg.org/multipage/nav-history-apis.html#process-navigate-event-handler-failure
+void Navigation::process_navigate_event_handler_failure(GC::Ref<NavigateEvent> event, JS::Value reason)
+{
+    // 1. If event's relevant global object's associated Document is not fully active, then return.
+    if (!event->relevant_window().associated_document().is_fully_active())
+        return;
+
+    // 2. If event's abort controller's signal is aborted, then return.
+    if (event->abort_controller()->signal()->aborted())
+        return;
+
+    // 3. Assert: event is event's relevant global object's navigation API's ongoing navigate event.
+    VERIFY(event == m_ongoing_navigate_event);
+
+    // AD-HOC: Settle the ongoing API method tracker before finishing the event, see the navigate event intercept
+    //         commit handler steps.
+    if (m_ongoing_api_method_tracker)
+        reject_the_finished_promise(*m_ongoing_api_method_tracker, reason);
+
+    // 4. If event's interception state is not "intercepted", then finish event given false.
+    if (event->interception_state() != NavigateEvent::InterceptionState::Intercepted)
+        event->finish(false);
+
+    // 5. Abort event given reason.
+    abort_a_navigate_event(event, reason);
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#inner-navigate-event-firing-algorithm
@@ -1084,7 +1045,8 @@ bool Navigation::inner_navigate_event_firing_algorithm(
     GC::Ptr<DOM::Element> source_element,
     Optional<GC::ConservativeVector<XHR::FormDataEntry>&> form_data_entry_list,
     Optional<Utf16String> download_request_filename,
-    Optional<StorageSerializationRecord> classic_history_api_state)
+    Optional<StorageSerializationRecord> classic_history_api_state,
+    GC::Ptr<NavigationAPIMethodTracker> api_method_tracker)
 {
     // NOTE: Specification assumes that ongoing navigation event is cancelled before dispatching next navigation event.
     if (m_ongoing_navigate_event)
@@ -1092,48 +1054,65 @@ bool Navigation::inner_navigate_event_firing_algorithm(
 
     auto& realm = window().principal_realm();
 
-    // 1. If navigation has entries and events disabled, then:
-    // NOTE: These assertions holds because traverseTo(), back(), and forward() will immediately fail when entries and events are disabled
-    //       (since there are no entries to traverse to), and if our starting point is instead navigate() or reload(),
-    //       then we avoided setting the upcoming non-traverse API method tracker in the first place.
+    // 1. If navigation has entries and events disabled:
+    // NOTE: These assertions holds because traverseTo(), back(), and forward() will immediately fail when entries and
+    //       events are disabled (since there are no entries to traverse to).
     if (has_entries_and_events_disabled()) {
         // 1. Assert: navigation's ongoing API method tracker is null.
         VERIFY(m_ongoing_api_method_tracker == nullptr);
 
-        // 2. Assert: navigation's upcoming non-traverse API method tracker is null.
-        VERIFY(m_upcoming_non_traverse_api_method_tracker == nullptr);
-
-        // 3. Assert: navigation's upcoming traverse API method trackers is empty.
+        // 2. Assert: navigation's upcoming traverse API method trackers is empty.
         VERIFY(m_upcoming_traverse_api_method_trackers.is_empty());
+
+        // 3. Assert: apiMethodTracker is null.
+        VERIFY(api_method_tracker == nullptr);
 
         // 4. Return true.
         return true;
     }
 
-    // 2. Let destinationKey be null.
-    Optional<Utf16String> destination_key = {};
+    // 2. Assert: navigation's ongoing API method tracker is null.
+    VERIFY(m_ongoing_api_method_tracker == nullptr);
 
-    // 3. If destination's entry is non-null, then set destinationKey to destination's entry's key.
-    if (destination->navigation_history_entry() != nullptr)
-        destination_key = destination->navigation_history_entry()->key();
+    // 3. If destination's entry is non-null:
+    if (destination->navigation_history_entry() != nullptr) {
+        // 1. Assert: apiMethodTracker is null.
+        // NOTE: apiMethodTracker is passed as an argument only for navigate() and reload() calls.
+        VERIFY(api_method_tracker == nullptr);
 
-    // 4. Assert: destinationKey is not the empty string.
-    VERIFY(!destination_key.has_value() || !destination_key->is_empty());
+        // 2. Let destinationKey be destination's entry's key.
+        auto destination_key = destination->navigation_history_entry()->key();
 
-    // 5. Promote an upcoming API method tracker to ongoing given navigation and destinationKey.
-    promote_an_upcoming_api_method_tracker_to_ongoing(destination_key);
+        // 3. Assert: destinationKey is not the empty string.
+        VERIFY(!destination_key.is_empty());
 
-    // 6. Let apiMethodTracker be navigation's ongoing API method tracker.
-    auto api_method_tracker = m_ongoing_api_method_tracker;
+        // 4. If navigation's upcoming traverse API method trackers[destinationKey] exists:
+        if (auto tracker = m_upcoming_traverse_api_method_trackers.get(destination_key); tracker.has_value()) {
+            // 1. Set apiMethodTracker to navigation's upcoming traverse API method trackers[destinationKey].
+            api_method_tracker = tracker.value();
 
-    // 7. Let navigable be navigation's relevant global object's navigable.
+            // 2. Remove navigation's upcoming traverse API method trackers[destinationKey].
+            m_upcoming_traverse_api_method_trackers.remove(destination_key);
+        }
+    }
+
+    // 4. If apiMethodTracker is not null:
+    if (api_method_tracker) {
+        // 1. Set navigation's ongoing API method tracker to apiMethodTracker.
+        m_ongoing_api_method_tracker = api_method_tracker;
+
+        // 2. Set apiMethodTracker's pending to false.
+        api_method_tracker->pending = NavigationAPIMethodTracker::Pending::No;
+    }
+
+    // 5. Let navigable be navigation's relevant global object's navigable.
     auto& window = this->window();
     auto navigable = window.navigable();
 
-    // 8. Let document be navigation's relevant global object's associated Document.
+    // 6. Let document be navigation's relevant global object's associated Document.
     auto& document = window.associated_document();
 
-    // 19. Set event's abort controller to a new AbortController created in navigation's relevant realm.
+    // 17. Set event's abort controller to a new AbortController created in navigation's relevant realm.
     // AD-HOC: Set on the NavigateEvent later after construction
     auto abort_controller = DOM::AbortController::create();
 
@@ -1154,12 +1133,12 @@ bool Navigation::inner_navigate_event_firing_algorithm(
         nullptr,
     };
 
-    // 9.  If document can have its URL rewritten to destination's URL,
+    // 7.  If document can have its URL rewritten to destination's URL,
     //     and either destination's is same document is true or navigationType is not "traverse",
     //     then initialize event's canIntercept to true. Otherwise, initialize it to false.
     event_init.can_intercept = can_have_its_url_rewritten(document, destination->raw_url()) && (destination->same_document() || navigation_type != NavigationType::Traverse);
 
-    // 10. Let traverseCanBeCanceled be true if all of the following are true:
+    // 8. Let traverseCanBeCanceled be true if all of the following are true:
     //      - navigable is a top-level traversable;
     //      - destination's is same document is true; and
     //      - either userInvolvement is not "browser UI", or navigation's relevant global object has history-action activation.
@@ -1168,25 +1147,25 @@ bool Navigation::inner_navigate_event_firing_algorithm(
         && destination->same_document()
         && (user_involvement != UserNavigationInvolvement::BrowserUI || window.has_history_action_activation());
 
-    // 11. If either:
+    // 9. If either:
     //      - navigationType is not "traverse"; or
     //      - traverseCanBeCanceled is true
     //     then initialize event's cancelable to true. Otherwise, initialize it to false.
     event_init.cancelable = (navigation_type != NavigationType::Traverse) || traverse_can_be_canceled;
 
-    // 12. Initialize event's type to "navigate".
+    // 10. Initialize event's type to "navigate".
     // AD-HOC: Happens later, when calling the factory function
 
-    // 13. Initialize event's navigationType to navigationType.
+    // 11. Initialize event's navigationType to navigationType.
     event_init.navigation_type = navigation_type;
 
-    // 14. Initialize event's destination to destination.
+    // 12. Initialize event's destination to destination.
     event_init.destination = destination;
 
-    // 15. Initialize event's downloadRequest to downloadRequestFilename.
+    // 13. Initialize event's downloadRequest to downloadRequestFilename.
     event_init.download_request = move(download_request_filename);
 
-    // 16. If apiMethodTracker is not null, then initialize event's info to apiMethodTracker's info. Otherwise, initialize it to undefined.
+    // 14. If apiMethodTracker is not null, then initialize event's info to apiMethodTracker's info. Otherwise, initialize it to undefined.
     // NOTE: At this point apiMethodTracker's info is no longer needed and can be nulled out instead of keeping it alive for the lifetime of the navigation API method tracker.
     if (api_method_tracker) {
         event_init.info = api_method_tracker->info;
@@ -1195,20 +1174,20 @@ bool Navigation::inner_navigate_event_firing_algorithm(
         event_init.info = JS::js_undefined();
     }
 
-    // FIXME: 17: Initialize event's hasUAVisualTransition to true if a visual transition, to display a cached rendered state
+    // FIXME: 15. Initialize event's hasUAVisualTransition to true if a visual transition, to display a cached rendered state
     //     of the document's latest entry, was done by the user agent. Otherwise, initialize it to false.
     event_init.has_ua_visual_transition = false;
 
-    // 18. Initialize event's sourceElement to sourceElement.
+    // 16. Initialize event's sourceElement to sourceElement.
     event_init.source_element = source_element;
 
-    // 20. Initialize event's signal to event's abort controller's signal.
+    // 18. Initialize event's signal to event's abort controller's signal.
     // AD-HOC: Done when event_init is created.
 
-    // 21. Let currentURL be document's URL.
+    // 19. Let currentURL be document's URL.
     auto current_url = document.url();
 
-    // 22. If all of the following are true:
+    // 20. If all of the following are true:
     //  - event's classic history API state is null;
     //  - destination's is same document is true;
     //  - destination's URL equals currentURL with exclude fragments set to true; and
@@ -1219,10 +1198,10 @@ bool Navigation::inner_navigate_event_firing_algorithm(
         && destination->raw_url().equals(current_url, URL::ExcludeFragment::Yes)
         && destination->raw_url().fragment() != current_url.fragment());
 
-    // 23. If userInvolvement is not "none", then initialize event's userInitiated to true. Otherwise, initialize it to false.
+    // 21. If userInvolvement is not "none", then initialize event's userInitiated to true. Otherwise, initialize it to false.
     event_init.user_initiated = user_involvement != UserNavigationInvolvement::None;
 
-    // 24. If formDataEntryList is not null, then initialize event's formData to a new FormData created in navigation's relevant realm,
+    // 22. If formDataEntryList is not null, then initialize event's formData to a new FormData created in navigation's relevant realm,
     //     associated to formDataEntryList. Otherwise, initialize it to null.
     if (form_data_entry_list.has_value()) {
         event_init.form_data = XHR::FormData::create(form_data_entry_list.release_value());
@@ -1238,22 +1217,22 @@ bool Navigation::inner_navigate_event_firing_algorithm(
     //         we're doing a push or replace. We set it here because we create the event here
     event->set_classic_history_api_state(move(classic_history_api_state));
 
-    // 25. Assert: navigation's ongoing navigate event is null.
+    // 23. Assert: navigation's ongoing navigate event is null.
     VERIFY(m_ongoing_navigate_event == nullptr);
 
-    // 26. Set navigation's ongoing navigate event to event.
+    // 24. Set navigation's ongoing navigate event to event.
     m_ongoing_navigate_event = event;
 
-    // 27. Set navigation's focus changed during ongoing navigation to false.
+    // 25. Set navigation's focus changed during ongoing navigation to false.
     m_focus_changed_during_ongoing_navigation = false;
 
-    // 28. Set navigation's suppress normal scroll restoration during ongoing navigation to false.
+    // 26. Set navigation's suppress normal scroll restoration during ongoing navigation to false.
     m_suppress_normal_scroll_restoration_during_ongoing_navigation = false;
 
-    // 29. Let dispatchResult be the result of dispatching event at navigation.
+    // 27. Let dispatchResult be the result of dispatching event at navigation.
     auto dispatch_result = dispatch_event(*event);
 
-    // 30. If dispatchResult is false:
+    // 28. If dispatchResult is false:
     if (!dispatch_result) {
         // 1. If navigationType is "traverse", then consume history-action user activation given navigation's relevant global object.
         if (navigation_type == NavigationType::Traverse)
@@ -1267,26 +1246,19 @@ bool Navigation::inner_navigate_event_firing_algorithm(
         return false;
     }
 
-    // 31. Let endResultIsSameDocument be true if event's interception state
-    //     is not "none" or event's destination's is same document is true.
-    bool const end_result_is_same_document = (event->interception_state() != NavigateEvent::InterceptionState::None) || event->destination()->same_document();
-
-    // 32. Prepare to run script given navigation's relevant settings object.
-    // NOTE: There's a massive spec note here
-    TemporaryExecutionContext execution_context { realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
-
-    // 33. If event's interception state is not "none":
+    // 29. If event's interception state is not "none":
     if (event->interception_state() != NavigateEvent::InterceptionState::None) {
-        // 1. Set event's interception state to "committed".
-        event->set_interception_state(NavigateEvent::InterceptionState::Committed);
+        // AD-HOC: A traverse navigate event fires from a session history traversal task with no JavaScript on the
+        //         stack, and creating the transition's promises needs a running execution context.
+        TemporaryExecutionContext execution_context { realm };
 
-        // 2. Let fromNHE be the current entry of navigation.
+        // 1. Let fromNHE be the current entry of navigation.
         auto from_nhe = current_entry();
 
-        // 3. Assert: fromNHE is not null.
+        // 2. Assert: fromNHE is not null.
         VERIFY(from_nhe != nullptr);
 
-        // 4. Set navigation's transition to a new NavigationTransition created in navigation's relevant realm, with
+        // 3. Set navigation's transition to a new NavigationTransition created in navigation's relevant realm, with
         //    navigation type: navigationType
         //    from entry: fromNHE
         //    destination: event's destination
@@ -1294,14 +1266,58 @@ bool Navigation::inner_navigate_event_firing_algorithm(
         //    finished promise: a new promise created in navigation's relevant realm
         m_transition = NavigationTransition::create(navigation_type, *from_nhe, event->destination(), WebIDL::create_promise_for(window), WebIDL::create_promise_for(window));
 
-        // 5. Mark as handled navigation's transition's finished promise.
+        // 4. Mark as handled navigation's transition's finished promise.
+        // NOTE: See the discussion about other finished promises to understand why this is done.
         WebIDL::mark_promise_as_handled(*m_transition->finished());
 
-        // AD-HOC: The current spec has changed significantly from what we implement here, but marks the committed
-        //         promise as handled at the equivalent place.
+        // 5. Mark as handled navigation's transition's committed promise.
         WebIDL::mark_promise_as_handled(*m_transition->committed());
+    }
 
-        // Switch on event's navigationType:
+    // 30. If event's navigation precommit handler list is empty then commit event given apiMethodTracker.
+    // FIXME: 31. Otherwise, invoke the precommit handlers and commit event once they have all fulfilled.
+    commit_a_navigate_event(event, api_method_tracker);
+
+    // 32. If event's interception state is "none", then return true.
+    // 33. Return false.
+    return event->interception_state() == NavigateEvent::InterceptionState::None;
+}
+
+// https://html.spec.whatwg.org/multipage/nav-history-apis.html#commit-a-navigate-event
+void Navigation::commit_a_navigate_event(GC::Ref<NavigateEvent> event, GC::Ptr<NavigationAPIMethodTracker> api_method_tracker)
+{
+    // 1. Let navigation be event's target.
+    // NB: Navigation is `this`.
+
+    // 2. Let navigable be event's relevant global object's navigable.
+    auto& window = event->relevant_window();
+    auto navigable = window.navigable();
+
+    // 3. If event's relevant global object's associated Document is not fully active, then return.
+    auto& document = window.associated_document();
+    if (!document.is_fully_active())
+        return;
+
+    // 4. If event's abort controller's signal is aborted, then return.
+    if (event->abort_controller()->signal()->aborted())
+        return;
+
+    // 5. Let endResultIsSameDocument be true if event's interception state is not "none" or event's destination's
+    //    is same document is true.
+    bool const end_result_is_same_document = (event->interception_state() != NavigateEvent::InterceptionState::None) || event->destination()->same_document();
+
+    // 6. Prepare to run script given navigation's relevant settings object.
+    // NOTE: There's a massive spec note here
+    TemporaryExecutionContext execution_context { window.principal_realm(), TemporaryExecutionContext::CallbacksEnabled::Yes };
+
+    auto const navigation_type = event->navigation_type();
+
+    // 7. If event's interception state is not "none":
+    if (event->interception_state() != NavigateEvent::InterceptionState::None) {
+        // 1. Set event's interception state to "committed".
+        event->set_interception_state(NavigateEvent::InterceptionState::Committed);
+
+        // 2. Switch on event's navigationType:
         // - "traverse":
         if (navigation_type == Bindings::NavigationType::Traverse) {
             // 1. Set navigation's suppress normal scroll restoration during ongoing navigation to true.
@@ -1341,6 +1357,7 @@ bool Navigation::inner_navigate_event_firing_algorithm(
                     .pre_steps = GC::create_function(heap(), [this, event](Optional<Web::ReconstructedChildNavigation>, GC::Ref<HistoryExecutor::OnHistoryOperationReady> ready) {
                         // NB: This operation can start after a later navigation has aborted the intercepted
                         //     traverse. In that case, the aborted traverse must not be resumed.
+                        //     See https://github.com/whatwg/html/issues/12362.
                         if (event->abort_controller()->signal()->aborted() || event != m_ongoing_navigate_event) {
                             ready->function()(HistoryStepResult::Applied);
                             return;
@@ -1350,18 +1367,19 @@ bool Navigation::inner_navigate_event_firing_algorithm(
                 });
         }
 
-        // 7. If navigationType is "push" or "replace", then run the URL and history update steps given document and
-        //    event's destination's URL, with serializedData set to event's classic history API state and historyHandling
-        //    set to navigationType.
+        // - "push"
+        // - "replace":
+        //   Run the URL and history update steps given event's relevant global object's associated Document and event's
+        //   destination's URL, with serializedData set to event's classic history API state and historyHandling set to
+        //   event's navigationType.
         if (navigation_type == NavigationType::Push || navigation_type == NavigationType::Replace) {
             auto history_handling = navigation_type == NavigationType::Push ? HistoryHandlingBehavior::Push : HistoryHandlingBehavior::Replace;
             perform_url_and_history_update_steps(document, event->destination()->raw_url(), event->classic_history_api_state(), history_handling);
         }
 
-        // 8. Otherwise, if navigationType is "reload", then update the navigation API entries for a same-document navigation
-        //    given navigation, navigable's active session history entry, and "reload".
-        // NOTE: If navigationType is "traverse", then this event firing is happening as part of the traversal process, and
-        //       that process will take care of performing the appropriate session history entry updates.
+        // - "reload":
+        //   Update the navigation API entries for a same-document navigation given navigation, navigable's active session
+        //   history entry, and "reload".
         if (navigation_type == NavigationType::Reload) {
             update_the_navigation_api_entries_for_a_same_document_navigation(*navigable->active_session_history_entry(), NavigationType::Reload);
         }
@@ -1385,17 +1403,16 @@ bool Navigation::inner_navigate_event_firing_algorithm(
             run_the_navigate_event_intercept_commit_handler_steps(event, api_method_tracker);
     }
 
-    // If endResultIsSameDocument is false and apiMethodTracker is non-null, then clean up apiMethodTracker.
-    else if (api_method_tracker != nullptr) {
+    // 8. If navigation's transition is not null, then resolve navigation's transition's committed promise with undefined.
+    if (m_transition)
+        WebIDL::resolve_promise(m_transition->committed());
+
+    // 9. If endResultIsSameDocument is false and apiMethodTracker is non-null, then clean up apiMethodTracker.
+    if (!end_result_is_same_document && api_method_tracker != nullptr)
         clean_up(*api_method_tracker);
-    }
 
-    // Clean up after running script given navigation's relevant settings object.
+    // 10. Clean up after running script given navigation's relevant settings object.
     // NB: Handled by TemporaryExecutionContext destructor.
-
-    // 37. If event's interception state is "none", then return true.
-    // 38. Return false.
-    return event->interception_state() == NavigateEvent::InterceptionState::None;
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#fire-a-traverse-navigate-event
@@ -1456,7 +1473,8 @@ bool Navigation::fire_a_push_replace_reload_navigate_event(
     GC::Ptr<DOM::Element> source_element,
     Optional<GC::ConservativeVector<XHR::FormDataEntry>&> form_data_entry_list,
     Optional<StorageSerializationRecord> navigation_api_state,
-    Optional<StorageSerializationRecord> classic_history_api_state)
+    Optional<StorageSerializationRecord> classic_history_api_state,
+    GC::Ptr<NavigationAPIMethodTracker> api_method_tracker)
 {
 
     // This fulfills the entry requirement: an optional serialized state navigationAPIState (default StructuredSerializeForStorage(null))
@@ -1469,9 +1487,19 @@ bool Navigation::fire_a_push_replace_reload_navigate_event(
     // 2. Inform the navigation API about aborting navigation in document's node navigable.
     document.navigable()->inform_the_navigation_api_about_aborting_navigation();
 
-    // FIXME: 3. If navigation has entries and events disabled, and apiMethodTracker is not null:
-    //           1. Set apiMethodTracker's pending to false.
-    //           2. Set apiMethodTracker to null.
+    // 3. If navigation has entries and events disabled, and apiMethodTracker is not null:
+    // NOTE: If navigation has entries and events disabled, then navigate() and reload() calls return promises that
+    //       will never fulfill. We never create a NavigationHistoryEntry object for such Documents, there is no
+    //       NavigationHistoryEntry to apply serializedState to, and there is no navigate event to include info with.
+    //       So, we don't need to track this API method call after all. We need to check this after aborting previous
+    //       navigations, in case the Document has became non-fully active as a result of a navigateerror event.
+    if (has_entries_and_events_disabled() && api_method_tracker) {
+        // 1. Set apiMethodTracker's pending to false.
+        api_method_tracker->pending = NavigationAPIMethodTracker::Pending::No;
+
+        // 2. Set apiMethodTracker to null.
+        api_method_tracker = nullptr;
+    }
 
     // 4. If document is not fully active, then return false.
     if (!document.is_fully_active())
@@ -1497,9 +1525,10 @@ bool Navigation::fire_a_push_replace_reload_navigate_event(
     destination->set_is_same_document(is_same_document);
 
     // 12. Return the result of performing the inner navigate event firing algorithm given navigation,
-    //     navigationType, event, destination, userInvolvement, sourceElement, formDataEntryList, and null.
+    //     navigationType, event, destination, userInvolvement, sourceElement, formDataEntryList, null, and
+    //     apiMethodTracker.
     // AD-HOC: We don't pass the event, but we do pass the classic_history_api state at the end to be set later
-    return inner_navigate_event_firing_algorithm(navigation_type, destination, user_involvement, source_element, move(form_data_entry_list), {}, move(classic_history_api_state));
+    return inner_navigate_event_firing_algorithm(navigation_type, destination, user_involvement, source_element, move(form_data_entry_list), {}, move(classic_history_api_state), api_method_tracker);
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#fire-a-download-request-navigate-event

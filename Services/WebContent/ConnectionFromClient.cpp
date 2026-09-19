@@ -397,16 +397,22 @@ void ConnectionFromClient::set_window_handle(Web::PageId page_id, String handle)
     }
 }
 
-void ConnectionFromClient::run_webdriver_command(Web::PageId page_id, u64 command_id, String name, JsonValue payload, Vector<String> arguments)
+void ConnectionFromClient::run_webdriver_command(Web::PageId page_id, u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String name, JsonValue payload, Vector<String> arguments)
 {
     if (auto page = this->page(page_id); page.has_value())
-        page->run_webdriver_command(command_id, name, move(payload), move(arguments));
+        page->run_webdriver_command(command_id, navigable_id, name, move(payload), move(arguments));
 }
 
 void ConnectionFromClient::set_webdriver_session_config(Web::PageId page_id, Web::WebDriver::UserPromptHandler user_prompt_handler, Web::WebDriver::PageLoadStrategy page_load_strategy, bool strict_file_interactability, JsonValue timeouts)
 {
     if (auto page = this->page(page_id); page.has_value())
         page->set_webdriver_session_config(move(user_prompt_handler), page_load_strategy, strict_file_interactability, timeouts);
+}
+
+void ConnectionFromClient::did_handle_webdriver_mouse_event(Web::PageId page_id, u64 request_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->did_handle_webdriver_mouse_event(request_id);
 }
 
 void ConnectionFromClient::run_webdriver_user_prompt_handling(Web::PageId page_id, u64 request_id)
@@ -2892,6 +2898,12 @@ void ConnectionFromClient::run_javascript(Web::PageId page_id, String js_source)
 {
     if (auto page = this->page(page_id); page.has_value())
         page->run_javascript(js_source);
+}
+
+void ConnectionFromClient::did_open_dialog_in_another_process(Web::PageId page_id, Web::Page::PendingDialog dialog, Utf16String message)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().did_open_dialog_in_another_process(dialog, message);
 }
 
 void ConnectionFromClient::alert_closed(Web::PageId page_id)

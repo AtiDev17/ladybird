@@ -21,6 +21,7 @@
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/Page/InputEvent.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/WebDriver/Actions.h>
@@ -30,6 +31,8 @@
 #include <LibWeb/WebDriver/Properties.h>
 
 namespace Web::WebDriver {
+
+using DispatchMouseEvent = Function<void(MouseEvent)>;
 
 static Optional<ActionObject::Subtype> action_object_subtype_from_string(StringView action_subtype)
 {
@@ -116,6 +119,13 @@ static Optional<ActionObject::Origin> determine_origin(ActionsOptions const& act
     return {};
 }
 
+// NB: Coordinates are relative to the local root of the browsing context's navigable, which is the top-level
+//     traversable unless another process hosts an ancestor of the navigable.
+static GC::Ref<HTML::LocalNavigable> local_root(HTML::BrowsingContext const& browsing_context)
+{
+    return browsing_context.active_document()->navigable()->local_root();
+}
+
 // https://pr-preview.s3.amazonaws.com/w3c/webdriver/pull/1847.html#dfn-get-parent-offset
 static CSSPixelPoint get_parent_offset(HTML::BrowsingContext const& browsing_context)
 {
@@ -131,9 +141,9 @@ static CSSPixelPoint get_parent_offset(HTML::BrowsingContext const& browsing_con
     auto parent_navigable = navigable->parent();
 
     // 4. If parent navigable is not null:
-    if (parent_navigable) {
-        auto& local_parent_navigable = as<HTML::LocalNavigable>(*parent_navigable);
-        auto parent_document = local_parent_navigable.active_document();
+    // NB: Input is dispatched to the local root, so the offset of a frame another process hosts the parent of is none.
+    if (auto* local_parent_navigable = as_if<HTML::LocalNavigable>(parent_navigable.ptr())) {
+        auto parent_document = local_parent_navigable->active_document();
         if (!parent_document || !parent_document->browsing_context())
             return offset;
 
@@ -148,7 +158,9 @@ static CSSPixelPoint get_parent_offset(HTML::BrowsingContext const& browsing_con
         offset.translate_by(parent_offset);
 
         // 5. Let containerElement be an element which navigable container presents parent navigable.
-        auto container_element = local_parent_navigable.container();
+        // AD-HOC: The draft names parent navigable's container. It is navigable's, in parent navigable's document;
+        //         WPT webdriver/tests/classic/perform_actions/pointer_mouse.py::test_move_to_origin_position_within_frame pins it.
+        auto container_element = navigable->container();
         if (!container_element)
             return offset;
 
@@ -181,7 +193,7 @@ static CSSPixelPoint get_parent_offset(HTML::BrowsingContext const& browsing_con
 }
 
 // https://w3c.github.io/webdriver/#dfn-get-coordinates-relative-to-an-origin
-static ErrorOr<CSSPixelPoint, WebDriver::Error> get_coordinates_relative_to_origin(PointerInputSource const* source, HTML::BrowsingContext const& browsing_context, CSSPixelPoint offset, CSSPixelRect viewport, ActionObject::Origin const& origin, ActionsOptions const& actions_options)
+static ErrorOr<CSSPixelPoint, WebDriver::Error> get_coordinates_relative_to_origin(PointerInputSource const* source, HTML::BrowsingContext const& browsing_context, CSSPixelPoint offset, ActionObject::Origin const& origin, ActionsOptions const& actions_options)
 {
     // FIXME: Spec-issue: If the browsing context is that of a subframe, we need to get its offset relative to the top
     //        frame, rather than its own frame.
@@ -219,7 +231,7 @@ static ErrorOr<CSSPixelPoint, WebDriver::Error> get_coordinates_relative_to_orig
             auto element = TRY(actions_options.get_element_origin(browsing_context, origin));
 
             // 3. Let x element and y element be the result of calculating the in-view center point of element.
-            auto position = TRY(in_view_center_point(element, viewport));
+            auto position = TRY(in_view_center_point(element));
 
             // 4. Let x equal x element + x offset, and y equal y element + y offset.
             return position.translated(offset);
@@ -1107,7 +1119,7 @@ static ErrorOr<void, WebDriver::Error> dispatch_key_up_action(ActionObject::KeyF
 }
 
 // https://w3c.github.io/webdriver/#dfn-dispatch-a-pointerdown-action
-static ErrorOr<void, WebDriver::Error> dispatch_pointer_down_action(ActionObject::PointerUpDownFields const& action_object, PointerInputSource& source, GlobalKeyState const& global_key_state, HTML::BrowsingContext& browsing_context)
+static ErrorOr<void, WebDriver::Error> dispatch_pointer_down_action(ActionObject::PointerUpDownFields const& action_object, PointerInputSource& source, GlobalKeyState const& global_key_state, HTML::BrowsingContext& browsing_context, DispatchMouseEvent const& dispatch_mouse_event)
 {
     // 1. Let pointerType be equal to action object's pointerType property.
     auto pointer_type = action_object.pointer_type;
@@ -1144,11 +1156,19 @@ static ErrorOr<void, WebDriver::Error> dispatch_pointer_down_action(ActionObject
     //     and [POINTER-EVENTS]. set ctrlKey, shiftKey, altKey, and metaKey equal to the corresponding items in global
     //     key state. Type specific properties for the pointer that are not exposed through the webdriver API must be
     //     set to the default value specified for hardware that doesn't support that property.
-    int click_count = 1;
     switch (pointer_type) {
-    case PointerInputSource::Subtype::Mouse:
-        browsing_context.page().handle_mousedown(position, position, button, buttons, global_key_state.modifiers(), click_count);
+    case PointerInputSource::Subtype::Mouse: {
+        MouseEvent event;
+        event.type = MouseEvent::Type::MouseDown;
+        event.position = position;
+        event.screen_position = position;
+        event.button = button;
+        event.buttons = buttons;
+        event.modifiers = global_key_state.modifiers();
+        event.click_count = 1;
+        dispatch_mouse_event(move(event));
         break;
+    }
     case PointerInputSource::Subtype::Pen:
         return WebDriver::Error::from_code(WebDriver::ErrorCode::UnsupportedOperation, "Pen events not implemented"sv);
     case PointerInputSource::Subtype::Touch:
@@ -1160,7 +1180,7 @@ static ErrorOr<void, WebDriver::Error> dispatch_pointer_down_action(ActionObject
 }
 
 // https://w3c.github.io/webdriver/#dfn-dispatch-a-pointerup-action
-static ErrorOr<void, WebDriver::Error> dispatch_pointer_up_action(ActionObject::PointerUpDownFields const& action_object, PointerInputSource& source, GlobalKeyState const& global_key_state, HTML::BrowsingContext& browsing_context)
+static ErrorOr<void, WebDriver::Error> dispatch_pointer_up_action(ActionObject::PointerUpDownFields const& action_object, PointerInputSource& source, GlobalKeyState const& global_key_state, HTML::BrowsingContext& browsing_context, DispatchMouseEvent const& dispatch_mouse_event)
 {
     // 1. Let pointerType be equal to action object's pointerType property.
     auto pointer_type = action_object.pointer_type;
@@ -1188,9 +1208,17 @@ static ErrorOr<void, WebDriver::Error> dispatch_pointer_up_action(ActionObject::
     //    that are not exposed through the webdriver API must be set to the default value specified for hardware that
     //    doesn't support that property.
     switch (pointer_type) {
-    case PointerInputSource::Subtype::Mouse:
-        browsing_context.page().handle_mouseup(position, position, button, buttons, global_key_state.modifiers());
+    case PointerInputSource::Subtype::Mouse: {
+        MouseEvent event;
+        event.type = MouseEvent::Type::MouseUp;
+        event.position = position;
+        event.screen_position = position;
+        event.button = button;
+        event.buttons = buttons;
+        event.modifiers = global_key_state.modifiers();
+        dispatch_mouse_event(move(event));
         break;
+    }
     case PointerInputSource::Subtype::Pen:
         return WebDriver::Error::from_code(WebDriver::ErrorCode::UnsupportedOperation, "Pen events not implemented"sv);
     case PointerInputSource::Subtype::Touch:
@@ -1202,7 +1230,7 @@ static ErrorOr<void, WebDriver::Error> dispatch_pointer_up_action(ActionObject::
 }
 
 // https://w3c.github.io/webdriver/#dfn-perform-a-pointer-move
-static ErrorOr<void, WebDriver::Error> perform_pointer_move(ActionObject::PointerMoveFields const& action_object, PointerInputSource& source, GlobalKeyState const& global_key_state, HTML::BrowsingContext& browsing_context, AK::Duration, CSSPixelPoint coordinates)
+static ErrorOr<void, WebDriver::Error> perform_pointer_move(ActionObject::PointerMoveFields const& action_object, PointerInputSource& source, GlobalKeyState const& global_key_state, HTML::BrowsingContext& browsing_context, AK::Duration, CSSPixelPoint coordinates, DispatchMouseEvent const& dispatch_mouse_event)
 {
     // FIXME: 1. Let time delta be the time since the beginning of the current tick, measured in milliseconds on a monotonic clock.
     // FIXME: 2. Let duration ratio be the ratio of time delta and duration, if duration is greater than 0, or 1 otherwise.
@@ -1234,9 +1262,16 @@ static ErrorOr<void, WebDriver::Error> perform_pointer_move(ActionObject::Pointe
         auto position = browsing_context.page().css_to_device_point(coordinates);
 
         switch (action_object.pointer_type) {
-        case PointerInputSource::Subtype::Mouse:
-            browsing_context.page().handle_mousemove(position, position, buttons, global_key_state.modifiers());
+        case PointerInputSource::Subtype::Mouse: {
+            MouseEvent event;
+            event.type = MouseEvent::Type::MouseMove;
+            event.position = position;
+            event.screen_position = position;
+            event.buttons = buttons;
+            event.modifiers = global_key_state.modifiers();
+            dispatch_mouse_event(move(event));
             break;
+        }
         case PointerInputSource::Subtype::Pen:
             return WebDriver::Error::from_code(WebDriver::ErrorCode::UnsupportedOperation, "Pen events not implemented"sv);
         case PointerInputSource::Subtype::Touch:
@@ -1258,16 +1293,16 @@ static ErrorOr<void, WebDriver::Error> perform_pointer_move(ActionObject::Pointe
 }
 
 // https://w3c.github.io/webdriver/#dfn-dispatch-a-pointermove-action
-static ErrorOr<void, WebDriver::Error> dispatch_pointer_move_action(ActionObject::PointerMoveFields const& action_object, PointerInputSource& source, GlobalKeyState const& global_key_state, AK::Duration tick_duration, HTML::BrowsingContext& browsing_context, ActionsOptions const& actions_options)
+static ErrorOr<void, WebDriver::Error> dispatch_pointer_move_action(ActionObject::PointerMoveFields const& action_object, PointerInputSource& source, GlobalKeyState const& global_key_state, AK::Duration tick_duration, HTML::BrowsingContext& browsing_context, ActionsOptions const& actions_options, DispatchMouseEvent const& dispatch_mouse_event)
 {
-    auto viewport = as<HTML::LocalNavigable>(*browsing_context.page().top_level_traversable()).viewport_rect();
+    auto viewport = local_root(browsing_context)->viewport_rect();
 
     // 1. Let x offset be equal to the x property of action object.
     // 2. Let y offset be equal to the y property of action object.
     // 3. Let origin be equal to the origin property of action object.
     // 4. Let (x, y) be the result of trying to get coordinates relative to an origin with source, x offset, y offset,
     //    origin, browsing context, and actions options.
-    auto coordinates = TRY(get_coordinates_relative_to_origin(&source, browsing_context, action_object.position, viewport, action_object.origin, actions_options));
+    auto coordinates = TRY(get_coordinates_relative_to_origin(&source, browsing_context, action_object.position, action_object.origin, actions_options));
 
     // 5. If x is less than 0 or greater than the width of the viewport in CSS pixels, then return error with error code move target out of bounds.
     if (coordinates.x() < 0 || coordinates.x() > viewport.width())
@@ -1295,7 +1330,7 @@ static ErrorOr<void, WebDriver::Error> dispatch_pointer_move_action(ActionObject
 
     // 18. Perform a pointer move with arguments source, global key state, duration, start x, start y, x, y, width,
     //     height, pressure, tangentialPressure, tiltX, tiltY, twist, altitudeAngle, azimuthAngle.
-    TRY(perform_pointer_move(action_object, source, global_key_state, browsing_context, duration, coordinates));
+    TRY(perform_pointer_move(action_object, source, global_key_state, browsing_context, duration, coordinates, dispatch_mouse_event));
 
     // 19. Return success with data null.
     return {};
@@ -1304,7 +1339,7 @@ static ErrorOr<void, WebDriver::Error> dispatch_pointer_move_action(ActionObject
 // https://w3c.github.io/webdriver/#dfn-dispatch-a-scroll-action
 static ErrorOr<void, WebDriver::Error> dispatch_scroll_action(ActionObject::ScrollFields const& action_object, GlobalKeyState const& global_key_state, AK::Duration tick_duration, HTML::BrowsingContext& browsing_context, ActionsOptions const& actions_options)
 {
-    auto viewport = as<HTML::LocalNavigable>(*browsing_context.page().top_level_traversable()).viewport_rect();
+    auto viewport = local_root(browsing_context)->viewport_rect();
 
     // 1. Let x offset be equal to the x property of action object.
     // 2. Let y offset be equal to the y property of action object.
@@ -1313,7 +1348,7 @@ static ErrorOr<void, WebDriver::Error> dispatch_scroll_action(ActionObject::Scro
     // 3. Let origin be equal to the origin property of action object.
     // 4. Let (x, y) be the result of trying to get coordinates relative to an origin with source, x offset, y offset,
     //    origin, browsing context, and actions options.
-    auto coordinates = TRY(get_coordinates_relative_to_origin(nullptr, browsing_context, offset, viewport, action_object.origin, actions_options));
+    auto coordinates = TRY(get_coordinates_relative_to_origin(nullptr, browsing_context, offset, action_object.origin, actions_options));
 
     // 5. If x is less than 0 or greater than the width of the viewport in CSS pixels, then return error with error
     //    code move target out of bounds.
@@ -1342,13 +1377,15 @@ static ErrorOr<void, WebDriver::Error> dispatch_scroll_action(ActionObject::Scro
 
     // AD-HOC: A scroll action emulates a mouse wheel, so its deltas are stepwise wheel input. A snap container the
     //         action scrolls therefore ends at the snap position the input selects, rather than at the requested delta.
-    browsing_context.page().handle_mousewheel(position, position, 0, 0, global_key_state.modifiers(), static_cast<double>(action_object.delta_x), static_cast<double>(action_object.delta_y), WheelDeltaPrecision::Discrete);
+    browsing_context.page().handle_mousewheel(local_root(browsing_context), position, position, 0, 0, global_key_state.modifiers(), static_cast<double>(action_object.delta_x), static_cast<double>(action_object.delta_y), WheelDeltaPrecision::Discrete, ScrollGesturePhase::None, false, nullptr);
 
     // 12. Return success with data null.
     return {};
 }
 
 // https://w3c.github.io/webdriver/#dfn-dispatch-actions-inner
+static ErrorOr<void, WebDriver::Error> dispatch_tick_actions(InputState&, ReadonlySpan<ActionObject>, AK::Duration, HTML::BrowsingContext&, ActionsOptions const&, DispatchMouseEvent const&);
+
 class ActionExecutor final : public JS::Cell {
     GC_CELL(ActionExecutor, JS::Cell);
     GC_DECLARE_ALLOCATOR(ActionExecutor);
@@ -1382,8 +1419,19 @@ public:
         // 2. Let tick duration be the result of computing the tick duration with argument tick actions.
         auto tick_duration = compute_tick_duration(tick_actions);
 
+        // NB: Pointer input goes through the UI process, which dispatches it to the process hosting the document under
+        //     the pointer as it does the user's.
+        m_tick_duration_has_passed = false;
+        DispatchMouseEvent dispatch_mouse_event = [this](MouseEvent event) {
+            ++m_pending_mouse_event_count;
+            m_browsing_context->page().client().page_did_request_webdriver_mouse_event(local_root(m_browsing_context)->id(), move(event), GC::create_function(heap(), [this]() {
+                --m_pending_mouse_event_count;
+                process_next_tick_once_the_tick_is_over();
+            }));
+        };
+
         // 3. Try to dispatch tick actions with input state, tick actions, tick duration, browsing context, and actions options.
-        if (auto result = dispatch_tick_actions(m_input_state, tick_actions, tick_duration, m_browsing_context, m_actions_options); result.is_error()) {
+        if (auto result = dispatch_tick_actions(m_input_state, tick_actions, tick_duration, m_browsing_context, m_actions_options, dispatch_mouse_event); result.is_error()) {
             m_on_complete->function()(result.release_error());
             return;
         }
@@ -1395,17 +1443,25 @@ public:
         //       invocation of the dispatch tick actions steps.
         //     * At least tick duration milliseconds have passed.
 
-        // FIXME: We currently do not implement any asynchronous waits. And we assume that Page will generally fire the
-        //        events of interest synchronously. So we simply wait for the tick duration to pass, and then let the
-        //        event loop spin a single time.
+        // NB: The pointer input of the tick is the only asynchronous wait. Key and wheel input fire their events
+        //     synchronously. Once both it and the tick duration have passed, the event loop spins a single time.
         m_timer = Core::Timer::create_single_shot(static_cast<int>(tick_duration.to_milliseconds()), [this]() {
             m_timer = nullptr;
-
-            HTML::queue_a_task(HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(GC::Heap::the(), [this]() {
-                process_next_tick();
-            }));
+            m_tick_duration_has_passed = true;
+            process_next_tick_once_the_tick_is_over();
         });
         m_timer->start();
+    }
+
+    void process_next_tick_once_the_tick_is_over()
+    {
+        if (!m_tick_duration_has_passed || m_pending_mouse_event_count > 0)
+            return;
+        m_tick_duration_has_passed = false;
+
+        HTML::queue_a_task(HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(GC::Heap::the(), [this]() {
+            process_next_tick();
+        }));
     }
 
 private:
@@ -1423,6 +1479,9 @@ private:
 
     Vector<Vector<ActionObject>> m_actions_by_tick;
     size_t m_current_tick { 0 };
+
+    size_t m_pending_mouse_event_count { 0 };
+    bool m_tick_duration_has_passed { false };
 
     OnActionsComplete m_on_complete;
 
@@ -1467,7 +1526,7 @@ GC::Ref<JS::Cell> dispatch_actions(InputState& input_state, Vector<Vector<Action
 }
 
 // https://w3c.github.io/webdriver/#dfn-dispatch-tick-actions
-ErrorOr<void, WebDriver::Error> dispatch_tick_actions(InputState& input_state, ReadonlySpan<ActionObject> tick_actions, AK::Duration tick_duration, HTML::BrowsingContext& browsing_context, ActionsOptions const& actions_options)
+static ErrorOr<void, WebDriver::Error> dispatch_tick_actions(InputState& input_state, ReadonlySpan<ActionObject> tick_actions, AK::Duration tick_duration, HTML::BrowsingContext& browsing_context, ActionsOptions const& actions_options, DispatchMouseEvent const& dispatch_mouse_event)
 {
     // 1. For each action object in tick actions:
     for (auto const& action_object : tick_actions) {
@@ -1519,13 +1578,13 @@ ErrorOr<void, WebDriver::Error> dispatch_tick_actions(InputState& input_state, R
             TRY(dispatch_key_up_action(action_object.key_fields(), source->get<KeyInputSource>(), global_key_state, browsing_context));
             break;
         case ActionObject::Subtype::PointerDown:
-            TRY(dispatch_pointer_down_action(action_object.pointer_up_down_fields(), source->get<PointerInputSource>(), global_key_state, browsing_context));
+            TRY(dispatch_pointer_down_action(action_object.pointer_up_down_fields(), source->get<PointerInputSource>(), global_key_state, browsing_context, dispatch_mouse_event));
             break;
         case ActionObject::Subtype::PointerUp:
-            TRY(dispatch_pointer_up_action(action_object.pointer_up_down_fields(), source->get<PointerInputSource>(), global_key_state, browsing_context));
+            TRY(dispatch_pointer_up_action(action_object.pointer_up_down_fields(), source->get<PointerInputSource>(), global_key_state, browsing_context, dispatch_mouse_event));
             break;
         case ActionObject::Subtype::PointerMove:
-            TRY(dispatch_pointer_move_action(action_object.pointer_move_fields(), source->get<PointerInputSource>(), global_key_state, tick_duration, browsing_context, actions_options));
+            TRY(dispatch_pointer_move_action(action_object.pointer_move_fields(), source->get<PointerInputSource>(), global_key_state, tick_duration, browsing_context, actions_options, dispatch_mouse_event));
             break;
         case ActionObject::Subtype::PointerCancel:
             return WebDriver::Error::from_code(WebDriver::ErrorCode::UnsupportedOperation, "Pointer cancel events not implemented"sv);

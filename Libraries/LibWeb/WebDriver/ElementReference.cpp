@@ -7,6 +7,7 @@
 #include <AK/HashMap.h>
 #include <AK/NeverDestroyed.h>
 #include <LibJS/Runtime/Object.h>
+#include <LibWeb/Crypto/Crypto.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Node.h>
@@ -49,6 +50,13 @@ static HashMap<GC::RawPtr<HTML::LocalNavigable>, HashTable<String>>& navigable_s
     return *map;
 }
 
+// NB: Every process hosting part of a tab hands out node ids, so the ids of this process share a prefix unique to it.
+static String const& node_id_prefix()
+{
+    static auto const& prefix = *new String(Crypto::generate_random_uuid());
+    return prefix;
+}
+
 // https://w3c.github.io/webdriver/#dfn-get-a-node
 GC::Ptr<Web::DOM::Node> get_node(HTML::BrowsingContext const& browsing_context, StringView reference)
 {
@@ -66,7 +74,7 @@ GC::Ptr<Web::DOM::Node> get_node(HTML::BrowsingContext const& browsing_context, 
     GC::Ptr<Web::DOM::Node> node;
 
     if (node_id_map->contains(reference)) {
-        auto node_id = reference.to_number<i64>().value();
+        auto node_id = reference.substring_view(node_id_prefix().bytes_as_string_view().length() + 1).to_number<i64>().value();
         node = Web::DOM::Node::from_unique_id(UniqueNodeID(node_id));
     }
 
@@ -86,7 +94,7 @@ String get_or_create_a_node_reference(HTML::BrowsingContext const& browsing_cont
     // 4. Let node id map be browsing context group node map[browsing context group].
     auto& node_id_map = browsing_context_group_node_map().ensure(browsing_context_group);
 
-    auto node_id = String::number(node.unique_id().value());
+    auto node_id = MUST(String::formatted("{}_{}", node_id_prefix(), node.unique_id().value()));
 
     // 5. If node id map does not contain node:
     if (!node_id_map.contains(node_id)) {
@@ -272,8 +280,7 @@ bool is_element_pointer_interactable(Web::HTML::BrowsingContext const& browsing_
     if (!layout_root || !Painting::has_committed_box(*layout_root))
         return false;
 
-    auto viewport = as<HTML::LocalNavigable>(*browsing_context.page().top_level_traversable()).viewport_rect();
-    auto center_point_or_error = in_view_center_point(element, viewport);
+    auto center_point_or_error = in_view_center_point(element);
     if (center_point_or_error.is_error())
         return false;
     auto center_point = center_point_or_error.release_value();
@@ -412,8 +419,7 @@ GC::RootVector<GC::Ref<Web::DOM::Element>> pointer_interactable_tree(Web::HTML::
         return GC::RootVector<GC::Ref<Web::DOM::Element>> {};
 
     // 4. Let center point be the in-view center point of the first indexed element in rectangles.
-    auto viewport = as<HTML::LocalNavigable>(*browsing_context.page().top_level_traversable()).viewport_rect();
-    auto center_point_or_error = Web::WebDriver::in_view_center_point(element, viewport);
+    auto center_point_or_error = Web::WebDriver::in_view_center_point(element);
     if (center_point_or_error.is_error())
         return GC::RootVector<GC::Ref<Web::DOM::Element>> {};
     auto center_point = center_point_or_error.release_value();
@@ -545,8 +551,10 @@ String element_rendered_text(DOM::Node& node)
 }
 
 // https://w3c.github.io/webdriver/#dfn-center-point
-ErrorOr<CSSPixelPoint, WebDriver::Error> in_view_center_point(DOM::Element const& element, CSSPixelRect viewport)
+ErrorOr<CSSPixelPoint, WebDriver::Error> in_view_center_point(DOM::Element const& element)
 {
+    auto viewport = element.document().viewport_rect();
+
     // 1. Let rectangle be the first element of the DOMRect sequence returned by calling getClientRects() on element.
     auto rects = element.get_client_rects();
     if (rects.is_empty())

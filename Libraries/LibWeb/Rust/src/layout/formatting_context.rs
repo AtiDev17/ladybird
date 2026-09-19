@@ -539,6 +539,11 @@ pub(crate) fn box_baseline_with_content_baselines(
         }
     }
 
+    // INTEROP: A range input's baseline is its bottom border edge in Chrome, whatever its internal layout.
+    if facts.is_range_input_box() {
+        return used.margin_box_top(collapsed) + used.content_block_size.get() + used.border_box_bottom(collapsed);
+    }
+
     // https://drafts.csswg.org/css-inline-3/#baseline-source
     // auto: Specifies last-baseline alignment for inline-block, first-baseline alignment for everything else.
     // NB: Callers ask an inline-level box for its last baseline set, since that is what CSS2's inline-block rule below
@@ -616,12 +621,7 @@ pub(crate) fn store_derived_baselines(used: &UsedValues, baselines: DerivedBasel
     }
 }
 
-pub(crate) fn derive_baselines(
-    records: &RunRecords,
-    callbacks: &LayoutPass<'_>,
-    box_: Node,
-    inhibits_floating: bool,
-) -> DerivedBaselines {
+pub(crate) fn derive_baselines(records: &RunRecords, callbacks: &LayoutPass<'_>, box_: Node) -> DerivedBaselines {
     let facts = NodeFacts::new(callbacks, box_);
     let own_used = records.used_values(box_);
     let own_line_data = own_used.line_data_ref();
@@ -655,17 +655,8 @@ pub(crate) fn derive_baselines(
     }
 
     // Derive baselines from the first/last in-flow child that has a baseline set of its own.
-    // https://drafts.csswg.org/css-flexbox-1/#flex-baselines
-    // Otherwise, if the flex container has at least one flex item, the flex container's first/last main-axis baseline
-    // set is generated from the alignment baseline of the startmost/endmost flex item.
-    // https://drafts.csswg.org/css-grid-1/#grid-baselines
-    // Otherwise, the grid container's first (last) baseline set is generated from the alignment baseline of the first
-    // (last) grid item in row-major grid order.
-    // FIXME: This does not yet select the spec-defined startmost/endmost flex item, or the first/last grid item in
-    //        row-major grid order.
+    // NB: Flex and grid containers derive their baselines from their items instead.
     let container_display = facts.display();
-    let container_skips_anonymous_whitespace_runs =
-        container_display.is_flex_inside() || container_display.is_grid_inside();
     let baseline_from_children = |baseline_set: BaselineSet| -> Option<CssPixels> {
         let mut next_child = match baseline_set {
             BaselineSet::First => callbacks.first_child(box_),
@@ -678,7 +669,7 @@ pub(crate) fn derive_baselines(
                 BaselineSet::Last => callbacks.previous_sibling(child),
             };
             let child_facts = NodeFacts::new(callbacks, child);
-            if !child_facts.is_flow_layout_participant() || (!inhibits_floating && child_facts.is_floating()) {
+            if !child_facts.is_flow_layout_participant() || child_facts.is_floating() {
                 continue;
             }
             if !table_formatting_context::child_participates_in_table_run(container_display, &child_facts) {
@@ -690,20 +681,10 @@ pub(crate) fn derive_baselines(
             if facts.is_table_wrapper() && !child_facts.display().is_table_inside() {
                 continue;
             }
-            if container_skips_anonymous_whitespace_runs && callbacks.can_skip_is_anonymous_text_run(child) {
-                continue;
+            if let Some(baseline) = baseline_of_child(records, callbacks, child, baseline_set, ChildBaselineSource::Own)
+            {
+                return Some(baseline);
             }
-            let Some(child_state) = records.used_values_if_owned(child) else {
-                continue;
-            };
-            match baseline_set {
-                BaselineSet::First if child_state.has_first_baseline.get() => {}
-                BaselineSet::Last if child_state.has_last_baseline.get() => {}
-                _ => continue,
-            }
-            let child_offset_from_margin_edge = child_state.content_offset.get().y
-                - child_state.margin_box_top(child_state.uses_collapsing_borders_model.get());
-            return Some(child_offset_from_margin_edge + box_baseline(callbacks, child, &child_state, baseline_set));
         }
         None
     };
@@ -711,6 +692,44 @@ pub(crate) fn derive_baselines(
         first: baseline_from_children(BaselineSet::First),
         last: baseline_from_children(BaselineSet::Last),
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildBaselineSource {
+    Own,
+    OwnOrSynthesized,
+    Synthesized,
+}
+
+/// The baseline of a laid out child, relative to its container's margin edge. A synthesized baseline comes from the
+/// child's border box.
+pub(crate) fn baseline_of_child(
+    records: &RunRecords,
+    callbacks: &LayoutPass<'_>,
+    child: Node,
+    baseline_set: BaselineSet,
+    source: ChildBaselineSource,
+) -> Option<CssPixels> {
+    let child_state = records.used_values_if_owned(child)?;
+    let has_baseline = match baseline_set {
+        BaselineSet::First => child_state.has_first_baseline.get(),
+        BaselineSet::Last => child_state.has_last_baseline.get(),
+    };
+    let collapsed = child_state.uses_collapsing_borders_model.get();
+    if !has_baseline || source == ChildBaselineSource::Synthesized {
+        if source == ChildBaselineSource::Own {
+            return None;
+        }
+        // https://drafts.csswg.org/css-align-3/#synthesize-baseline
+        // The alphabetic baseline is synthesized from the line-under edge of the border box.
+        return Some(
+            child_state.content_offset.get().y
+                + child_state.content_block_size.get()
+                + child_state.border_box_bottom(collapsed),
+        );
+    }
+    let child_offset_from_margin_edge = child_state.content_offset.get().y - child_state.margin_box_top(collapsed);
+    Some(child_offset_from_margin_edge + box_baseline(callbacks, child, &child_state, baseline_set))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -742,6 +761,8 @@ pub(crate) struct ChildLayoutResult {
     pub automatic_line_clamp_max_lines: Option<usize>,
     pub baselines: DerivedBaselines,
     pub table_box_in_wrapper_border_box_block_size: Option<CssPixels>,
+    /// For a box with a preferred aspect ratio, the block size of its laid out content.
+    pub content_block_size_for_aspect_ratio_minimum: Option<CssPixels>,
     pub depends_on_percentage_block_size: bool,
 }
 
@@ -1292,6 +1313,59 @@ fn dimension_block_level_root(run: &FormattingContextRun, input: &LayoutInput) -
     body_input
 }
 
+/// The content block size of a laid out box, for growing a block size transferred through its aspect ratio. Chrome
+/// derives it from the layout at the transferred size, so percentages inside resolve against that size.
+pub(crate) fn content_block_size_for_aspect_ratio_minimum(
+    records: &RunRecords<'_>,
+    callbacks: &LayoutPass<'_>,
+    node: Node,
+    automatic_content_block_size: CssPixels,
+) -> Option<CssPixels> {
+    let facts = NodeFacts::new(callbacks, node);
+    if facts.node_has_size_containment() {
+        // NB: The automatic content block size of a size containment box already ignores its content.
+        return Some(automatic_content_block_size);
+    }
+    if facts.uses_button_layout() {
+        // NB: The anonymous wrapper fills the button, so its content box has to be measured.
+        return None;
+    }
+    match formatting_context_type_created_by_box(facts) {
+        Some(FormattingContextType::Block) => Some(automatic_content_block_size),
+        // NB: These report their own block size, so take the extent of their laid out children instead.
+        Some(FormattingContextType::Flex | FormattingContextType::Grid) => {
+            in_flow_children_margin_box_block_extent(records, callbacks, node)
+        }
+        _ => None,
+    }
+}
+
+fn in_flow_children_margin_box_block_extent(
+    records: &RunRecords<'_>,
+    callbacks: &LayoutPass<'_>,
+    node: Node,
+) -> Option<CssPixels> {
+    let mut block_start = CssPixels::default();
+    let mut block_end = CssPixels::default();
+    let mut child = callbacks.first_child(node);
+    while !child.is_invalid() {
+        let facts = NodeFacts::new(callbacks, child);
+        if facts.is_box() && !facts.is_absolutely_positioned() {
+            let used = records.used_values_if_owned(child)?;
+            if !used.has_content_offset.get() {
+                return None;
+            }
+            let collapsed = used.uses_collapsing_borders_model.get();
+            let content_block_offset = used.content_offset.get().y;
+            block_start = block_start.min(content_block_offset - used.margin_box_top(collapsed));
+            block_end =
+                block_end.max(content_block_offset + used.content_block_size.get() + used.margin_box_bottom(collapsed));
+        }
+        child = callbacks.next_sibling(child);
+    }
+    Some(block_end - block_start)
+}
+
 fn finalize_block_level_root(run: &FormattingContextRun, input: &LayoutInput, body_result: &ChildLayoutResult) {
     let node = run.box_;
     let facts = NodeFacts::new(&run.callbacks, node);
@@ -1669,6 +1743,15 @@ fn execute_formatting_context_run(
             };
         }
 
+        if containment_facts.has_preferred_aspect_ratio() {
+            result.content_block_size_for_aspect_ratio_minimum = content_block_size_for_aspect_ratio_minimum(
+                run.records,
+                &run.callbacks,
+                run.box_,
+                result.automatic_content_block_size,
+            );
+        }
+
         match input.participation {
             ParticipationInParentFormattingContext::BlockLevel => {
                 finalize_block_level_root(run, &input, &result);
@@ -1702,6 +1785,24 @@ fn execute_formatting_context_run(
                 }
             }
             ParticipationInParentFormattingContext::Root => {}
+        }
+        if matches!(
+            input.participation,
+            ParticipationInParentFormattingContext::BlockLevel
+                | ParticipationInParentFormattingContext::Float
+                | ParticipationInParentFormattingContext::AtomicInline
+        ) {
+            let sizing = run.sizing();
+            sizing.apply_automatic_minimum_block_size_from_aspect_ratio(
+                run.box_,
+                sizing.available_space_for_block_size_resolution(
+                    run.box_,
+                    input.available_space,
+                    input.containing_block_constraints,
+                ),
+                input.containing_block_constraints,
+                result.content_block_size_for_aspect_ratio_minimum,
+            );
         }
         result.omitted_line_layout = run.records.omitted_line_layout();
         result.depends_on_percentage_block_size = run.sizing().resolve_percentage_block_size_dependency(run.box_);

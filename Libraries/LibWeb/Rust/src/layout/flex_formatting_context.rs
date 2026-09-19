@@ -68,6 +68,8 @@ struct FlexItem<'pass> {
     is_min_violation: bool,
     is_max_violation: bool,
     content_baselines: DerivedBaselines,
+    // For a table wrapper stretched in the block axis, its measured table box and content block sizes.
+    stretched_table_wrapper_block_sizes: Option<sizing_context::TableWrapperBlockSizes>,
 }
 
 impl FlexItem<'_> {
@@ -96,6 +98,7 @@ impl FlexItem<'_> {
             is_min_violation: false,
             is_max_violation: false,
             content_baselines: DerivedBaselines::default(),
+            stretched_table_wrapper_block_sizes: None,
         }
     }
 
@@ -1627,7 +1630,16 @@ impl<'pass> FlexFormattingContext<'pass> {
             return false;
         }
         // If the cross size property of the flex item computes to auto, and neither of the cross-axis margins are auto, the flex item is stretched.
-        self.computed_cross_size(self.flex_items[index].box_).0.is_auto()
+        // https://drafts.csswg.org/css-flexbox-1/#flex-items
+        // Like width and height, the cross size property of a display: table item applies to the table box.
+        // NB: A table box resolves its own inline size inside the wrapper, so this only matters in the block axis.
+        let node = self.flex_items[index].box_;
+        let sizing_box = if self.facts(node).is_table_wrapper() && !self.cross_axis_is_horizontal() {
+            self.sizing().table_box_inside_wrapper(node)
+        } else {
+            node
+        };
+        self.computed_cross_size(sizing_box).0.is_auto()
             && !self.flex_items[index].margins.cross_before_is_auto
             && !self.flex_items[index].margins.cross_after_is_auto
     }
@@ -1697,11 +1709,22 @@ impl<'pass> FlexFormattingContext<'pass> {
             // and CSS Flexible Box Model Level 1 § 9.2. The axis in which the preferred size calculation depends
             // on this aspect ratio is called the ratio-dependent axis, and the resulting size is definite if its
             // input sizes are also definite.
-            self.flex_items[index].hypothetical_cross_size = css_clamp(
-                self.cross_size_from_main_size_and_aspect_ratio(self.flex_items[index].main_size.unwrap(), ratio),
-                clamp_min,
-                clamp_max,
-            );
+            let main_size = self.flex_items[index].main_size.unwrap();
+            let transferred_cross_size = self.cross_size_from_main_size_and_aspect_ratio(main_size, ratio);
+            // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-minimum
+            let clamp_min = self
+                .sizing()
+                .automatic_minimum_size_from_aspect_ratio(
+                    node,
+                    self.cross_sizing_axis(),
+                    main_size,
+                    transferred_cross_size,
+                    self.available_space_for_items.unwrap().space,
+                    self.item_containing_block_constraints(),
+                    None,
+                )
+                .unwrap_or(clamp_min);
+            self.flex_items[index].hypothetical_cross_size = css_clamp(transferred_cross_size, clamp_min, clamp_max);
             self.flex_items[index].cross_size_was_resolved_from_aspect_ratio = self.has_definite_main_size(index);
             return;
         }
@@ -1856,11 +1879,17 @@ impl<'pass> FlexFormattingContext<'pass> {
                     // https://drafts.csswg.org/css-flexbox-1/#definite-sizes
                     // Once the cross size of a flex line has been determined, the cross sizes of items in auto-sized flex
                     // containers are also considered definite for the purpose of layout.
-                    let cross_min = if min.is_auto() {
+                    let mut cross_min = if min.is_auto() {
                         CssPixels::default()
                     } else {
                         self.specified_cross_min_size(index)
                     };
+                    if self.facts(node).is_table_wrapper() && !self.cross_axis_is_horizontal() {
+                        // A table is never smaller than its content, so neither is its stretched wrapper.
+                        let sizes = self.measure_table_wrapper_block_sizes(index);
+                        self.flex_items[index].stretched_table_wrapper_block_sizes = Some(sizes);
+                        cross_min = cross_min.max(sizes.wrapper_content_block_size);
+                    }
                     let cross_max = if self.should_treat_max_size_as_none(node, true) {
                         CssPixels::from_raw(i32::MAX)
                     } else {
@@ -2310,8 +2339,27 @@ impl<'pass> FlexFormattingContext<'pass> {
         }
     }
 
+    // https://drafts.csswg.org/css-align-3/#synthesize-baseline
+    // NB: An item in another writing mode has no baseline in this container's axis, so it synthesizes one.
+    fn item_baseline_is_synthesized(&self, index: usize) -> bool {
+        self.style(self.flex_items[index].box_).writing_mode() != writing_mode::HORIZONTAL_TB
+    }
+
+    fn item_participates_in_baseline_alignment(&self, index: usize) -> bool {
+        // FIXME: box_baseline() only understands horizontal-tb line box geometry, so items can only be baseline-aligned
+        //        in a horizontal-tb container unless they are horizontal-tb themselves.
+        self.alignment_for_item(self.flex_items[index].box_) == align_items::BASELINE
+            && (!self.item_baseline_is_synthesized(index)
+                || self.style(self.flex_container).writing_mode() == writing_mode::HORIZONTAL_TB)
+    }
+
     fn item_box_baseline(&self, index: usize) -> CssPixels {
         let item = &self.flex_items[index];
+        if self.item_baseline_is_synthesized(index) {
+            let used = self.item_used(index);
+            let collapsed = used.uses_collapsing_borders_model.get();
+            return used.margin_box_top(collapsed) + used.content_block_size.get() + used.border_box_bottom(collapsed);
+        }
         formatting_context::box_baseline_with_content_baselines(
             &self.callbacks,
             item.box_,
@@ -2332,21 +2380,15 @@ impl<'pass> FlexFormattingContext<'pass> {
             if !self.flex_lines[line_index].has_baseline_aligned_items {
                 continue;
             }
-            // FIXME: box_baseline() only understands horizontal-tb line box geometry, so baseline-aligning items with
-            //        other writing modes would shift them by physically meaningless amounts. Skip them for now.
-            let participates = |context: &Self, index: usize| {
-                context.alignment_for_item(context.flex_items[index].box_) == align_items::BASELINE
-                    && context.style(context.flex_items[index].box_).writing_mode() == writing_mode::HORIZONTAL_TB
-            };
             let mut max_baseline = CssPixels::default();
             for index in self.flex_lines[line_index].items.iter().copied() {
-                if participates(self, index) {
+                if self.item_participates_in_baseline_alignment(index) {
                     max_baseline = max_baseline.max(self.item_box_baseline(index));
                 }
             }
             for item_position in 0..self.flex_lines[line_index].items.len() {
                 let index = self.flex_lines[line_index].items[item_position];
-                if participates(self, index) {
+                if self.item_participates_in_baseline_alignment(index) {
                     let baseline = self.item_box_baseline(index);
                     self.flex_items[index].cross_offset += max_baseline - baseline;
                 }
@@ -2374,6 +2416,18 @@ impl<'pass> FlexFormattingContext<'pass> {
         }
     }
 
+    fn measure_table_wrapper_block_sizes(&self, index: usize) -> sizing_context::TableWrapperBlockSizes {
+        let mut intrinsic_space = self
+            .item_used(index)
+            .available_inner_space_or_constraints_from(self.available_space_for_items.unwrap().space);
+        intrinsic_space.block_size = AvailableSize::Indefinite;
+        self.sizing().measure_table_box_block_size_inside_wrapper(
+            self.flex_items[index].box_,
+            intrinsic_space,
+            self.item_containing_block_constraints(),
+        )
+    }
+
     fn layout_inside_item(&mut self, run: &FormattingContextRun<'pass>, index: usize) {
         let node = self.flex_items[index].box_;
         let mut input = LayoutInput {
@@ -2398,16 +2452,15 @@ impl<'pass> FlexFormattingContext<'pass> {
         // and the table box were the flex item.
         if self.facts(node).is_table_wrapper() && !self.cross_axis_is_horizontal() && self.flex_item_is_stretched(index)
         {
-            let mut intrinsic_space = input.available_space;
-            intrinsic_space.block_size = AvailableSize::Indefinite;
-            let intrinsic_size = self.sizing().compute_table_box_block_size_inside_wrapper(
-                node,
-                intrinsic_space,
-                input.containing_block_constraints,
-            );
-            let extra = (self.flex_items[index].cross_size.unwrap() - self.flex_items[index].hypothetical_cross_size)
-                .max(CssPixels::default());
-            input.sizing.forced_min_border_box_block_size = Some(intrinsic_size + extra);
+            let sizes = self.flex_items[index]
+                .stretched_table_wrapper_block_sizes
+                .unwrap_or_else(|| self.measure_table_wrapper_block_sizes(index));
+            // NB: The hypothetical cross size of an item stretched in a single-line container with a definite cross
+            //     size is already the stretched size, so measure the captions against the wrapper's own content.
+            let captions_block_size = sizes.wrapper_content_block_size - sizes.table_box_border_box_block_size;
+            let stretched_table_box_block_size = self.flex_items[index].cross_size.unwrap() - captions_block_size;
+            input.sizing.forced_min_border_box_block_size =
+                Some(stretched_table_box_block_size.max(sizes.table_box_border_box_block_size));
         }
 
         self.flex_items[index].content_baselines =
@@ -3250,8 +3303,55 @@ impl<'pass> FlexFormattingContext<'pass> {
             };
             formatting_context::place_child(&self.formatting_context_run(), item.box_, offset, None);
         }
-        self.derived_baselines_of_root_box =
-            formatting_context::derive_baselines(self.records, &self.callbacks, self.flex_container, true);
+        self.derived_baselines_of_root_box = DerivedBaselines {
+            first: self.baseline_of_line(0, formatting_context::BaselineSet::First),
+            last: self
+                .flex_lines
+                .len()
+                .checked_sub(1)
+                .and_then(|line_index| self.baseline_of_line(line_index, formatting_context::BaselineSet::Last)),
+        };
+    }
+
+    // https://drafts.csswg.org/css-flexbox-1/#flex-baselines
+    fn baseline_of_line(&self, line_index: usize, baseline_set: formatting_context::BaselineSet) -> Option<CssPixels> {
+        let items = &self.flex_lines.get(line_index)?.items;
+        // 1. If any of the flex items on the flex container's first line participate in baseline alignment, the flex
+        //    container's main-axis baseline is the baseline of those flex items.
+        let participating = (baseline_set == formatting_context::BaselineSet::First)
+            .then(|| {
+                items
+                    .iter()
+                    .copied()
+                    .find(|&index| self.item_participates_in_baseline_alignment(index))
+            })
+            .flatten();
+        // 2. Otherwise, the flex container's first (last) main-axis baseline set is generated from the alignment
+        //    baseline of the startmost (endmost) flex item. If that item has no alignment baseline, then one is first
+        //    synthesized from its border edges.
+        // INTEROP: Chrome takes the startmost and endmost items in physical order, also for reversed directions.
+        let item = participating.or_else(|| match baseline_set {
+            formatting_context::BaselineSet::First => items
+                .iter()
+                .copied()
+                .min_by_key(|&index| self.flex_items[index].main_offset),
+            formatting_context::BaselineSet::Last => items
+                .iter()
+                .copied()
+                .max_by_key(|&index| self.flex_items[index].main_offset),
+        })?;
+        let source = if self.item_baseline_is_synthesized(item) {
+            formatting_context::ChildBaselineSource::Synthesized
+        } else {
+            formatting_context::ChildBaselineSource::OwnOrSynthesized
+        };
+        formatting_context::baseline_of_child(
+            self.records,
+            &self.callbacks,
+            self.flex_items[item].box_,
+            baseline_set,
+            source,
+        )
     }
 
     pub(super) fn parent_did_dimension(&self) {

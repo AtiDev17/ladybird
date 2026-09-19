@@ -370,6 +370,8 @@ void WebContentClient::register_embedded_page(Web::PageId page_id, CanonicalTrav
 
     if (auto view = ViewImplementation::find_view_for_traversable(traversable); view.has_value())
         view->send_preferences_to_page({}, { this, page_id });
+    if (Application::browser_options().webdriver_browser_endpoint.has_value())
+        Application::the().push_webdriver_session_config({ this, page_id });
     async_set_has_focus(page_id, traversable.has_system_focus());
     if (auto focused_navigable_id = traversable.focused_navigable_id(); focused_navigable_id.has_value())
         async_set_focused_navigable(page_id, *focused_navigable_id);
@@ -731,13 +733,16 @@ void WebContentClient::dispatch_mouse_event_to_web_content(Web::PageId page_id, 
         return;
     }
 
+    // The compositor forwards input to the page a context presents, which the context of a hosted root has none of.
+    if (&root != &root.top_level_traversable()) {
+        async_mouse_event_in_hosted_root(page_id, root.id(), event.clone_without_browser_data());
+        return;
+    }
+
     if (context_id.has_value() && Application::the().dispatch_mouse_event_to_web_content(*context_id, event))
         return;
 
-    if (&root == &root.top_level_traversable())
-        async_mouse_event(page_id, event.clone_without_browser_data());
-    else
-        async_mouse_event_in_hosted_root(page_id, root.id(), event.clone_without_browser_data());
+    async_mouse_event(page_id, event.clone_without_browser_data());
 }
 
 void WebContentClient::notify_presented_bitmap_ready_to_paint(Web::PageId page_id, i32 bitmap_id)
@@ -2098,9 +2103,19 @@ void WebContentClient::did_finish_network_request(Web::PageId page_id, u64 reque
     }
 }
 
+// A dialog blocks the whole tab, so every other page of the tab is told of the one a document of this page opened.
+void WebContentClient::did_open_dialog(ViewImplementation& view, Web::PageId page_id, Web::Page::PendingDialog dialog, Utf16String const& message)
+{
+    view.traversable().for_each_hosting_page([&](WebContentPage const& page) {
+        if (page != WebContentPage { this, page_id })
+            page.client->async_did_open_dialog_in_another_process(page.id, dialog, message);
+    });
+}
+
 void WebContentClient::did_request_alert(Web::PageId page_id, Utf16String message)
 {
-    if (auto view = view_for_page_id(page_id); view.has_value()) {
+    if (auto view = owning_view_for_page_id(page_id); view.has_value()) {
+        did_open_dialog(*view, page_id, Web::Page::PendingDialog::Alert, message);
         if (view->on_request_alert)
             view->on_request_alert(message);
     }
@@ -2108,7 +2123,8 @@ void WebContentClient::did_request_alert(Web::PageId page_id, Utf16String messag
 
 void WebContentClient::did_request_confirm(Web::PageId page_id, Utf16String message)
 {
-    if (auto view = view_for_page_id(page_id); view.has_value()) {
+    if (auto view = owning_view_for_page_id(page_id); view.has_value()) {
+        did_open_dialog(*view, page_id, Web::Page::PendingDialog::Confirm, message);
         if (view->on_request_confirm)
             view->on_request_confirm(message);
     }
@@ -2116,7 +2132,8 @@ void WebContentClient::did_request_confirm(Web::PageId page_id, Utf16String mess
 
 void WebContentClient::did_request_prompt(Web::PageId page_id, Utf16String message, Utf16String default_)
 {
-    if (auto view = view_for_page_id(page_id); view.has_value()) {
+    if (auto view = owning_view_for_page_id(page_id); view.has_value()) {
+        did_open_dialog(*view, page_id, Web::Page::PendingDialog::Prompt, message);
         if (view->on_request_prompt)
             view->on_request_prompt(message, default_);
     }
@@ -2124,7 +2141,7 @@ void WebContentClient::did_request_prompt(Web::PageId page_id, Utf16String messa
 
 void WebContentClient::did_request_set_prompt_text(Web::PageId page_id, Utf16String message)
 {
-    if (auto view = view_for_page_id(page_id); view.has_value()) {
+    if (auto view = owning_view_for_page_id(page_id); view.has_value()) {
         if (view->on_request_set_prompt_text)
             view->on_request_set_prompt_text(message);
     }
@@ -2132,7 +2149,7 @@ void WebContentClient::did_request_set_prompt_text(Web::PageId page_id, Utf16Str
 
 void WebContentClient::did_request_accept_dialog(Web::PageId page_id)
 {
-    if (auto view = view_for_page_id(page_id); view.has_value()) {
+    if (auto view = owning_view_for_page_id(page_id); view.has_value()) {
         if (view->on_request_accept_dialog)
             view->on_request_accept_dialog();
     }
@@ -2140,7 +2157,7 @@ void WebContentClient::did_request_accept_dialog(Web::PageId page_id)
 
 void WebContentClient::did_request_dismiss_dialog(Web::PageId page_id)
 {
-    if (auto view = view_for_page_id(page_id); view.has_value()) {
+    if (auto view = owning_view_for_page_id(page_id); view.has_value()) {
         if (view->on_request_dismiss_dialog)
             view->on_request_dismiss_dialog();
     }
@@ -2436,9 +2453,15 @@ void WebContentClient::webdriver_user_prompt_handling_complete(Web::PageId page_
         view->did_complete_webdriver_user_prompt_handling({}, request_id, move(response));
 }
 
+void WebContentClient::webdriver_did_set_current_browsing_context(Web::PageId page_id, u64 command_id, Web::HTML::CrossProcessId navigable_id)
+{
+    if (auto view = owning_view_for_page_id(page_id); view.has_value())
+        view->did_set_webdriver_current_browsing_context({}, command_id, navigable_id);
+}
+
 void WebContentClient::webdriver_command_complete(Web::PageId page_id, u64 command_id, Web::WebDriver::Response response)
 {
-    if (auto view = view_for_page_id(page_id); view.has_value())
+    if (auto view = owning_view_for_page_id(page_id); view.has_value())
         view->did_complete_webdriver_content_command({}, command_id, move(response));
 }
 
@@ -2717,6 +2740,27 @@ void WebContentClient::did_request_key_event_for_testing(Web::PageId page_id, We
 {
     if (auto view = owning_view_for_page_id(page_id); view.has_value())
         view->enqueue_input_event(move(event));
+}
+
+void WebContentClient::did_request_webdriver_mouse_event(Web::PageId page_id, u64 request_id, Web::HTML::CrossProcessId root_navigable_id, Web::MouseEvent event)
+{
+    auto on_handled = [self = NonnullRefPtr { *this }, page_id, request_id]() {
+        self->async_did_handle_webdriver_mouse_event(page_id, request_id);
+    };
+
+    auto view = owning_view_for_page_id(page_id);
+    if (!view.has_value()) {
+        on_handled();
+        return;
+    }
+
+    // The event is relative to the viewport of the local root its page dispatches input to.
+    if (auto root = view->traversable().find(root_navigable_id); root.has_value()) {
+        auto offset = view->traversable().local_root_offset(*root);
+        event.position.translate_by(offset);
+        event.screen_position.translate_by(offset);
+    }
+    view->enqueue_webdriver_mouse_event({}, move(event), move(on_handled));
 }
 
 void WebContentClient::did_request_set_system_visibility_state(Web::PageId page_id, Web::HTML::VisibilityState visibility_state)
