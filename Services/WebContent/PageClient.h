@@ -75,7 +75,7 @@ public:
 
     void set_palette_impl(Gfx::PaletteImpl&);
     void set_viewport(Web::DevicePixelSize const&, double device_pixel_ratio);
-    void set_hosted_root_viewport(Web::HTML::CrossProcessId, Web::DevicePixelSize const&, double device_pixel_ratio);
+    void set_hosted_root_viewport(Web::HTML::CrossProcessId, Web::DevicePixelSize const&, Web::DevicePixelRect const& viewport_intersection, double device_pixel_ratio);
     void set_screen_rects(Vector<Web::DevicePixelRect> const& rects, size_t main_screen_index)
     {
         m_all_screen_rects = rects;
@@ -102,7 +102,6 @@ public:
     void toggle_media_controls_state();
 
     void set_geolocation_emulated_position(WebView::GeolocationPositionData const&, Optional<u16> error_code);
-    void apply_pending_geolocation_emulated_position();
     void geolocation_position_response(u64 request_id, WebView::GeolocationPositionData const&, Optional<u16> error_code);
 
     void alert_closed();
@@ -196,7 +195,7 @@ private:
     virtual void page_did_completely_finish_loading(Web::HTML::CrossProcessId navigable_id) override;
     virtual void page_did_change_navigable_container_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedContainerState const&) override;
     virtual void page_did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::ReplicatedNavigableState const&) override;
-    virtual void page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::CSSPixelRect) override;
+    virtual void page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::CSSPixelRect viewport_rect, Web::CSSPixelRect viewport_intersection) override;
     virtual void page_did_destroy_child_frame(Web::HTML::CrossProcessId frame_id) override;
     virtual String dump_site_isolation_process_tree_for_testing() override;
     virtual void crash_remote_frame_processes_for_testing() override;
@@ -234,10 +233,10 @@ private:
     virtual void page_did_click_link(URL::URL const&, ByteString const& target, unsigned modifiers) override;
     virtual void page_did_middle_click_link(URL::URL const&, ByteString const& target, unsigned modifiers) override;
     virtual void page_did_request_external_url(URL::URL const&, URL::Origin const& initiator_origin, bool has_transient_activation) override;
-    virtual void page_did_request_context_menu(Web::CSSPixelPoint, Web::ContextMenuForInputEventsTarget) override;
-    virtual void page_did_request_link_context_menu(Web::CSSPixelPoint, URL::URL const&, ByteString const& target, unsigned modifiers) override;
-    virtual void page_did_request_image_context_menu(Web::CSSPixelPoint, URL::URL const&, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*>) override;
-    virtual void page_did_request_media_context_menu(Web::CSSPixelPoint, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const&) override;
+    virtual void page_did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, Web::ContextMenuForInputEventsTarget) override;
+    virtual void page_did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, URL::URL const&, ByteString const& target, unsigned modifiers) override;
+    virtual void page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, URL::URL const&, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*>) override;
+    virtual void page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const&) override;
     virtual void page_did_create_new_document(Web::DOM::Document&) override;
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) override;
     virtual void page_did_finish_loading(Web::HTML::CrossProcessId, Optional<Utf16String> const&) override;
@@ -294,7 +293,7 @@ private:
     virtual void page_did_request_set_system_focus(bool) override;
     virtual void page_did_change_focused_navigable(Web::HTML::CrossProcessId) override;
     virtual void page_did_request_key_event_for_testing(Web::KeyEvent) override;
-    virtual void page_did_request_webdriver_mouse_event(Web::HTML::CrossProcessId root_navigable_id, Web::MouseEvent, GC::Ref<GC::Function<void()>> on_handled) override;
+    virtual void page_did_request_webdriver_mouse_event(Web::HTML::CrossProcessId local_root_id, Web::MouseEvent, GC::Ref<GC::Function<void()>> on_handled) override;
     virtual void page_did_request_set_system_visibility_state(Web::HTML::VisibilityState) override;
     virtual void page_did_request_history_operation(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters) override;
     virtual void page_did_request_child_navigable_unload(Web::HTML::CrossProcessId navigable_id) override;
@@ -313,7 +312,7 @@ private:
     virtual Optional<Web::FileAPI::SerializedBlobURLEntry> page_did_request_blob_url_entry(Utf16String const& url, Optional<URL::BlobURLEntry::Token> token) override;
     virtual void page_did_request_color_picker(Color current_color) override;
     virtual void page_did_request_file_picker(Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles) override;
-    virtual void page_did_request_select_dropdown(Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items) override;
+    virtual void page_did_request_select_dropdown(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items) override;
     virtual void page_did_request_geolocation_position(u64 request_id) override;
     virtual void page_did_cancel_geolocation_position_request(u64 request_id) override;
     virtual void page_did_start_geolocation_position_watch(u64 request_id) override;
@@ -370,12 +369,6 @@ private:
     Web::CSS::PreferredColorScheme m_preferred_color_scheme { Web::CSS::PreferredColorScheme::Auto };
     Web::CSS::PreferredContrast m_preferred_contrast { Web::CSS::PreferredContrast::NoPreference };
     Web::CSS::PreferredMotion m_preferred_motion { Web::CSS::PreferredMotion::NoPreference };
-
-    struct PendingGeolocationEmulatedPosition {
-        WebView::GeolocationPositionData position;
-        Optional<u16> error_code {};
-    };
-    Optional<PendingGeolocationEmulatedPosition> m_pending_geolocation_emulated_position;
 
     Core::AnonymousBuffer m_document_cookie_version_buffer;
 

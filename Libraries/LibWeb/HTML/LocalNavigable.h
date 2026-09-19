@@ -252,6 +252,11 @@ public:
     CSSPixelRect viewport_rect() const { return { m_viewport_scroll_offset, m_viewport_size }; }
     CSSPixelSize viewport_size() const { return m_viewport_size; }
     void set_viewport_size(CSSPixelSize, InvalidateDisplayList = InvalidateDisplayList::No);
+
+    // The part of the viewport of a local root another process embeds that the top-level viewport shows, in this
+    // viewport's coordinates, as its embedder last reported. None of it until then.
+    Optional<CSSPixelRect> viewport_intersection() const;
+    void set_viewport_intersection(CSSPixelRect);
     void perform_scroll_of_viewport_scrolling_box(CSSPixelPoint position);
     void adopt_pending_async_scroll_offsets(Compositor::AsyncScrollUpdateFreshness = Compositor::AsyncScrollUpdateFreshness::Pushed);
     void adopt_started_user_scroll(DOM::Document&, Compositor::StartedUserScroll const&);
@@ -294,6 +299,7 @@ public:
     void prepare_to_populate_reconstructed_history_entry(Utf16String navigation_api_key);
 
     bool record_display_list_and_scroll_state(PaintConfig);
+    void report_navigable_container_viewport_rects();
     void paint_next_frame();
     void render_screenshot(Gfx::PaintingSurface&, PaintConfig, Function<void()>&& callback);
     Painting::DisplayListResourceStorage& display_list_resource_storage() { return m_display_list_resource_storage; }
@@ -533,6 +539,7 @@ private:
     ReplicatedContainerState m_root_container_state;
 
     CSSPixelSize m_viewport_size;
+    Optional<CSSPixelRect> m_viewport_intersection;
     CSSPixelPoint m_viewport_scroll_offset;
     struct PendingPersistedStateRestoration {
         GC::Weak<DOM::Document> document;

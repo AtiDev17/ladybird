@@ -41,6 +41,18 @@ pub(crate) fn resolve_constants(function: &mut Function, constants: &LayoutConst
                 .filter(|instruction| instruction.operation == Operation::Address)
                 .flat_map(|instruction| instruction.inputs.iter().skip(1).copied()),
         )
+        .chain(
+            function
+                .instructions
+                .iter()
+                .filter(|instruction| {
+                    matches!(
+                        instruction.operation,
+                        Operation::Intrinsic(Intrinsic::Value(ValueOperation::ExtractTag { .. }))
+                    )
+                })
+                .flat_map(|instruction| instruction.inputs.iter().copied()),
+        )
         .collect::<HashSet<_>>();
     for value_id in values {
         let value = &mut function.values[value_id.0];
@@ -260,6 +272,7 @@ fn run_optimization_pipeline(
         "global-common-subexpression-elimination",
         eliminate_common_subexpressions_pass
     );
+    run_pass!("redundant-assertion-elimination", eliminate_redundant_assertions);
     run_pass!("dead-code-elimination", eliminate_dead_code_pass);
     run_pass!("global-code-motion", schedule_global_code_motion_pass);
     run_pass!("rematerialize-cold-values", rematerialize_cold_values);
@@ -694,6 +707,11 @@ fn eliminate_common_subexpressions_pass(function: &mut Function, analyses: &mut 
                 guard_mark = Some(undo.len());
             }
             rewrite_values(&mut instruction.inputs, &replacements);
+            // NB: Assertions only exit on failure and leave values unchanged on success.
+            //     Keep expressions available so later checks can reuse their predicates.
+            if matches!(instruction.operation, Operation::Intrinsic(Intrinsic::Assertion(_))) {
+                continue;
+            }
             // Allocation only preserves simple rematerializable values across
             // calls, and sharing across a trapping check increases pressure on
             // paths that may exit. Keep other cheap expressions rematerializable
@@ -1449,6 +1467,41 @@ pub(super) fn rebuild_instruction_arena(
     );
 }
 
+fn eliminate_redundant_assertions(function: &mut Function, analyses: &mut AnalysisManager) -> bool {
+    let mut eliminated = HashSet::default();
+    // NB: A successful guard or assertion also proves its SSA condition for subsequent
+    //     instructions in the same block, even when the condition is not constant.
+    let cfg = analyses.cfg(function);
+    for (index, block) in function.blocks.iter().enumerate() {
+        let mut successful_conditions = crate::hash::HashSet::default();
+        if BlockId(index) != function.entry
+            && let [predecessor] = cfg.predecessors(BlockId(index))
+            && let Some(Terminator::Branch {
+                condition, then_edge, ..
+            }) = &function.blocks[predecessor.0].terminator
+            && then_edge.block == BlockId(index)
+        {
+            successful_conditions.insert(*condition);
+        }
+        for id in &block.instructions {
+            let instruction = &function.instructions[id.0];
+            let assertion = matches!(instruction.operation, Operation::Intrinsic(Intrinsic::Assertion(_)));
+            if assertion || instruction.operation.guard_failure().is_some() {
+                let condition = instruction.inputs[0];
+                if !successful_conditions.insert(condition) && assertion {
+                    eliminated.insert(*id);
+                }
+            }
+        }
+    }
+
+    if eliminated.is_empty() {
+        return false;
+    }
+    rebuild_instruction_arena(function, &eliminated, InstructionOrder::ByBlock);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1694,7 +1747,7 @@ mod tests {
         let (consume, _) = append_test_operation(
             &mut function,
             cold,
-            Intrinsic::Assertion(AssertionOperation::NonZero),
+            Intrinsic::Assertion(AssertionOperation::Assert),
             result,
             Vec::new(),
             Effects::UNKNOWN,
@@ -1733,7 +1786,7 @@ mod tests {
         )[0];
         function.append_instruction(
             cold,
-            Intrinsic::Assertion(AssertionOperation::NonZero),
+            Intrinsic::Assertion(AssertionOperation::Assert),
             vec![tag],
             Vec::new(),
         );
@@ -1779,7 +1832,7 @@ mod tests {
         let (consume, _) = append_test_operation(
             &mut function,
             entry,
-            Intrinsic::Assertion(AssertionOperation::NonZero),
+            Intrinsic::Assertion(AssertionOperation::Assert),
             result,
             Vec::new(),
             Effects::UNKNOWN,
@@ -1815,7 +1868,7 @@ mod tests {
         let (consume, _) = append_test_operation(
             &mut function,
             header,
-            Intrinsic::Assertion(AssertionOperation::NonZero),
+            Intrinsic::Assertion(AssertionOperation::Assert),
             result,
             Vec::new(),
             Effects::UNKNOWN,
@@ -1872,7 +1925,7 @@ handler Add(lhs: i32, rhs: i32) {
     let first = lhs + rhs;
     let second = lhs + rhs;
     let total = first + second;
-    assert_nonzero(total);
+    assert(total != 0);
     dispatch_next;
 }
 "#,
@@ -1884,7 +1937,7 @@ handler Add(lhs: i32, rhs: i32) {
         eliminate_common_subexpressions(&mut function);
 
         let entry = &function.blocks[function.entry.0];
-        assert_eq!(entry.instructions.len(), 4);
+        assert_eq!(entry.instructions.len(), 5);
         let first_add = &function.instructions[entry.instructions[0].0];
         let total = &function.instructions[entry.instructions[1].0];
         assert_eq!(total.inputs.as_slice(), [first_add.results[0], first_add.results[0]]);
@@ -1899,7 +1952,7 @@ handler Add(lhs: i32) {
     let first = lhs + 1;
     let second = lhs + 1;
     let total = first + second;
-    assert_nonzero(total);
+    assert(total != 0);
     dispatch_next;
 }
 "#,
@@ -1910,7 +1963,7 @@ handler Add(lhs: i32) {
 
         eliminate_common_subexpressions(&mut function);
 
-        assert_eq!(function.blocks[function.entry.0].instructions.len(), 4);
+        assert_eq!(function.blocks[function.entry.0].instructions.len(), 5);
     }
 
     #[test]

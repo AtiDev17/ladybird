@@ -498,6 +498,16 @@ static ThrowCompletionOr<GC::Ref<ObjectPropertyIteratorCacheData>> asm_get_objec
             return *cache->data;
     }
 
+    // Keep a snapshot on the shape so sites that alternate between shapes can reuse
+    // previously collected keys instead of rebuilding the list each time.
+    if (auto shape_cache = object->shape().property_iterator_cache()) {
+        if (object_property_iterator_cache_matches(*object, *shape_cache)) {
+            if (cache)
+                cache->data = shape_cache;
+            return *shape_cache;
+        }
+    }
+
     if (auto fast_iterator_data = TRY(asm_try_get_fast_property_name_iterator_data(*object)); fast_iterator_data.has_value()) {
         VERIFY(fast_iterator_data->shape);
         auto cache_data = vm.heap().allocate<ObjectPropertyIteratorCacheData>(
@@ -510,6 +520,7 @@ static ThrowCompletionOr<GC::Ref<ObjectPropertyIteratorCacheData>> asm_get_objec
             fast_iterator_data->prototype_chain_validity);
         if (cache)
             cache->data = cache_data;
+        object->shape().set_property_iterator_cache(cache_data);
         return cache_data;
     }
 
@@ -2866,6 +2877,7 @@ DEFINE_SLOW_PATH(asm_slow_path_create_lexical_environment, CreateLexicalEnvironm
 {
     auto& parent = as<Environment>(values.parent.as_cell());
     auto environment = new_declarative_environment(parent);
+    environment->set_environment_shape_cache(vm->current_executable().environment_shape_caches[instruction->shape_cache()], instruction->capacity());
     environment->ensure_capacity(instruction->capacity());
     environment->set_is_catch_environment(instruction->is_catch_environment());
     values.dst = environment;

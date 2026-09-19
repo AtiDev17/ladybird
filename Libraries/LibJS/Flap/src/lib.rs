@@ -360,7 +360,9 @@ impl Compiler {
         let machine_instructions = machine
             .functions
             .iter()
-            .map(|function| function.hot_instructions.len() + function.cold_instructions.len())
+            .map(|function| {
+                function.hot_instructions.len() + function.cold_instructions.len() + function.assertion_traps.len()
+            })
             .sum();
 
         let started_at = Instant::now();
@@ -761,7 +763,7 @@ handler Copy(dst: out Operand, src: in Operand) {
 }
 handler Touch(src: in Operand) {
     let value = load(src);
-    assert_nonzero(value);
+    assert(extract_tag(value) != 0);
     dispatch_next;
 }
 specialize Copy(src: Int32);

@@ -10,9 +10,12 @@
 #    include <AK/LexicalPath.h>
 #    include <AK/ScopeGuard.h>
 #    include <AK/Vector.h>
+#    include <dirent.h>
 #    include <errno.h>
 #    include <fcntl.h>
 #    include <linux/landlock.h>
+#    include <stdlib.h>
+#    include <string.h>
 #    include <sys/prctl.h>
 #    include <sys/stat.h>
 #    include <sys/syscall.h>
@@ -680,17 +683,49 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
 #endif
 
 #if defined(AK_OS_LINUX)
+static ErrorOr<size_t> count_threads()
+{
+    auto* directory = opendir("/proc/self/task");
+    if (!directory)
+        return Error::from_syscall("opendir(/proc/self/task)"sv, errno);
+
+    size_t thread_count = 0;
+    while (auto* entry = readdir(directory)) {
+        if (entry->d_name[0] != '.')
+            ++thread_count;
+    }
+    closedir(directory);
+    return thread_count;
+}
+
 ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths)
 {
-#    if defined(__NR_landlock_create_ruleset) && defined(__NR_landlock_add_rule) && defined(__NR_landlock_restrict_self)
+    // Landlock confines only the calling thread and the threads that it starts later. A thread that already runs would
+    // keep full access to the file system.
+    if (TRY(count_threads()) != 1)
+        return Error::from_string_literal("Landlock must be applied before the process starts a second thread");
+
+    // Without Landlock, nothing limits the files a helper can open, so we refuse to go on. Running without it has to
+    // be a choice that the user makes with --disable-sandbox.
     auto landlock_abi = syscall(__NR_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
-    if (landlock_abi < 0) {
-        if (errno == ENOSYS || errno == EOPNOTSUPP || errno == EINVAL)
-            return {};
+    if (landlock_abi < 0 && errno != ENOSYS && errno != EOPNOTSUPP)
         return Error::from_syscall("landlock_create_ruleset(LANDLOCK_CREATE_RULESET_VERSION)"sv, errno);
+    if (landlock_abi <= 0) {
+        // NB: Only for machines that cannot run Landlock at all, such as our CI runners. The rest of the sandbox still
+        //     applies. On a kernel that has Landlock, this changes nothing.
+        if (auto const* allow = getenv("LADYBIRD_UNSAFE_ALLOW_MISSING_LANDLOCK"); allow && StringView { allow, strlen(allow) } == "1"sv) {
+            warnln("Landlock is not available in this kernel. This helper runs without file system confinement, because LADYBIRD_UNSAFE_ALLOW_MISSING_LANDLOCK is set.");
+            return {};
+        }
+        return Error::from_string_literal("Landlock is not available in this kernel, so the helper cannot be sandboxed (--disable-sandbox runs helpers without a sandbox)");
     }
-    if (landlock_abi == 0)
-        return {};
+
+    // Before ABI 3, Landlock does not handle truncation, so a helper can truncate any file that it can open.
+    static bool s_warned_about_truncation = false;
+    if (landlock_abi < 3 && !s_warned_about_truncation) {
+        s_warned_about_truncation = true;
+        warnln("Landlock ABI {} does not restrict file truncation. Linux 6.2 or later is needed for that.", landlock_abi);
+    }
 
     landlock_ruleset_attr ruleset_attributes {};
     ruleset_attributes.handled_access_fs = LANDLOCK_ACCESS_FS_EXECUTE
@@ -707,19 +742,19 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
         | LANDLOCK_ACCESS_FS_MAKE_BLOCK
         | LANDLOCK_ACCESS_FS_MAKE_SYM;
 
-#        ifdef LANDLOCK_ACCESS_FS_REFER
+#    ifdef LANDLOCK_ACCESS_FS_REFER
     if (landlock_abi >= 2)
         ruleset_attributes.handled_access_fs |= LANDLOCK_ACCESS_FS_REFER;
-#        endif
-#        ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+#    endif
+#    ifdef LANDLOCK_ACCESS_FS_TRUNCATE
     if (landlock_abi >= 3)
         ruleset_attributes.handled_access_fs |= LANDLOCK_ACCESS_FS_TRUNCATE;
-#        endif
-#        if defined(LANDLOCK_ACCESS_NET_BIND_TCP) && defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)
+#    endif
+#    if defined(LANDLOCK_ACCESS_NET_BIND_TCP) && defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)
     auto ruleset_attributes_size = offsetof(landlock_ruleset_attr, handled_access_net);
-#        else
+#    else
     auto ruleset_attributes_size = sizeof(ruleset_attributes);
-#        endif
+#    endif
     auto ruleset_fd = syscall(__NR_landlock_create_ruleset, &ruleset_attributes, ruleset_attributes_size, 0);
     if (ruleset_fd < 0)
         return Error::from_syscall("landlock_create_ruleset"sv, errno);
@@ -756,10 +791,10 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
         case LandlockPath::Access::ReadWrite: {
             path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE;
 
-#        ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+#    ifdef LANDLOCK_ACCESS_FS_TRUNCATE
             if (landlock_abi >= 3)
                 path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
-#        endif
+#    endif
 
             if (landlock_path.is_directory) {
                 path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_READ_DIR
@@ -770,10 +805,10 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
                     | LANDLOCK_ACCESS_FS_MAKE_SOCK
                     | LANDLOCK_ACCESS_FS_MAKE_FIFO;
 
-#        ifdef LANDLOCK_ACCESS_FS_REFER
+#    ifdef LANDLOCK_ACCESS_FS_REFER
                 if (landlock_abi >= 2)
                     path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_REFER;
-#        endif
+#    endif
             }
             break;
         }
@@ -785,9 +820,6 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
 
     if (syscall(__NR_landlock_restrict_self, ruleset_fd, 0) < 0)
         return Error::from_syscall("landlock_restrict_self"sv, errno);
-#    else
-    (void)paths;
-#    endif
 
     return {};
 }

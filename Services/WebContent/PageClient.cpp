@@ -376,9 +376,9 @@ void PageClient::page_did_create_child_frame(Web::HTML::CrossProcessId parent_fr
     client().async_did_create_child_frame(m_id, parent_frame_id, frame_id, replicated_state);
 }
 
-void PageClient::page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::CSSPixelRect viewport_rect)
+void PageClient::page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::CSSPixelRect viewport_rect, Web::CSSPixelRect viewport_intersection)
 {
-    client().async_did_update_child_frame_viewport(m_id, frame_id, page().css_to_device_rect(viewport_rect), page().client().device_pixel_ratio());
+    client().async_did_update_child_frame_viewport(m_id, frame_id, page().css_to_device_rect(viewport_rect), page().css_to_device_rect(viewport_intersection), page().client().device_pixel_ratio());
 }
 
 void PageClient::page_did_destroy_child_frame(Web::HTML::CrossProcessId frame_id)
@@ -518,7 +518,7 @@ void PageClient::set_viewport(Web::DevicePixelSize const& size, double device_pi
     hurry_outstanding_rendering_opportunity();
 }
 
-void PageClient::set_hosted_root_viewport(Web::HTML::CrossProcessId navigable_id, Web::DevicePixelSize const& size, double device_pixel_ratio)
+void PageClient::set_hosted_root_viewport(Web::HTML::CrossProcessId navigable_id, Web::DevicePixelSize const& size, Web::DevicePixelRect const& viewport_intersection, double device_pixel_ratio)
 {
     auto* navigable = as_if<Web::HTML::LocalNavigable>(page().navigable_with_id(navigable_id).ptr());
     if (!navigable || !navigable->is_local_root())
@@ -531,6 +531,7 @@ void PageClient::set_hosted_root_viewport(Web::HTML::CrossProcessId navigable_id
     m_device_pixel_ratio = device_pixel_ratio;
 
     navigable->set_viewport_size(page().device_to_css_size(size), invalidate);
+    navigable->set_viewport_intersection(page().device_to_css_rect(viewport_intersection));
     hurry_outstanding_rendering_opportunity();
 }
 
@@ -897,7 +898,6 @@ void PageClient::page_did_request_external_url(URL::URL const& url, URL::Origin 
 void PageClient::page_did_create_new_document(Web::DOM::Document& document)
 {
     initialize_js_console(document);
-    apply_pending_geolocation_emulated_position();
 }
 
 void PageClient::page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document& document)
@@ -1031,54 +1031,38 @@ void PageClient::page_did_set_device_pixel_ratio_for_testing(double ratio)
     set_viewport(m_viewport_size, ratio);
 }
 
-void PageClient::page_did_request_context_menu(Web::CSSPixelPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target)
+void PageClient::page_did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target)
 {
-    client().async_did_request_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>(), for_input_events_target);
+    client().async_did_request_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), for_input_events_target);
 }
 
-void PageClient::page_did_request_link_context_menu(Web::CSSPixelPoint content_position, URL::URL const& url, ByteString const& target, unsigned modifiers)
+void PageClient::page_did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, URL::URL const& url, ByteString const& target, unsigned modifiers)
 {
-    client().async_did_request_link_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>(), url, target, modifiers);
+    client().async_did_request_link_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), url, target, modifiers);
 }
 
-void PageClient::page_did_request_image_context_menu(Web::CSSPixelPoint content_position, URL::URL const& url, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*> bitmap_pointer)
+void PageClient::page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, URL::URL const& url, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*> bitmap_pointer)
 {
     Optional<Gfx::ShareableBitmap> bitmap;
     if (bitmap_pointer.has_value() && bitmap_pointer.value())
         bitmap = bitmap_pointer.value()->to_shareable_bitmap();
 
-    client().async_did_request_image_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>(), url, target, modifiers, bitmap);
+    client().async_did_request_image_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), url, target, modifiers, bitmap);
 }
 
-void PageClient::page_did_request_media_context_menu(Web::CSSPixelPoint content_position, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const& menu)
+void PageClient::page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const& menu)
 {
-    client().async_did_request_media_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>(), target, modifiers, menu);
+    client().async_did_request_media_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), target, modifiers, menu);
 }
 
 void PageClient::set_geolocation_emulated_position(WebView::GeolocationPositionData const& position, Optional<u16> error_code)
 {
-    m_pending_geolocation_emulated_position = PendingGeolocationEmulatedPosition {
-        .position = position,
-        .error_code = error_code,
-    };
-    apply_pending_geolocation_emulated_position();
-}
-
-void PageClient::apply_pending_geolocation_emulated_position()
-{
-    if (!m_pending_geolocation_emulated_position.has_value() || !page().has_local_traversable())
-        return;
-
-    auto const& pending = *m_pending_geolocation_emulated_position;
-    auto const& position = pending.position;
-    auto& traversable = as<Web::HTML::LocalTraversableNavigable>(*page().top_level_traversable());
-
-    if (pending.error_code.has_value())
-        traversable.set_emulated_position_data(geolocation_position_error_code_from_ipc(*pending.error_code));
+    if (error_code.has_value())
+        page().set_emulated_position_data(geolocation_position_error_code_from_ipc(*error_code));
     else if (auto coordinates = geolocation_coordinates_from_ipc(position); coordinates.has_value())
-        traversable.set_emulated_position_data(*coordinates);
+        page().set_emulated_position_data(*coordinates);
     else
-        traversable.set_emulated_position_data(Empty {});
+        page().set_emulated_position_data(Empty {});
 }
 
 void PageClient::geolocation_position_response(u64 request_id, WebView::GeolocationPositionData const& position, Optional<u16> error_code)
@@ -1524,11 +1508,11 @@ void PageClient::page_did_request_key_event_for_testing(Web::KeyEvent event)
     client().async_did_request_key_event_for_testing(m_id, move(event));
 }
 
-void PageClient::page_did_request_webdriver_mouse_event(Web::HTML::CrossProcessId root_navigable_id, Web::MouseEvent event, GC::Ref<GC::Function<void()>> on_handled)
+void PageClient::page_did_request_webdriver_mouse_event(Web::HTML::CrossProcessId local_root_id, Web::MouseEvent event, GC::Ref<GC::Function<void()>> on_handled)
 {
     auto request_id = m_next_webdriver_mouse_event_request_id++;
     m_pending_webdriver_mouse_events.set(request_id, on_handled);
-    client().async_did_request_webdriver_mouse_event(m_id, request_id, root_navigable_id, move(event));
+    client().async_did_request_webdriver_mouse_event(m_id, request_id, local_root_id, move(event));
 }
 
 void PageClient::did_handle_webdriver_mouse_event(u64 request_id)
@@ -1688,9 +1672,9 @@ void PageClient::page_did_request_file_picker(Web::HTML::FileFilter const& accep
     client().async_did_request_file_picker(m_id, accepted_file_types, allow_multiple_files);
 }
 
-void PageClient::page_did_request_select_dropdown(Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items)
+void PageClient::page_did_request_select_dropdown(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items)
 {
-    client().async_did_request_select_dropdown(m_id, page().css_to_device_point(content_position).to_type<int>(), minimum_width * device_pixels_per_css_pixel(), items);
+    client().async_did_request_select_dropdown(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), minimum_width * device_pixels_per_css_pixel(), items);
 }
 
 void PageClient::page_did_change_theme_color(Gfx::Color color)

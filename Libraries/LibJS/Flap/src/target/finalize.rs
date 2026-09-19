@@ -45,12 +45,14 @@ fn finalize_function_for_target(
     let mut cold_instructions = finalize_instructions(cold, backend, &mut emit)?;
 
     cold_instructions.extend(emit.cold);
+    let assertion_traps = emit.assertion_traps;
     let machine = MachineFunction {
         id: function.id,
         name: function.name,
         is_cold: function.is_cold,
         hot_instructions,
         cold_instructions,
+        assertion_traps,
     };
     Ok(machine)
 }
@@ -257,9 +259,51 @@ fn finalize_instruction(
 ) -> Result<(), CompileError> {
     let operation = instruction.opcode.operation();
 
-    if let Operation::Assertion(operation) = operation {
-        let ok_label = emit.enable_assertions.then(|| emit.unique_label("assert_ok"));
-        backend.finalize_assertion(emit, operation, &instruction.operands, ok_label)?;
+    if matches!(operation, Operation::AssertBranch(_) | Operation::AssertFailure) {
+        if !emit.enable_assertions {
+            return Ok(());
+        }
+        let failure = instruction
+            .operands
+            .iter()
+            .find(|operand| matches!(operand, AllocatedOperand::Label(_)))
+            .unwrap()
+            .clone();
+        let (label_opcode, trap_opcode) = match instruction.opcode.architecture() {
+            crate::Architecture::X86_64 => (
+                MachineOpcode::X86_64(super::x86_64::Opcode::Label),
+                MachineOpcode::X86_64(super::x86_64::Opcode::UndefinedInstruction),
+            ),
+            crate::Architecture::Aarch64 => (
+                MachineOpcode::Aarch64(super::aarch64::Opcode::Label),
+                MachineOpcode::Aarch64(super::aarch64::Opcode::Break),
+            ),
+        };
+        emit.assertion_traps.push(MachineInstruction {
+            opcode: label_opcode,
+            operands: vec![failure],
+        });
+        emit.assertion_traps.push(MachineInstruction {
+            opcode: trap_opcode,
+            operands: Vec::new(),
+        });
+        return finalize_instruction(
+            AllocatedInstruction {
+                opcode: instruction.opcode.replacing_operation(match operation {
+                    Operation::AssertBranch(branch) => Operation::Branch(branch),
+                    Operation::AssertFailure => Operation::Control(ControlOperation::JumpLabel),
+                    _ => unreachable!(),
+                }),
+                operands: instruction.operands,
+            },
+            backend,
+            emit,
+        );
+    }
+
+    if operation == Operation::AssertNonzero {
+        let failure_label = emit.enable_assertions.then(|| emit.unique_label("assert_failure"));
+        backend.finalize_nonzero_assertion(emit, &instruction.operands, failure_label)?;
         if emit.enable_assertions {
             emit.last_fp_compare = None;
         }

@@ -46,6 +46,7 @@
 #include <LibWeb/FileAPI/SerializedBlobURLEntry.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Fullscreen/FullscreenRequestType.h>
+#include <LibWeb/Geolocation/Geolocation.h>
 #include <LibWeb/Geolocation/GeolocationCoordinates.h>
 #include <LibWeb/Geolocation/GeolocationPositionError.h>
 #include <LibWeb/HTML/ActivateTab.h>
@@ -281,7 +282,7 @@ public:
     void did_request_file_picker(GC::Weak<HTML::HTMLInputElement> target, HTML::FileFilter const& accepted_file_types, HTML::AllowMultipleFiles);
     void file_picker_closed(Span<HTML::SelectedFile> selected_files);
 
-    void did_request_select_dropdown(GC::Weak<HTML::HTMLSelectElement> target, Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items);
+    void did_request_select_dropdown(GC::Weak<HTML::HTMLSelectElement> target, HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items);
     void select_dropdown_closed(Optional<u32> const& selected_item_id);
 
     using ClipboardRequest = GC::Ref<GC::Function<void(Vector<Clipboard::SystemClipboardItem>)>>;
@@ -297,6 +298,14 @@ public:
     u64 request_geolocation_position(GeolocationPositionCallback, GeolocationRequestType = GeolocationRequestType::OneShot);
     void cancel_geolocation_position_request(u64 request_id);
     void receive_geolocation_position(u64 request_id, GeolocationPositionResult);
+
+    // https://w3c.github.io/geolocation/#dfn-emulated-position-data
+    // NB: The top-level traversable's, which the UI process tells every page representing it.
+    Geolocation::EmulatedPositionData const& emulated_position_data() const { return m_emulated_position_data; }
+    void set_emulated_position_data(Geolocation::EmulatedPositionData);
+    void set_emulated_position_data(Geolocation::CoordinatesData);
+    u64 register_emulated_position_data_observer(GC::Ref<GC::Function<void()>>);
+    void unregister_emulated_position_data_observer(u64 observer_id);
 
     enum class PendingNonBlockingDialog {
         None,
@@ -343,7 +352,7 @@ public:
         bool is_looping { false };
         bool is_fullscreen { false };
     };
-    void did_request_media_context_menu(UniqueNodeID media_id, CSSPixelPoint, ByteString const& target, unsigned modifiers, MediaContextMenu const&);
+    void did_request_media_context_menu(UniqueNodeID media_id, HTML::CrossProcessId local_root_id, CSSPixelPoint, ByteString const& target, unsigned modifiers, MediaContextMenu const&);
     void toggle_media_play_state();
     void toggle_media_mute_state();
     void toggle_media_loop_state();
@@ -491,6 +500,12 @@ private:
     u64 m_next_geolocation_request_id { 0 };
     Optional<u64> m_active_geolocation_request_id;
 
+    // AD-HOC: Denied until the UI process sends the browser-wide setting, so a request cannot observe the test
+    //         position in the short window before that arrives.
+    Geolocation::EmulatedPositionData m_emulated_position_data { Geolocation::GeolocationPositionError::ErrorCode::PermissionDenied };
+    HashMap<u64, GC::Ref<GC::Function<void()>>> m_emulated_position_data_observers;
+    u64 m_next_emulated_position_data_observer_id { 0 };
+
     Vector<UniqueNodeID> m_media_elements;
     Vector<UniqueNodeID> m_canvas_elements;
     Optional<UniqueNodeID> m_media_context_menu_element_id;
@@ -573,7 +588,7 @@ public:
     virtual void page_did_change_replicated_navigable_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::ReplicatedNavigableState const& state) { }
     virtual void page_did_completely_finish_loading([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
     virtual void page_did_change_navigable_container_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::ReplicatedContainerState const& state) { }
-    virtual void page_did_update_child_frame_viewport(HTML::CrossProcessId, CSSPixelRect) { }
+    virtual void page_did_update_child_frame_viewport(HTML::CrossProcessId, [[maybe_unused]] CSSPixelRect viewport_rect, [[maybe_unused]] CSSPixelRect viewport_intersection) { }
     virtual void page_did_destroy_child_frame(HTML::CrossProcessId) { }
     virtual String dump_site_isolation_process_tree_for_testing() { return {}; }
     virtual void crash_remote_frame_processes_for_testing() { }
@@ -647,10 +662,10 @@ public:
     virtual void page_did_unregister_download([[maybe_unused]] u64 download_id) { }
     virtual bool page_is_download_canceled([[maybe_unused]] u64 download_id) const { return false; }
     virtual void page_did_request_cursor_change(Gfx::Cursor const&) { }
-    virtual void page_did_request_context_menu(CSSPixelPoint, ContextMenuForInputEventsTarget) { }
-    virtual void page_did_request_link_context_menu(CSSPixelPoint, URL::URL const&, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
-    virtual void page_did_request_image_context_menu(CSSPixelPoint, URL::URL const&, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Optional<Gfx::Bitmap const*>) { }
-    virtual void page_did_request_media_context_menu(CSSPixelPoint, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Page::MediaContextMenu const&) { }
+    virtual void page_did_request_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, ContextMenuForInputEventsTarget) { }
+    virtual void page_did_request_link_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, URL::URL const&, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
+    virtual void page_did_request_image_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, URL::URL const&, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Optional<Gfx::Bitmap const*>) { }
+    virtual void page_did_request_media_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Page::MediaContextMenu const&) { }
     virtual void page_did_click_link(URL::URL const&, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
     virtual void page_did_middle_click_link(URL::URL const&, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
     virtual void page_did_request_external_url([[maybe_unused]] URL::URL const& url, [[maybe_unused]] URL::Origin const& initiator_origin, [[maybe_unused]] bool has_transient_activation) { }
@@ -713,7 +728,7 @@ public:
     virtual void page_did_request_set_system_focus([[maybe_unused]] bool has_system_focus) { }
     virtual void page_did_change_focused_navigable([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
     virtual void page_did_request_key_event_for_testing([[maybe_unused]] KeyEvent event) { }
-    virtual void page_did_request_webdriver_mouse_event([[maybe_unused]] HTML::CrossProcessId root_navigable_id, [[maybe_unused]] MouseEvent event, GC::Ref<GC::Function<void()>> on_handled) { on_handled->function()(); }
+    virtual void page_did_request_webdriver_mouse_event([[maybe_unused]] HTML::CrossProcessId local_root_id, [[maybe_unused]] MouseEvent event, GC::Ref<GC::Function<void()>> on_handled) { on_handled->function()(); }
     virtual void page_did_request_set_system_visibility_state([[maybe_unused]] HTML::VisibilityState visibility_state) { }
     virtual String page_did_request_ui_process_session_history_for_testing() { return "{}"_string; }
     virtual bool page_did_request_capture_session_history_snapshot_for_testing() { return false; }
@@ -733,7 +748,7 @@ public:
     // https://html.spec.whatwg.org/multipage/input.html#show-the-picker,-if-applicable
     virtual void page_did_request_color_picker([[maybe_unused]] Color current_color) { }
     virtual void page_did_request_file_picker([[maybe_unused]] HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles) { }
-    virtual void page_did_request_select_dropdown([[maybe_unused]] Web::CSSPixelPoint content_position, [[maybe_unused]] Web::CSSPixels minimum_width, [[maybe_unused]] Vector<Web::HTML::SelectItem> items) { }
+    virtual void page_did_request_select_dropdown([[maybe_unused]] HTML::CrossProcessId local_root_id, [[maybe_unused]] Web::CSSPixelPoint content_position, [[maybe_unused]] Web::CSSPixels minimum_width, [[maybe_unused]] Vector<Web::HTML::SelectItem> items) { }
     virtual void page_did_request_geolocation_position([[maybe_unused]] u64 request_id) { }
     virtual void page_did_cancel_geolocation_position_request([[maybe_unused]] u64 request_id) { }
     virtual void page_did_start_geolocation_position_watch([[maybe_unused]] u64 request_id) { }

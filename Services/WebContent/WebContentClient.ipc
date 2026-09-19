@@ -96,7 +96,7 @@ endpoint WebContentClient
     did_change_replicated_navigable_state(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedNavigableState state) =|
     did_completely_finish_loading(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
     did_change_navigable_container_state(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedContainerState state) =|
-    did_update_child_frame_viewport(Web::PageId page_id, Web::HTML::CrossProcessId frame_id, Web::DevicePixelRect viewport_rect, double device_pixel_ratio) =|
+    did_update_child_frame_viewport(Web::PageId page_id, Web::HTML::CrossProcessId frame_id, Web::DevicePixelRect viewport_rect, Web::DevicePixelRect viewport_intersection, double device_pixel_ratio) =|
     did_destroy_child_frame(Web::PageId page_id, Web::HTML::CrossProcessId frame_id) =|
     did_finish_loading(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id) =|
     did_start_download_without_request(Web::PageId page_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size) => (Optional<u64> download_id)
@@ -117,10 +117,10 @@ endpoint WebContentClient
     did_click_link(Web::PageId page_id, URL::URL url, ByteString target, unsigned modifiers) =|
     did_middle_click_link(Web::PageId page_id, URL::URL url, ByteString target, unsigned modifiers) =|
     did_request_external_url(Web::PageId page_id, URL::URL url, URL::Origin initiator_origin, bool has_transient_activation) =|
-    did_request_context_menu(Web::PageId page_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target) =|
-    did_request_link_context_menu(Web::PageId page_id, Gfx::IntPoint content_position, URL::URL url, ByteString target, unsigned modifiers) =|
-    did_request_image_context_menu(Web::PageId page_id, Gfx::IntPoint content_position, URL::URL url, ByteString target, unsigned modifiers, Optional<Gfx::ShareableBitmap> bitmap) =|
-    did_request_media_context_menu(Web::PageId page_id, Gfx::IntPoint content_position, ByteString target, unsigned modifiers, Web::Page::MediaContextMenu menu) =|
+    did_request_context_menu(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target) =|
+    did_request_link_context_menu(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, URL::URL url, ByteString target, unsigned modifiers) =|
+    did_request_image_context_menu(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, URL::URL url, ByteString target, unsigned modifiers, Optional<Gfx::ShareableBitmap> bitmap) =|
+    did_request_media_context_menu(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString target, unsigned modifiers, Web::Page::MediaContextMenu menu) =|
     did_request_alert(Web::PageId page_id, Utf16String message) =|
     did_request_confirm(Web::PageId page_id, Utf16String message) =|
     did_request_prompt(Web::PageId page_id, Utf16String message, Utf16String default_) =|
@@ -215,7 +215,7 @@ endpoint WebContentClient
     did_start_geolocation_position_watch(Web::PageId page_id, u64 request_id) =|
     did_stop_geolocation_position_watch(Web::PageId page_id, u64 request_id) =|
     did_request_file_picker(Web::PageId page_id, Web::HTML::FileFilter accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files) =|
-    did_request_select_dropdown(Web::PageId page_id, Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) =|
+    did_request_select_dropdown(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) =|
     did_finish_handling_input_event(Web::PageId page_id, u64 event_id, Web::EventResult event_result) =|
     did_update_input_method_state(Web::PageId page_id, Optional<Web::DevicePixelRect> caret_rect, bool is_enabled, i32 cursor_position, i32 anchor_position, Utf16String text_before_cursor, Utf16String text_after_cursor) =|
     did_change_theme_color(Web::PageId page_id, Gfx::Color color) =|
@@ -233,7 +233,7 @@ endpoint WebContentClient
     did_request_set_system_focus(Web::PageId page_id, bool has_system_focus) =|
     did_change_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
     did_request_key_event_for_testing(Web::PageId page_id, Web::KeyEvent event) =|
-    did_request_webdriver_mouse_event(Web::PageId page_id, u64 request_id, Web::HTML::CrossProcessId root_navigable_id, Web::MouseEvent event) =|
+    did_request_webdriver_mouse_event(Web::PageId page_id, u64 request_id, Web::HTML::CrossProcessId local_root_id, Web::MouseEvent event) =|
     did_request_set_system_visibility_state(Web::PageId page_id, Web::HTML::VisibilityState visibility_state) =|
     request_history_operation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters parameters) =|
     history_operation_ready(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationReadyResult result) =|

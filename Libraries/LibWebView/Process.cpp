@@ -67,6 +67,14 @@ Vector<ByteString> Process::helper_process_environment(ProcessType type)
         "TMPDIR"sv,
         "TZ"sv,
         "USER"sv,
+        "XDG_CACHE_HOME"sv,
+        "XDG_CONFIG_DIRS"sv,
+        "XDG_CONFIG_HOME"sv,
+        "XDG_DATA_DIRS"sv,
+        "XDG_DATA_HOME"sv,
+        "XDG_RUNTIME_DIR"sv,
+        "FONTCONFIG_FILE"sv,
+        "FONTCONFIG_PATH"sv,
         "__CF_USER_TEXT_ENCODING"sv,
     };
     static constexpr Array allowed_prefixes {
@@ -90,13 +98,39 @@ Vector<ByteString> Process::helper_process_environment(ProcessType type)
         "https_proxy"sv,
         "no_proxy"sv,
     };
+    // OpenSSL reads these to find the system's certificates. OPENSSL_CONF is not here on purpose: a configuration file
+    // can load providers and engines into the process.
+    static constexpr Array certificate_names {
+        "SSL_CERT_DIR"sv,
+        "SSL_CERT_FILE"sv,
+    };
+    // libpulse reads these to find the audio server, and the Browser uses them to decide which server the renderer may
+    // connect to.
+    static constexpr Array audio_names {
+        "PULSE_RUNTIME_PATH"sv,
+        "PULSE_SERVER"sv,
+    };
+    // Mesa and the Vulkan loader read these to select and configure the GPU driver.
+    static constexpr Array gpu_prefixes {
+        "DRI_PRIME"sv,
+        "MESA_"sv,
+        "VK_"sv,
+        "__EGL_"sv,
+        "__GLX_"sv,
+    };
 
     Vector<ByteString> environment;
     for (auto** variable = Core::Environment::raw_environ(); *variable; ++variable) {
         auto entry = Core::Environment::Entry::from_chars(*variable);
         auto is_allowed = allowed_names.contains_slow(entry.name) || any_of(allowed_prefixes, [&](auto prefix) { return entry.name.starts_with(prefix); });
-        if (type == ProcessType::RequestServer)
+        if (type == ProcessType::RequestServer) {
             is_allowed |= any_of(proxy_names, [&](auto name) { return entry.name.equals_ignoring_ascii_case(name); });
+            is_allowed |= certificate_names.contains_slow(entry.name);
+        }
+        if (type == ProcessType::WebContent)
+            is_allowed |= audio_names.contains_slow(entry.name);
+        if (type == ProcessType::Compositor)
+            is_allowed |= any_of(gpu_prefixes, [&](auto prefix) { return entry.name.starts_with(prefix); });
         if (is_allowed)
             environment.append(entry.full_entry);
     }
@@ -144,7 +178,7 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([
 
     Core::ProcessSpawnOptions spawn_options = options;
     spawn_options.die_with_parent = true;
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_LINUX)
     spawn_options.environment = helper_process_environment(type);
 #endif
 
@@ -157,15 +191,10 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([
         stdout_pipe = TRY(Core::System::pipe2(O_CLOEXEC));
         stderr_pipe = TRY(Core::System::pipe2(O_CLOEXEC));
 
-        // Clear close-on-exec for the write ends so they're inherited by the child
-        TRY(Core::System::set_close_on_exec(stdout_pipe[1], false));
-        TRY(Core::System::set_close_on_exec(stderr_pipe[1], false));
-
-        // Add file actions to redirect stdout/stderr in the child
+        // The write ends stay close-on-exec, so no other process that is spawned meanwhile inherits them. The child
+        // gets its copies from these file actions.
         spawn_options.file_actions.append(Core::FileAction::DupFd { .write_fd = stdout_pipe[1], .fd = STDOUT_FILENO });
         spawn_options.file_actions.append(Core::FileAction::DupFd { .write_fd = stderr_pipe[1], .fd = STDERR_FILENO });
-        spawn_options.file_actions.append(Core::FileAction::CloseFile { .fd = stdout_pipe[1] });
-        spawn_options.file_actions.append(Core::FileAction::CloseFile { .fd = stderr_pipe[1] });
     }
 
 #if defined(AK_OS_MACOS)
@@ -186,16 +215,29 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([
     auto transport = make<IPC::Transport>(move(port_a_recv), move(port_b_send));
 #else
     int socket_fds[2] {};
+#    if defined(AK_OS_WINDOWS)
     TRY(Core::System::socketpair(AF_LOCAL, SOCK_STREAM, 0, socket_fds));
+#    else
+    TRY(Core::System::socketpair(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, socket_fds));
+#    endif
 
     ArmedScopeGuard guard_fd_0 { [&] { MUST(Core::System::close(socket_fds[0])); } };
     ArmedScopeGuard guard_fd_1 { [&] { MUST(Core::System::close(socket_fds[1])); } };
 
-    // Note: Core::System::socketpair creates inheritable sockets both on Linux and Windows unless SOCK_CLOEXEC is specified.
+#    if defined(AK_OS_WINDOWS)
+    // Note: Core::System::socketpair creates inheritable sockets on Windows.
     TRY(Core::System::set_close_on_exec(socket_fds[0], true));
+#    else
+    // Only the helper's end reaches the helper, and only this helper.
+    spawn_options.file_actions.append(Core::FileAction::DupFd { .write_fd = socket_fds[1], .fd = socket_fds[1] });
+#    endif
 
-    auto takeover_string = MUST(String::formatted("{}:{}", options.name, socket_fds[1]));
-    TRY(Core::Environment::set("SOCKET_TAKEOVER"sv, takeover_string, Core::Environment::Overwrite::Yes));
+    // NB: Only the helper gets to see this, if it has an environment of its own.
+    auto takeover_string = ByteString::formatted("{}:{}", options.name, socket_fds[1]);
+    if (spawn_options.environment.has_value())
+        spawn_options.environment->append(ByteString::formatted("SOCKET_TAKEOVER={}", takeover_string));
+    else
+        TRY(Core::Environment::set("SOCKET_TAKEOVER"sv, takeover_string, Core::Environment::Overwrite::Yes));
 
     auto process = TRY(Core::Process::spawn(spawn_options));
 
