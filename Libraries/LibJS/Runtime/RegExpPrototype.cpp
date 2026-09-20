@@ -14,10 +14,12 @@
 #include <AK/Utf16StringBuilder.h>
 #include <AK/Utf16View.h>
 #include <LibJS/Runtime/AbstractOperations.h>
+#include <LibJS/Runtime/Accessor.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/Error.h>
 #include <LibJS/Runtime/ErrorTypes.h>
 #include <LibJS/Runtime/GlobalObject.h>
+#include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/RegExpConstructor.h>
 #include <LibJS/Runtime/RegExpObject.h>
 #include <LibJS/Runtime/RegExpPrototype.h>
@@ -1181,19 +1183,41 @@ ThrowCompletionOr<Value> RegExpPrototype::symbol_split_impl(VM& vm, Object& rege
     {
         auto* typed_regexp = as_if<RegExpObject>(regexp_object);
         bool exec_is_builtin = false;
+        bool flags_getter_is_builtin = false;
+        bool inherited_match_is_data_property = false;
         if (typed_regexp) {
             static auto& exec_cache = *new Bytecode::StaticPropertyLookupCache;
             auto exec_val = TRY(regexp_object.get(vm.names.exec, exec_cache));
             if (auto exec_fn = exec_val.as_if<FunctionObject>())
                 exec_is_builtin = exec_fn->builtin() == Bytecode::Builtin::RegExpPrototypeExec;
+
+            auto flags = realm.intrinsics().regexp_prototype()->storage_get(vm.names.flags);
+            if (flags.has_value() && flags->value.is_accessor()) {
+                auto* getter = flags->value.as_accessor().getter();
+                flags_getter_is_builtin = getter && is<RawNativeFunction>(*getter)
+                    && static_cast<RawNativeFunction&>(*getter).native_function() == RegExpPrototype::flags;
+            }
+
+            auto match = realm.intrinsics().regexp_prototype()->storage_get(vm.well_known_symbol_match());
+            inherited_match_is_data_property = match.has_value() && !match->value.is_accessor();
         }
         if (typed_regexp
             && exec_is_builtin
+            && flags_getter_is_builtin
+            && inherited_match_is_data_property
+            && typed_regexp->legacy_features_enabled()
             && static_cast<Object const&>(regexp_object).prototype() == realm.intrinsics().regexp_prototype().ptr()
+            && !regexp_object.storage_has(vm.names.hasIndices)
+            && !regexp_object.storage_has(vm.names.global)
+            && !regexp_object.storage_has(vm.names.ignoreCase)
+            && !regexp_object.storage_has(vm.names.multiline)
+            && !regexp_object.storage_has(vm.names.dotAll)
+            && !regexp_object.storage_has(vm.names.unicode)
+            && !regexp_object.storage_has(vm.names.unicodeSets)
+            && !regexp_object.storage_has(vm.names.sticky)
             && !regexp_object.storage_has(vm.names.flags)
             && !regexp_object.storage_has(vm.names.constructor)
             && !regexp_object.storage_has(vm.well_known_symbol_match())
-            && realm.intrinsics().regexp_prototype()->storage_has(vm.names.flags)
             && (limit_value.is_undefined() || limit_value.is_number())) {
 
             auto* compiled_regex = get_or_compile_regex(*typed_regexp);
@@ -1255,6 +1279,21 @@ ThrowCompletionOr<Value> RegExpPrototype::symbol_split_impl(VM& vm, Object& rege
                     if (match_start >= size)
                         break;
 
+                    // Update legacy properties before split decides whether to
+                    // ignore this successful match.
+                    if (need_legacy) {
+                        auto cap_count = min(static_cast<unsigned int>(9), n_capture_groups);
+                        int cap_starts[9];
+                        int cap_ends[9];
+                        for (unsigned int g = 0; g < cap_count; ++g) {
+                            auto gi = g + 1;
+                            cap_starts[g] = (gi < total_groups) ? compiled_regex->capture_slot(gi * 2) : -1;
+                            cap_ends[g] = (gi < total_groups) ? compiled_regex->capture_slot(gi * 2 + 1) : -1;
+                        }
+                        update_legacy_regexp_static_properties_lazy(realm.intrinsics().regexp_constructor(),
+                            string, match_start, match_end, cap_count, cap_starts, cap_ends);
+                    }
+
                     // If the match doesn't start at next_search_from, skip to
                     // where it does start.
                     if (match_start > next_search_from)
@@ -1273,20 +1312,6 @@ ThrowCompletionOr<Value> RegExpPrototype::symbol_split_impl(VM& vm, Object& rege
                         return array;
 
                     last_match_end = last_index;
-
-                    // Update legacy properties lazily.
-                    if (need_legacy) {
-                        auto cap_count = min(static_cast<unsigned int>(9), n_capture_groups);
-                        int cap_starts[9];
-                        int cap_ends[9];
-                        for (unsigned int g = 0; g < cap_count; ++g) {
-                            auto gi = g + 1;
-                            cap_starts[g] = (gi < total_groups) ? compiled_regex->capture_slot(gi * 2) : -1;
-                            cap_ends[g] = (gi < total_groups) ? compiled_regex->capture_slot(gi * 2 + 1) : -1;
-                        }
-                        update_legacy_regexp_static_properties_lazy(realm.intrinsics().regexp_constructor(),
-                            string, match_start, match_end, cap_count, cap_starts, cap_ends);
-                    }
 
                     // Add captures.
                     for (unsigned int i = 1; i <= n_capture_groups; ++i) {

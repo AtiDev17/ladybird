@@ -140,6 +140,7 @@ extern "C" size_t ladybird_html_parser_node_index(size_t);
 extern "C" size_t ladybird_html_parser_create_element(void*, size_t, RustFfiHtmlNamespace, u16 const*, size_t, size_t, RustFfiHtmlParserAttribute const*, size_t, bool, size_t, bool);
 extern "C" void ladybird_html_parser_append_child(size_t, size_t);
 extern "C" void ladybird_html_parser_insert_node(size_t, size_t, size_t, bool);
+extern "C" void ladybird_html_parser_reinsert_last_node(size_t, size_t, size_t);
 extern "C" void ladybird_html_parser_move_all_children(size_t, size_t);
 extern "C" size_t ladybird_html_parser_template_content(size_t);
 extern "C" size_t ladybird_html_parser_attach_declarative_shadow_root(size_t, RustFfiHtmlShadowRootMode, RustFfiHtmlSlotAssignmentMode, bool, bool, bool, bool);
@@ -1050,6 +1051,19 @@ void HTMLParser::resume_after_parser_blocking_script()
     // INTEROP: Blink and WebKit detach a parser when document.open() replaces it. Do not let resume work from the
     //          detached parser consume a parsing-blocking script owned by the replacement parser.
     if (m_document->parser().ptr() != this)
+        return;
+
+    // The spec reaches the steps below only from the "text" insertion mode's script end-tag handling, at script-nesting
+    // level zero: While the level is nonzero (parser is being re-entered from a running script) that handling instead
+    // sets the parser pause flag and yields — leaving the pending script to the outer tree-construction stage. This
+    // async continuation is a deferred invocation, and a nested event-loop spin under a running script (sync XHR send)
+    // pumps those. So it can fire while a script is still executing; e.g. the one that wrote the pending script with
+    // document.write(). Yield the same way: Leave the parser paused, and let whatever ran the script (script end-tag
+    // handling, or tail of this method) re-schedule the check once the nesting level is back to zero. Gecko does the
+    // same in nsHtml5TreeOpExecutor::RunFlushLoop, which defers through ContinueParsingDocumentAfterCurrentScript while
+    // IsScriptExecuting; Blink/WebKit instead assert !IsExecutingScript() in HTMLDocumentParser::NotifyScriptLoaded and
+    // in HTMLScriptRunner's executeScriptsWaitingForLoad, since their sync XHR blocks without running tasks.
+    if (script_nesting_level() != 0)
         return;
 
     auto pending = document().pending_parsing_blocking_script();
@@ -2641,6 +2655,37 @@ extern "C" void ladybird_html_parser_insert_node(size_t parent, size_t offset, s
     if (queue_custom_element_reactions && child_element) {
         auto queue = relevant_similar_origin_window_agent(*child_element).custom_element_reactions_stack.element_queue_stack.take_last();
         invoke_custom_element_reactions(queue);
+    }
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#adoptionAgency
+// NB: Steps 15 and 16, given the (target, refNode) pair computed by step 14.
+extern "C" void ladybird_html_parser_reinsert_last_node(size_t parent, size_t offset, size_t last_node)
+{
+    auto insertion_location = node_and_offset_from_html_parser_ffi(parent, offset);
+    auto& target = *insertion_location.node;
+    GC::Ptr<DOM::Node> ref_node = insertion_location.child_at_offset();
+    auto& last_node_to_insert = node_from_html_parser_ffi(last_node);
+
+    // 15. If lastNode's parent is non-null, then remove lastNode.
+    if (last_node_to_insert.parent())
+        last_node_to_insert.remove();
+
+    // 16. If all of the following are true:
+    //     - lastNode's parent is null;
+    //     - lastNode is not a host-including inclusive ancestor of target;
+    //     - target is not a Document node, or it does not have an element child; and
+    //     - refNode is null or its parent is target,
+    if (!last_node_to_insert.parent()
+        && !last_node_to_insert.is_host_including_inclusive_ancestor_of(target)
+        && (!is<DOM::Document>(target) || !target.first_child_of_type<DOM::Element>())
+        && (!ref_node || ref_node->parent() == &target)) {
+        // then:
+        // 1. Assert: ensure pre-insert validity given lastNode, target, refNode, and « » does not throw.
+        ASSERT(!target.ensure_pre_insertion_validity(last_node_to_insert, ref_node).is_error());
+
+        // 2. Insert lastNode into target before refNode.
+        insert_node_for_parser(target, last_node_to_insert, ref_node.ptr());
     }
 }
 
