@@ -35,6 +35,7 @@ public:
     WebWorkerClient(NonnullOwnPtr<IPC::Transport>, IsPrivate, Web::HTML::WorkerAgentId agent_id);
     ~WebWorkerClient();
 
+    RefPtr<BrowsingSession> session() const { return m_session.strong_ref(); }
     IsPrivate is_private() const { return m_is_private; }
     void remove_blob_url_entries();
 
@@ -50,7 +51,6 @@ public:
     virtual void did_remove_blob_url_entries(Vector<Utf16String> urls, URL::Origin origin) override;
     virtual Messages::WebWorkerClient::DidRequestBlobUrlEntryResponse did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) override;
     virtual void did_request_file(ByteString path, i32 request_id) override;
-    virtual void did_store_hsts_policy(String domain, HTTP::HSTS::ParsedHSTSPolicy policy) override;
     virtual Messages::WebWorkerClient::DidIsKnownHstsHostResponse did_is_known_hsts_host(String domain) override;
     virtual void did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage) override;
     virtual Messages::WebWorkerClient::StartWorkerAgentResponse start_worker_agent(Web::HTML::WorkerAgentStartRequest request) override;

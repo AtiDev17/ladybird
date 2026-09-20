@@ -62,7 +62,7 @@ Messages::RequestServerControl::InitTransportResponse ControlConnectionFromClien
     VERIFY_NOT_REACHED();
 }
 
-ErrorOr<IPC::TransportHandle> ControlConnectionFromClient::create_client_socket(IsPrivate is_private)
+ErrorOr<ControlConnectionFromClient::ClientSocket> ControlConnectionFromClient::create_client_socket(IsPrivate is_private)
 {
     auto paired = TRY(IPC::Transport::create_paired());
     auto handle = move(paired.remote_handle);
@@ -71,7 +71,7 @@ ErrorOr<IPC::TransportHandle> ControlConnectionFromClient::create_client_socket(
     // Note: A ref is stored in the m_connections map
     auto client = adopt_ref(*new RequestServer::ConnectionFromClient(move(paired.local), is_private, m_connections, m_request_transfer_leases, disk_cache, m_alt_svc_cache_path));
 
-    return handle;
+    return ClientSocket { .handle = move(handle), .client_id = client->client_id() };
 }
 
 Messages::RequestServerControl::ConnectNewClientResponse ControlConnectionFromClient::connect_new_client(IsPrivate is_private)
@@ -79,28 +79,31 @@ Messages::RequestServerControl::ConnectNewClientResponse ControlConnectionFromCl
     auto client_socket = create_client_socket(is_private);
     if (client_socket.is_error()) {
         dbgln("Failed to create client socket: {}", client_socket.error());
-        return IPC::TransportHandle {};
+        return { IPC::TransportHandle {}, -1 };
     }
 
-    return client_socket.release_value();
+    return { move(client_socket.value().handle), client_socket.value().client_id };
 }
 
 Messages::RequestServerControl::ConnectNewClientsResponse ControlConnectionFromClient::connect_new_clients(size_t count, IsPrivate is_private)
 {
     Vector<IPC::TransportHandle> handles;
+    Vector<int> client_ids;
     handles.ensure_capacity(count);
+    client_ids.ensure_capacity(count);
 
     for (size_t i = 0; i < count; ++i) {
         auto client_socket = create_client_socket(is_private);
         if (client_socket.is_error()) {
             dbgln("Failed to create client socket: {}", client_socket.error());
-            return Vector<IPC::TransportHandle> {};
+            return { Vector<IPC::TransportHandle> {}, Vector<int> {} };
         }
 
-        handles.unchecked_append(client_socket.release_value());
+        handles.unchecked_append(move(client_socket.value().handle));
+        client_ids.unchecked_append(client_socket.value().client_id);
     }
 
-    return handles;
+    return { move(handles), move(client_ids) };
 }
 
 void ControlConnectionFromClient::set_disk_cache_settings(HTTP::DiskCacheSettings disk_cache_settings)
@@ -201,6 +204,12 @@ void ControlConnectionFromClient::retrieved_http_cookie(int client_id, u64 reque
     note_event_tick("ipc-retrieved-cookie"sv);
 
     if (auto connection = m_connections.get(client_id); connection.has_value()) {
+        if (request_type == RequestType::WebSocket) {
+            if (!(*connection)->websocket_retrieved_http_cookie({}, request_id, cookie_request_id, move(cookie)))
+                did_misbehave("Unexpected WebSocket HTTP cookie response");
+            return;
+        }
+
         auto request = [&]() {
             switch (request_type) {
             case RequestType::Fetch:
@@ -208,6 +217,7 @@ void ControlConnectionFromClient::retrieved_http_cookie(int client_id, u64 reque
             case RequestType::BackgroundRevalidation:
                 return (*connection)->m_active_revalidation_requests.get(request_id);
             case RequestType::Connect:
+            case RequestType::WebSocket:
                 did_misbehave("HTTP cookie response has an invalid request type");
                 return decltype((*connection)->m_active_requests.get(request_id)) {};
             }
@@ -216,6 +226,16 @@ void ControlConnectionFromClient::retrieved_http_cookie(int client_id, u64 reque
 
         if (request.has_value() && !(*request)->notify_retrieved_http_cookie({}, cookie_request_id, cookie))
             did_misbehave("Duplicate or unexpected HTTP cookie response");
+    }
+}
+
+void ControlConnectionFromClient::stored_response_cookies_and_hsts_policy(int client_id, u64 request_id, u64 store_request_id)
+{
+    if (auto connection = m_connections.get(client_id); connection.has_value()) {
+        if (auto request = (*connection)->m_active_requests.get(request_id); request.has_value()) {
+            if (!(*request)->notify_stored_response_cookies_and_hsts_policy({}, store_request_id))
+                did_misbehave("Duplicate or unexpected response cookie storage acknowledgement");
+        }
     }
 }
 

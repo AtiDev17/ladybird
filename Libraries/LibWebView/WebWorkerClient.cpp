@@ -101,6 +101,12 @@ void WebWorkerClient::remove_blob_url_entries()
 
 Messages::WebWorkerClient::DidRequestCookieResponse WebWorkerClient::did_request_cookie(URL::URL url, HTTP::Cookie::Source source)
 {
+    // RequestServer handles the cookies of HTTP requests itself, so a worker has no use for HttpOnly cookies.
+    if (source == HTTP::Cookie::Source::Http) {
+        did_misbehave("did_request_cookie"sv, "HTTP cookie source"sv);
+        return HTTP::Cookie::VersionedCookie {};
+    }
+
     HTTP::Cookie::VersionedCookie cookie;
     if (auto session = m_session.strong_ref())
         cookie.cookie = session->cookie_jar->get_cookie(url, source);
@@ -132,12 +138,6 @@ Messages::WebWorkerClient::DidRequestBlobUrlEntryResponse WebWorkerClient::did_r
 void WebWorkerClient::did_request_file(ByteString path, i32 request_id)
 {
     WorkerProcessManager::the().worker_did_request_file(m_agent_id, move(path), request_id);
-}
-
-void WebWorkerClient::did_store_hsts_policy(String domain, HTTP::HSTS::ParsedHSTSPolicy policy)
-{
-    if (auto session = m_session.strong_ref())
-        session->hsts_store->store_policy(domain, policy);
 }
 
 Messages::WebWorkerClient::DidIsKnownHstsHostResponse WebWorkerClient::did_is_known_hsts_host(String domain)

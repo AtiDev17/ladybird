@@ -2184,8 +2184,21 @@ void WebContentClient::did_request_document_cookie_version_index(Web::PageId pag
     }
 }
 
+// Seeing HttpOnly cookies, storing cookies the way an HTTP response does, and changing a cookie by its identity are for
+// WebDriver and the test harness. RequestServer handles the cookies of HTTP responses and requests itself, so a renderer
+// serving an ordinary browsing session never needs any of it.
+static bool renderers_may_access_cookies_like_http()
+{
+    return Application::browser_options().webdriver_browser_endpoint.has_value()
+        || Application::web_content_options().is_test_mode == IsTestMode::Yes;
+}
+
 Messages::WebContentClient::DidRequestAllCookiesWebdriverResponse WebContentClient::did_request_all_cookies_webdriver(URL::URL url)
 {
+    if (!renderers_may_access_cookies_like_http()) {
+        did_misbehave("did_request_all_cookies_webdriver"sv, "not driven by WebDriver"sv);
+        return Vector<HTTP::Cookie::Cookie> {};
+    }
     return m_session->cookie_jar->get_all_cookies_webdriver(url);
 }
 
@@ -2196,11 +2209,21 @@ Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse WebContentCl
 
 Messages::WebContentClient::DidRequestNamedCookieResponse WebContentClient::did_request_named_cookie(URL::URL url, String name)
 {
+    if (!renderers_may_access_cookies_like_http()) {
+        did_misbehave("did_request_named_cookie"sv, "not driven by WebDriver"sv);
+        return Optional<HTTP::Cookie::Cookie> {};
+    }
+
     return m_session->cookie_jar->get_named_cookie(url, name);
 }
 
 Messages::WebContentClient::DidRequestCookieResponse WebContentClient::did_request_cookie(Web::PageId page_id, URL::URL url, HTTP::Cookie::Source source)
 {
+    if (source == HTTP::Cookie::Source::Http && !renderers_may_access_cookies_like_http()) {
+        did_misbehave("did_request_cookie"sv, "HTTP cookie source"sv);
+        return HTTP::Cookie::VersionedCookie {};
+    }
+
     // A spare process can request cookies for its initial page before a view adopts it.
     if (!is_page_open(page_id) && m_unassigned_initial_page_id != page_id)
         return HTTP::Cookie::VersionedCookie {};
@@ -2218,11 +2241,21 @@ Messages::WebContentClient::DidRequestCookieResponse WebContentClient::did_reque
 
 void WebContentClient::did_set_cookie(URL::URL url, HTTP::Cookie::ParsedCookie cookie, HTTP::Cookie::Source source)
 {
+    if (source == HTTP::Cookie::Source::Http && !renderers_may_access_cookies_like_http()) {
+        did_misbehave("did_set_cookie"sv, "HTTP cookie source"sv);
+        return;
+    }
+
     m_session->cookie_jar->set_cookie(url, cookie, source);
 }
 
 void WebContentClient::did_update_cookie(HTTP::Cookie::Cookie cookie)
 {
+    if (!renderers_may_access_cookies_like_http()) {
+        did_misbehave("did_update_cookie"sv, "not driven by WebDriver"sv);
+        return;
+    }
+
     m_session->cookie_jar->update_cookie(cookie);
 }
 
@@ -2233,12 +2266,17 @@ void WebContentClient::did_expire_cookies_with_time_offset(AK::Duration offset)
 
 void WebContentClient::did_request_delete_all_cookies(Web::PageId page_id, u64 request_id, URL::URL url)
 {
+    if (!renderers_may_access_cookies_like_http()) {
+        did_misbehave("did_request_delete_all_cookies"sv, "not driven by WebDriver"sv);
+        return;
+    }
+
     if (is_page_open(page_id))
         m_session->cookie_jar->delete_all_cookies(url);
     async_did_delete_all_cookies(page_id, request_id);
 }
 
-void WebContentClient::did_store_hsts_policy(String domain, HTTP::HSTS::ParsedHSTSPolicy policy)
+void WebContentClient::did_store_hsts_policy_for_testing(String domain, HTTP::HSTS::ParsedHSTSPolicy policy)
 {
     m_session->hsts_store->store_policy(domain, policy);
 }
@@ -2250,7 +2288,7 @@ Messages::WebContentClient::DidIsKnownHstsHostResponse WebContentClient::did_is_
 
 Messages::WebContentClient::DidLoseRequestServerConnectionResponse WebContentClient::did_lose_request_server_connection()
 {
-    auto handle = connect_new_request_server_client(m_is_private);
+    auto handle = connect_new_request_server_client(*m_session);
     if (handle.is_error()) {
         warnln("Unable to connect a replacement RequestServer client: {}", handle.error());
         return OptionalNone {};
