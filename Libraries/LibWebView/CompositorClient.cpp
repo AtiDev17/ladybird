@@ -9,6 +9,7 @@
 #include <LibCore/EventLoop.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/WebContentClient.h>
+#include <LibWebView/WebContentPage.h>
 
 namespace WebView {
 
@@ -29,13 +30,19 @@ void CompositorClient::die()
 void CompositorClient::did_allocate_backing_stores(Web::Compositor::CompositorContextId context_id, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores)
 {
     auto web_content_client = WebContentClient::client_for_compositor_context_id(context_id);
-    if (!web_content_client.has_value())
-        return;
+    if (web_content_client.has_value()) {
+        auto page_id = web_content_client->page_id_for_compositor_context_id(context_id);
+        VERIFY(page_id.has_value());
 
-    auto page_id = web_content_client->page_id_for_compositor_context_id(context_id);
-    VERIFY(page_id.has_value());
+        if (auto* page = web_content_client->page(*page_id)) {
+            page->did_present_backing_stores(move(bitmap_ids), move(backing_stores));
+            return;
+        }
+    }
 
-    web_content_client->did_present_backing_stores(*page_id, move(bitmap_ids), move(backing_stores));
+    // The compositor reserves the first published buffer for the UI to install as its front buffer.
+    if (!bitmap_ids.is_empty())
+        async_presented_bitmap_ready_to_paint(context_id, bitmap_ids[0]);
 }
 
 void CompositorClient::did_present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id)
@@ -44,8 +51,10 @@ void CompositorClient::did_present_frame(Web::Compositor::CompositorContextId co
     if (web_content_client.has_value()) {
         auto page_id = web_content_client->page_id_for_compositor_context_id(context_id);
         VERIFY(page_id.has_value());
-        web_content_client->did_present_bitmap(*page_id, content_rect, damage_rect, bitmap_id);
-        return;
+        if (auto* page = web_content_client->page(*page_id)) {
+            page->did_present_bitmap(content_rect, damage_rect, bitmap_id);
+            return;
+        }
     }
 
     async_presented_bitmap_ready_to_paint(context_id, bitmap_id);
