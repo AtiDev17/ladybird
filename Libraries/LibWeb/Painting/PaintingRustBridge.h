@@ -29,7 +29,6 @@ WEB_API void dump_layout_tree(StringBuilder&, Layout::Node const&, bool interact
 
 WEB_API Layout::RustFFI::FfiVisualContextUpdateOutcome rust_update_accumulated_visual_contexts(DOM::Document&);
 WEB_API Vector<u32> rust_owned_visual_context_node_indices(Layout::Node const&, Layout::RustFFI::FfiVisualContextBoxNodeList);
-WEB_API Vector<u32> rust_visual_animation_target_node_indices(Layout::Node const&, AccumulatedVisualContextTree const&, Layout::RustFFI::FfiVisualAnimationTargetKind);
 WEB_API bool rust_background_color_can_be_compositor_animated(Layout::Node const&);
 WEB_API void const* retain_rust_main_visual_context_tree(DOM::Document const&);
 WEB_API Layout::RustFFI::FfiPhysicalOverflowDirections rust_physical_overflow_directions(Layout::Node const&);
@@ -70,6 +69,7 @@ WEB_API Utf16String serialize_painting_dump(DOM::Document const&, AccumulatedVis
 WEB_API CSS::ColorResolutionContext gradient_stop_color_resolution_context(Layout::NodeWithStyle const&);
 // The graph applying a list of filter functions in order, or nothing for an empty list.
 WEB_API Optional<Gfx::Filter> filter_from_functions(ReadonlySpan<Layout::RustFFI::FfiFilterFunction>);
+
 WEB_API DisplayListResource record_image_paint_display_list(ImagePaint const&, ImagePaintRequest const&, double device_pixels_per_css_pixel);
 
 }

@@ -376,9 +376,9 @@ void PageClient::page_did_create_child_frame(Web::HTML::CrossProcessId parent_fr
     client().async_did_create_child_frame(m_id, parent_frame_id, frame_id, replicated_state);
 }
 
-void PageClient::page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::CSSPixelRect viewport_rect, Web::CSSPixelRect viewport_intersection)
+void PageClient::page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::DevicePixelRect viewport_rect, Web::DevicePixelRect viewport_intersection)
 {
-    client().async_did_update_child_frame_viewport(m_id, frame_id, page().css_to_device_rect(viewport_rect), page().css_to_device_rect(viewport_intersection), page().client().device_pixel_ratio());
+    client().async_did_update_child_frame_viewport(m_id, frame_id, viewport_rect, viewport_intersection, page().client().device_pixel_ratio());
 }
 
 void PageClient::page_did_destroy_child_frame(Web::HTML::CrossProcessId frame_id)
@@ -500,6 +500,11 @@ void PageClient::report_finished_handling_input_event(Web::PageId page_id, u64 e
     client().async_did_finish_handling_input_event(page_id, event_id, event_was_handled);
 }
 
+void PageClient::forward_mouse_event_to_remote_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::MouseEvent event)
+{
+    client().async_did_forward_mouse_event_to_child_frame(page_id, navigable_id, move(event));
+}
+
 Web::Compositor::CompositorContextId PageClient::allocate_compositor_context_id(Web::Compositor::PagePresentationRegistration page_presentation_registration)
 {
     return client().allocate_compositor_context_id(m_id, page_presentation_registration);
@@ -571,7 +576,9 @@ bool PageClient::hosted_documents_are_hidden() const
 void PageClient::set_zoom_level(double zoom_level)
 {
     m_zoom_level = zoom_level;
-    page().local_traversable()->set_viewport_size(page().device_to_css_size(m_viewport_size), Web::InvalidateDisplayList::PaintCommandsAndHitTestList);
+    // A local root another page's document embeds is sized by that page again at the new zoom level.
+    if (page().has_local_traversable())
+        page().local_traversable()->set_viewport_size(page().device_to_css_size(m_viewport_size), Web::InvalidateDisplayList::PaintCommandsAndHitTestList);
 }
 
 void PageClient::request_frame()
@@ -1545,6 +1552,26 @@ void PageClient::page_did_request_remote_document_abort(Web::HTML::CrossProcessI
 void PageClient::page_did_request_remote_document_unfullscreen(Web::HTML::CrossProcessId navigable_id)
 {
     client().async_request_navigable_document_unfullscreen(m_id, navigable_id);
+}
+
+void PageClient::page_did_request_container_fullscreen(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId requesting_navigable_id, Web::Fullscreen::RequestType request_type)
+{
+    client().async_request_navigable_container_fullscreen(m_id, navigable_id, requesting_navigable_id, request_type);
+}
+
+void PageClient::page_did_request_container_unfullscreen(Web::HTML::CrossProcessId navigable_id)
+{
+    client().async_request_navigable_container_unfullscreen(m_id, navigable_id);
+}
+
+void PageClient::page_did_complete_container_unfullscreen(Web::HTML::CrossProcessId requesting_navigable_id)
+{
+    client().async_navigable_container_unfullscreen_complete(m_id, requesting_navigable_id);
+}
+
+void PageClient::page_did_request_fully_exit_fullscreen()
+{
+    client().async_request_fully_exit_fullscreen(m_id);
 }
 
 void PageClient::page_did_request_unload_check(Web::HTML::CrossProcessId navigable_id, GC::Ref<GC::Function<void(Web::HTML::CheckIfUnloadingIsCanceledResult)>> on_complete)

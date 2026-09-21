@@ -183,6 +183,7 @@ public:
     double maximum_frames_per_second() const { return m_maximum_frames_per_second; }
     void enqueue_input_event(Web::InputEvent);
     void did_finish_handling_input_event(Badge<WebContentPage>, u64 event_id, Web::EventResult event_result);
+    void did_forward_input_event(Badge<WebContentPage>, u64 event_id, WebContentPage& endpoint);
     void did_lose_input_event_endpoint(Badge<WebContentClient>, WebContentPage&);
     void handle_external_url(Badge<WebContentPage>, URL::URL, URL::Origin, bool has_transient_activation);
     void did_request_cursor_change(Badge<WebContentPage>, Gfx::Cursor);
@@ -399,7 +400,7 @@ public:
 
     Function<void()> on_ready_to_paint;
     Function<void(TabPerformanceStats const&)> on_performance_stats;
-    Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, Optional<Web::PageId>)> on_new_web_view;
+    Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, WebContentClient& page_process, Optional<Web::PageId>)> on_new_web_view;
     Function<void()> on_activate_tab;
     Function<void()> on_close;
     Function<void(URL::URL const&)> on_link_hover;

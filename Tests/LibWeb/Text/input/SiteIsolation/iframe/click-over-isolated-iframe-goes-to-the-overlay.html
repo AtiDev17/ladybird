@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<style>
+    body {
+        margin: 0;
+    }
+    iframe {
+        display: block;
+        width: 200px;
+        height: 100px;
+        border: 0;
+    }
+    #overlay {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100px;
+        height: 200px;
+    }
+</style>
+<div id="overlay"></div>
+<script>
+    // A banner over an isolated iframe takes the clicks on it: the top document hit-tests first, and only a click on
+    // the part of the iframe nothing covers reaches the iframe's process.
+    promiseTest(async () => {
+        const runId = crypto.randomUUID();
+        const childUrl = new URL(
+            await httpTestServer().createEcho("GET", `/oop-overlay-click-${runId}`, {
+                status: 200,
+                headers: { "Content-Type": "text/html" },
+                body: `<!DOCTYPE html><body style="margin: 0"><script>
+                    addEventListener("mousedown", event => parent.postMessage({ x: event.clientX, y: event.clientY }, "*"));
+                    parent.postMessage("ready", "*");
+                <\/script>`,
+            })
+        );
+        childUrl.hostname = uniqueLocalhostHostname("oop-overlay-click");
+
+        const nextMessage = () => new Promise(resolve => addEventListener("message", event => resolve(event.data), { once: true }));
+        const ready = nextMessage();
+        const iframe = document.createElement("iframe");
+        iframe.src = childUrl;
+        document.body.appendChild(iframe);
+        await ready;
+
+        let overlayClicks = 0;
+        document.getElementById("overlay").addEventListener("mousedown", () => overlayClicks++);
+
+        const rect = iframe.getBoundingClientRect();
+        const seen = nextMessage();
+        internals.clickThroughUIProcess(rect.left + 50, rect.top + 50);
+        internals.clickThroughUIProcess(rect.left + 150, rect.top + 50);
+        const position = await seen;
+        println(`the overlay took the click over it: ${overlayClicks === 1}`);
+        println(`the isolated iframe saw the uncovered click at: ${position.x}, ${position.y}`);
+        println(internals.dumpSiteIsolationProcessTree().trimEnd());
+    });
+</script>

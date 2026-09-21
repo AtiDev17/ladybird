@@ -425,17 +425,6 @@ Vector<u32> rust_owned_visual_context_node_indices(Layout::Node const& layout_no
     return indices;
 }
 
-Vector<u32> rust_visual_animation_target_node_indices(Layout::Node const& layout_node, AccumulatedVisualContextTree const& visual_context_tree, Layout::RustFFI::FfiVisualAnimationTargetKind target_kind)
-{
-    Vector<u32> indices;
-    if (!has_committed_box(layout_node))
-        return indices;
-    Layout::RustFFI::layout_arena_paintable_visual_animation_target_indices(
-        layout_node.arena_handle(), committed_row_slot(layout_node), visual_context_tree.rust_handle(), target_kind,
-        &indices, [](void* context, u32 index) { static_cast<Vector<u32>*>(context)->append(index); });
-    return indices;
-}
-
 bool rust_background_color_can_be_compositor_animated(Layout::Node const& layout_node)
 {
     if (!has_committed_box(layout_node))

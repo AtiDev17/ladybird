@@ -17,8 +17,8 @@
 </style>
 <div id="spacer"></div>
 <script>
-    // The UI process routes a click over an isolated iframe by the rect its container reports, which scrolling the
-    // top-level document moves. The iframe sees the click where it landed in its own viewport.
+    // The top-level document hit-tests a click at its scrolled position and hands it to the isolated iframe under it,
+    // which sees the click where it landed in its own viewport.
     promiseTest(async () => {
         const runId = crypto.randomUUID();
         const childUrl = new URL(
@@ -43,12 +43,13 @@
         window.scrollTo(0, 3000);
         await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
+        // The output element is above the iframe and grows with each line, so nothing is printed between measuring
+        // the iframe and clicking it.
         const rect = iframe.getBoundingClientRect();
-        println(`iframe is on screen after scrolling: ${scrollY > 0 && rect.top >= 0 && rect.bottom <= innerHeight}`);
-
         const click = nextMessage();
         internals.clickThroughUIProcess(rect.left + 30, rect.top + 20);
         const seen = await click;
+        println(`iframe is on screen after scrolling: ${scrollY > 0 && rect.top >= 0 && rect.bottom <= innerHeight}`);
         println(`click reached the isolated iframe at: ${seen.x}, ${seen.y}`);
         println(internals.dumpSiteIsolationProcessTree().trimEnd());
     });

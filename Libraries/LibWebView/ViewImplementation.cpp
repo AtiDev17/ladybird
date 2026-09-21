@@ -837,7 +837,7 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
             auto delta_in_device_pixels = Gfx::FloatPoint { wheel_delta_x, wheel_delta_y }.scaled(device_pixels_per_css_pixel);
             dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI attempting compositor wheel bypass for page {} at {},{} device delta {},{}",
                 page_id(), position.x(), position.y(), delta_in_device_pixels.x(), delta_in_device_pixels.y());
-            if (page().send_async_scroll_to_compositor(position, delta_in_device_pixels, mouse_event->wheel_delta_precision, mouse_event->scroll_gesture_phase))
+            if (page().send_async_scroll_to_compositor(position, delta_in_device_pixels, mouse_event->wheel_delta_precision, mouse_event->scroll_gesture_phase, mouse_event->modifiers))
                 mouse_event->async_scroll_performed_default_action = true;
             dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor wheel bypass result for page {}: {}",
                 page_id(), mouse_event->async_scroll_performed_default_action ? "accepted"sv : "rejected"sv);
@@ -1086,6 +1086,13 @@ void ViewImplementation::did_finish_handling_input_event(Badge<WebContentPage>, 
         [](auto const&) {});
 }
 
+void ViewImplementation::did_forward_input_event(Badge<WebContentPage>, u64 event_id, WebContentPage& endpoint)
+{
+    auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
+    if (index.has_value())
+        m_pending_input_events[*index].endpoint = endpoint;
+}
+
 void ViewImplementation::did_lose_input_event_endpoint(Badge<WebContentClient>, WebContentPage& page)
 {
     // Nothing will finish the events the lost page held, and a pending event holds back compositor input.
@@ -1151,6 +1158,7 @@ void ViewImplementation::send_preferences_to_page(Badge<WebContentClient>, WebCo
     page.async_set_preferred_contrast(m_preferred_contrast);
     page.async_set_preferred_motion(m_preferred_motion);
     page.async_set_preferred_languages(Application::settings().languages());
+    page.async_set_zoom_level(m_zoom_level);
     if (m_user_style_sheet.has_value())
         page.async_set_user_style(*m_user_style_sheet);
     send_browsing_behavior(page);
@@ -1979,6 +1987,13 @@ void ViewImplementation::set_is_fullscreen(Web::ViewportIsFullscreen is_fullscre
         return;
     m_is_fullscreen = is_fullscreen;
 
+    // NB: handle_resize() carries the state to the page displaying the tab. A page holding only part of the tab has
+    //     no viewport of its own to resize, and a fullscreen request its document made waits on the state.
+    m_top_level_traversable.for_each_hosting_page([&](WebContentPage& page) {
+        if (!page.displays_tab())
+            page.async_set_viewport_is_fullscreen(is_fullscreen);
+    });
+
     handle_resize();
 }
 
@@ -2256,7 +2271,10 @@ void ViewImplementation::update_zoom()
         m_reset_zoom_action->set_visible(false);
     }
 
-    client().async_set_zoom_level(page_id(), m_zoom_level);
+    // Every process showing part of the tab lays out and converts input at the tab's zoom level.
+    m_top_level_traversable.for_each_hosting_page([&](WebContentPage& page) {
+        page.async_set_zoom_level(m_zoom_level);
+    });
 }
 
 void ViewImplementation::apply_zoom_for_current_host()

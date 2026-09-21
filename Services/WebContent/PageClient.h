@@ -195,7 +195,8 @@ private:
     virtual void page_did_completely_finish_loading(Web::HTML::CrossProcessId navigable_id) override;
     virtual void page_did_change_navigable_container_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedContainerState const&) override;
     virtual void page_did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::ReplicatedNavigableState const&) override;
-    virtual void page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::CSSPixelRect viewport_rect, Web::CSSPixelRect viewport_intersection) override;
+    virtual void page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::DevicePixelRect viewport_rect, Web::DevicePixelRect viewport_intersection) override;
+    virtual void forward_mouse_event_to_remote_navigable(Web::PageId, Web::HTML::CrossProcessId navigable_id, Web::MouseEvent) override;
     virtual void page_did_destroy_child_frame(Web::HTML::CrossProcessId frame_id) override;
     virtual String dump_site_isolation_process_tree_for_testing() override;
     virtual void crash_remote_frame_processes_for_testing() override;
@@ -299,6 +300,10 @@ private:
     virtual void page_did_request_child_navigable_unload(Web::HTML::CrossProcessId navigable_id) override;
     virtual void page_did_request_remote_document_abort(Web::HTML::CrossProcessId navigable_id) override;
     virtual void page_did_request_remote_document_unfullscreen(Web::HTML::CrossProcessId navigable_id) override;
+    virtual void page_did_request_container_fullscreen(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId requesting_navigable_id, Web::Fullscreen::RequestType request_type) override;
+    virtual void page_did_request_container_unfullscreen(Web::HTML::CrossProcessId navigable_id) override;
+    virtual void page_did_complete_container_unfullscreen(Web::HTML::CrossProcessId requesting_navigable_id) override;
+    virtual void page_did_request_fully_exit_fullscreen() override;
     virtual void page_did_request_unload_check(Web::HTML::CrossProcessId navigable_id, GC::Ref<GC::Function<void(Web::HTML::CheckIfUnloadingIsCanceledResult)>>) override;
     virtual String page_did_request_ui_process_session_history_for_testing() override;
     virtual bool page_did_request_capture_session_history_snapshot_for_testing() override;

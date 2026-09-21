@@ -136,6 +136,11 @@ public:
     void stop_hosting(HTML::LocalNavigable&, HTML::ReplicatedNavigableState);
     void host_navigable(HTML::CrossProcessId, HTML::SessionHistoryEntryDescriptor const& current_history_entry, HTML::VisibilityState system_visibility_state);
     void unfullscreen_descendant_documents(Vector<GC::Root<HTML::Navigable>> const&);
+    enum class ElementIsRequestedElement : u8 {
+        No,
+        Yes,
+    };
+    GC::Ptr<HTML::LocalNavigable> fullscreen_element_and_its_containers(GC::Ref<DOM::Element>, Fullscreen::RequestType, ElementIsRequestedElement);
 
     void discard();
 
@@ -170,11 +175,11 @@ public:
     DevicePixelRect rounded_device_rect(CSSPixelRect) const;
     ChromeMetrics chrome_metrics() const;
 
-    EventResult handle_mouseup(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers);
-    EventResult handle_mousedown(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count, Optional<Compositor::ScrollbarDraggedByCompositor> const& = {});
-    EventResult handle_mousemove(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers);
+    EventResult handle_mouseup(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target);
+    EventResult handle_mousedown(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count, Optional<Compositor::ScrollbarDraggedByCompositor> const&, Optional<RemoteInputEventTarget>* remote_target);
+    EventResult handle_mousemove(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target);
     EventResult handle_mouseleave(HTML::LocalNavigable& root);
-    EventResult handle_mousewheel(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, WheelDeltaPrecision, ScrollGesturePhase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation);
+    EventResult handle_mousewheel(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, WheelDeltaPrecision, ScrollGesturePhase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation, Optional<RemoteInputEventTarget>* remote_target);
     EventResult handle_drag_and_drop_event(HTML::LocalNavigable& root, DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files);
     EventResult handle_pinch_event(HTML::LocalNavigable& root, DevicePixelPoint point, unsigned modifiers, double scale);
 
@@ -399,8 +404,10 @@ public:
     void set_listen_for_dom_mutations(bool listen_for_dom_mutations) { m_listen_for_dom_mutations = listen_for_dom_mutations; }
 
     void enqueue_fullscreen_enter(GC::Ref<DOM::Element>, GC::Ref<DOM::Document>, DOM::RequestFullscreenError, GC::Ptr<WebIDL::Promise>, Fullscreen::RequestType);
-    void enqueue_fullscreen_exit(GC::Ref<DOM::Document> doc, bool resize, GC::Ptr<WebIDL::Promise>);
+    void enqueue_fullscreen_exit(GC::Ref<DOM::Document> doc, bool resize, GC::Ptr<WebIDL::Promise>, Optional<HTML::CrossProcessId> requesting_navigable_id = {});
     void process_pending_fullscreen_operations();
+    void container_fullscreen_complete(HTML::CrossProcessId hosted_root_id);
+    void container_unfullscreen_complete(HTML::CrossProcessId hosted_root_id);
 
     ViewportIsFullscreen viewport_is_fullscreen() const { return m_viewport_is_fullscreen; }
     void set_viewport_is_fullscreen(ViewportIsFullscreen);
@@ -530,18 +537,31 @@ private:
     bool m_listen_for_dom_mutations { false };
     Optional<CSS::PreferredColorScheme> m_preferred_color_scheme_override_for_testing;
 
+    // The chain of containers above a document leaves this process at a hosted root, and the process holding the
+    // container above runs the steps for the rest of it.
+    enum class ContainerChain : u8 {
+        NotStarted,
+        InAnotherProcess,
+        Complete,
+    };
+
     struct PendingFullscreenEnter {
         GC::Ref<DOM::Element> element;
         GC::Ref<DOM::Document> pending_doc;
         DOM::RequestFullscreenError error;
         GC::Ptr<WebIDL::Promise> promise;
         Fullscreen::RequestType request_type;
+        ContainerChain container_chain { ContainerChain::NotStarted };
+        Optional<HTML::CrossProcessId> hosted_root_id {};
     };
 
     struct PendingFullscreenExit {
         GC::Ref<DOM::Document> doc;
         bool resize;
         GC::Ptr<WebIDL::Promise> promise;
+        Optional<HTML::CrossProcessId> requesting_navigable_id;
+        ContainerChain container_chain { ContainerChain::NotStarted };
+        Optional<HTML::CrossProcessId> hosted_root_id {};
     };
 
     using PendingFullscreenOperation = Variant<PendingFullscreenEnter, PendingFullscreenExit>;
@@ -588,7 +608,7 @@ public:
     virtual void page_did_change_replicated_navigable_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::ReplicatedNavigableState const& state) { }
     virtual void page_did_completely_finish_loading([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
     virtual void page_did_change_navigable_container_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::ReplicatedContainerState const& state) { }
-    virtual void page_did_update_child_frame_viewport(HTML::CrossProcessId, [[maybe_unused]] CSSPixelRect viewport_rect, [[maybe_unused]] CSSPixelRect viewport_intersection) { }
+    virtual void page_did_update_child_frame_viewport(HTML::CrossProcessId, [[maybe_unused]] DevicePixelRect viewport_rect, [[maybe_unused]] DevicePixelRect viewport_intersection) { }
     virtual void page_did_destroy_child_frame(HTML::CrossProcessId) { }
     virtual String dump_site_isolation_process_tree_for_testing() { return {}; }
     virtual void crash_remote_frame_processes_for_testing() { }
@@ -606,6 +626,8 @@ public:
     virtual Queue<QueuedInputEvent>& input_event_queue() = 0;
     virtual void did_handle_input_event([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] InputEvent const&) { }
     virtual void report_finished_handling_input_event(Web::PageId page_id, u64 event_id, EventResult event_was_handled) = 0;
+    // The event lands on content another process hosts, which handles it and finishes it.
+    virtual void forward_mouse_event_to_remote_navigable([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] MouseEvent) { }
     virtual Compositor::CompositorContextId allocate_compositor_context_id(Compositor::PagePresentationRegistration page_presentation_registration)
     {
         if (page_presentation_registration == Compositor::PagePresentationRegistration::Yes)
@@ -739,6 +761,10 @@ public:
     virtual void page_did_request_child_navigable_unload([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
     virtual void page_did_request_remote_document_abort([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
     virtual void page_did_request_remote_document_unfullscreen([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
+    virtual void page_did_request_container_fullscreen([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::CrossProcessId requesting_navigable_id, [[maybe_unused]] Fullscreen::RequestType request_type) { }
+    virtual void page_did_request_container_unfullscreen([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
+    virtual void page_did_complete_container_unfullscreen([[maybe_unused]] HTML::CrossProcessId requesting_navigable_id) { }
+    virtual void page_did_request_fully_exit_fullscreen() { }
     virtual void page_did_request_unload_check(HTML::CrossProcessId, GC::Ref<GC::Function<void(HTML::CheckIfUnloadingIsCanceledResult)>>) { VERIFY_NOT_REACHED(); }
     virtual void page_did_change_needs_beforeunload_check([[maybe_unused]] bool needs_beforeunload_check) { }
     virtual void page_did_consume_user_activation([[maybe_unused]] HTML::UserActivationConsumption consumption) { }

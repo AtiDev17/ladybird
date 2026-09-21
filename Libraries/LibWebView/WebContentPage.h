@@ -58,6 +58,8 @@ public:
     // The process and page hosting the document of a navigable that a page represents. A page represents every
     // navigable of its tab whose document it does not host, so those are the ones it can ask to navigate or post to.
     RefPtr<WebContentPage> endpoint_hosting_navigable_represented_by(Web::HTML::CrossProcessId navigable_id) const;
+    RefPtr<WebContentPage> page_hosting_container_of(Web::HTML::CrossProcessId navigable_id) const;
+    RefPtr<WebContentPage> page_hosting_navigable(Web::HTML::CrossProcessId navigable_id) const;
 
     // False once the page can no longer host work: the page is unregistered or the process is gone. A page
     // awaiting a detached close remains open; it still coordinates its own close.
@@ -77,7 +79,7 @@ public:
     void discard();
 
     Web::Compositor::CompositorContextId compositor_context_id();
-    bool send_async_scroll_to_compositor(Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Web::WheelDeltaPrecision, Web::ScrollGesturePhase);
+    bool send_async_scroll_to_compositor(Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers);
     bool handle_key_event_in_compositor(Web::KeyEvent const&);
     void dispatch_key_event_to_web_content(Web::KeyEvent const&);
     bool handle_pinch_event_in_compositor(Web::PinchEvent const&);
@@ -89,10 +91,6 @@ public:
     void fail_renderer_owned_downloads();
 
 private:
-    // Input over a remote child of the root is the hosting process's to handle, in the root's compositor context there.
-    Web::Compositor::MouseEventHandlingResult handle_mouse_event_in_compositor(CanonicalNavigable const& root, Optional<Web::Compositor::CompositorContextId>, Web::MouseEvent const&);
-    void dispatch_mouse_event_to_web_content(CanonicalNavigable const& root, Optional<Web::Compositor::CompositorContextId>, Web::MouseEvent const&);
-
     Optional<CanonicalNavigable&> population_worker_navigable(Web::HTML::CrossProcessId navigable_id) const;
     bool continue_navigation_population_in_selected_process(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id);
     StorageJar* storage_jar(Web::StorageAPI::StorageEndpointType) const;
@@ -203,6 +201,11 @@ private:
     virtual void descendant_unload_task_complete(Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void request_navigable_document_abort(Web::HTML::CrossProcessId navigable_id) override;
     virtual void request_navigable_document_unfullscreen(Web::HTML::CrossProcessId navigable_id) override;
+    virtual void request_navigable_container_fullscreen(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId requesting_navigable_id, Web::Fullscreen::RequestType request_type) override;
+    virtual void navigable_container_fullscreen_complete(Web::HTML::CrossProcessId requesting_navigable_id) override;
+    virtual void request_navigable_container_unfullscreen(Web::HTML::CrossProcessId navigable_id) override;
+    virtual void navigable_container_unfullscreen_complete(Web::HTML::CrossProcessId navigable_id) override;
+    virtual void request_fully_exit_fullscreen() override;
     virtual void request_child_navigable_unload(Web::HTML::CrossProcessId navigable_id) override;
     virtual void changing_navigable_continuation_applied(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::ReplicatedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) override;
     virtual void nonchanging_navigable_history_state_updated(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) override;
@@ -228,6 +231,7 @@ private:
     virtual void did_change_replicated_navigable_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedNavigableState state) override;
     virtual void did_change_navigable_container_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedContainerState state) override;
     virtual void did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::DevicePixelRect viewport_rect, Web::DevicePixelRect viewport_intersection, double device_pixel_ratio) override;
+    virtual void did_forward_mouse_event_to_child_frame(Web::HTML::CrossProcessId frame_id, Web::MouseEvent) override;
     virtual void did_destroy_child_frame(Web::HTML::CrossProcessId frame_id) override;
     Messages::WebContentClient::DidStartDownloadWithoutRequestResponse did_start_download_without_request(URL::URL url, ByteString suggested_filename, Optional<u64> total_size);
     Messages::WebContentClient::DidStartDownloadResponse did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data);

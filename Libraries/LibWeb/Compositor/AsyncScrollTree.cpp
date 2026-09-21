@@ -164,7 +164,7 @@ static void set_or_append_scroll_offset(Vector<AsyncScrollOffset>& scroll_offset
     });
 }
 
-Vector<AsyncScrollOffset> AsyncScrollTree::apply_scroll_delta(AsyncScrollNodeID node_id, Gfx::FloatPoint delta, Painting::AccumulatedVisualContextTree const& visual_context_tree, Painting::ScrollStateSnapshot& scroll_state_snapshot)
+Vector<AsyncScrollOffset> AsyncScrollTree::apply_scroll_delta(AsyncScrollNodeID node_id, Gfx::FloatPoint delta, Painting::AccumulatedVisualContextTree const& visual_context_tree, Painting::ScrollStateSnapshot& scroll_state_snapshot, ScrollChaining scroll_chaining)
 {
     // The compositor can advance only the scroll offsets it owns in this snapshot. Hit testing already selects an
     // ancestor when the target cannot scroll in the wheel direction at all, so once a node moves it consumes the event.
@@ -186,6 +186,8 @@ Vector<AsyncScrollOffset> AsyncScrollTree::apply_scroll_delta(AsyncScrollNodeID 
             break;
         }
 
+        if (scroll_chaining == ScrollChaining::None)
+            break;
         auto ancestor_node_id = scrollable_ancestor_for_node(node_id, scroll_state_snapshot, remaining_delta);
         if (!ancestor_node_id.has_value())
             break;
@@ -218,14 +220,7 @@ void AsyncScrollTree::rebuild_wheel_hit_test_targets(RefPtr<Painting::DisplayLis
         return visual_context_tree->context_is_valid(context);
     };
 
-    Vector<Painting::SpatialNodeIndex> animated_spatial_nodes;
-    for (auto const& animation : visual_context_tree->visual_animations()) {
-        if (animation.target_kind != VisualAnimation::TargetKind::Transform)
-            continue;
-        for (auto node_index : animation.visual_context_node_indices)
-            animated_spatial_nodes.append(Painting::SpatialNodeIndex { node_index });
-    }
-    auto spatial_context_has_visual_animation = visual_context_tree->spatial_nodes_in_subtrees_of(animated_spatial_nodes);
+    auto spatial_context_has_visual_animation = visual_context_tree->spatial_nodes_in_subtrees_of_transform_animations();
     auto viewport_rect_for_context = [&](Painting::ContextRef context, Gfx::FloatRect const& rect) -> Optional<Gfx::FloatRect> {
         if (spatial_context_has_visual_animation[context.spatial.value()])
             return {};
