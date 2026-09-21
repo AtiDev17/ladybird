@@ -44,7 +44,7 @@ pub enum DisplayListCommandType {
     CompositorWheelHitTestTarget,
     CompositorWheelHitTestTargetWithCornerRadii,
     CompositorMainThreadWheelEventRegion,
-    CompositorViewportScrollbar,
+    CompositorScrollbar,
     CompositorBlockingWheelEventRegion,
     PaintScrollBar,
     CompositorSnapContainer,
@@ -71,7 +71,7 @@ impl DisplayListCommandType {
                 | Self::CompositorWheelHitTestTarget
                 | Self::CompositorWheelHitTestTargetWithCornerRadii
                 | Self::CompositorMainThreadWheelEventRegion
-                | Self::CompositorViewportScrollbar
+                | Self::CompositorScrollbar
                 | Self::CompositorBlockingWheelEventRegion
                 | Self::CompositorSnapContainer
                 | Self::CompositorSnapArea
@@ -111,7 +111,7 @@ impl DisplayListCommandType {
             Self::CompositorWheelHitTestTarget => "CompositorWheelHitTestTarget",
             Self::CompositorWheelHitTestTargetWithCornerRadii => "CompositorWheelHitTestTargetWithCornerRadii",
             Self::CompositorMainThreadWheelEventRegion => "CompositorMainThreadWheelEventRegion",
-            Self::CompositorViewportScrollbar => "CompositorViewportScrollbar",
+            Self::CompositorScrollbar => "CompositorScrollbar",
             Self::CompositorBlockingWheelEventRegion => "CompositorBlockingWheelEventRegion",
             Self::PaintScrollBar => "PaintScrollBar",
             Self::CompositorSnapContainer => "CompositorSnapContainer",
@@ -1563,11 +1563,12 @@ impl DisplayListCommand for CompositorMainThreadWheelEventRegion {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
-pub struct CompositorViewportScrollbar {
+pub struct CompositorScrollbar {
     pub document_id: UniqueNodeId,
     pub scroll_node_index: SpatialNodeIndex,
     pub gutter_rect: IntRect,
     pub thumb_rect: IntRect,
+    pub track_rect: IntRect,
     pub expanded_gutter_rect: IntRect,
     pub expanded_thumb_rect: IntRect,
     pub scroll_size: f64,
@@ -1577,12 +1578,15 @@ pub struct CompositorViewportScrollbar {
     pub thumb_color: Color,
     pub track_color: Color,
     pub vertical: bool,
+    pub is_painted_by_compositor: bool,
+    pub display_list_paints_enlarged_scrollbar: bool,
 }
-ffi_bytes_fields!(CompositorViewportScrollbar {
+ffi_bytes_fields!(CompositorScrollbar {
     document_id,
     scroll_node_index,
     gutter_rect,
     thumb_rect,
+    track_rect,
     expanded_gutter_rect,
     expanded_thumb_rect,
     scroll_size,
@@ -1591,11 +1595,13 @@ ffi_bytes_fields!(CompositorViewportScrollbar {
     max_scroll_offset,
     thumb_color,
     track_color,
-    vertical
+    vertical,
+    is_painted_by_compositor,
+    display_list_paints_enlarged_scrollbar
 });
 
-impl DisplayListCommand for CompositorViewportScrollbar {
-    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorViewportScrollbar;
+impl DisplayListCommand for CompositorScrollbar {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorScrollbar;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

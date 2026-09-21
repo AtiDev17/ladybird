@@ -4,12 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <Compositor/ViewportScrollbarController.h>
+#include <Compositor/ScrollbarController.h>
 #include <LibTest/TestCase.h>
 #include <LibWeb/Compositor/AsyncScrollTree.h>
 #include <LibWeb/Painting/ScrollState.h>
+#include <LibWeb/Painting/VisualContextTreeTestBuilder.h>
 
-static Compositor::ViewportScrollbarController::Drag begin_scrollbar_drag(Gfx::Orientation orientation, Gfx::FloatPoint position, Optional<Gfx::IntRect> expanded_thumb_rect = {})
+static Compositor::ScrollbarController::Drag begin_scrollbar_drag(Gfx::Orientation orientation, Gfx::FloatPoint position, Optional<Gfx::IntRect> expanded_thumb_rect = {})
 {
     auto vertical = orientation == Gfx::Orientation::Vertical;
     auto document_id = Web::UniqueNodeID { 1 };
@@ -40,12 +41,16 @@ static Compositor::ViewportScrollbarController::Drag begin_scrollbar_drag(Gfx::O
     scroll_tree.set_state(move(scrolling_state));
     Web::Painting::ScrollStateSnapshot scroll_state_snapshot;
 
-    Vector<Web::Compositor::ViewportScrollbar> scrollbars;
+    Vector<Web::Compositor::AsyncScrollbar> scrollbars;
     scrollbars.append({
         .scroll_node_id = scroll_node_id,
+        .scroller_stable_node_id = {},
         .scroll_node_index = scroll_node_index,
+        .context = {},
+        .paint_order_index = 0,
         .gutter_rect = vertical ? Gfx::IntRect { 96, 0, 4, 100 } : Gfx::IntRect { 0, 96, 100, 4 },
         .thumb_rect = vertical ? Gfx::IntRect { 98, 20, 2, 20 } : Gfx::IntRect { 20, 98, 20, 2 },
+        .track_rect = vertical ? Gfx::IntRect { 96, 0, 4, 100 } : Gfx::IntRect { 0, 96, 100, 4 },
         .expanded_gutter_rect = vertical ? Gfx::IntRect { 92, 0, 8, 100 } : Gfx::IntRect { 0, 92, 100, 8 },
         .expanded_thumb_rect = expanded_thumb_rect.value_or(vertical ? Gfx::IntRect { 94, 20, 6, 20 } : Gfx::IntRect { 20, 94, 20, 6 }),
         .scroll_size = 0.8,
@@ -55,11 +60,17 @@ static Compositor::ViewportScrollbarController::Drag begin_scrollbar_drag(Gfx::O
         .thumb_color = Gfx::Color::Black,
         .track_color = Gfx::Color::Transparent,
         .vertical = vertical,
+        .is_painted_by_compositor = true,
+        .display_list_paints_enlarged_scrollbar = false,
     });
 
-    Compositor::ViewportScrollbarController controller;
+    Web::Painting::VisualContextTreeTestBuilder visual_context_tree_builder;
+    visual_context_tree_builder.append_scroll(Web::Painting::VISUAL_VIEWPORT_NODE_INDEX);
+    auto visual_context_tree = visual_context_tree_builder.finish();
+
+    Compositor::ScrollbarController controller;
     controller.set_scrollbars(scrollbars);
-    auto drag = controller.begin_drag(scroll_tree, scroll_state_snapshot, position);
+    auto drag = controller.begin_drag(scroll_tree, visual_context_tree, scroll_state_snapshot, position);
     VERIFY(drag.has_value());
     return drag.release_value();
 }

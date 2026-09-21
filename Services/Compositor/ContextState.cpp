@@ -247,9 +247,9 @@ void ContextState::install_display_list_update(
         m_async_visual_viewport_transform.clear();
     }
 
-    auto was_dragging_viewport_scrollbar = m_viewport_scrollbar_controller.has_captured_scrollbar();
-    m_viewport_scrollbar_controller.set_scrollbars(async_scrolling_state.viewport_scrollbars);
-    note_user_scroll_gesture_end_if_drag_ended(was_dragging_viewport_scrollbar);
+    auto was_dragging_scrollbar = m_scrollbar_controller.has_captured_scrollbar();
+    m_scrollbar_controller.set_scrollbars(async_scrolling_state.scrollbars);
+    note_user_scroll_gesture_end_if_drag_ended(was_dragging_scrollbar);
     m_async_scroll_tree.set_state(move(async_scrolling_state));
     m_scroll_snap_controller.did_install_scrolling_state(m_async_scroll_tree);
     if (auto unreconciled = unreconciled_async_scroll_offsets(); !unreconciled.is_empty()) {
@@ -541,39 +541,55 @@ ContextState::ContextUpdateResult ContextState::handle_mouse_event(Web::MouseEve
         static_cast<float>(event.position.y().value()),
     };
 
+    if (m_scrollbar_controller.is_empty())
+        return {};
+
+    // The compositor paints how its own scrollbars expand, outside of what damage tracking sees.
+    auto frame_repainting_scrollbars_painted_by_compositor = [&]() -> Optional<PendingFrame> {
+        if (m_async_scrolling_viewport_rect.is_empty())
+            return {};
+        return PendingFrame::repainting_everything(m_async_scrolling_viewport_rect);
+    };
+
     switch (event.type) {
     case Web::MouseEvent::Type::MouseDown: {
         if (event.button != Web::UIEvents::MouseButton::Primary)
             return {};
 
-        auto drag = m_viewport_scrollbar_controller.begin_drag(m_async_scroll_tree, m_scroll_state_snapshot, position);
+        auto drag = m_scrollbar_controller.begin_drag(m_async_scroll_tree, visual_context_tree_for_compositing(), m_scroll_state_snapshot, position);
         if (!drag.has_value())
             return {};
 
         ContextUpdateResult result;
         result.accepted = true;
-        if (!m_async_scrolling_viewport_rect.is_empty())
-            result.frame_to_present = PendingFrame::repainting_everything(m_async_scrolling_viewport_rect);
-        if (auto frame_to_present = apply_viewport_scrollbar_drag(*drag); frame_to_present.has_value()) {
+        result.scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list();
+        if (!result.scrollbar_dragged_by_compositor.has_value())
+            result.frame_to_present = frame_repainting_scrollbars_painted_by_compositor();
+        if (auto frame_to_present = apply_scrollbar_drag(*drag); frame_to_present.has_value()) {
             result.frame_to_present = *frame_to_present;
             result.should_request_rendering_update = true;
         }
         return result;
     }
     case Web::MouseEvent::Type::MouseMove: {
-        auto had_capture = m_viewport_scrollbar_controller.has_captured_scrollbar();
-        if (had_capture) {
-            auto drag = m_viewport_scrollbar_controller.captured_drag(position);
-            if (!drag.has_value())
-                return {};
-            auto frame_to_present = apply_viewport_scrollbar_drag(*drag);
-            return { .accepted = true, .frame_to_present = frame_to_present, .should_request_rendering_update = frame_to_present.has_value() };
+        if (m_scrollbar_controller.has_captured_scrollbar()) {
+            auto scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list();
+            auto drag = m_scrollbar_controller.captured_drag(visual_context_tree_for_compositing(), m_scroll_state_snapshot, position);
+            VERIFY(drag.has_value());
+            auto frame_to_present = apply_scrollbar_drag(*drag);
+            return {
+                .accepted = true,
+                .frame_to_present = frame_to_present,
+                .should_request_rendering_update = frame_to_present.has_value(),
+                .scrollbar_dragged_by_compositor = scrollbar_dragged_by_compositor,
+            };
         }
 
-        auto hovered_scrollbar_index = m_viewport_scrollbar_controller.hit_test(m_async_scroll_tree, m_scroll_state_snapshot, position);
+        // The main thread hovers the scrollbars the display list paints.
+        auto hovered_scrollbar_index = m_scrollbar_controller.hit_test_scrollbar_painted_by_compositor(m_async_scroll_tree, m_scroll_state_snapshot, position);
         Optional<PendingFrame> frame_to_present;
-        if (m_viewport_scrollbar_controller.set_hovered_scrollbar(hovered_scrollbar_index) && !m_async_scrolling_viewport_rect.is_empty())
-            frame_to_present = PendingFrame::repainting_everything(m_async_scrolling_viewport_rect);
+        if (m_scrollbar_controller.set_hovered_scrollbar(hovered_scrollbar_index))
+            frame_to_present = frame_repainting_scrollbars_painted_by_compositor();
         return {
             .accepted = hovered_scrollbar_index.has_value(),
             .frame_to_present = frame_to_present,
@@ -584,38 +600,43 @@ ContextState::ContextUpdateResult ContextState::handle_mouse_event(Web::MouseEve
         if (event.button != Web::UIEvents::MouseButton::Primary)
             return {};
 
-        auto was_dragging_viewport_scrollbar = m_viewport_scrollbar_controller.has_captured_scrollbar();
-        auto drag = m_viewport_scrollbar_controller.release_captured_drag(position);
+        auto was_dragging_scrollbar = m_scrollbar_controller.has_captured_scrollbar();
+        auto scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list();
+        auto drag = m_scrollbar_controller.release_captured_drag(visual_context_tree_for_compositing(), m_scroll_state_snapshot, position);
         if (!drag.has_value())
             return {};
 
-        note_user_scroll_gesture_end_if_drag_ended(was_dragging_viewport_scrollbar);
+        note_user_scroll_gesture_end_if_drag_ended(was_dragging_scrollbar);
 
         ContextUpdateResult result;
         result.accepted = true;
+        result.scrollbar_dragged_by_compositor = scrollbar_dragged_by_compositor;
         // The main thread learns of the release from the next update it takes, so one is asked for even when the
         // release scrolls nothing.
         result.should_request_rendering_update = true;
-        if (!m_async_scrolling_viewport_rect.is_empty())
-            result.frame_to_present = PendingFrame::repainting_everything(m_async_scrolling_viewport_rect);
-        if (auto frame_to_present = apply_viewport_scrollbar_drag(*drag); frame_to_present.has_value())
+        if (!scrollbar_dragged_by_compositor.has_value())
+            result.frame_to_present = frame_repainting_scrollbars_painted_by_compositor();
+        if (auto frame_to_present = apply_scrollbar_drag(*drag); frame_to_present.has_value())
             result.frame_to_present = *frame_to_present;
 
-        auto hovered_scrollbar_index = m_viewport_scrollbar_controller.hit_test(m_async_scroll_tree, m_scroll_state_snapshot, position);
-        if (m_viewport_scrollbar_controller.set_hovered_scrollbar(hovered_scrollbar_index) && !m_async_scrolling_viewport_rect.is_empty())
-            result.frame_to_present = PendingFrame::repainting_everything(m_async_scrolling_viewport_rect);
+        auto hovered_scrollbar_index = m_scrollbar_controller.hit_test_scrollbar_painted_by_compositor(m_async_scroll_tree, m_scroll_state_snapshot, position);
+        if (m_scrollbar_controller.set_hovered_scrollbar(hovered_scrollbar_index)) {
+            if (auto frame_to_present = frame_repainting_scrollbars_painted_by_compositor(); frame_to_present.has_value())
+                result.frame_to_present = frame_to_present;
+        }
 
         return result;
     }
     case Web::MouseEvent::Type::MouseLeave: {
-        auto had_capture = m_viewport_scrollbar_controller.has_captured_scrollbar();
+        auto had_capture = m_scrollbar_controller.has_captured_scrollbar();
         Optional<PendingFrame> frame_to_present;
-        if (m_viewport_scrollbar_controller.set_hovered_scrollbar({}) && !m_async_scrolling_viewport_rect.is_empty())
-            frame_to_present = PendingFrame::repainting_everything(m_async_scrolling_viewport_rect);
+        if (m_scrollbar_controller.set_hovered_scrollbar({}))
+            frame_to_present = frame_repainting_scrollbars_painted_by_compositor();
         return {
             .accepted = had_capture,
             .frame_to_present = frame_to_present,
             .should_request_rendering_update = false,
+            .scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list(),
         };
     }
     case Web::MouseEvent::Type::MouseWheel:
@@ -1604,15 +1625,15 @@ void ContextState::cancel_smooth_scroll_taken_over_by_user_input(Web::Compositor
     }
 }
 
-void ContextState::note_user_scroll_gesture_end_if_drag_ended(bool was_dragging_viewport_scrollbar)
+void ContextState::note_user_scroll_gesture_end_if_drag_ended(bool was_dragging_scrollbar)
 {
-    if (was_dragging_viewport_scrollbar && !m_viewport_scrollbar_controller.has_captured_scrollbar())
+    if (was_dragging_scrollbar && !m_scrollbar_controller.has_captured_scrollbar())
         m_user_scroll_gesture_ended = true;
 }
 
 bool ContextState::user_scroll_gesture_in_progress() const
 {
-    return m_viewport_scrollbar_controller.has_captured_scrollbar()
+    return m_scrollbar_controller.has_captured_scrollbar()
         || !m_held_scroll_keys.is_empty()
         || m_scroll_snap_controller.has_gesture_awaiting_input();
 }
@@ -1644,27 +1665,39 @@ void ContextState::end_scroll_step_gestures_whose_input_ran_out(MonotonicTime no
     schedule_end_of_scroll_step_gestures(now);
 }
 
-Optional<ContextState::PendingFrame> ContextState::apply_viewport_scrollbar_drag(ViewportScrollbarController::Drag const& drag)
+Optional<ContextState::PendingFrame> ContextState::apply_scrollbar_drag(ScrollbarController::Drag const& drag)
 {
-    auto scroll_delta = m_viewport_scrollbar_controller.scroll_delta_for_drag(m_async_scroll_tree, m_scroll_state_snapshot, drag);
-    if (!scroll_delta.has_value())
+    auto dragged_to = m_scrollbar_controller.scroll_offset_for_drag(m_async_scroll_tree, m_scroll_state_snapshot, drag);
+    if (!dragged_to.has_value())
         return {};
 
-    cancel_smooth_scroll_taken_over_by_user_input(scroll_delta->scroll_node_id);
-    auto scroll_offsets = m_async_scroll_tree.apply_scroll_delta(scroll_delta->scroll_node_id, scroll_delta->delta, current_visual_context_tree(), m_scroll_state_snapshot);
-    if (scroll_offsets.is_empty())
+    // A scrollbar scrolls its own scroller to where the thumb was dragged, and never hands any of that to an ancestor.
+    auto node_id = dragged_to->scroll_node_id;
+    auto const* node = m_async_scroll_tree.scroll_node_for_id(node_id);
+    auto old_scroll_offset = m_async_scroll_tree.scroll_offset_for_node(node_id, m_scroll_state_snapshot);
+    if (!node || !old_scroll_offset.has_value())
         return {};
+    if (m_async_scroll_tree.clamped_scroll_offset_for_node(node_id, dragged_to->scroll_offset) == *old_scroll_offset)
+        return {};
+
+    cancel_smooth_scroll_taken_over_by_user_input(node_id);
+    auto new_scroll_offset = m_async_scroll_tree.set_scroll_offset(node_id, dragged_to->scroll_offset, current_visual_context_tree(), m_scroll_state_snapshot);
+    VERIFY(new_scroll_offset.has_value());
     rebuild_wheel_hit_test_targets();
 
-    auto viewport_scroll_offset = viewport_scroll_offset_from(scroll_offsets);
-    if (!viewport_scroll_offset.has_value())
-        return {};
-
+    Vector<Web::Compositor::AsyncScrollOffset> scroll_offsets;
+    scroll_offsets.append({
+        .stable_node_id = node->stable_node_id,
+        .compositor_scroll_offset = *new_scroll_offset,
+        .unadopted_scroll_delta = *new_scroll_offset - *old_scroll_offset,
+        .last_relative_scroll_delta = {},
+    });
     store_pending_async_scroll_offsets(scroll_offsets);
-    auto async_scroll_viewport_rect = m_async_scrolling_viewport_rect;
-    async_scroll_viewport_rect.set_location(viewport_scroll_offset->to_type<int>());
-    m_async_scrolling_viewport_rect = async_scroll_viewport_rect;
-    return PendingFrame::repainting_everything(async_scroll_viewport_rect);
+
+    if (!node->is_viewport)
+        return PendingFrame::repainting_changes(m_async_scrolling_viewport_rect);
+    m_async_scrolling_viewport_rect.set_location(new_scroll_offset->to_type<int>());
+    return PendingFrame::repainting_everything(m_async_scrolling_viewport_rect);
 }
 
 void ContextState::rebuild_wheel_hit_test_targets()
@@ -1757,7 +1790,9 @@ Gfx::IntRect ContextState::damage_since_last_raster(Gfx::IntSize viewport_size)
         return viewport_rect;
 
     auto damage_rect = *display_list_damage;
-    for (auto const& scrollbar : m_viewport_scrollbar_controller.scrollbars()) {
+    for (auto const& scrollbar : m_scrollbar_controller.scrollbars()) {
+        if (!scrollbar.is_painted_by_compositor)
+            continue;
         if (last_frame.scroll_state_snapshot.device_offset_for_index(scrollbar.scroll_node_index) == m_scroll_state_snapshot.device_offset_for_index(scrollbar.scroll_node_index))
             continue;
         damage_rect.unite(scrollbar.gutter_rect.united(scrollbar.expanded_gutter_rect));
@@ -1892,7 +1927,7 @@ void ContextState::paint_current_display_list(Web::Painting::DisplayListPlayerSk
             target_surface,
             &m_canvas_surface_registry,
             composited_context_resolver);
-        m_viewport_scrollbar_controller.paint(target_surface, display_list_player, m_scroll_state_snapshot);
+        m_scrollbar_controller.paint(target_surface, display_list_player, m_scroll_state_snapshot);
         if (paint_ui_overlay == PaintUIOverlay::Yes && m_paused_debugger_overlay_visible)
             paint_paused_debugger_overlay(target_surface, m_viewport_size, m_paused_debugger_overlay_device_pixel_ratio, m_paused_debugger_overlay_font_family, m_paused_debugger_overlay_hovered_action);
     };

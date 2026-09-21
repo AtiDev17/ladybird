@@ -242,6 +242,7 @@ void AsyncScrollTree::rebuild_wheel_hit_test_targets(RefPtr<Painting::DisplayLis
             .rect = target.rect,
             .corner_radii = target.corner_radii,
             .viewport_rect = viewport_rect_for_context(target.context, target.rect),
+            .paint_order_index = target.paint_order_index,
         });
     }
 
@@ -388,6 +389,25 @@ WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Painting::Acc
     if (!viewport_node || !viewport_node->scrollport_rect.to_type<float>().contains(position))
         return {};
     return hit_test_result_for_scroll_node(*viewport_node_id, delta);
+}
+
+bool AsyncScrollTree::is_covered_by_hit_test_target_painted_after(u32 paint_order_index, Painting::AccumulatedVisualContextTree const& visual_context_tree, Gfx::FloatPoint position) const
+{
+    if (m_visual_context_tree_structural_epoch != visual_context_tree.structural_epoch())
+        return true;
+
+    for (auto const& target : m_cached_wheel_hit_test_targets.in_reverse()) {
+        if (target.paint_order_index < paint_order_index)
+            break;
+        if (target.viewport_rect.has_value() && !target.viewport_rect->contains(position))
+            continue;
+        if (!visual_context_tree.context_is_valid(target.context))
+            continue;
+        auto position_in_context = visual_context_tree.transform_point_for_hit_test(target.context, position, m_scroll_state_snapshot);
+        if (position_in_context.has_value() && wheel_hit_test_target_contains_point(target, *position_in_context))
+            return true;
+    }
+    return false;
 }
 
 Optional<AsyncScrollNodeID> AsyncScrollTree::scroll_node_for_keyboard_scroll(AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint delta, Painting::ScrollStateSnapshot const& scroll_state_snapshot) const

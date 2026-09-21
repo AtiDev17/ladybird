@@ -17,6 +17,7 @@
 #include <LibGfx/CornerRadii.h>
 #include <LibGfx/Point.h>
 #include <LibGfx/Rect.h>
+#include <LibWeb/Compositor/AsyncScrollNodeStableID.h>
 #include <LibWeb/Compositor/ScrollSnapSelection.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
@@ -35,22 +36,7 @@ struct AsyncScrollNodeID {
     bool operator==(AsyncScrollNodeID const&) const = default;
 };
 
-enum class AsyncScrollNodeKind : u8 {
-    Viewport,
-    Element,
-    PseudoElement,
-};
-
 WEB_API AsyncScrollNodeKind async_scroll_node_kind_for(Painting::CompositorScrollNodeKind);
-
-// Stable identity for reconciling compositor-side scroll offsets after the paint snapshot has been rebuilt.
-struct AsyncScrollNodeStableID {
-    UniqueNodeID node_id;
-    AsyncScrollNodeKind kind { AsyncScrollNodeKind::Element };
-    u8 pseudo_element_type { 0 };
-
-    bool operator==(AsyncScrollNodeStableID const&) const = default;
-};
 
 struct AsyncScrollOffset {
     AsyncScrollNodeStableID stable_node_id;
@@ -95,6 +81,8 @@ struct WheelHitTestTarget {
     Gfx::FloatRect rect;
     Gfx::CornerRadii corner_radii;
     Optional<AsyncScrollNodeID> target_node_id;
+    // Position among the wheel hit test targets and scrollbars of the display list, which are recorded in paint order.
+    u32 paint_order_index { 0 };
 };
 
 // A region that must always use main-thread wheel routing even without a blocking listener, such as a nested navigable.
@@ -103,11 +91,16 @@ struct MainThreadWheelEventRegion {
     Gfx::FloatRect rect;
 };
 
-struct ViewportScrollbar {
+struct AsyncScrollbar {
     AsyncScrollNodeID scroll_node_id;
+    Optional<AsyncScrollNodeStableID> scroller_stable_node_id;
     Painting::SpatialNodeIndex scroll_node_index;
+    // The rects of a scrollbar the display list paints are in the space of this context.
+    Painting::ContextRef context;
+    u32 paint_order_index { 0 };
     Gfx::IntRect gutter_rect;
     Gfx::IntRect thumb_rect;
+    Gfx::IntRect track_rect;
     Gfx::IntRect expanded_gutter_rect;
     Gfx::IntRect expanded_thumb_rect;
     double scroll_size { 0 };
@@ -117,6 +110,10 @@ struct ViewportScrollbar {
     Color thumb_color;
     Color track_color;
     bool vertical { false };
+    // The compositor paints the viewport's scrollbars itself and owns their hover expansion. The display list paints
+    // every other scrollbar, in whichever of the two geometries the main thread currently gives it.
+    bool is_painted_by_compositor { false };
+    bool display_list_paints_enlarged_scrollbar { false };
 };
 
 // A scroll node that is a snap container, with the geometry snap positions are selected from.
@@ -131,7 +128,7 @@ struct AsyncScrollingState {
     Vector<AsyncSnapContainer> snap_containers;
     Vector<WheelHitTestTarget> wheel_hit_test_targets;
     Vector<MainThreadWheelEventRegion> main_thread_wheel_event_regions;
-    Vector<ViewportScrollbar> viewport_scrollbars;
+    Vector<AsyncScrollbar> scrollbars;
 
     // Non-passive wheel listeners can cancel scrolling, so async scrolling must treat them as hard barriers.
     // Viewport-wide barriers cover listeners on the root targets; element regions let input hit-testing accept
@@ -171,12 +168,3 @@ WEB_API bool blocks_wheel_event_at_position(AsyncScrollingState const&, RefPtr<P
 WEB_API WheelScrollAdmission admit_wheel_scroll(AsyncScrollingState const&, RefPtr<Painting::DisplayList const> const&, Painting::AccumulatedVisualContextTree const*, Painting::ScrollStateSnapshot const&, Gfx::FloatPoint position, Gfx::FloatPoint delta, bool blocking_wheel_event_regions_are_current);
 
 }
-
-template<>
-struct AK::Traits<Web::Compositor::AsyncScrollNodeStableID> : DefaultTraits<Web::Compositor::AsyncScrollNodeStableID> {
-    static unsigned hash(Web::Compositor::AsyncScrollNodeStableID const& stable_node_id)
-    {
-        return pair_int_hash(u64_hash(static_cast<u64>(stable_node_id.node_id.value())),
-            pair_int_hash(to_underlying(stable_node_id.kind), stable_node_id.pseudo_element_type));
-    }
-};
