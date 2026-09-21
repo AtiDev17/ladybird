@@ -321,6 +321,13 @@ Element::AttributeList& Element::ensure_attribute_list()
     return *m_attributes;
 }
 
+void Element::ensure_attribute_capacity(size_t capacity)
+{
+    if (capacity == 0)
+        return;
+    ensure_attribute_list().ensure_capacity(capacity);
+}
+
 void Element::synchronize_attribute(Utf16FlyString const& qualified_name) const
 {
     if (m_style_attribute_is_dirty && qualified_name == HTML::AttributeNames::style)
@@ -468,7 +475,7 @@ HTML::TokenizedFeature::NoOpener Element::get_an_elements_noopener(URL::URL cons
 {
     // To get an element's noopener, given an a, area, or form element element, a URL record url, and a string target,
     // perform the following steps. They return a boolean.
-    auto link_types = attribute(HTML::AttributeNames::rel).value_or({});
+    auto link_types = get_attribute_ns({}, HTML::AttributeNames::rel).value_or({});
     auto has_link_type = [&](Utf16View link_type) {
         size_t start = 0;
         for (size_t i = 0; i <= link_types.length_in_code_units(); ++i) {
