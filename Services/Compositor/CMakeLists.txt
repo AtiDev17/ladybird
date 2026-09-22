@@ -18,10 +18,10 @@ set(SOURCES
 invoke_py_generator(
     "WebGLCommandReplayer.cpp"
     "generate_compositor_webgl_replayer.py"
-    "${LADYBIRD_SOURCE_DIR}/Libraries/LibWeb/WebGL/GLFunctions.json"
+    "${LADYBIRD_SOURCE_DIR}/Libraries/LibCompositing/WebGL/GLFunctions.json"
     "WebGLCommandReplayer.h"
     "WebGLCommandReplayer.cpp"
-    arguments -j "${LADYBIRD_SOURCE_DIR}/Libraries/LibWeb/WebGL/GLFunctions.json"
+    arguments -j "${LADYBIRD_SOURCE_DIR}/Libraries/LibCompositing/WebGL/GLFunctions.json"
     dependencies "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_webgl.py"
 )
 
@@ -32,7 +32,7 @@ set(GENERATED_SOURCES
     CompositorFontServerEndpoint.h
     CompositorWebContentClientEndpoint.h
     CompositorWebContentServerEndpoint.h
-    ${CMAKE_BINARY_DIR}/Libraries/LibWeb/WebGL/GLFunctions.cpp
+    ${CMAKE_BINARY_DIR}/Libraries/LibCompositing/WebGL/GLFunctions.cpp
     WebGLCommandReplayer.cpp
 )
 
@@ -55,7 +55,7 @@ target_include_directories(compositorservice PRIVATE ${LADYBIRD_SOURCE_DIR}/Serv
 target_link_libraries(Compositor PRIVATE compositorservice LibCore LibMain LibSandbox LibWebView)
 # ANGLE must precede Skia so macOS GLES symbols bind to ANGLE rather than the
 # OpenGL framework pulled in by Skia.
-target_link_libraries(compositorservice PRIVATE LibCore LibGfx LibIPC LibMedia LibWeb ${ANGLE_TARGETS} skia)
+target_link_libraries(compositorservice PRIVATE LibCore LibGfx LibIPC LibMedia LibCompositing ${ANGLE_TARGETS} skia)
 
 if (APPLE)
     target_link_libraries(compositorservice PUBLIC "-framework CoreGraphics" "-framework CoreVideo")

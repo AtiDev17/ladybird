@@ -7,8 +7,6 @@
 use crate::css::css_pixels::CssPixels;
 use crate::layout::svg_formatting_context::FfiSvgNumberPercentage;
 use crate::layout::used_values;
-use crate::painting::display_list::builder::RecordedDisplayList;
-use crate::painting::display_list::commands::DisplayListCommandRun;
 use crate::painting::display_list::commands::{OptionalAffineTransform, OptionalColor};
 use libgfx_rust::{Color, IntRect, InterpolationColorSpace};
 use std::ffi::c_void;
@@ -74,12 +72,12 @@ impl FfiRecordingInputs {
         root_background_source: super::FfiRootBackgroundSource,
     ) -> crate::painting::record::inputs::RecordingInputs<'_> {
         use crate::painting::display_list::commands::UniqueNodeId;
-        use crate::painting::ffi::ffi_slice;
         use crate::painting::force_dark::ForceDarkSettings;
         use crate::painting::record::inputs::{
             CaretPaint, CaretTarget, FocusedAreaOutline, FocusedTextControlSelection, GridOverlays, InspectorHighlight,
             RecordingInputs,
         };
+        use libcompositing_rust::ffi::ffi_slice;
 
         // SAFETY: The caller lends these arrays and buffers for the returned inputs' lifetime.
         let (grid_overlays, flex_overlays, outline_path) = unsafe {
@@ -467,38 +465,7 @@ pub struct FfiVectorImageRenderRequest {
     pub raster_scale: f32,
 }
 
-// A read-only view into retained command storage. The owner must outlive the view. An empty
-// Vec's pointer is dangling, so the host never dereferences a pointer whose count is zero.
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiRecordedDisplayList {
-    pub bytes: *const u8,
-    pub byte_count: usize,
-    pub command_runs: *const DisplayListCommandRun,
-    pub command_run_count: usize,
-}
-
-impl FfiRecordedDisplayList {
-    pub const fn empty() -> Self {
-        Self {
-            bytes: std::ptr::null(),
-            byte_count: 0,
-            command_runs: std::ptr::null(),
-            command_run_count: 0,
-        }
-    }
-}
-
-impl From<&RecordedDisplayList> for FfiRecordedDisplayList {
-    fn from(recorded: &RecordedDisplayList) -> Self {
-        Self {
-            bytes: recorded.bytes.as_ptr(),
-            byte_count: recorded.bytes.len(),
-            command_runs: recorded.command_runs.as_ptr(),
-            command_run_count: recorded.command_runs.len(),
-        }
-    }
-}
+pub use crate::painting::display_list::storage::FfiRecordedDisplayList;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]

@@ -24,6 +24,9 @@
 #include <AK/Utf16StringBuilder.h>
 #include <AK/Utf16View.h>
 #include <AK/Utf8View.h>
+#include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
+#include <LibCompositing/DisplayList/DisplayList.h>
+#include <LibCompositing/DisplayList/DisplayListCommand.h>
 #include <LibCore/Timer.h>
 #include <LibGC/ConservativeVector.h>
 #include <LibGC/Heap.h>
@@ -222,12 +225,9 @@
 #include <LibWeb/NavigationTiming/PerformanceNavigationTiming.h>
 #include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/ChromeWidget.h>
 #include <LibWeb/Painting/CompositorAnimationEffectState.h>
-#include <LibWeb/Painting/DisplayList.h>
-#include <LibWeb/Painting/DisplayListCommand.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/HitTestDisplayList.h>
 #include <LibWeb/Painting/PaintableTypes.h>
@@ -670,7 +670,7 @@ Layout::NodeArena& Document::layout_node_arena()
             },
         };
         Layout::RustFFI::layout_arena_set_style_record_host_callbacks(m_layout_node_arena->handle(), style_record_host_callbacks);
-        Layout::RustFFI::layout_arena_set_shell_factory(m_layout_node_arena->handle(), this, [](void* context, Layout::RustFFI::NodeSlotId slot, Layout::RustFFI::NodeKind kind) {
+        Layout::RustFFI::layout_arena_set_shell_factory(m_layout_node_arena->handle(), this, [](void* context, Compositing::RustFFI::NodeSlotId slot, Layout::RustFFI::NodeKind kind) {
             auto& document = *static_cast<Document*>(context);
             switch (kind) {
             case Layout::RustFFI::NodeKind::BlockContainer:
@@ -689,7 +689,7 @@ Layout::NodeArena& Document::layout_node_arena()
         });
         Layout::RustFFI::layout_arena_set_chrome_state_callback(
             m_layout_node_arena->handle(), this,
-            [](void* context, Layout::RustFFI::NodeSlotId slot, Layout::RustFFI::PaintableRowResetKind kind) {
+            [](void* context, Compositing::RustFFI::NodeSlotId slot, Layout::RustFFI::PaintableRowResetKind kind) {
                 auto& document = *static_cast<Document*>(context);
                 document.chrome_widget_registry().drop_widgets_for_slot(slot);
                 if (kind == Layout::RustFFI::PaintableRowResetKind::Recommitted && Painting::viewport_row_slot(document).index == slot.index)
@@ -1537,7 +1537,7 @@ WebIDL::ExceptionOr<void> Document::set_title(Utf16View title)
     return {};
 }
 
-void Document::set_layout_root(Layout::RustFFI::NodeSlotId viewport_slot)
+void Document::set_layout_root(Compositing::RustFFI::NodeSlotId viewport_slot)
 {
     auto* viewport_shell = static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_node_shell_if_live(layout_node_arena().handle(), viewport_slot));
     VERIFY(viewport_shell);
@@ -2131,11 +2131,11 @@ bool Document::needs_style_update_after_layout()
 // Collect elements with content-visibility: auto. This is used in the HTML event loop to avoid traversing the whole tree every time.
 void Document::collect_boxes_with_auto_content_visibility()
 {
-    Vector<Layout::RustFFI::NodeSlotId> boxes_with_auto_content_visibility;
+    Vector<Compositing::RustFFI::NodeSlotId> boxes_with_auto_content_visibility;
     Layout::RustFFI::layout_arena_collect_boxes_with_auto_content_visibility(
         layout_node_arena().handle(), Layout::Node::slot_id(unsafe_layout_node()), &boxes_with_auto_content_visibility,
-        [](void* context, Layout::RustFFI::NodeSlotId slot) {
-            static_cast<Vector<Layout::RustFFI::NodeSlotId>*>(context)->append(slot);
+        [](void* context, Compositing::RustFFI::NodeSlotId slot) {
+            static_cast<Vector<Compositing::RustFFI::NodeSlotId>*>(context)->append(slot);
         });
     paint_state().set_boxes_with_auto_content_visibility(move(boxes_with_auto_content_visibility));
 }
@@ -6271,7 +6271,7 @@ void Document::queue_an_intersection_observer_entry(IntersectionObserver::Inters
 }
 
 // https://www.w3.org/TR/intersection-observer/#compute-the-intersection
-static CSSPixelRect compute_intersection(GC::Ref<Element> target, CSSPixelRect target_rect, IntersectionObserver::IntersectionObserver const& observer, Layout::Box const* root_layout_box, CSSPixelRect const& root_bounds, Painting::AccumulatedVisualContextTree const& visual_context_tree)
+static CSSPixelRect compute_intersection(GC::Ref<Element> target, CSSPixelRect target_rect, IntersectionObserver::IntersectionObserver const& observer, Layout::Box const* root_layout_box, CSSPixelRect const& root_bounds, Compositing::AccumulatedVisualContextTree const& visual_context_tree)
 {
     auto& document = target->document();
     auto const& scroll_margin = observer.scroll_margin_values();
@@ -6307,9 +6307,9 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
 
     update_paint_and_hit_testing_properties_if_needed();
 
-    HashMap<Document*, Painting::AccumulatedVisualContextTree> observation_visual_context_trees;
+    HashMap<Document*, Compositing::AccumulatedVisualContextTree> observation_visual_context_trees;
     auto sample_time_ns = MonotonicTime::now().nanoseconds();
-    auto sampled_visual_context_tree = [&](Document& document) -> Optional<Painting::AccumulatedVisualContextTree> {
+    auto sampled_visual_context_tree = [&](Document& document) -> Optional<Compositing::AccumulatedVisualContextTree> {
         if (!document.m_paint_state)
             return {};
         if (auto cached_tree = observation_visual_context_trees.get(&document); cached_tree.has_value())
@@ -6699,7 +6699,7 @@ Painting::DocumentPaintState const& Document::paint_state() const
     return *m_paint_state;
 }
 
-Painting::AccumulatedVisualContextTree Document::visual_context_tree() const
+Compositing::AccumulatedVisualContextTree Document::visual_context_tree() const
 {
     return paint_state().visual_context_tree(*this);
 }
@@ -6709,7 +6709,7 @@ u64 Document::visual_context_tree_structural_epoch() const
     return paint_state().visual_context_tree_structural_epoch(*this);
 }
 
-Painting::ScrollStateSnapshot const& Document::scroll_state_snapshot() const
+Compositing::ScrollStateSnapshot const& Document::scroll_state_snapshot() const
 {
     return paint_state().scroll_state_snapshot();
 }
@@ -7077,7 +7077,7 @@ static Painting::CompositorAnimationKeyframes const& compositor_animation_keyfra
 // Builds the compositor animation of one target kind for an effect the compositor could drive, and
 // keeps it pending with the effect. The checks here are the ones that read the animation objects; the
 // builder in Rust lowers and validates the keyframes.
-static Painting::CompositorAnimationEffectState::BuildOutcome build_compositor_animation(Animations::KeyframeEffect& effect, Layout::RustFFI::FfiVisualAnimationTargetKind target_kind, CompositorAnimationKeyframesByEffect& keyframes_by_effect)
+static Painting::CompositorAnimationEffectState::BuildOutcome build_compositor_animation(Animations::KeyframeEffect& effect, Compositing::RustFFI::FfiVisualAnimationTargetKind target_kind, CompositorAnimationKeyframesByEffect& keyframes_by_effect)
 {
     auto animation = effect.associated_animation();
     if (!animation || animation->play_state() != Bindings::AnimationPlayState::Running)
@@ -7110,10 +7110,10 @@ static Painting::CompositorAnimationEffectState::BuildOutcome build_compositor_a
     if (effect.target_properties().is_empty())
         return {};
 
-    bool targets_opacity = target_kind == Layout::RustFFI::FfiVisualAnimationTargetKind::Opacity && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Opacity));
-    bool targets_background_color = target_kind == Layout::RustFFI::FfiVisualAnimationTargetKind::BackgroundColor && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::BackgroundColor));
-    bool targets_filter = target_kind == Layout::RustFFI::FfiVisualAnimationTargetKind::Filter && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Filter));
-    bool targets_transform = target_kind == Layout::RustFFI::FfiVisualAnimationTargetKind::Transform && any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); });
+    bool targets_opacity = target_kind == Compositing::RustFFI::FfiVisualAnimationTargetKind::Opacity && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Opacity));
+    bool targets_background_color = target_kind == Compositing::RustFFI::FfiVisualAnimationTargetKind::BackgroundColor && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::BackgroundColor));
+    bool targets_filter = target_kind == Compositing::RustFFI::FfiVisualAnimationTargetKind::Filter && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Filter));
+    bool targets_transform = target_kind == Compositing::RustFFI::FfiVisualAnimationTargetKind::Transform && any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); });
     if (!targets_opacity && !targets_background_color && !targets_filter && !targets_transform)
         return {};
     if (any_of(effect.target_properties(), [&](auto const& property) { return !first_is_one_of(property.id(), CSS::PropertyID::Opacity, CSS::PropertyID::BackgroundColor, CSS::PropertyID::Filter) && !is_transform_family_property(property.id()); }))
@@ -7312,7 +7312,7 @@ void Document::update_compositor_animations()
         CompetingPropertyEffects transform;
     };
 
-    Optional<Painting::AccumulatedVisualContextTree> visual_context_tree = paint_state().visual_context_tree(*this);
+    Optional<Compositing::AccumulatedVisualContextTree> visual_context_tree = paint_state().visual_context_tree(*this);
     paint_state().begin_compositor_animation_update(*this);
     GC::RootHashMap<GC::Ref<Layout::Node>, bool> previous_content_retention;
     GC::RootHashTable<GC::Ref<Layout::Node>> retained_this_pass;
@@ -7698,7 +7698,7 @@ void Document::update_compositor_animations()
         if (!effect || opacity_affects_visibility_observation(target.element()) || !can_force_opacity_effects_layer(*effect))
             continue;
 
-        bool missing_visual_context_node = build_compositor_animation(*effect, Layout::RustFFI::FfiVisualAnimationTargetKind::Opacity, keyframes_by_effect).missing_visual_context_node;
+        bool missing_visual_context_node = build_compositor_animation(*effect, Compositing::RustFFI::FfiVisualAnimationTargetKind::Opacity, keyframes_by_effect).missing_visual_context_node;
         auto* layout_node = target.unsafe_layout_node();
         if (!layout_node)
             continue;
@@ -7819,7 +7819,7 @@ void Document::update_compositor_animations()
             if (auto* layout_node = abstract_target->unsafe_layout_node()) {
                 if (!force_dark_applies && Painting::rust_background_color_can_be_compositor_animated(*layout_node)) {
                     background_color_layout_node = layout_node;
-                    auto build = build_compositor_animation(effect, Layout::RustFFI::FfiVisualAnimationTargetKind::BackgroundColor, keyframes_by_effect);
+                    auto build = build_compositor_animation(effect, Compositing::RustFFI::FfiVisualAnimationTargetKind::BackgroundColor, keyframes_by_effect);
                     background_color_animation_was_built = build.built;
                     background_color_animation_is_valid = build.built || build.missing_visual_context_node;
                     if (!background_color_animation_is_valid) {
@@ -7843,7 +7843,7 @@ void Document::update_compositor_animations()
         if (selected_for_filter) {
             if (auto* layout_node = abstract_target->unsafe_layout_node()) {
                 filter_layout_node = layout_node;
-                auto build = build_compositor_animation(effect, Layout::RustFFI::FfiVisualAnimationTargetKind::Filter, keyframes_by_effect);
+                auto build = build_compositor_animation(effect, Compositing::RustFFI::FfiVisualAnimationTargetKind::Filter, keyframes_by_effect);
                 filter_animation_was_built = build.built;
                 filter_animation_is_valid = build.built || build.missing_visual_context_node;
                 if (!filter_animation_is_valid) {
@@ -7876,7 +7876,7 @@ void Document::update_compositor_animations()
 
         auto& compositor_animation_state = effect.compositor_animation_state();
         bool opacity_was_handed_off = !selected_for_opacity;
-        if (selected_for_opacity && build_compositor_animation(effect, Layout::RustFFI::FfiVisualAnimationTargetKind::Opacity, keyframes_by_effect).built)
+        if (selected_for_opacity && build_compositor_animation(effect, Compositing::RustFFI::FfiVisualAnimationTargetKind::Opacity, keyframes_by_effect).built)
             opacity_was_handed_off = true;
         bool background_color_was_handed_off = !selected_for_background_color;
         if (background_color_animation_was_built)
@@ -7900,14 +7900,14 @@ void Document::update_compositor_animations()
         }
         bool transform_was_handed_off = !selected_for_transform;
         if (selected_for_transform) {
-            auto build = build_compositor_animation(effect, Layout::RustFFI::FfiVisualAnimationTargetKind::Transform, keyframes_by_effect);
+            auto build = build_compositor_animation(effect, Compositing::RustFFI::FfiVisualAnimationTargetKind::Transform, keyframes_by_effect);
             transform_was_handed_off = build.built;
             if (build.only_translates_horizontally.has_value())
                 only_translates_horizontally_cache.set(effect, *build.only_translates_horizontally);
         }
 
         if (selected_for_opacity && opacity_affects_visibility_observation(target)) {
-            compositor_animation_state.discard_pending(Layout::RustFFI::FfiVisualAnimationTargetKind::Opacity);
+            compositor_animation_state.discard_pending(Compositing::RustFFI::FfiVisualAnimationTargetKind::Opacity);
             opacity_was_handed_off = false;
         }
 
@@ -7923,7 +7923,7 @@ void Document::update_compositor_animations()
             transform_affects_observation = transform_affects_intersection_observation(target, effect, only_translates_horizontally, requires_main_thread_observation_sampling);
         }
         if (requires_main_thread_observation_sampling) {
-            compositor_animation_state.discard_pending(Layout::RustFFI::FfiVisualAnimationTargetKind::Transform);
+            compositor_animation_state.discard_pending(Compositing::RustFFI::FfiVisualAnimationTargetKind::Transform);
             transform_was_handed_off = false;
         }
 
@@ -9821,16 +9821,16 @@ void Document::schedule_accumulated_visual_context_update(Element& element, Accu
     });
 }
 
-Painting::SnappedAreas const& Document::snapped_areas_of_scroll_container(Compositor::AsyncScrollNodeStableID const& stable_node_id) const
+Compositing::SnappedAreas const& Document::snapped_areas_of_scroll_container(Compositing::AsyncScrollNodeStableID const& stable_node_id) const
 {
-    static NeverDestroyed<Painting::SnappedAreas const> no_snapped_areas;
+    static NeverDestroyed<Compositing::SnappedAreas const> no_snapped_areas;
     auto snapped_areas = m_scroll_container_snapped_areas.find(stable_node_id);
     if (snapped_areas == m_scroll_container_snapped_areas.end())
         return *no_snapped_areas;
     return snapped_areas->value;
 }
 
-void Document::set_snapped_areas_of_scroll_container(Compositor::AsyncScrollNodeStableID const& stable_node_id, Painting::SnappedAreas snapped_areas)
+void Document::set_snapped_areas_of_scroll_container(Compositing::AsyncScrollNodeStableID const& stable_node_id, Compositing::SnappedAreas snapped_areas)
 {
     if (snapped_areas.is_empty()) {
         m_scroll_container_snapped_areas.remove(stable_node_id);
@@ -9884,7 +9884,7 @@ void Document::set_needs_to_record_display_list_keeping_hit_test_display_list()
         navigable->set_needs_to_record_display_list();
 }
 
-RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig config, Painting::DisplayListResourceStorage& resource_storage, Painting::PaintCommandCacheMode cache_mode)
+RefPtr<Compositing::DisplayList> Document::record_display_list(HTML::PaintConfig config, Compositing::DisplayListResourceStorage& resource_storage, Painting::PaintCommandCacheMode cache_mode)
 {
     update_paint_and_hit_testing_properties_if_needed();
     VERIFY(has_committed_viewport_box());
@@ -9896,7 +9896,7 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
     auto& document_paint_state = paint_state();
     auto visual_context_tree = document_paint_state.visual_context_tree(*this);
 
-    auto placeholder_display_list = Painting::DisplayList::create(visual_context_tree);
+    auto placeholder_display_list = Compositing::DisplayList::create(visual_context_tree);
 
     // https://drafts.csswg.org/css-color-adjust-1/#color-scheme-effect
     // On the root element, the used color scheme additionally must affect the surface color of the canvas, and the viewport’s scrollbars.
@@ -9965,7 +9965,7 @@ Painting::HitTestDisplayList const* Document::ensure_hit_test_display_list()
             (void)record_display_list(paint_config, navigable->display_list_resource_storage(), Painting::PaintCommandCacheMode::ReadWrite);
             return;
         }
-        Painting::DisplayListResourceStorage throwaway_resource_storage_for_hit_test_only_recording;
+        Compositing::DisplayListResourceStorage throwaway_resource_storage_for_hit_test_only_recording;
         (void)record_display_list(paint_config, throwaway_resource_storage_for_hit_test_only_recording, Painting::PaintCommandCacheMode::ReadOnly);
     };
 

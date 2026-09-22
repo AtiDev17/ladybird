@@ -5,6 +5,7 @@
  */
 
 #include <AK/GenericShorthands.h>
+#include <LibCompositing/Scrolling/ScrollState.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
@@ -12,7 +13,6 @@
 #include <LibWeb/Painting/ChromeMetrics.h>
 #include <LibWeb/Painting/ChromeWidget.h>
 #include <LibWeb/Painting/ResizeHandle.h>
-#include <LibWeb/Painting/ScrollState.h>
 #include <LibWeb/Painting/Scrollbar.h>
 
 namespace Web::Painting {
@@ -24,7 +24,7 @@ ChromeWidgetRegistry::~ChromeWidgetRegistry()
     clear();
 }
 
-RefPtr<Scrollbar> ChromeWidgetRegistry::scrollbar(Layout::RustFFI::NodeSlotId slot, ScrollDirection direction) const
+RefPtr<Scrollbar> ChromeWidgetRegistry::scrollbar(Compositing::RustFFI::NodeSlotId slot, ScrollDirection direction) const
 {
     auto entry = m_entries.find(slot.index);
     if (entry == m_entries.end())
@@ -32,7 +32,7 @@ RefPtr<Scrollbar> ChromeWidgetRegistry::scrollbar(Layout::RustFFI::NodeSlotId sl
     return direction == ScrollDirection::Horizontal ? entry->value.horizontal_scrollbar : entry->value.vertical_scrollbar;
 }
 
-NonnullRefPtr<Scrollbar> ChromeWidgetRegistry::get_or_create_scrollbar(Layout::NodeArena& arena, Layout::RustFFI::NodeSlotId slot, ScrollDirection direction)
+NonnullRefPtr<Scrollbar> ChromeWidgetRegistry::get_or_create_scrollbar(Layout::NodeArena& arena, Compositing::RustFFI::NodeSlotId slot, ScrollDirection direction)
 {
     auto& entry = m_entries.ensure(slot.index);
     auto& scrollbar = direction == ScrollDirection::Horizontal ? entry.horizontal_scrollbar : entry.vertical_scrollbar;
@@ -41,7 +41,7 @@ NonnullRefPtr<Scrollbar> ChromeWidgetRegistry::get_or_create_scrollbar(Layout::N
     return *scrollbar;
 }
 
-RefPtr<ResizeHandle> ChromeWidgetRegistry::resize_handle(Layout::RustFFI::NodeSlotId slot) const
+RefPtr<ResizeHandle> ChromeWidgetRegistry::resize_handle(Compositing::RustFFI::NodeSlotId slot) const
 {
     auto entry = m_entries.find(slot.index);
     if (entry == m_entries.end())
@@ -49,7 +49,7 @@ RefPtr<ResizeHandle> ChromeWidgetRegistry::resize_handle(Layout::RustFFI::NodeSl
     return entry->value.resize_handle;
 }
 
-NonnullRefPtr<ResizeHandle> ChromeWidgetRegistry::get_or_create_resize_handle(Layout::NodeArena& arena, Layout::RustFFI::NodeSlotId slot)
+NonnullRefPtr<ResizeHandle> ChromeWidgetRegistry::get_or_create_resize_handle(Layout::NodeArena& arena, Compositing::RustFFI::NodeSlotId slot)
 {
     auto& entry = m_entries.ensure(slot.index);
     if (!entry.resize_handle)
@@ -57,7 +57,7 @@ NonnullRefPtr<ResizeHandle> ChromeWidgetRegistry::get_or_create_resize_handle(La
     return *entry.resize_handle;
 }
 
-void ChromeWidgetRegistry::drop_widgets_for_slot(Layout::RustFFI::NodeSlotId slot)
+void ChromeWidgetRegistry::drop_widgets_for_slot(Compositing::RustFFI::NodeSlotId slot)
 {
     auto entry = m_entries.take(slot.index);
     if (!entry.has_value())
@@ -83,7 +83,7 @@ void ChromeWidgetRegistry::clear()
     m_entries.clear();
 }
 
-ChromeWidget::ChromeWidget(Layout::NodeArena& arena, Layout::RustFFI::NodeSlotId slot)
+ChromeWidget::ChromeWidget(Layout::NodeArena& arena, Compositing::RustFFI::NodeSlotId slot)
     : m_arena(arena)
     , m_slot(slot)
 {
@@ -97,7 +97,7 @@ Layout::Node* ChromeWidget::layout_node() const
 void ChromeWidget::detach(Badge<ChromeWidgetRegistry>)
 {
     did_detach();
-    m_slot = Layout::RustFFI::NodeSlotId_INVALID;
+    m_slot = Compositing::RustFFI::NodeSlotId_INVALID;
 }
 
 PhysicalResizeAxes physical_resize_axes(Layout::Node const& node)
@@ -106,7 +106,7 @@ PhysicalResizeAxes physical_resize_axes(Layout::Node const& node)
     return { axes.horizontal, axes.vertical };
 }
 
-Optional<ScrollbarData> compute_scrollbar_data(Layout::Node const& node, ScrollDirection direction, ChromeMetrics const& metrics, ScrollStateSnapshot const* scroll_state_snapshot, ScrollbarSizing scrollbar_sizing)
+Optional<ScrollbarData> compute_scrollbar_data(Layout::Node const& node, ScrollDirection direction, ChromeMetrics const& metrics, Compositing::ScrollStateSnapshot const* scroll_state_snapshot, ScrollbarSizing scrollbar_sizing)
 {
     auto& document = node.document();
     auto overflow_x = overflow_value_applied_to_viewport_for_wheel_scrolling(document, ScrollDirection::Horizontal);

@@ -60,7 +60,7 @@ struct PhysicalResizeAxes {
     bool vertical;
 };
 
-Optional<ScrollbarData> compute_scrollbar_data(Layout::Node const&, ScrollDirection, ChromeMetrics const&, ScrollStateSnapshot const* = nullptr, ScrollbarSizing = ScrollbarSizing::Regular);
+Optional<ScrollbarData> compute_scrollbar_data(Layout::Node const&, ScrollDirection, ChromeMetrics const&, Compositing::ScrollStateSnapshot const* = nullptr, ScrollbarSizing = ScrollbarSizing::Regular);
 PhysicalResizeAxes physical_resize_axes(Layout::Node const&);
 
 class Scrollbar;
@@ -71,11 +71,11 @@ public:
     ChromeWidgetRegistry();
     ~ChromeWidgetRegistry();
 
-    RefPtr<Scrollbar> scrollbar(Layout::RustFFI::NodeSlotId, ScrollDirection) const;
-    NonnullRefPtr<Scrollbar> get_or_create_scrollbar(Layout::NodeArena&, Layout::RustFFI::NodeSlotId, ScrollDirection);
-    RefPtr<ResizeHandle> resize_handle(Layout::RustFFI::NodeSlotId) const;
-    NonnullRefPtr<ResizeHandle> get_or_create_resize_handle(Layout::NodeArena&, Layout::RustFFI::NodeSlotId);
-    void drop_widgets_for_slot(Layout::RustFFI::NodeSlotId);
+    RefPtr<Scrollbar> scrollbar(Compositing::RustFFI::NodeSlotId, ScrollDirection) const;
+    NonnullRefPtr<Scrollbar> get_or_create_scrollbar(Layout::NodeArena&, Compositing::RustFFI::NodeSlotId, ScrollDirection);
+    RefPtr<ResizeHandle> resize_handle(Compositing::RustFFI::NodeSlotId) const;
+    NonnullRefPtr<ResizeHandle> get_or_create_resize_handle(Layout::NodeArena&, Compositing::RustFFI::NodeSlotId);
+    void drop_widgets_for_slot(Compositing::RustFFI::NodeSlotId);
     void clear();
 
 private:
@@ -101,7 +101,7 @@ public:
     virtual Optional<CSS::CursorPredefined> cursor() const { return {}; }
 
 protected:
-    ChromeWidget(Layout::NodeArena&, Layout::RustFFI::NodeSlotId);
+    ChromeWidget(Layout::NodeArena&, Compositing::RustFFI::NodeSlotId);
 
     Layout::Node* layout_node() const;
 
@@ -112,7 +112,7 @@ private:
     virtual void did_detach() { }
 
     NonnullRefPtr<Layout::NodeArena> m_arena;
-    Layout::RustFFI::NodeSlotId m_slot;
+    Compositing::RustFFI::NodeSlotId m_slot;
 };
 
 }

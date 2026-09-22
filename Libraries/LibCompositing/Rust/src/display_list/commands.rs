@@ -1,0 +1,1639 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+use crate::css_pixels::{FfiCssPixelPoint, FfiCssPixelRect};
+use crate::display_list::ffi_bytes::FfiBytes;
+use crate::ffi_bytes_fields;
+use crate::ffi_enum_bytes;
+use libgfx_rust::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum DisplayListCommandType {
+    DrawGlyphRun,
+    FillRect,
+    PaintCaret,
+    DrawScaledDecodedImageFrame,
+    DrawRepeatedDecodedImageFrame,
+    DrawRepeatedTile,
+    DrawTiledDecodedImageFrame,
+    DrawCompositedContext,
+    DrawCanvas,
+    DrawVideoFrame,
+    PaintLinearGradient,
+    PaintRadialGradient,
+    PaintConicGradient,
+    PaintOuterBoxShadow,
+    PaintInnerBoxShadow,
+    PaintTextShadow,
+    FillRectWithRoundedCorners,
+    FillRoundedRectRing,
+    FillPath,
+    StrokePath,
+    DrawEllipse,
+    DrawLine,
+    BackdropFilterRegion,
+    DrawRect,
+    PaintNestedDisplayList,
+    DrawIsolatedGroup,
+    DeclareMaskContent,
+    CompositorScrollNode,
+    CompositorWheelHitTestTarget,
+    CompositorWheelHitTestTargetWithCornerRadii,
+    CompositorMainThreadWheelEventRegion,
+    CompositorScrollbar,
+    CompositorBlockingWheelEventRegion,
+    PaintScrollBar,
+    CompositorSnapContainer,
+    CompositorSnapArea,
+}
+ffi_enum_bytes!(DisplayListCommandType as u8);
+
+pub const DISPLAY_LIST_COMMAND_TYPE_COUNT: usize = DisplayListCommandType::CompositorSnapArea as usize + 1;
+
+impl DisplayListCommandType {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        if (value as usize) < DISPLAY_LIST_COMMAND_TYPE_COUNT {
+            // SAFETY: the enum is a dense u8 range starting at zero.
+            Some(unsafe { std::mem::transmute::<u8, Self>(value) })
+        } else {
+            None
+        }
+    }
+
+    pub const fn is_compositor_metadata(self) -> bool {
+        matches!(
+            self,
+            Self::CompositorScrollNode
+                | Self::CompositorWheelHitTestTarget
+                | Self::CompositorWheelHitTestTargetWithCornerRadii
+                | Self::CompositorMainThreadWheelEventRegion
+                | Self::CompositorScrollbar
+                | Self::CompositorBlockingWheelEventRegion
+                | Self::CompositorSnapContainer
+                | Self::CompositorSnapArea
+        )
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::DrawGlyphRun => "DrawGlyphRun",
+            Self::FillRect => "FillRect",
+            Self::PaintCaret => "PaintCaret",
+            Self::DrawScaledDecodedImageFrame => "DrawScaledDecodedImageFrame",
+            Self::DrawRepeatedDecodedImageFrame => "DrawRepeatedDecodedImageFrame",
+            Self::DrawRepeatedTile => "DrawRepeatedTile",
+            Self::DrawTiledDecodedImageFrame => "DrawTiledDecodedImageFrame",
+            Self::DrawCompositedContext => "DrawCompositedContext",
+            Self::DrawCanvas => "DrawCanvas",
+            Self::DrawVideoFrame => "DrawVideoFrame",
+            Self::PaintLinearGradient => "PaintLinearGradient",
+            Self::PaintRadialGradient => "PaintRadialGradient",
+            Self::PaintConicGradient => "PaintConicGradient",
+            Self::PaintOuterBoxShadow => "PaintOuterBoxShadow",
+            Self::PaintInnerBoxShadow => "PaintInnerBoxShadow",
+            Self::PaintTextShadow => "PaintTextShadow",
+            Self::FillRectWithRoundedCorners => "FillRectWithRoundedCorners",
+            Self::FillRoundedRectRing => "FillRoundedRectRing",
+            Self::FillPath => "FillPath",
+            Self::StrokePath => "StrokePath",
+            Self::DrawEllipse => "DrawEllipse",
+            Self::DrawLine => "DrawLine",
+            Self::BackdropFilterRegion => "BackdropFilterRegion",
+            Self::DrawRect => "DrawRect",
+            Self::PaintNestedDisplayList => "PaintNestedDisplayList",
+            Self::DrawIsolatedGroup => "DrawIsolatedGroup",
+            Self::DeclareMaskContent => "DeclareMaskContent",
+            Self::CompositorScrollNode => "CompositorScrollNode",
+            Self::CompositorWheelHitTestTarget => "CompositorWheelHitTestTarget",
+            Self::CompositorWheelHitTestTargetWithCornerRadii => "CompositorWheelHitTestTargetWithCornerRadii",
+            Self::CompositorMainThreadWheelEventRegion => "CompositorMainThreadWheelEventRegion",
+            Self::CompositorScrollbar => "CompositorScrollbar",
+            Self::CompositorBlockingWheelEventRegion => "CompositorBlockingWheelEventRegion",
+            Self::PaintScrollBar => "PaintScrollBar",
+            Self::CompositorSnapContainer => "CompositorSnapContainer",
+            Self::CompositorSnapArea => "CompositorSnapArea",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct SpatialNodeIndex(pub u32);
+
+impl FfiBytes for SpatialNodeIndex {
+    #[inline]
+    fn write_ffi_bytes(&self, out: &mut [u8]) {
+        self.0.write_ffi_bytes(out);
+    }
+}
+
+// Indices into the clip and effect trees. `u32::MAX` is the absent node.
+macro_rules! optional_node_index {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[repr(transparent)]
+        pub struct $name(pub u32);
+
+        impl $name {
+            pub const NONE: Self = Self(u32::MAX);
+
+            pub const fn is_none(self) -> bool {
+                self.0 == u32::MAX
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::NONE
+            }
+        }
+
+        impl FfiBytes for $name {
+            #[inline]
+            fn write_ffi_bytes(&self, out: &mut [u8]) {
+                self.0.write_ffi_bytes(out);
+            }
+        }
+    };
+}
+
+optional_node_index!(ClipNodeIndex);
+optional_node_index!(EffectNodeIndex);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct ContextRef {
+    pub spatial: SpatialNodeIndex,
+    pub clip: ClipNodeIndex,
+    pub effect: EffectNodeIndex,
+}
+ffi_bytes_fields!(ContextRef { spatial, clip, effect });
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ClipMode {
+    Intersect,
+    Difference,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct ReplayClip {
+    pub rect: FloatRect,
+    pub corner_radii: CornerRadii,
+    pub mode: ClipMode,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct ReplayLayer {
+    pub opacity: f32,
+    pub blend_mode: CompositingAndBlendingOperator,
+    pub filter_bytes: *const u8,
+    pub filter_bytes_size: usize,
+    pub backdrop_filter_bytes: *const u8,
+    pub backdrop_filter_bytes_size: usize,
+    pub backdrop_region: IntRect,
+    pub backdrop_corner_radii: CornerRadii,
+    pub effect: EffectNodeIndex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct ReplayMask {
+    pub rect: IntRect,
+    pub kind: MaskKind,
+}
+
+impl ContextRef {
+    pub const fn spatial_only(spatial: SpatialNodeIndex) -> Self {
+        Self {
+            spatial,
+            clip: ClipNodeIndex::NONE,
+            effect: EffectNodeIndex::NONE,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct FontResourceId(pub u64);
+
+impl FfiBytes for FontResourceId {
+    #[inline]
+    fn write_ffi_bytes(&self, out: &mut [u8]) {
+        self.0.write_ffi_bytes(out);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct ImageFrameResourceId(pub u64);
+
+impl FfiBytes for ImageFrameResourceId {
+    #[inline]
+    fn write_ffi_bytes(&self, out: &mut [u8]) {
+        self.0.write_ffi_bytes(out);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct VideoSinkResourceId(pub u64);
+
+impl FfiBytes for VideoSinkResourceId {
+    #[inline]
+    fn write_ffi_bytes(&self, out: &mut [u8]) {
+        self.0.write_ffi_bytes(out);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct DisplayListResourceId(pub u64);
+
+impl FfiBytes for DisplayListResourceId {
+    #[inline]
+    fn write_ffi_bytes(&self, out: &mut [u8]) {
+        self.0.write_ffi_bytes(out);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct CanvasId(pub u64);
+
+impl FfiBytes for CanvasId {
+    #[inline]
+    fn write_ffi_bytes(&self, out: &mut [u8]) {
+        self.0.write_ffi_bytes(out);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct CompositorContextId(pub u64);
+
+impl FfiBytes for CompositorContextId {
+    #[inline]
+    fn write_ffi_bytes(&self, out: &mut [u8]) {
+        self.0.write_ffi_bytes(out);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct UniqueNodeId(pub i64);
+
+impl FfiBytes for UniqueNodeId {
+    #[inline]
+    fn write_ffi_bytes(&self, out: &mut [u8]) {
+        self.0.write_ffi_bytes(out);
+    }
+}
+
+pub const VISUAL_VIEWPORT_NODE_INDEX: SpatialNodeIndex = SpatialNodeIndex(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct OptionalFloatRect {
+    pub value: FloatRect,
+    pub has_value: bool,
+}
+ffi_bytes_fields!(OptionalFloatRect { value, has_value });
+
+impl OptionalFloatRect {
+    pub const fn none() -> Self {
+        Self {
+            value: FloatRect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            },
+            has_value: false,
+        }
+    }
+    pub const fn some(value: FloatRect) -> Self {
+        Self { value, has_value: true }
+    }
+    pub fn get(self) -> Option<FloatRect> {
+        self.has_value.then_some(self.value)
+    }
+}
+
+impl From<Option<FloatRect>> for OptionalFloatRect {
+    fn from(value: Option<FloatRect>) -> Self {
+        match value {
+            Some(value) => Self::some(value),
+            None => Self::none(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct OptionalColor {
+    pub value: Color,
+    pub has_value: bool,
+}
+ffi_bytes_fields!(OptionalColor { value, has_value });
+
+impl OptionalColor {
+    pub const fn none() -> Self {
+        Self {
+            value: Color(0),
+            has_value: false,
+        }
+    }
+    pub const fn some(value: Color) -> Self {
+        Self { value, has_value: true }
+    }
+    pub fn get(self) -> Option<Color> {
+        self.has_value.then_some(self.value)
+    }
+}
+
+impl From<Option<Color>> for OptionalColor {
+    fn from(value: Option<Color>) -> Self {
+        match value {
+            Some(value) => Self::some(value),
+            None => Self::none(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct OptionalU32 {
+    pub value: u32,
+    pub has_value: bool,
+}
+ffi_bytes_fields!(OptionalU32 { value, has_value });
+
+impl OptionalU32 {
+    pub const fn none() -> Self {
+        Self {
+            value: 0,
+            has_value: false,
+        }
+    }
+    pub const fn some(value: u32) -> Self {
+        Self { value, has_value: true }
+    }
+    pub fn get(self) -> Option<u32> {
+        self.has_value.then_some(self.value)
+    }
+}
+
+impl From<Option<u32>> for OptionalU32 {
+    fn from(value: Option<u32>) -> Self {
+        match value {
+            Some(value) => Self::some(value),
+            None => Self::none(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct OptionalF32 {
+    pub value: f32,
+    pub has_value: bool,
+}
+ffi_bytes_fields!(OptionalF32 { value, has_value });
+
+impl OptionalF32 {
+    pub const fn none() -> Self {
+        Self {
+            value: 0.0,
+            has_value: false,
+        }
+    }
+    pub const fn some(value: f32) -> Self {
+        Self { value, has_value: true }
+    }
+    pub fn get(self) -> Option<f32> {
+        self.has_value.then_some(self.value)
+    }
+}
+
+impl From<Option<f32>> for OptionalF32 {
+    fn from(value: Option<f32>) -> Self {
+        match value {
+            Some(value) => Self::some(value),
+            None => Self::none(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct OptionalAffineTransform {
+    pub value: AffineTransform,
+    pub has_value: bool,
+}
+ffi_bytes_fields!(OptionalAffineTransform { value, has_value });
+
+impl OptionalAffineTransform {
+    pub const fn none() -> Self {
+        Self {
+            value: AffineTransform { values: [0.0; 6] },
+            has_value: false,
+        }
+    }
+    pub const fn some(value: AffineTransform) -> Self {
+        Self { value, has_value: true }
+    }
+    pub fn get(self) -> Option<AffineTransform> {
+        self.has_value.then_some(self.value)
+    }
+}
+
+impl From<Option<AffineTransform>> for OptionalAffineTransform {
+    fn from(value: Option<AffineTransform>) -> Self {
+        match value {
+            Some(value) => Self::some(value),
+            None => Self::none(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct DisplayListDataSpan {
+    // Offset into the command payload containing this span.
+    pub offset: u32,
+    pub size: u32,
+}
+ffi_bytes_fields!(DisplayListDataSpan { offset, size });
+
+impl DisplayListDataSpan {
+    pub const fn is_empty(self) -> bool {
+        self.size == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct DisplayListGradientColorStops {
+    pub colors: DisplayListDataSpan,
+    pub positions: DisplayListDataSpan,
+    pub repeating: bool,
+}
+ffi_bytes_fields!(DisplayListGradientColorStops {
+    colors,
+    positions,
+    repeating
+});
+
+// Keep payloads aligned after the three-index context, including inline object arrays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C, align(16))]
+pub struct DisplayListCommandHeader {
+    pub command_type: DisplayListCommandType,
+    pub has_bounding_rect: bool,
+    pub inline_clip_count: u8,
+    pub has_inline_transform: bool,
+    pub payload_size: u32,
+    pub context: ContextRef,
+    pub bounding_rect: IntRect,
+}
+ffi_bytes_fields!(DisplayListCommandHeader {
+    command_type,
+    has_bounding_rect,
+    inline_clip_count,
+    has_inline_transform,
+    payload_size,
+    context,
+    bounding_rect
+});
+const _: () = assert!(std::mem::size_of::<DisplayListCommandHeader>() == 48);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InlineClipKind {
+    #[default]
+    Rect,
+    RoundedRect,
+    Path,
+}
+ffi_enum_bytes!(InlineClipKind as u8);
+ffi_enum_bytes!(ClipMode as u8);
+
+// A clip applied by the player around a single command dispatch, stored as a
+// fixed-size entry at the tail of the command payload.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DisplayListInlineClip {
+    pub clip_rect_or_path_device_bounds: FloatRect,
+    pub corner_radii: CornerRadii,
+    pub path_data: DisplayListDataSpan,
+    pub path_winding_rule: WindingRule,
+    pub kind: InlineClipKind,
+    pub mode: ClipMode,
+}
+ffi_bytes_fields!(DisplayListInlineClip {
+    clip_rect_or_path_device_bounds,
+    corner_radii,
+    path_data,
+    path_winding_rule,
+    kind,
+    mode
+});
+pub const INLINE_CLIP_ENTRY_SIZE: usize = std::mem::size_of::<DisplayListInlineClip>();
+const _: () = assert!(INLINE_CLIP_ENTRY_SIZE == 64);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DisplayListInlineTransform {
+    pub transform: AffineTransform,
+    pub padding: [u32; 2],
+}
+ffi_bytes_fields!(DisplayListInlineTransform { transform, padding });
+pub const INLINE_TRANSFORM_ENTRY_SIZE: usize = std::mem::size_of::<DisplayListInlineTransform>();
+const _: () = assert!(INLINE_TRANSFORM_ENTRY_SIZE == 32);
+
+// A maximal sequence of consecutive commands sharing one visual context, summarized as the tape is
+// built so that replay can enter a context, cull, and depth-sort per run instead of rediscovering
+// the runs from every command header. Runs are contiguous and cover the whole tape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct DisplayListCommandRun {
+    pub offset: u32,
+    pub size: u32,
+    pub context: ContextRef,
+    // Union of the draw commands' bounding rects in the run's spatial node space.
+    pub ink_bounds: IntRect,
+    pub has_unbounded_draw: bool,
+    pub has_compositor_metadata: bool,
+}
+const _: () = assert!(std::mem::size_of::<DisplayListCommandRun>() == 40);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct DisplayListGlyph {
+    pub position: FloatPoint,
+    pub glyph_id: u32,
+}
+ffi_bytes_fields!(DisplayListGlyph { position, glyph_id });
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CompositorScrollNodeKind {
+    Viewport,
+    #[default]
+    Element,
+    PseudoElement,
+}
+ffi_enum_bytes!(CompositorScrollNodeKind as u8);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PathPaintKind {
+    #[default]
+    Color,
+    PaintStyle,
+}
+ffi_enum_bytes!(PathPaintKind as u8);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DisplayListPaintStyleType {
+    #[default]
+    None,
+    LinearGradient,
+    RadialGradient,
+    Pattern,
+}
+ffi_enum_bytes!(DisplayListPaintStyleType as u8);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DisplayListGradientSpreadMethod {
+    #[default]
+    Pad,
+    Repeat,
+    Reflect,
+}
+ffi_enum_bytes!(DisplayListGradientSpreadMethod as u8);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct DisplayListGradientPaintStyle {
+    pub gradient_transform: OptionalAffineTransform,
+    pub spread_method: DisplayListGradientSpreadMethod,
+    pub color_space: InterpolationColorSpace,
+    pub color_stops: DisplayListGradientColorStops,
+}
+ffi_bytes_fields!(DisplayListGradientPaintStyle {
+    gradient_transform,
+    spread_method,
+    color_space,
+    color_stops
+});
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DisplayListPaintStyle {
+    pub paint_style_type: DisplayListPaintStyleType,
+    pub gradient: DisplayListGradientPaintStyle,
+    pub linear_gradient_start_point: FloatPoint,
+    pub linear_gradient_end_point: FloatPoint,
+    pub radial_gradient_start_center: FloatPoint,
+    pub radial_gradient_start_radius: f32,
+    pub radial_gradient_end_center: FloatPoint,
+    pub radial_gradient_end_radius: f32,
+    pub pattern_tile: DisplayListDataSpan,
+    pub pattern_tile_rect: FloatRect,
+    pub pattern_content_scale: FloatSize,
+    pub pattern_transform: OptionalAffineTransform,
+}
+ffi_bytes_fields!(DisplayListPaintStyle {
+    paint_style_type,
+    gradient,
+    linear_gradient_start_point,
+    linear_gradient_end_point,
+    radial_gradient_start_center,
+    radial_gradient_start_radius,
+    radial_gradient_end_center,
+    radial_gradient_end_radius,
+    pattern_tile,
+    pattern_tile_rect,
+    pattern_content_scale,
+    pattern_transform
+});
+
+impl Default for DisplayListPaintStyle {
+    fn default() -> Self {
+        Self {
+            paint_style_type: DisplayListPaintStyleType::None,
+            gradient: DisplayListGradientPaintStyle::default(),
+            linear_gradient_start_point: FloatPoint::default(),
+            linear_gradient_end_point: FloatPoint::default(),
+            radial_gradient_start_center: FloatPoint::default(),
+            radial_gradient_start_radius: 0.0,
+            radial_gradient_end_center: FloatPoint::default(),
+            radial_gradient_end_radius: 0.0,
+            pattern_tile: DisplayListDataSpan::default(),
+            pattern_tile_rect: FloatRect::default(),
+            pattern_content_scale: FloatSize {
+                width: 1.0,
+                height: 1.0,
+            },
+            pattern_transform: OptionalAffineTransform::none(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct Repeat {
+    pub x: bool,
+    pub y: bool,
+}
+ffi_bytes_fields!(Repeat { x, y });
+
+pub trait DisplayListCommand: Copy + FfiBytes {
+    const COMMAND_TYPE: DisplayListCommandType;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DrawGlyphRun {
+    pub font_id: FontResourceId,
+    pub glyphs: DisplayListDataSpan,
+    pub rect: IntRect,
+    pub glyph_bounding_rect: IntRect,
+    pub translation: FloatPoint,
+    pub scale: f32,
+    pub color: Color,
+    pub orientation: Orientation,
+    pub font_smoothing: u8,
+}
+ffi_bytes_fields!(DrawGlyphRun {
+    font_id,
+    glyphs,
+    rect,
+    glyph_bounding_rect,
+    translation,
+    scale,
+    color,
+    orientation,
+    font_smoothing
+});
+
+impl DisplayListCommand for DrawGlyphRun {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawGlyphRun;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.glyph_bounding_rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct FillRect {
+    pub rect: IntRect,
+    pub color: Color,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
+    pub background_color_animation_effect: EffectNodeIndex,
+}
+ffi_bytes_fields!(FillRect {
+    rect,
+    color,
+    compositing_and_blending_operator,
+    background_color_animation_effect
+});
+
+impl DisplayListCommand for FillRect {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::FillRect;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct PaintCaret {
+    pub rect: IntRect,
+    pub color: Color,
+    pub blink_cycle_start_time_ns: i64,
+    pub should_blink: bool,
+}
+ffi_bytes_fields!(PaintCaret {
+    rect,
+    color,
+    blink_cycle_start_time_ns,
+    should_blink
+});
+
+impl DisplayListCommand for PaintCaret {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintCaret;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DrawScaledDecodedImageFrame {
+    pub dst_rect: FloatRect,
+    pub src_rect: OptionalFloatRect,
+    pub frame_id: ImageFrameResourceId,
+    pub scaling_mode: ScalingMode,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
+    pub isolated_backdrop_color: OptionalColor,
+    pub apply_force_dark: bool,
+}
+ffi_bytes_fields!(DrawScaledDecodedImageFrame {
+    dst_rect,
+    src_rect,
+    frame_id,
+    scaling_mode,
+    compositing_and_blending_operator,
+    isolated_backdrop_color,
+    apply_force_dark
+});
+
+impl DisplayListCommand for DrawScaledDecodedImageFrame {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawScaledDecodedImageFrame;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(enclosing_int_rect(self.dst_rect))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DrawRepeatedDecodedImageFrame {
+    pub dst_rect: IntRect,
+    pub clip_rect: IntRect,
+    pub frame_id: ImageFrameResourceId,
+    pub scaling_mode: ScalingMode,
+    pub repeat: Repeat,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
+    pub isolated_backdrop_color: OptionalColor,
+    pub apply_force_dark: bool,
+}
+ffi_bytes_fields!(DrawRepeatedDecodedImageFrame {
+    dst_rect,
+    clip_rect,
+    frame_id,
+    scaling_mode,
+    repeat,
+    compositing_and_blending_operator,
+    isolated_backdrop_color,
+    apply_force_dark
+});
+
+impl DisplayListCommand for DrawRepeatedDecodedImageFrame {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawRepeatedDecodedImageFrame;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.clip_rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DrawRepeatedTile {
+    pub dst_rect: FloatRect,
+    pub clip_rect: IntRect,
+    pub tile_size: IntSize,
+    pub tile_step: FloatSize,
+    // Tile records paint into a raster of tile_size, with its origin at (0, 0).
+    pub tile: DisplayListDataSpan,
+    pub scaling_mode: ScalingMode,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
+    pub repeat: Repeat,
+}
+ffi_bytes_fields!(DrawRepeatedTile {
+    dst_rect,
+    clip_rect,
+    tile_size,
+    tile_step,
+    tile,
+    scaling_mode,
+    compositing_and_blending_operator,
+    repeat
+});
+
+impl DisplayListCommand for DrawRepeatedTile {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawRepeatedTile;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.clip_rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DrawTiledDecodedImageFrame {
+    pub tile_rect: FloatRect,
+    pub clip_rect: IntRect,
+    pub src_rect: FloatRect,
+    pub tile_step: FloatSize,
+    pub frame_id: ImageFrameResourceId,
+    pub scaling_mode: ScalingMode,
+    pub tile_count_x: OptionalU32,
+    pub tile_count_y: OptionalU32,
+    pub apply_force_dark: bool,
+}
+ffi_bytes_fields!(DrawTiledDecodedImageFrame {
+    tile_rect,
+    clip_rect,
+    src_rect,
+    tile_step,
+    frame_id,
+    scaling_mode,
+    tile_count_x,
+    tile_count_y,
+    apply_force_dark
+});
+
+impl DisplayListCommand for DrawTiledDecodedImageFrame {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawTiledDecodedImageFrame;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.clip_rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DrawCompositedContext {
+    pub dst_rect: FloatRect,
+    pub child_context_id: CompositorContextId,
+    pub scaling_mode: ScalingMode,
+}
+ffi_bytes_fields!(DrawCompositedContext {
+    dst_rect,
+    child_context_id,
+    scaling_mode
+});
+
+impl DisplayListCommand for DrawCompositedContext {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawCompositedContext;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(enclosing_int_rect(self.dst_rect))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DrawCanvas {
+    pub dst_rect: IntRect,
+    pub canvas_id: CanvasId,
+    // NB: The canvas pixels live in the compositor's canvas surface registry, so the command bytes don't
+    //     change when the canvas content does. The content generation encodes content changes so that display
+    //     list damage computation can tell that the canvas needs to be repainted.
+    pub content_generation: u64,
+    pub scaling_mode: ScalingMode,
+}
+ffi_bytes_fields!(DrawCanvas {
+    dst_rect,
+    canvas_id,
+    content_generation,
+    scaling_mode
+});
+
+impl DisplayListCommand for DrawCanvas {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawCanvas;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.dst_rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DrawVideoFrame {
+    pub dst_rect: IntRect,
+    pub video_sink_id: VideoSinkResourceId,
+    pub scaling_mode: ScalingMode,
+}
+ffi_bytes_fields!(DrawVideoFrame {
+    dst_rect,
+    video_sink_id,
+    scaling_mode
+});
+
+impl DisplayListCommand for DrawVideoFrame {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawVideoFrame;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.dst_rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct PaintLinearGradient {
+    pub gradient_rect: IntRect,
+    pub gradient_angle: f32,
+    pub color_stops: DisplayListGradientColorStops,
+    pub first_stop_position: f32,
+    pub repeat_length: f32,
+    pub interpolation_method: GradientInterpolationMethod,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
+}
+ffi_bytes_fields!(PaintLinearGradient {
+    gradient_rect,
+    gradient_angle,
+    color_stops,
+    first_stop_position,
+    repeat_length,
+    interpolation_method,
+    compositing_and_blending_operator
+});
+
+impl DisplayListCommand for PaintLinearGradient {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintLinearGradient;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.gradient_rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct PaintOuterBoxShadow {
+    pub color: Color,
+    pub blur_radius: i32,
+    pub device_content_rect: IntRect,
+    pub content_corner_radii: CornerRadii,
+    pub shadow_rect: IntRect,
+    pub shadow_corner_radii: CornerRadii,
+}
+ffi_bytes_fields!(PaintOuterBoxShadow {
+    color,
+    blur_radius,
+    device_content_rect,
+    content_corner_radii,
+    shadow_rect,
+    shadow_corner_radii
+});
+
+impl DisplayListCommand for PaintOuterBoxShadow {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintOuterBoxShadow;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        let blur_margin = self.blur_radius * 2;
+        Some(
+            self.shadow_rect
+                .inflated_edges(blur_margin, blur_margin, blur_margin, blur_margin),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct PaintInnerBoxShadow {
+    pub color: Color,
+    pub blur_radius: i32,
+    pub device_content_rect: IntRect,
+    pub content_corner_radii: CornerRadii,
+    pub outer_shadow_rect: IntRect,
+    pub inner_shadow_rect: IntRect,
+    pub inner_shadow_corner_radii: CornerRadii,
+}
+ffi_bytes_fields!(PaintInnerBoxShadow {
+    color,
+    blur_radius,
+    device_content_rect,
+    content_corner_radii,
+    outer_shadow_rect,
+    inner_shadow_rect,
+    inner_shadow_corner_radii
+});
+
+impl DisplayListCommand for PaintInnerBoxShadow {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintInnerBoxShadow;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.device_content_rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct PaintTextShadow {
+    pub font_id: FontResourceId,
+    pub glyphs: DisplayListDataSpan,
+    pub shadow_bounding_rect: IntRect,
+    pub rect: IntRect,
+    pub translation: FloatPoint,
+    pub scale: f32,
+    pub blur_radius: i32,
+    pub color: Color,
+    pub orientation: Orientation,
+    pub font_smoothing: u8,
+}
+ffi_bytes_fields!(PaintTextShadow {
+    font_id,
+    glyphs,
+    shadow_bounding_rect,
+    rect,
+    translation,
+    scale,
+    blur_radius,
+    color,
+    orientation,
+    font_smoothing
+});
+
+impl DisplayListCommand for PaintTextShadow {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintTextShadow;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.shadow_bounding_rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct FillRectWithRoundedCorners {
+    pub rect: IntRect,
+    pub color: Color,
+    pub corner_radii: CornerRadii,
+    pub background_color_animation_effect: EffectNodeIndex,
+}
+ffi_bytes_fields!(FillRectWithRoundedCorners {
+    rect,
+    color,
+    corner_radii,
+    background_color_animation_effect
+});
+
+impl DisplayListCommand for FillRectWithRoundedCorners {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::FillRectWithRoundedCorners;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.rect)
+    }
+}
+
+/// The band between a rounded rect and the same rect shrunk by an edge width on each side, with each corner
+/// of the inner outline keeping the outer radius minus the widths of its two adjacent edges (square once
+/// either reaches zero). This is the shape of a uniformly colored CSS border, painted in one draw.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct FillRoundedRectRing {
+    pub rect: IntRect,
+    pub corner_radii: CornerRadii,
+    pub top_width: i32,
+    pub right_width: i32,
+    pub bottom_width: i32,
+    pub left_width: i32,
+    pub color: Color,
+}
+ffi_bytes_fields!(FillRoundedRectRing {
+    rect,
+    corner_radii,
+    top_width,
+    right_width,
+    bottom_width,
+    left_width,
+    color
+});
+
+impl DisplayListCommand for FillRoundedRectRing {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::FillRoundedRectRing;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct FillPath {
+    pub path_bounding_rect: FloatRect,
+    pub path_data: DisplayListDataSpan,
+    pub opacity: f32,
+    pub paint_kind: PathPaintKind,
+    pub color: Color,
+    pub paint_style: DisplayListPaintStyle,
+    pub winding_rule: WindingRule,
+    pub should_anti_alias: ShouldAntiAlias,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
+}
+ffi_bytes_fields!(FillPath {
+    path_bounding_rect,
+    path_data,
+    opacity,
+    paint_kind,
+    color,
+    paint_style,
+    winding_rule,
+    should_anti_alias,
+    compositing_and_blending_operator
+});
+
+impl DisplayListCommand for FillPath {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::FillPath;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(enclosing_int_rect(self.path_bounding_rect))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct StrokePath {
+    pub cap_style: CapStyle,
+    pub join_style: JoinStyle,
+    pub miter_limit: f32,
+    pub dash_array: DisplayListDataSpan,
+    pub dash_offset: f32,
+    pub path_bounding_rect: FloatRect,
+    pub path_data: DisplayListDataSpan,
+    pub opacity: f32,
+    pub paint_kind: PathPaintKind,
+    pub color: Color,
+    pub paint_style: DisplayListPaintStyle,
+    pub thickness: f32,
+    pub should_anti_alias: ShouldAntiAlias,
+}
+ffi_bytes_fields!(StrokePath {
+    cap_style,
+    join_style,
+    miter_limit,
+    dash_array,
+    dash_offset,
+    path_bounding_rect,
+    path_data,
+    opacity,
+    paint_kind,
+    color,
+    paint_style,
+    thickness,
+    should_anti_alias
+});
+
+impl DisplayListCommand for StrokePath {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::StrokePath;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(enclosing_int_rect(self.path_bounding_rect))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DrawEllipse {
+    pub rect: IntRect,
+    pub color: Color,
+    pub thickness: i32,
+}
+ffi_bytes_fields!(DrawEllipse { rect, color, thickness });
+
+impl DisplayListCommand for DrawEllipse {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawEllipse;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DrawLine {
+    pub color: Color,
+    pub from: IntPoint,
+    pub to: IntPoint,
+    pub thickness: i32,
+    pub style: LineStyle,
+    pub alternate_color: Color,
+}
+ffi_bytes_fields!(DrawLine {
+    color,
+    from,
+    to,
+    thickness,
+    style,
+    alternate_color
+});
+
+impl DisplayListCommand for DrawLine {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawLine;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(int_rect_from_two_points(self.from, self.to).inflated(self.thickness, self.thickness))
+    }
+}
+
+// The backdrop filter is applied by the effect the box records under. This command holds the box's
+// place in paint order, so the effect is entered there even when the box paints nothing else.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct BackdropFilterRegion {
+    pub rect: IntRect,
+}
+ffi_bytes_fields!(BackdropFilterRegion { rect });
+
+impl DisplayListCommand for BackdropFilterRegion {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::BackdropFilterRegion;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DrawRect {
+    pub rect: IntRect,
+    pub color: Color,
+    pub rough: bool,
+}
+ffi_bytes_fields!(DrawRect { rect, color, rough });
+
+impl DisplayListCommand for DrawRect {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawRect;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct PaintRadialGradient {
+    pub rect: IntRect,
+    pub color_stops: DisplayListGradientColorStops,
+    pub interpolation_method: GradientInterpolationMethod,
+    pub center: IntPoint,
+    pub size: IntSize,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
+}
+ffi_bytes_fields!(PaintRadialGradient {
+    rect,
+    color_stops,
+    interpolation_method,
+    center,
+    size,
+    compositing_and_blending_operator
+});
+
+impl DisplayListCommand for PaintRadialGradient {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintRadialGradient;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct PaintConicGradient {
+    pub rect: IntRect,
+    pub start_angle: f32,
+    pub color_stops: DisplayListGradientColorStops,
+    pub interpolation_method: GradientInterpolationMethod,
+    pub position: IntPoint,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
+}
+ffi_bytes_fields!(PaintConicGradient {
+    rect,
+    start_angle,
+    color_stops,
+    interpolation_method,
+    position,
+    compositing_and_blending_operator
+});
+
+impl DisplayListCommand for PaintConicGradient {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintConicGradient;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct PaintNestedDisplayList {
+    pub display_list_id: DisplayListResourceId,
+    pub rect: FloatRect,
+    // The size the nested list was recorded at; replay scales it into the destination rect.
+    pub list_size: IntSize,
+}
+ffi_bytes_fields!(PaintNestedDisplayList {
+    display_list_id,
+    rect,
+    list_size
+});
+
+impl DisplayListCommand for PaintNestedDisplayList {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintNestedDisplayList;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(enclosing_int_rect(self.rect))
+    }
+}
+
+// Plays the content records inside an internally scoped saveLayer that carries
+// the group's opacity, blend and filter, optionally masked by a second run of
+// records composited with DestinationIn, so a group that must not blend with
+// the canvas needs no clips or effects. Both runs are recorded in place inside
+// this command's payload under its context.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DrawIsolatedGroup {
+    pub clip_rect: OptionalFloatRect,
+    pub content: DisplayListDataSpan,
+    pub mask: DisplayListDataSpan,
+    pub filter: DisplayListDataSpan,
+    pub opacity: f32,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
+    pub mask_kind: MaskKind,
+}
+ffi_bytes_fields!(DrawIsolatedGroup {
+    clip_rect,
+    content,
+    mask,
+    filter,
+    opacity,
+    compositing_and_blending_operator,
+    mask_kind
+});
+
+impl DisplayListCommand for DrawIsolatedGroup {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawIsolatedGroup;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        self.clip_rect.get().map(enclosing_int_rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DeclareMaskContent {
+    pub rect: IntRect,
+    pub effect: EffectNodeIndex,
+    pub content: DisplayListDataSpan,
+}
+ffi_bytes_fields!(DeclareMaskContent { rect, effect, content });
+
+impl DisplayListCommand for DeclareMaskContent {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DeclareMaskContent;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct CompositorScrollNode {
+    pub document_id: UniqueNodeId,
+    pub scrollable_node_id: UniqueNodeId,
+    pub scroll_node_index: SpatialNodeIndex,
+    pub parent_scroll_node_index: SpatialNodeIndex,
+    pub scrollport_rect: IntRect,
+    pub min_scroll_offset: FloatPoint,
+    pub max_scroll_offset: FloatPoint,
+    pub scroll_node_kind: CompositorScrollNodeKind,
+    pub pseudo_element_type: u8,
+    pub is_viewport: bool,
+    pub can_be_wheel_scrolled_horizontally: bool,
+    pub can_be_wheel_scrolled_vertically: bool,
+}
+ffi_bytes_fields!(CompositorScrollNode {
+    document_id,
+    scrollable_node_id,
+    scroll_node_index,
+    parent_scroll_node_index,
+    scrollport_rect,
+    min_scroll_offset,
+    max_scroll_offset,
+    scroll_node_kind,
+    pseudo_element_type,
+    is_viewport,
+    can_be_wheel_scrolled_horizontally,
+    can_be_wheel_scrolled_vertically
+});
+
+impl DisplayListCommand for CompositorScrollNode {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorScrollNode;
+}
+
+/// The geometry snap position selection runs over for a scroll node that is a snap container. In CSS
+/// pixels so that the compositor selects the same position the main thread would.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct CompositorSnapContainer {
+    pub document_id: UniqueNodeId,
+    pub scroll_node_index: SpatialNodeIndex,
+    pub snapport: FfiCssPixelRect,
+    pub min_scroll_offset: FfiCssPixelPoint,
+    pub max_scroll_offset: FfiCssPixelPoint,
+    pub strictness: u8,
+    pub snaps_x: bool,
+    pub snaps_y: bool,
+    pub horizontal_writing_mode: bool,
+}
+ffi_bytes_fields!(CompositorSnapContainer {
+    document_id,
+    scroll_node_index,
+    snapport,
+    min_scroll_offset,
+    max_scroll_offset,
+    strictness,
+    snaps_x,
+    snaps_y,
+    horizontal_writing_mode
+});
+
+impl DisplayListCommand for CompositorSnapContainer {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorSnapContainer;
+}
+
+/// A snap area of the snap container recorded before it: the transformed border box with the scroll
+/// margin added, in the container's coordinate space, and the alignment along each physical axis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct CompositorSnapArea {
+    pub document_id: UniqueNodeId,
+    pub scroll_node_index: SpatialNodeIndex,
+    pub area_node_id: UniqueNodeId,
+    pub pseudo_element_type: u8,
+    pub rect: FfiCssPixelRect,
+    pub align_x: u8,
+    pub align_y: u8,
+    pub always_stop: bool,
+}
+ffi_bytes_fields!(CompositorSnapArea {
+    document_id,
+    scroll_node_index,
+    area_node_id,
+    pseudo_element_type,
+    rect,
+    align_x,
+    align_y,
+    always_stop
+});
+
+impl DisplayListCommand for CompositorSnapArea {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorSnapArea;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct CompositorBlockingWheelEventRegion {
+    pub rect: FloatRect,
+}
+ffi_bytes_fields!(CompositorBlockingWheelEventRegion { rect });
+
+impl DisplayListCommand for CompositorBlockingWheelEventRegion {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorBlockingWheelEventRegion;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct CompositorWheelHitTestTarget {
+    pub document_id: UniqueNodeId,
+    pub target_scroll_node_index: SpatialNodeIndex,
+    pub rect: FloatRect,
+}
+ffi_bytes_fields!(CompositorWheelHitTestTarget {
+    document_id,
+    target_scroll_node_index,
+    rect
+});
+
+impl DisplayListCommand for CompositorWheelHitTestTarget {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorWheelHitTestTarget;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct CompositorWheelHitTestTargetWithCornerRadii {
+    pub document_id: UniqueNodeId,
+    pub target_scroll_node_index: SpatialNodeIndex,
+    pub rect: FloatRect,
+    pub corner_radii: CornerRadii,
+}
+ffi_bytes_fields!(CompositorWheelHitTestTargetWithCornerRadii {
+    document_id,
+    target_scroll_node_index,
+    rect,
+    corner_radii
+});
+
+impl DisplayListCommand for CompositorWheelHitTestTargetWithCornerRadii {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorWheelHitTestTargetWithCornerRadii;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct CompositorMainThreadWheelEventRegion {
+    pub rect: FloatRect,
+}
+ffi_bytes_fields!(CompositorMainThreadWheelEventRegion { rect });
+
+impl DisplayListCommand for CompositorMainThreadWheelEventRegion {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorMainThreadWheelEventRegion;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct CompositorScrollbar {
+    pub document_id: UniqueNodeId,
+    pub scroll_node_index: SpatialNodeIndex,
+    pub gutter_rect: IntRect,
+    pub thumb_rect: IntRect,
+    pub track_rect: IntRect,
+    pub expanded_gutter_rect: IntRect,
+    pub expanded_thumb_rect: IntRect,
+    pub scroll_size: f64,
+    pub expanded_scroll_size: f64,
+    pub min_scroll_offset: f32,
+    pub max_scroll_offset: f32,
+    pub thumb_color: Color,
+    pub track_color: Color,
+    pub vertical: bool,
+    pub is_painted_by_compositor: bool,
+    pub display_list_paints_enlarged_scrollbar: bool,
+}
+ffi_bytes_fields!(CompositorScrollbar {
+    document_id,
+    scroll_node_index,
+    gutter_rect,
+    thumb_rect,
+    track_rect,
+    expanded_gutter_rect,
+    expanded_thumb_rect,
+    scroll_size,
+    expanded_scroll_size,
+    min_scroll_offset,
+    max_scroll_offset,
+    thumb_color,
+    track_color,
+    vertical,
+    is_painted_by_compositor,
+    display_list_paints_enlarged_scrollbar
+});
+
+impl DisplayListCommand for CompositorScrollbar {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorScrollbar;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct PaintScrollBar {
+    pub scroll_node_index: SpatialNodeIndex,
+    pub gutter_rect: IntRect,
+    pub thumb_rect: IntRect,
+    pub track_rect: IntRect,
+    pub scroll_size: f64,
+    pub thumb_color: Color,
+    pub track_color: Color,
+    pub vertical: bool,
+}
+ffi_bytes_fields!(PaintScrollBar {
+    scroll_node_index,
+    gutter_rect,
+    thumb_rect,
+    track_rect,
+    scroll_size,
+    thumb_color,
+    track_color,
+    vertical
+});
+
+impl DisplayListCommand for PaintScrollBar {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintScrollBar;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.track_rect.united(self.thumb_rect))
+    }
+}
+
+pub fn int_rect_from_two_points(a: IntPoint, b: IntPoint) -> IntRect {
+    IntRect::new(a.x.min(b.x), a.y.min(b.y), (a.x - b.x).abs(), (a.y - b.y).abs())
+}

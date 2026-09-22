@@ -284,7 +284,7 @@ pub(crate) fn box_owns_geometry_dependent_nodes(
     });
     let effects_filter_is_resolved_by_the_host_against_geometry = layout_arena
         .node_style_if_live(slot)
-        .is_some_and(|style| crate::painting::filter_bytes::contains_url(&style.effects().filter));
+        .is_some_and(|style| crate::painting::css_filter::contains_url(&style.effects().filter));
     let clips_are_geometry_dependent = handles
         .clip_handles()
         .any(|index| tree.clip_nodes[index.0 as usize].data.is_live());
@@ -704,6 +704,7 @@ pub(crate) fn debug_assert_every_live_node_is_owned(
 mod tests {
     use super::*;
     use libgfx_rust::{CompositingAndBlendingOperator, FloatMatrix4x4};
+    use libgfx_rust::{FloatPoint, FloatRect};
 
     fn effects() -> EffectNodeData {
         EffectNodeData::Effects(EffectsData {

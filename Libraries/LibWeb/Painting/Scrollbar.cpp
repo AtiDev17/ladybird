@@ -16,12 +16,12 @@
 
 namespace Web::Painting {
 
-NonnullRefPtr<Scrollbar> Scrollbar::create(Layout::NodeArena& arena, Layout::RustFFI::NodeSlotId slot, ScrollDirection direction)
+NonnullRefPtr<Scrollbar> Scrollbar::create(Layout::NodeArena& arena, Compositing::RustFFI::NodeSlotId slot, ScrollDirection direction)
 {
     return adopt_ref(*new Scrollbar(arena, slot, direction));
 }
 
-Scrollbar::Scrollbar(Layout::NodeArena& arena, Layout::RustFFI::NodeSlotId slot, ScrollDirection direction)
+Scrollbar::Scrollbar(Layout::NodeArena& arena, Compositing::RustFFI::NodeSlotId slot, ScrollDirection direction)
     : ChromeWidget(arena, slot)
     , m_direction(direction)
 {
@@ -180,7 +180,7 @@ bool Scrollbar::scroll_to_mouse_position(CSSPixelPoint position)
     // Common examples of absolute scrolls include:
     //     manipulating the scrollbar "thumb" explicitly
     if (auto navigable = node->document().navigable())
-        navigable->note_user_scroll_input_intent(Painting::SnapSelectionStrategy::Type::EndPosition);
+        navigable->note_user_scroll_input_intent(Compositing::SnapSelectionStrategy::Type::EndPosition);
 
     Painting::set_scroll_offset_from_user_input(*node, new_scroll_offset, Painting::ScrollKind::Absolute);
     return true;

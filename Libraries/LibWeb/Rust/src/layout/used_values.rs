@@ -15,37 +15,7 @@ pub(crate) enum SizeConstraint {
     MaxContent,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub struct FfiCssPixelPoint {
-    pub x: CssPixels,
-    pub y: CssPixels,
-}
-
-impl Default for FfiCssPixelPoint {
-    fn default() -> Self {
-        Self {
-            x: CssPixels::from_raw(0),
-            y: CssPixels::from_raw(0),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct FfiCssPixelSize {
-    pub width: CssPixels,
-    pub height: CssPixels,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct FfiCssPixelRect {
-    pub x: CssPixels,
-    pub y: CssPixels,
-    pub width: CssPixels,
-    pub height: CssPixels,
-}
+pub use crate::css::css_pixels::{FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -155,58 +125,6 @@ impl From<Option<usize>> for OptionalUsize {
         Self {
             value: value.unwrap_or_default(),
             has_value: value.is_some(),
-        }
-    }
-}
-
-impl From<FfiCssPixelPoint> for CssPixelPoint {
-    fn from(point: FfiCssPixelPoint) -> Self {
-        Self { x: point.x, y: point.y }
-    }
-}
-
-impl From<CssPixelPoint> for FfiCssPixelPoint {
-    fn from(point: CssPixelPoint) -> Self {
-        Self { x: point.x, y: point.y }
-    }
-}
-
-impl From<FfiCssPixelSize> for CssPixelSize {
-    fn from(size: FfiCssPixelSize) -> Self {
-        Self {
-            width: size.width,
-            height: size.height,
-        }
-    }
-}
-
-impl From<CssPixelSize> for FfiCssPixelSize {
-    fn from(size: CssPixelSize) -> Self {
-        Self {
-            width: size.width,
-            height: size.height,
-        }
-    }
-}
-
-impl From<FfiCssPixelRect> for CssPixelRect {
-    fn from(rect: FfiCssPixelRect) -> Self {
-        Self {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
-        }
-    }
-}
-
-impl From<CssPixelRect> for FfiCssPixelRect {
-    fn from(rect: CssPixelRect) -> Self {
-        Self {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
         }
     }
 }

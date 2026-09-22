@@ -60,12 +60,12 @@ GC::Ptr<SVG::SVGFilterElement> resolve_svg_filter_reference(CSS::ComputedValuesF
     return referenced_element ? as_if<SVG::SVGFilterElement>(*referenced_element) : nullptr;
 }
 
-Layout::RustFFI::NodeSlotId committed_row_slot(Layout::Node const& node)
+Compositing::RustFFI::NodeSlotId committed_row_slot(Layout::Node const& node)
 {
     return Layout::Node::slot_id(&node);
 }
 
-Layout::RustFFI::NodeSlotId viewport_row_slot(DOM::Document const& document)
+Compositing::RustFFI::NodeSlotId viewport_row_slot(DOM::Document const& document)
 {
     return Layout::Node::slot_id(document.unsafe_layout_node());
 }
@@ -80,7 +80,7 @@ bool has_committed_box(Layout::Node const& node)
     return committed_row(node) != nullptr;
 }
 
-Layout::Node* layout_node_for_committed_slot(Layout::NodeArena& arena, Layout::RustFFI::NodeSlotId slot)
+Layout::Node* layout_node_for_committed_slot(Layout::NodeArena& arena, Compositing::RustFFI::NodeSlotId slot)
 {
     return static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_paintable_layout_node_shell(arena.handle(), slot));
 }
@@ -256,28 +256,28 @@ bool has_accumulated_visual_context(Layout::Node const& node)
     return row && row->has_accumulated_visual_context;
 }
 
-ContextRef accumulated_visual_context(Layout::Node const& node)
+Compositing::ContextRef accumulated_visual_context(Layout::Node const& node)
 {
     auto const* row = committed_row(node);
-    return row ? row->accumulated_visual_context : ContextRef {};
+    return row ? row->accumulated_visual_context : Compositing::ContextRef {};
 }
 
-ContextRef accumulated_visual_context_for_descendants(Layout::Node const& node)
+Compositing::ContextRef accumulated_visual_context_for_descendants(Layout::Node const& node)
 {
     auto const* row = committed_row(node);
-    return row ? row->accumulated_visual_context_for_descendants : ContextRef {};
+    return row ? row->accumulated_visual_context_for_descendants : Compositing::ContextRef {};
 }
 
-SpatialNodeIndex enclosing_scroll_node_index(Layout::Node const& node)
+Compositing::SpatialNodeIndex enclosing_scroll_node_index(Layout::Node const& node)
 {
     auto const* row = committed_row(node);
-    return row ? row->enclosing_scroll_node_index : VISUAL_VIEWPORT_NODE_INDEX;
+    return row ? row->enclosing_scroll_node_index : Compositing::VISUAL_VIEWPORT_NODE_INDEX;
 }
 
-SpatialNodeIndex own_scroll_node_index(Layout::Node const& node)
+Compositing::SpatialNodeIndex own_scroll_node_index(Layout::Node const& node)
 {
     auto const* row = committed_row(node);
-    return row ? row->own_scroll_node_index : VISUAL_VIEWPORT_NODE_INDEX;
+    return row ? row->own_scroll_node_index : Compositing::VISUAL_VIEWPORT_NODE_INDEX;
 }
 
 Gfx::Path const* committed_svg_path(Layout::Node const& node)
@@ -444,7 +444,7 @@ CSSPixelRect caret_rect_for_child_offset(Layout::Node const& block, size_t offse
 Layout::RustFFI::FfiCaretPaint resolve_document_caret_paint(DOM::Document& document)
 {
     Layout::RustFFI::FfiCaretPaint caret {};
-    Layout::RustFFI::NodeSlotId const no_slot { Layout::RustFFI::INVALID_NODE_SLOT_INDEX };
+    Compositing::RustFFI::NodeSlotId const no_slot { Compositing::RustFFI::INVALID_NODE_SLOT_INDEX };
     caret.kind = Layout::RustFFI::FfiCaretPaintKind::None;
     caret.block = no_slot;
     caret.owner = no_slot;
@@ -468,7 +468,7 @@ Layout::RustFFI::FfiCaretPaint resolve_document_caret_paint(DOM::Document& docum
     if (!cursor_is_editable)
         return caret;
 
-    auto fill = [&](Layout::RustFFI::FfiCaretPaintKind kind, Layout::RustFFI::NodeSlotId block, Layout::RustFFI::NodeSlotId owner, CSSPixelRect rect, Color color) {
+    auto fill = [&](Layout::RustFFI::FfiCaretPaintKind kind, Compositing::RustFFI::NodeSlotId block, Compositing::RustFFI::NodeSlotId owner, CSSPixelRect rect, Color color) {
         caret.kind = kind;
         caret.block = block;
         caret.owner = owner;
@@ -632,7 +632,7 @@ CSSPixelRect transform_reference_box(Layout::Node const& node)
     return Layout::RustFFI::layout_arena_paintable_transform_reference_box(node.arena_handle(), committed_row_slot(node));
 }
 
-CSSPixelRect transform_rect_to_viewport(Layout::Node const& node, CSSPixelRect const& rect, AccumulatedVisualContextTree::IncludeVisualViewportTransform include_visual_viewport_transform)
+CSSPixelRect transform_rect_to_viewport(Layout::Node const& node, CSSPixelRect const& rect, Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform include_visual_viewport_transform)
 {
     auto const* row = committed_row(node);
     if (!row)
@@ -856,7 +856,7 @@ Layout::RustFFI::FfiRectToViewportTransform identity_rect_to_viewport_transform(
     return {};
 }
 
-Layout::RustFFI::FfiRectToViewportTransform rect_to_viewport_transform(DOM::Document const& document, AccumulatedVisualContextTree const& visual_context_tree)
+Layout::RustFFI::FfiRectToViewportTransform rect_to_viewport_transform(DOM::Document const& document, Compositing::AccumulatedVisualContextTree const& visual_context_tree)
 {
     if (!document.has_committed_viewport_box())
         return identity_rect_to_viewport_transform();
@@ -888,7 +888,7 @@ CSSPixelRect bounding_client_rect(Layout::Node const& node, Layout::RustFFI::Ffi
 CSSPixelPoint cumulative_scroll_compensation(Layout::Node const& node)
 {
     auto index = enclosing_scroll_node_index(node);
-    if (index == VISUAL_VIEWPORT_NODE_INDEX)
+    if (index == Compositing::VISUAL_VIEWPORT_NODE_INDEX)
         return {};
     auto const& document = node.document();
     if (!document.layout_node() || !has_committed_box(*document.layout_node()))
