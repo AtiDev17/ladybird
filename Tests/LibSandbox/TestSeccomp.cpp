@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/Atomic.h>
 #include <AK/OwnPtr.h>
 #include <AK/Time.h>
@@ -14,15 +15,22 @@
 #include <LibTest/TestCase.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <linux/filter.h>
+#include <linux/landlock.h>
+#include <linux/netlink.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -111,6 +119,201 @@ static int run_with_policy(Configure configure, Body body)
     return status;
 }
 
+TEST_CASE(runtime_policy_refuses_other_processes_and_resource_limit_changes)
+{
+    auto parent = getpid();
+    auto body = [&] {
+        rlimit limit {};
+        VERIFY(getrlimit(RLIMIT_NOFILE, &limit) == 0);
+        VERIFY(syscall(__NR_prlimit64, getpid(), RLIMIT_NOFILE, nullptr, &limit) == 0);
+        VERIFY(syscall(__NR_prlimit64, parent, RLIMIT_NOFILE, nullptr, &limit) == -1);
+        VERIFY(errno == EPERM);
+        VERIFY(syscall(__NR_prlimit64, parent, RLIMIT_NOFILE, &limit, nullptr) == -1);
+        VERIFY(errno == EPERM);
+        VERIFY(syscall(__NR_prlimit64, 0, RLIMIT_NOFILE, &limit, nullptr) == -1);
+        VERIFY(errno == EPERM);
+        VERIFY(syscall(__NR_prlimit64, 0, RLIMIT_NOFILE, reinterpret_cast<void*>(1ULL << 32), nullptr) == -1);
+        VERIFY(errno == EPERM);
+
+        // Signal 0 checks permission without delivering a signal to the test runner.
+        VERIFY(syscall(__NR_tgkill, parent, parent, 0) == -1);
+        VERIFY(errno == EPERM);
+        VERIFY(syscall(__NR_tgkill, getpid(), syscall(__NR_gettid), 0) == 0);
+    };
+    auto status = run_with_policy([](auto&) { }, body);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST_CASE(runtime_policy_allows_thread_self_signals)
+{
+    auto body = [] {
+        VERIFY(signal(SIGUSR1, [](int) { }) != SIG_ERR);
+        pthread_t thread;
+        VERIFY(pthread_create(&thread, nullptr, [](void*) -> void* {
+            VERIFY(pthread_kill(pthread_self(), SIGUSR1) == 0);
+            return nullptr; }, nullptr) == 0);
+        VERIFY(pthread_join(thread, nullptr) == 0);
+    };
+    auto status = run_with_policy([](auto&) { }, body);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST_CASE(runtime_policy_limits_prctl_operations)
+{
+    auto body = [] {
+        VERIFY(prctl(PR_SET_NAME, "sandbox-test", 0ul, 0ul, 0ul) == 0);
+        char name[16] {};
+        VERIFY(prctl(PR_GET_NAME, name, 0ul, 0ul, 0ul) == 0);
+        VERIFY(strcmp(name, "sandbox-test") == 0);
+        VERIFY(prctl(PR_CAPBSET_READ, 0ul, 0ul, 0ul, 0ul) >= 0);
+        VERIFY(prctl(PR_SET_DUMPABLE, 0ul, 0ul, 0ul, 0ul) == -1);
+        VERIFY(errno == EPERM);
+        VERIFY(prctl(PR_SET_PDEATHSIG, SIGKILL, 0ul, 0ul, 0ul) == -1);
+        VERIFY(errno == EPERM);
+        VERIFY(prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0ul, 0ul, 0ul) == -1);
+        VERIFY(errno == EPERM);
+#if defined(PR_SET_VMA) && defined(PR_SET_VMA_ANON_NAME)
+        auto page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        auto* mapping = mmap(nullptr, page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        VERIFY(mapping != MAP_FAILED);
+        auto result = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, mapping, page_size, "sandbox-test");
+        // Older kernels do not implement anonymous mapping names.
+        VERIFY(result == 0 || (result == -1 && errno == EINVAL));
+        VERIFY(munmap(mapping, page_size) == 0);
+        VERIFY(prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME + 1, 0ul, 0ul, 0ul) == -1);
+        VERIFY(errno == EPERM);
+#endif
+    };
+    auto status = run_with_policy([](auto&) { }, body);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST_CASE(process_creation_policy_allows_parent_death_signal)
+{
+    auto status = run_with_policy(
+        [](auto& policy) { policy.allow_process_creation(); },
+        [] {
+            VERIFY(prctl(PR_SET_PDEATHSIG, SIGKILL, 0ul, 0ul, 0ul) == 0);
+            VERIFY(prctl(PR_SET_PDEATHSIG, SIGUSR1, 0ul, 0ul, 0ul) == -1);
+            VERIFY(errno == EPERM);
+        });
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST_CASE(gpu_policy_allows_graphics_ioctl_families)
+{
+    auto status = run_with_policy(
+        [](auto& policy) { policy.allow_gpu_device_operations(); },
+        [] {
+            for (auto type : { 'd', 'b', '>', 'u', 'F', 'm' }) {
+                // EBADF proves the request reached the kernel without requiring GPU hardware.
+                VERIFY(ioctl(-1, _IO(type, 0), nullptr) == -1);
+                VERIFY(errno == EBADF);
+            }
+        });
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST_CASE(gpu_policy_does_not_allow_unrelated_ioctls)
+{
+    for (auto request : Array<unsigned long, 3> { TIOCSTI, _IO('f', 2), _IO('X', 0) }) {
+        auto status = run_with_policy(
+            [](auto& policy) { policy.allow_gpu_device_operations(); },
+            [&] { (void)ioctl(-1, request, nullptr); });
+        EXPECT(WIFEXITED(status));
+        if (WIFEXITED(status))
+            EXPECT_EQ(WEXITSTATUS(status), 128 + SIGSYS);
+    }
+}
+
+TEST_CASE(filesystem_write_policy_refuses_timestamp_changes_outside_landlock)
+{
+    if (syscall(__NR_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION) < 1) {
+        warnln("Skipping timestamp confinement test: Landlock is required");
+        return;
+    }
+
+    char path[] = "/tmp/ladybird-utimensat-XXXXXX";
+    auto fd = mkstemp(path);
+    VERIFY(fd >= 0);
+    timespec original_times[2] { { 123456789, 0 }, { 123456789, 0 } };
+    VERIFY(futimens(fd, original_times) == 0);
+
+    auto status = run_with_policy(
+        [&](auto& policy) {
+            VERIFY(close(fd) == 0);
+            MUST(Sandbox::restrict_filesystem_with_landlock());
+            policy.allow_filesystem_writes();
+        },
+        [&] {
+            VERIFY(open(path, O_WRONLY) == -1);
+            VERIFY(errno == EACCES);
+            timespec changed_times[2] { { 987654321, 0 }, { 987654321, 0 } };
+            VERIFY(utimensat(AT_FDCWD, path, changed_times, 0) == -1);
+            VERIFY(errno == EPERM);
+            VERIFY(utimensat(AT_FDCWD, path, nullptr, 0) == -1);
+            VERIFY(errno == EPERM);
+        });
+
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+    struct stat metadata {};
+    VERIFY(fstat(fd, &metadata) == 0);
+    EXPECT_EQ(metadata.st_atim.tv_sec, original_times[0].tv_sec);
+    EXPECT_EQ(metadata.st_mtim.tv_sec, original_times[1].tv_sec);
+    VERIFY(close(fd) == 0);
+    VERIFY(unlink(path) == 0);
+}
+
+TEST_CASE(gpu_policy_refuses_path_permission_changes_without_crashing)
+{
+    char path[] = "/tmp/ladybird-chmod-XXXXXX";
+    auto fd = mkstemp(path);
+    VERIFY(fd >= 0);
+    VERIFY(fchmod(fd, 0600) == 0);
+
+    auto status = run_with_policy(
+        [](auto& policy) {
+            policy.allow_filesystem_writes();
+            policy.allow_gpu_device_operations();
+        },
+        [&] {
+#ifdef __NR_chmod
+            VERIFY(syscall(__NR_chmod, path, 0666) == -1);
+            VERIFY(errno == EPERM);
+#endif
+#ifdef __NR_fchmodat
+            VERIFY(syscall(__NR_fchmodat, AT_FDCWD, path, 0666) == -1);
+            VERIFY(errno == EPERM);
+#endif
+#ifdef __NR_fchmodat2
+            VERIFY(syscall(__NR_fchmodat2, AT_FDCWD, path, 0666, 0) == -1);
+            VERIFY(errno == EPERM);
+#endif
+        });
+
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+
+    struct stat metadata {};
+    VERIFY(fstat(fd, &metadata) == 0);
+    EXPECT_EQ(metadata.st_mode & 0777, 0600u);
+    VERIFY(close(fd) == 0);
+    VERIFY(unlink(path) == 0);
+}
+
 // A domain that no group asked for fails cleanly, so the child survives and sees the error.
 template<typename Configure>
 static void expect_socket_domain_is_refused(Configure configure, int domain)
@@ -193,16 +396,114 @@ TEST_CASE(ipc_policy_lets_a_process_pair_sockets_with_itself)
     auto status = run_with_policy(
         [](Sandbox::SeccompPolicy& policy) { policy.allow_ipc(); },
         [] {
-            int fds[2];
-            VERIFY(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+            for (auto type : { SOCK_STREAM, SOCK_SEQPACKET }) {
+                for (auto flags : Array<int, 4> { 0, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_CLOEXEC | SOCK_NONBLOCK }) {
+                    int fds[2];
+                    VERIFY(socketpair(AF_UNIX, type | flags, 0, fds) == 0);
 
-            char byte = 'k';
-            VERIFY(send(fds[0], &byte, 1, 0) == 1);
-            VERIFY(recv(fds[1], &byte, 1, 0) == 1);
-            VERIFY(byte == 'k');
+                    char byte = 'k';
+                    VERIFY(send(fds[0], &byte, 1, 0) == 1);
+                    VERIFY(recv(fds[1], &byte, 1, 0) == 1);
+                    VERIFY(byte == 'k');
 
-            VERIFY(close(fds[0]) == 0);
-            VERIFY(close(fds[1]) == 0);
+                    VERIFY(close(fds[0]) == 0);
+                    VERIFY(close(fds[1]) == 0);
+                }
+            }
+        });
+
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST_CASE(ipc_policy_refuses_datagram_socketpairs)
+{
+    auto status = run_with_policy(
+        [](Sandbox::SeccompPolicy& policy) { policy.allow_ipc(); },
+        [] {
+            for (auto type : Array<int, 3> { SOCK_DGRAM, SOCK_RAW, SOCK_STREAM | 0x100 }) {
+                for (auto flags : Array<int, 4> { 0, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_CLOEXEC | SOCK_NONBLOCK }) {
+                    int fds[2];
+                    VERIFY(socketpair(AF_UNIX, type | flags, 0, fds) == -1);
+                    VERIFY(errno == ESOCKTNOSUPPORT);
+                }
+            }
+        });
+
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST_CASE(ipc_policy_refuses_addressed_datagrams)
+{
+    char directory_template[] = "/tmp/ladybird-datagram-XXXXXX";
+    auto* directory = mkdtemp(directory_template);
+    VERIFY(directory);
+    auto path = ByteString::formatted("{}/socket", directory);
+
+    for (bool abstract : { false, true }) {
+        sockaddr_un address {};
+        address.sun_family = AF_UNIX;
+        memcpy(address.sun_path, path.characters(), path.length());
+        if (abstract)
+            address.sun_path[0] = '\0';
+
+        auto receiver = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        VERIFY(receiver >= 0);
+        VERIFY(bind(receiver, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+
+        // Inherit a datagram socketpair to test sendto() independently of the creation restrictions.
+        int sender[2];
+        VERIFY(socketpair(AF_UNIX, SOCK_DGRAM, 0, sender) == 0);
+        VERIFY(sendto(sender[0], "k", 1, 0, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 1);
+        char byte = 0;
+        VERIFY(recv(receiver, &byte, 1, 0) == 1);
+        VERIFY(byte == 'k');
+
+        auto status = run_with_policy(
+            [](Sandbox::SeccompPolicy& policy) { policy.allow_ipc(); },
+            [&] {
+                VERIFY(sendto(sender[0], "k", 1, 0, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == -1);
+                VERIFY(errno == EPERM);
+
+                // A pointer with a zero low word must not pass the null destination check.
+                VERIFY(sendto(sender[0], "k", 1, 0, reinterpret_cast<sockaddr*>(1ULL << 32), sizeof(address)) == -1);
+                VERIFY(errno == EPERM);
+            });
+
+        EXPECT(WIFEXITED(status));
+        if (WIFEXITED(status))
+            EXPECT_EQ(WEXITSTATUS(status), 0);
+
+        // The child has exited, so no send is pending and this needs no timeout.
+        EXPECT_EQ(recv(receiver, &byte, 1, 0), -1);
+        EXPECT_EQ(errno, EAGAIN);
+        VERIFY(close(sender[0]) == 0);
+        VERIFY(close(sender[1]) == 0);
+        VERIFY(close(receiver) == 0);
+    }
+
+    VERIFY(unlink(path.characters()) == 0);
+    VERIFY(rmdir(directory) == 0);
+}
+
+TEST_CASE(brokered_socket_creation_refuses_datagrams_before_contacting_the_broker)
+{
+    auto status = run_with_policy(
+        [](Sandbox::SeccompPolicy& policy) {
+            Sandbox::set_connect_broker_fd(-1);
+            policy.allow_ipc();
+            policy.broker_unix_socket_connections();
+        },
+        [] {
+            for (auto type : Array<int, 3> { SOCK_DGRAM, SOCK_RAW, SOCK_STREAM | 0x100 }) {
+                for (auto flags : Array<int, 4> { 0, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_CLOEXEC | SOCK_NONBLOCK }) {
+                    VERIFY(socket(AF_UNIX, type | flags, 0) == -1);
+                    VERIFY(errno == ESOCKTNOSUPPORT);
+                }
+            }
         });
 
     EXPECT(WIFEXITED(status));
@@ -352,6 +653,70 @@ TEST_CASE(network_policy_allows_only_the_internet_socket_options_we_use)
             VERIFY(close(udp_socket) == 0);
         });
 
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST_CASE(network_policy_allows_addressed_datagrams)
+{
+    auto receiver = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    VERIFY(receiver >= 0);
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    VERIFY(bind(receiver, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    socklen_t address_length = sizeof(address);
+    VERIFY(getsockname(receiver, reinterpret_cast<sockaddr*>(&address), &address_length) == 0);
+
+    auto status = run_with_policy(
+        [](Sandbox::SeccompPolicy& policy) {
+            policy.allow_ipc();
+            policy.allow_network();
+        },
+        [&] {
+            auto sender = socket(AF_INET, SOCK_DGRAM, 0);
+            VERIFY(sender >= 0);
+            VERIFY(sendto(sender, "k", 1, 0, reinterpret_cast<sockaddr*>(&address), address_length) == 1);
+            VERIFY(close(sender) == 0);
+        });
+
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+    char byte = 0;
+    EXPECT_EQ(recv(receiver, &byte, 1, 0), 1);
+    EXPECT_EQ(byte, 'k');
+    VERIFY(close(receiver) == 0);
+}
+
+TEST_CASE(network_policy_limits_netlink_to_interface_enumeration)
+{
+    auto status = run_with_policy(
+        [](auto& policy) {
+            policy.allow_ipc();
+            policy.allow_network();
+        },
+        [] {
+            for (auto type : { SOCK_RAW, SOCK_DGRAM }) {
+                for (auto flags : Array<int, 4> { 0, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_CLOEXEC | SOCK_NONBLOCK }) {
+                    auto fd = socket(AF_NETLINK, type | flags, NETLINK_ROUTE);
+                    VERIFY(fd >= 0);
+                    VERIFY(close(fd) == 0);
+                }
+                for (auto protocol : { NETLINK_USERSOCK, NETLINK_AUDIT, NETLINK_KOBJECT_UEVENT, NETLINK_GENERIC }) {
+                    VERIFY(socket(AF_NETLINK, type, protocol) == -1);
+                    VERIFY(errno == EPERM);
+                }
+            }
+            for (auto type : Array<int, 3> { SOCK_STREAM, SOCK_SEQPACKET, SOCK_RAW | 0x100 }) {
+                VERIFY(socket(AF_NETLINK, type, NETLINK_ROUTE) == -1);
+                VERIFY(errno == EPERM);
+            }
+            ifaddrs* interfaces = nullptr;
+            VERIFY(getifaddrs(&interfaces) == 0);
+            freeifaddrs(interfaces);
+        });
     EXPECT(WIFEXITED(status));
     if (WIFEXITED(status))
         EXPECT_EQ(WEXITSTATUS(status), 0);
@@ -581,6 +946,43 @@ static i32 await_broker_error(int reply_fd)
     }
 
     return response.error;
+}
+
+TEST_CASE(the_broker_refuses_datagrams_even_without_the_seccomp_policy)
+{
+    auto broker = MUST(Sandbox::ConnectBroker::create({}));
+    for (auto type : Array<int, 5> { SOCK_DGRAM, SOCK_RAW, SOCK_STREAM | 0x100, SOCK_STREAM, SOCK_SEQPACKET }) {
+        for (auto flags : Array<int, 4> { 0, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_CLOEXEC | SOCK_NONBLOCK }) {
+            Sandbox::Detail::ConnectBrokerRequest request {};
+            request.magic = Sandbox::Detail::connect_broker_magic;
+            request.operation = static_cast<u32>(Sandbox::Detail::ConnectBrokerOperation::CreateSocket);
+            request.socket_domain = AF_UNIX;
+            request.socket_type = type | flags;
+
+            int reply_fds[2];
+            VERIFY(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, reply_fds) == 0);
+            iovec io { .iov_base = &request, .iov_len = sizeof(request) };
+            union {
+                cmsghdr header;
+                char space[CMSG_SPACE(sizeof(int))];
+            } control {};
+            msghdr message {};
+            message.msg_iov = &io;
+            message.msg_iovlen = 1;
+            message.msg_control = &control;
+            message.msg_controllen = sizeof(control);
+            auto* header = CMSG_FIRSTHDR(&message);
+            header->cmsg_level = SOL_SOCKET;
+            header->cmsg_type = SCM_RIGHTS;
+            header->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(header), &reply_fds[1], sizeof(int));
+
+            VERIFY(sendmsg(broker->helper_fd(), &message, MSG_NOSIGNAL) == sizeof(request));
+            VERIFY(close(reply_fds[1]) == 0);
+            EXPECT_EQ(await_broker_error(reply_fds[0]), type == SOCK_STREAM || type == SOCK_SEQPACKET ? 0 : ESOCKTNOSUPPORT);
+            VERIFY(close(reply_fds[0]) == 0);
+        }
+    }
 }
 
 // The broker closes the connected socket and then the reply channel, both after answering. Waiting

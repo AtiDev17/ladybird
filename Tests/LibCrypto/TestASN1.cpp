@@ -184,8 +184,9 @@ TEST_CASE(test_encoder_primitives)
     roundtrip_value(TRY_OR_FAIL(Crypto::UnsignedBigInteger { 2 }.shift_left(128)));
     roundtrip_value(TRY_OR_FAIL(Crypto::UnsignedBigInteger { 2 }.shift_left(256)));
 
-    roundtrip_value(Vector { 1, 2, 840, 113549, 1, 1, 1 });
-    roundtrip_value(Vector { 1, 2, 840, 113549, 1, 1, 11 });
+    roundtrip_value(Crypto::ASN1::ObjectIdentifier { 1, 2, 840, 113549, 1, 1, 1 });
+    roundtrip_value(Crypto::ASN1::ObjectIdentifier { 1, 2, 840, 113549, 1, 1, 11 });
+    roundtrip_value(Crypto::ASN1::ObjectIdentifier { 1, 2, 0xfffffff });
 
     roundtrip_value(ByteString { "Hello, World!\n" });
 
@@ -261,4 +262,41 @@ TEST_CASE(test_decoder_restores_state_after_failed_drop)
 
     // The first failed drop should leave the decoder state unchanged, so a second drop should have the same result.
     EXPECT(decoder.drop().is_error());
+}
+
+TEST_CASE(test_decode_object_identifier)
+{
+    // 1.2.840.113549.1.1.1 (rsaEncryption)
+    u8 const rsa_encryption[] { 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
+    Crypto::ASN1::Decoder decoder({ rsa_encryption, sizeof(rsa_encryption) });
+    EXPECT_EQ(MUST(decoder.read<Crypto::ASN1::ObjectIdentifier>()), (Crypto::ASN1::ObjectIdentifier { 1, 2, 840, 113549, 1, 1, 1 }));
+
+    // The widest subidentifier the encoder can write back out.
+    u8 const widest_subidentifier[] { 0x06, 0x05, 0x2a, 0xff, 0xff, 0xff, 0x7f };
+    Crypto::ASN1::Decoder widest_decoder({ widest_subidentifier, sizeof(widest_subidentifier) });
+    EXPECT_EQ(MUST(widest_decoder.read<Crypto::ASN1::ObjectIdentifier>()), (Crypto::ASN1::ObjectIdentifier { 1, 2, 0xfffffff }));
+}
+
+TEST_CASE(test_decode_object_identifier_rejects_invalid_encodings)
+{
+    auto expect_decode_failure = [](ReadonlyBytes data) {
+        Crypto::ASN1::Decoder decoder(data);
+        EXPECT(decoder.read<Crypto::ASN1::ObjectIdentifier>().is_error());
+    };
+
+    // No subidentifiers at all.
+    u8 const empty[] { 0x06, 0x00 };
+    expect_decode_failure({ empty, sizeof(empty) });
+
+    // rsaEncryption followed by a subidentifier that asks for a base-128 digit which never arrives.
+    u8 const unterminated[] { 0x06, 0x0a, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x81 };
+    expect_decode_failure({ unterminated, sizeof(unterminated) });
+
+    // A subidentifier with a leading zero digit.
+    u8 const non_minimal[] { 0x06, 0x03, 0x2a, 0x80, 0x01 };
+    expect_decode_failure({ non_minimal, sizeof(non_minimal) });
+
+    // A subidentifier one bit wider than the encoder can represent.
+    u8 const too_large[] { 0x06, 0x06, 0x2a, 0x81, 0x80, 0x80, 0x80, 0x00 };
+    expect_decode_failure({ too_large, sizeof(too_large) });
 }
