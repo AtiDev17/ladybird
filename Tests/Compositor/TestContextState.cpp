@@ -1033,6 +1033,36 @@ TEST_CASE(a_wheel_gesture_latches_the_scroller_its_first_step_hit)
     EXPECT_EQ(fixture.latched_scroller_node_id(), nested_scroller_node_id);
 }
 
+TEST_CASE(scroll_snapshots_keep_newer_unreconciled_offsets_until_they_are_adopted)
+{
+    LatchedWheelContextFixture fixture;
+    auto& context = fixture.scene.context;
+
+    EXPECT(fixture.wheel({ 80, 80 }, { 0, 20 }, Web::ScrollGesturePhase::Ongoing, 0).accepted);
+    auto first_update = context.take_pending_async_scroll_updates();
+    EXPECT(fixture.wheel({ 80, 80 }, { 0, 10 }, Web::ScrollGesturePhase::Ongoing, 10).accepted);
+    auto second_update = context.take_pending_async_scroll_updates();
+    VERIFY(second_update.scroll_offsets.size() == 1);
+    EXPECT_EQ(second_update.scroll_offsets.first().compositor_scroll_offset, (Gfx::FloatPoint { 0, 30 }));
+
+    // A snapshot adopting only the first update must not rewind the more recent scroll.
+    auto snapshot = scroll_state_snapshot_with_offset(Web::Painting::SpatialNodeIndex { 1 }, { 0, -20 });
+    snapshot.set_adopted_async_scroll_sequence(first_update.sequence);
+    context.update_scroll_state(move(snapshot), {});
+    EXPECT(fixture.wheel({ 80, 80 }, { 0, 5 }, Web::ScrollGesturePhase::Ongoing, 20).accepted);
+    auto third_update = context.take_pending_async_scroll_updates();
+    VERIFY(third_update.scroll_offsets.size() == 1);
+    EXPECT_EQ(third_update.scroll_offsets.first().compositor_scroll_offset, (Gfx::FloatPoint { 0, 35 }));
+    EXPECT_EQ(third_update.scroll_offsets.first().unadopted_scroll_delta, (Gfx::FloatPoint { 0, 5 }));
+
+    // Once all updates are adopted, a main-thread scroll becomes the new starting offset.
+    snapshot = scroll_state_snapshot_with_offset(Web::Painting::SpatialNodeIndex { 1 }, { 0, -70 });
+    snapshot.set_adopted_async_scroll_sequence(third_update.sequence);
+    context.update_scroll_state(move(snapshot), {});
+    EXPECT(fixture.wheel({ 80, 80 }, { 0, 5 }, Web::ScrollGesturePhase::Ongoing, 30).accepted);
+    EXPECT_EQ(fixture.take_scroll_offsets().viewport, (Gfx::FloatPoint { 0, 75 }));
+}
+
 TEST_CASE(a_latched_scroller_absorbs_the_gesture_at_its_edge)
 {
     LatchedWheelContextFixture fixture;
@@ -1476,6 +1506,39 @@ TEST_CASE(viewport_location_change_reports_only_the_diff)
     EXPECT(frame.damage_rect.is_empty());
 }
 
+TEST_CASE(resize_frames_coalesce_while_waiting_for_a_backing_store)
+{
+    PresentingContextFixture fixture;
+    fixture.compositor_state->set_display_metadata(fixture.context_id, {}, 1.0);
+    fixture.viewport_rect.set_size({ 32, 32 });
+    fixture.compositor_state->viewport_size_updated(fixture.context_id, fixture.viewport_rect.size(), Web::Compositor::WindowResizingInProgress::Yes);
+    auto visual_context_tree = make_visual_context_tree();
+    fixture.install(make_display_list(visual_context_tree, Gfx::Color::Red), visual_context_tree);
+
+    fixture.compositor_state->present_frame(fixture.context_id, fixture.viewport_rect);
+    EXPECT_EQ(fixture.compositor_state->pending_async_present_count_for_testing(), 1u);
+    VERIFY(spin_event_loop_until(fixture.event_loop, 2000, [&] { return fixture.compositor_client.presented_frames.size() == 1; }));
+
+    // Keep both buffers held by the client while newer content rectangles arrive.
+    fixture.compositor_state->present_frame(fixture.context_id, { 0, 5, 32, 32 });
+    Gfx::IntRect latest_viewport_rect { 0, 10, 32, 32 };
+    fixture.compositor_state->present_frame(fixture.context_id, latest_viewport_rect);
+    fixture.compositor_state->present_pending_frames_for_testing();
+    EXPECT_EQ(fixture.compositor_state->pending_async_present_count_for_testing(), 0u);
+    EXPECT_EQ(fixture.compositor_client.presented_frames.size(), 1u);
+
+    fixture.compositor_state->presented_bitmap_ready_to_paint(fixture.context_id, fixture.compositor_client.allocated_bitmap_ids[0]);
+    fixture.compositor_state->present_pending_frames_for_testing();
+    EXPECT_EQ(fixture.compositor_state->pending_async_present_count_for_testing(), 1u);
+    VERIFY(spin_event_loop_until(fixture.event_loop, 2000, [&] { return fixture.compositor_client.presented_frames.size() == 2; }));
+    EXPECT_EQ(fixture.compositor_client.presented_frames.last().content_rect, latest_viewport_rect);
+
+    fixture.release_all_buffers();
+    fixture.compositor_state->present_pending_frames_for_testing();
+    EXPECT_EQ(fixture.compositor_state->pending_async_present_count_for_testing(), 0u);
+    EXPECT_EQ(fixture.compositor_client.presented_frames.size(), 2u);
+}
+
 TEST_CASE(screenshot_between_presents_does_not_advance_the_baseline)
 {
     PresentingContextFixture fixture;
@@ -1510,6 +1573,30 @@ TEST_CASE(blocked_present_does_not_advance_the_baseline)
     fixture.context.did_finish_gpu_present(first_frame->bitmap_id);
     VERIFY(fixture.context.acknowledge_presented_bitmap(first_frame->bitmap_id));
     EXPECT_EQ(fixture.rasterize(), (Gfx::IntRect { 1, 1, 6, 6 }));
+}
+
+TEST_CASE(backing_store_resize_waits_for_render_completion)
+{
+    RasterizingContextFixture fixture;
+    auto visual_context_tree = make_visual_context_tree();
+    fixture.context.install_display_list_update(make_display_list(visual_context_tree, Gfx::Color::Red), visual_context_tree, {});
+    auto frame = fixture.prepare();
+    VERIFY(frame.has_value());
+
+    Gfx::IntSize resized_viewport_size { 32, 32 };
+    fixture.context.viewport_size_updated(resized_viewport_size, Web::Compositor::WindowResizingInProgress::No);
+    EXPECT(!fixture.context.resize_backing_stores_if_needed({}, Compositor::BackingStoreManager::GpuSharing::Disallowed).has_value());
+    EXPECT_EQ(frame->rendered_surface->size(), fixture.viewport_rect.size());
+
+    fixture.finish(*frame);
+    auto publication = fixture.context.resize_backing_stores_if_needed({}, Compositor::BackingStoreManager::GpuSharing::Disallowed);
+    VERIFY(publication.has_value());
+    fixture.viewport_rect.set_size(resized_viewport_size);
+    auto resized_frame = fixture.prepare();
+    VERIFY(resized_frame.has_value());
+    EXPECT_EQ(resized_frame->rendered_surface->size(), resized_viewport_size);
+    EXPECT_EQ(resized_frame->damage_rect, fixture.viewport_rect);
+    fixture.finish(*resized_frame);
 }
 
 TEST_CASE(updates_between_rasters_are_diffed_against_the_last_rasterized_frame)

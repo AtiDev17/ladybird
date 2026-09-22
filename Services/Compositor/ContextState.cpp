@@ -223,10 +223,8 @@ void ContextState::install_display_list_update(
     note_user_scroll_gesture_end_if_drag_ended(was_dragging_scrollbar);
     m_async_scroll_tree.set_state(move(async_scrolling_state));
     m_scroll_snap_controller.did_install_scrolling_state(m_async_scroll_tree);
-    if (auto unreconciled = unreconciled_async_scroll_offsets(); !unreconciled.is_empty()) {
-        if (auto viewport_scroll_offset = reapply_pending_async_scroll_offsets(unreconciled); viewport_scroll_offset.has_value())
-            async_scrolling_viewport_rect.set_location(viewport_scroll_offset->to_type<int>());
-    }
+    if (auto viewport_scroll_offset = reapply_unreconciled_async_scroll_offsets(); viewport_scroll_offset.has_value())
+        async_scrolling_viewport_rect.set_location(viewport_scroll_offset->to_type<int>());
     rebuild_wheel_hit_test_targets();
     m_async_scrolling_viewport_rect = async_scrolling_viewport_rect;
     m_has_async_scrolling_state = true;
@@ -330,7 +328,7 @@ void ContextState::update_scroll_state(Web::Painting::ScrollStateSnapshot&& scro
     if (!m_has_async_scrolling_state)
         return;
 
-    auto reconciled_viewport_scroll_offset = reapply_pending_async_scroll_offsets(unreconciled_async_scroll_offsets());
+    auto reconciled_viewport_scroll_offset = reapply_unreconciled_async_scroll_offsets();
     rebuild_wheel_hit_test_targets();
     if (reconciled_viewport_scroll_offset.has_value()) {
         auto reconciled_viewport_rect = m_async_scrolling_viewport_rect;
@@ -712,10 +710,13 @@ Optional<Web::Compositor::AsyncScrollOperationID> ContextState::snap_at_gesture_
 }
 
 // The viewport rect a wheel scroll presents, moved along with the viewport when the scroll moved it.
-Gfx::IntRect ContextState::note_async_scrolling_viewport_rect(Gfx::IntRect viewport_rect, Vector<Web::Compositor::AsyncScrollOffset> const& scroll_offsets)
+Gfx::IntRect ContextState::note_async_scrolling_viewport_rect(Gfx::IntRect viewport_rect, Optional<Web::Compositor::AsyncScrollOffset> const& scroll_offset)
 {
-    if (auto viewport_scroll_offset = viewport_scroll_offset_from(scroll_offsets); viewport_scroll_offset.has_value())
-        viewport_rect.set_location(viewport_scroll_offset->to_type<int>());
+    if (scroll_offset.has_value()) {
+        auto node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(scroll_offset->stable_node_id);
+        if (node_id.has_value() && m_async_scroll_tree.scroll_node_is_viewport(*node_id))
+            viewport_rect.set_location(scroll_offset->compositor_scroll_offset.to_type<int>());
+    }
     m_async_scrolling_viewport_rect = viewport_rect;
     return viewport_rect;
 }
@@ -751,8 +752,8 @@ ContextState::WheelScrollOutcome ContextState::perform_wheel_scroll_of_node(Web:
     if (operation_tracking == Web::Compositor::AsyncScrollOperationTracking::Yes)
         outcome.operation_id = ++m_next_async_scroll_operation_id;
 
-    auto scroll_offsets = m_async_scroll_tree.apply_scroll_delta(node_id, delta, current_visual_context_tree(), m_scroll_state_snapshot, scroll_chaining);
-    if (scroll_offsets.is_empty()) {
+    auto scroll_offset = m_async_scroll_tree.apply_scroll_delta(node_id, delta, current_visual_context_tree(), m_scroll_state_snapshot, scroll_chaining);
+    if (!scroll_offset.has_value()) {
         if (outcome.operation_id.has_value())
             m_completed_async_scroll_operation_ids.append(*outcome.operation_id);
         return outcome;
@@ -760,19 +761,16 @@ ContextState::WheelScrollOutcome ContextState::perform_wheel_scroll_of_node(Web:
 
     // The box the delta moved is the one a gesture pans; on the first step of a gesture, scroll node chaining may have
     // moved an ancestor of the node the gesture latched to.
-    for (auto const& scroll_offset : scroll_offsets) {
-        auto scroll_offset_before_scroll = scroll_offset.compositor_scroll_offset - scroll_offset.unadopted_scroll_delta;
-        m_scroll_snap_controller.did_scroll_node_plainly(scroll_offset.stable_node_id, scroll_gesture_phase, m_async_scroll_tree.css_pixels_from_device_offset(scroll_offset_before_scroll));
-    }
+    auto scroll_offset_before_scroll = scroll_offset->compositor_scroll_offset - scroll_offset->unadopted_scroll_delta;
+    m_scroll_snap_controller.did_scroll_node_plainly(scroll_offset->stable_node_id, scroll_gesture_phase, m_async_scroll_tree.css_pixels_from_device_offset(scroll_offset_before_scroll));
 
     // https://drafts.csswg.org/css-scroll-snap-1/#scroll-types
     // A wheel or panning scroll is relative, which scroll-state(scrolled) queries observe.
-    for (auto& scroll_offset : scroll_offsets)
-        scroll_offset.last_relative_scroll_delta = scroll_offset.unadopted_scroll_delta;
+    scroll_offset->last_relative_scroll_delta = scroll_offset->unadopted_scroll_delta;
 
     rebuild_wheel_hit_test_targets();
-    store_pending_async_scroll_offsets(scroll_offsets, outcome.operation_id);
-    outcome.viewport_rect_to_present = note_async_scrolling_viewport_rect(viewport_rect, scroll_offsets);
+    store_pending_async_scroll_offsets({ &*scroll_offset, 1 }, outcome.operation_id);
+    outcome.viewport_rect_to_present = note_async_scrolling_viewport_rect(viewport_rect, scroll_offset);
     return outcome;
 }
 
@@ -1035,15 +1033,15 @@ Web::Compositor::PendingAsyncScrollUpdates ContextState::take_pending_async_scro
     for (auto const& scroll_offset : updates.scroll_offsets) {
         bool replaced = false;
         for (auto& unreconciled : m_unreconciled_async_scroll_offsets) {
-            if (unreconciled.offset.stable_node_id != scroll_offset.stable_node_id)
+            if (unreconciled.stable_node_id != scroll_offset.stable_node_id)
                 continue;
             unreconciled.sequence = updates.sequence;
-            unreconciled.offset.merge_later_scroll(scroll_offset);
+            unreconciled.compositor_scroll_offset = scroll_offset.compositor_scroll_offset;
             replaced = true;
             break;
         }
         if (!replaced)
-            m_unreconciled_async_scroll_offsets.append({ updates.sequence, scroll_offset });
+            m_unreconciled_async_scroll_offsets.append({ updates.sequence, scroll_offset.stable_node_id, scroll_offset.compositor_scroll_offset });
     }
     AK::swap(updates.completed_operation_ids, m_completed_async_scroll_operation_ids);
     AK::swap(updates.operation_ids_taken_over_by_user_input, m_async_scroll_operation_ids_taken_over_by_user_input);
@@ -1058,15 +1056,6 @@ Web::Compositor::PendingAsyncScrollUpdates ContextState::take_pending_async_scro
 void ContextState::retire_reconciled_async_scroll_offsets(u64 adopted_sequence)
 {
     m_unreconciled_async_scroll_offsets.remove_all_matching([&](auto const& unreconciled) { return unreconciled.sequence <= adopted_sequence; });
-}
-
-Vector<Web::Compositor::AsyncScrollOffset> ContextState::unreconciled_async_scroll_offsets() const
-{
-    Vector<Web::Compositor::AsyncScrollOffset> offsets;
-    offsets.ensure_capacity(m_unreconciled_async_scroll_offsets.size());
-    for (auto const& unreconciled : m_unreconciled_async_scroll_offsets)
-        offsets.unchecked_append(unreconciled.offset);
-    return offsets;
 }
 
 bool ContextState::has_pending_async_scroll_updates() const
@@ -1159,7 +1148,7 @@ void ContextState::finish_window_resize()
 
 Optional<BackingStoreManager::Publication> ContextState::resize_backing_stores_if_needed(RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, BackingStoreManager::GpuSharing gpu_sharing)
 {
-    if (m_gpu_present_bitmap_id_awaiting_completion.has_value())
+    if (m_backing_store_manager.is_rendering())
         return {};
     if (!presents_to_client()) {
         // A resize can arrive before the parent's next replay supplies the new embedding transform.
@@ -1181,7 +1170,7 @@ Optional<BackingStoreManager::Publication> ContextState::resize_backing_stores_i
 
 bool ContextState::update_composited_raster_transform(Gfx::FloatRect destination_rect, Gfx::FloatMatrix4x4 const& transform)
 {
-    if (presents_to_client() || m_gpu_present_bitmap_id_awaiting_completion.has_value() || m_viewport_size.is_empty() || destination_rect.is_empty())
+    if (presents_to_client() || m_backing_store_manager.is_rendering() || m_viewport_size.is_empty() || destination_rect.is_empty())
         return false;
 
     // Display list coordinates already include device scale and page zoom. Only the embedding transform and
@@ -1418,11 +1407,9 @@ Optional<ContextState::PreparedFrame> ContextState::prepare_frame(Web::Painting:
     paint_current_display_list(display_list_player, back_store, composited_context_resolver, render_target->damage_rect);
     remember_rasterized_frame(pending_frame.viewport_rect.size());
 
-    auto rendered_bitmap_id = render_target->bitmap_id;
-    m_gpu_present_bitmap_id_awaiting_completion = rendered_bitmap_id;
     return PreparedFrame {
         .rendered_surface = &back_store,
-        .bitmap_id = rendered_bitmap_id,
+        .bitmap_id = render_target->bitmap_id,
         .damage_rect = damage_rect,
     };
 }
@@ -1482,8 +1469,6 @@ bool ContextState::acknowledge_presented_bitmap(i32 bitmap_id)
 
 void ContextState::did_finish_gpu_present(i32 bitmap_id)
 {
-    VERIFY(m_gpu_present_bitmap_id_awaiting_completion == bitmap_id);
-    m_gpu_present_bitmap_id_awaiting_completion.clear();
     m_backing_store_manager.complete_rendering(bitmap_id, presents_to_client());
     m_latest_rendered_surface = m_backing_store_manager.latest_rendered_surface();
 }
@@ -1501,17 +1486,6 @@ Web::Painting::AccumulatedVisualContextTree const& ContextState::current_visual_
     VERIFY(m_display_list);
     VERIFY(m_visual_context_tree.has_value());
     return m_visual_context_tree.value();
-}
-
-Optional<Gfx::FloatPoint> ContextState::viewport_scroll_offset_from(Vector<Web::Compositor::AsyncScrollOffset> const& scroll_offsets) const
-{
-    Optional<Gfx::FloatPoint> viewport_scroll_offset;
-    for (auto const& scroll_offset : scroll_offsets) {
-        auto node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(scroll_offset.stable_node_id);
-        if (node_id.has_value() && m_async_scroll_tree.scroll_node_is_viewport(*node_id))
-            viewport_scroll_offset = scroll_offset.compositor_scroll_offset;
-    }
-    return viewport_scroll_offset;
 }
 
 Optional<float> ContextState::visual_viewport_scale_for_compositing() const
@@ -1573,16 +1547,16 @@ Optional<ContextState::VisualViewportScrollDelta> ContextState::apply_visual_vie
     };
 }
 
-Optional<Gfx::FloatPoint> ContextState::reapply_pending_async_scroll_offsets(Vector<Web::Compositor::AsyncScrollOffset> const& pending_scroll_offsets)
+Optional<Gfx::FloatPoint> ContextState::reapply_unreconciled_async_scroll_offsets()
 {
     Optional<Gfx::FloatPoint> viewport_scroll_offset;
-    for (auto const& pending_scroll_offset : pending_scroll_offsets) {
-        auto node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(pending_scroll_offset.stable_node_id);
+    for (auto const& unreconciled : m_unreconciled_async_scroll_offsets) {
+        auto node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(unreconciled.stable_node_id);
         if (!node_id.has_value())
             continue;
         auto reconciled_scroll_offset = m_async_scroll_tree.set_scroll_offset(
             *node_id,
-            pending_scroll_offset.compositor_scroll_offset,
+            unreconciled.compositor_scroll_offset,
             current_visual_context_tree(),
             m_scroll_state_snapshot);
         if (reconciled_scroll_offset.has_value() && m_async_scroll_tree.scroll_node_is_viewport(*node_id))
@@ -1592,7 +1566,7 @@ Optional<Gfx::FloatPoint> ContextState::reapply_pending_async_scroll_offsets(Vec
 }
 
 void ContextState::store_pending_async_scroll_offsets(
-    Vector<Web::Compositor::AsyncScrollOffset> const& scroll_offsets,
+    ReadonlySpan<Web::Compositor::AsyncScrollOffset> scroll_offsets,
     Optional<Web::Compositor::AsyncScrollOperationID> operation_id)
 {
     m_animated_content_may_affect_viewport.clear();
@@ -1744,7 +1718,7 @@ void ContextState::rebuild_wheel_hit_test_targets()
 
 bool ContextState::is_present_blocked() const
 {
-    return m_gpu_present_bitmap_id_awaiting_completion.has_value()
+    return m_backing_store_manager.is_rendering()
         || !m_backing_store_manager.has_available_buffer();
 }
 
