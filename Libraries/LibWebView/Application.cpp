@@ -42,6 +42,7 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Statuses.h>
 #include <LibWeb/Loader/DownloadFilename.h>
 #include <LibWeb/Loader/UserAgent.h>
+#include <LibWeb/WebDriver/TimeoutsConfiguration.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/AutocompleteService.h>
 #include <LibWebView/BlobURLStore.h>
@@ -1035,6 +1036,7 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
         initial_document_state_id = cross_process_id_allocator.allocate();
 
     auto client = TRY(WebView::launch_web_content_process(is_private, initial_page_id, root_navigable_id));
+    TRY(Application::the().connect_web_content_to_compositor(*client));
     // NB: A replacement process's bootstrap about:blank is not the displayed document. Keep it hidden so it
     //     cannot paint over the outgoing page; activation supplies the destination's actual visibility state.
     auto system_visibility_state = view.has_value() && !navigable_to_adopt.has_value()
@@ -1060,7 +1062,6 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     client->async_connect_to_wasm_compiler(wasm_compiler_handle);
 #endif
-    TRY(Application::the().connect_web_content_to_compositor(*client));
 
     m_web_content_clients.set(client);
     return client;
@@ -1199,6 +1200,13 @@ void Application::update_webdriver_session_config(Badge<WebDriverBrowserConnecti
         push_webdriver_session_config(view);
         return IterationDecision::Continue;
     });
+}
+
+Optional<u64> Application::webdriver_page_load_timeout() const
+{
+    Web::WebDriver::TimeoutsConfiguration timeouts;
+    (void)Web::WebDriver::json_deserialize_as_a_timeouts_configuration_into(m_webdriver_session_config.timeouts, timeouts);
+    return timeouts.page_load_timeout;
 }
 
 void Application::complete_webdriver_content_command(u64 command_id, Web::WebDriver::Response response)

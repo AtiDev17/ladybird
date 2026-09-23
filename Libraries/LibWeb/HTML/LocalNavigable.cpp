@@ -17,6 +17,7 @@
 #include <LibGC/RootVector.h>
 #include <LibGfx/PaintingSurface.h>
 #include <LibWeb/CSS/ComputedValues.h>
+#include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/SerializationMode.h>
@@ -1000,7 +1001,8 @@ void LocalNavigable::prepare_child_navigable_history_reconstruction(SessionHisto
             //        for a child the UI process already knows about.
             for (size_t i = 0; i < child_navigables.size(); ++i) {
                 auto canonical_id = *child_navigable_ids[i];
-                as<LocalNavigable>(*child_navigables[i]).set_id_for_session_history_reconstruction(canonical_id);
+                if (auto* local_child = as_if<LocalNavigable>(*child_navigables[i]))
+                    local_child->set_id_for_session_history_reconstruction(canonical_id);
                 child_navigable_ids[i].clear();
             }
         }
@@ -2225,6 +2227,7 @@ static GC::Ref<NavigationParams> create_navigation_params_from_a_srcdoc_resource
     Variant<SerializedPolicyContainer, DocumentState::Client> const& history_policy_container_variant,
     Optional<URL::URL> const& about_base_url,
     GC::Ptr<LocalNavigable> navigable,
+    SourceSnapshotParams const& source_snapshot_params,
     TargetSnapshotParams const& target_snapshot_params,
     UserNavigationInvolvement user_involvement,
     Optional<Utf16String> navigation_id,
@@ -2274,6 +2277,11 @@ static GC::Ref<NavigationParams> create_navigation_params_from_a_srcdoc_resource
         //       We also use srcdoc to implement load_html() for top level navigables so we need to null check container
         //       because it might be null.
         policy_container = determine_navigation_params_policy_container(*response->url(), realm.heap(), history_policy_container, {}, navigable->container_document()->policy_container(), {});
+    } else if (navigable->parent()) {
+        // NB: The container document is in another process. Only its iframe element's srcdoc attribute navigates the
+        //     navigable to about:srcdoc, so the container document is the source document, whose policy container the
+        //     source snapshot params hold.
+        policy_container = determine_navigation_params_policy_container(*response->url(), realm.heap(), history_policy_container, {}, source_snapshot_params.source_policy_container, {});
     } else {
         policy_container = realm.heap().allocate<PolicyContainer>(realm.heap());
     }
@@ -2878,7 +2886,7 @@ static void create_navigation_params_for_population(
                 origin,
                 history_policy_container,
                 about_base_url,
-                &navigable, target_snapshot_params, user_involvement, navigation_id, navigation_timing_type));
+                &navigable, source_snapshot_params, target_snapshot_params, user_involvement, navigation_id, navigation_timing_type));
         }
         // 2. Otherwise, if all of the following are true:
         //    - entry's URL's scheme is a fetch scheme; and
@@ -3362,7 +3370,11 @@ void LocalNavigable::continue_navigation_after_population_dispatch(PreparedNavig
         GC::Ptr<PolicyContainer> parent_policy_container;
         if (auto container_document = this->container_document())
             parent_policy_container = container_document->policy_container();
-        else if (*response_url == URL::about_srcdoc()) {
+        else if (*response_url == URL::about_srcdoc() && parent() && source_policy_container) {
+            // NB: The container document is in another process. Only its iframe element's srcdoc attribute navigates
+            //     the navigable to about:srcdoc, so the container document is the source document.
+            parent_policy_container = source_policy_container;
+        } else if (*response_url == URL::about_srcdoc()) {
             // NOTE: Specification assumes that only navigables corresponding to iframes can be navigated to about:srcdoc.
             //       We also use srcdoc to implement load_html() for top level navigables so we need a policy container
             //       because the navigable might not have a container.
@@ -3456,10 +3468,11 @@ void LocalNavigable::deliver_posted_message_from_another_process(PostedMessageDe
         return;
 
     // NB: incumbentSettings's global object lives in the posting page. The WindowProxy of its navigable stands for it
-    //     here as source, taken now since that navigable can be gone from this page by the time the task runs.
+    //     here as source, taken now since that navigable can be gone from this page by the time the task runs. A popup
+    //     posting to its opener's tab, or the other way round, posts from a tab another page of this process holds.
     GC::Ptr<WindowProxy> source;
     if (message.source_navigable_id.has_value()) {
-        if (auto source_navigable = page().navigable_with_id(*message.source_navigable_id))
+        if (auto source_navigable = navigable_with_id_in_any_page(page(), *message.source_navigable_id))
             source = source_navigable->active_window_proxy();
     }
 
@@ -6771,11 +6784,39 @@ void LocalNavigable::paint_next_frame()
     compositor_context().present_frame(viewport_rect);
 }
 
+bool LocalNavigable::paint_next_frame_if_needed(DOM::UpdateLayoutReason layout_reason)
+{
+    if (!needs_repaint())
+        return false;
+    // OPTIMIZATION: Don't paint navigables hidden by an ancestor iframe with visibility: hidden.
+    //               needs_repaint() stays true — so, once the navigable becomes visible, it's painted.
+    if (has_inclusive_ancestor_with_visibility_hidden())
+        return false;
+    if (is_svg_page())
+        return false;
+    if (auto document = active_document()) {
+        document->update_layout(layout_reason);
+        if (document->font_computer().should_defer_initial_paint())
+            return false;
+    }
+    paint_next_frame();
+    return true;
+}
+
 void LocalNavigable::render_screenshot(Gfx::PaintingSurface& painting_surface, PaintConfig paint_config, Function<void()>&& callback)
 {
     if (!has_compositor_context()) {
         callback();
         return;
+    }
+
+    // The compositor composes the display lists this process last published for the navigables of the subtree. A
+    // descendant that has not painted since it changed, such as one whose document has just loaded, would be missing
+    // from the screenshot, so paint it first as the rendering update would.
+    auto navigables = hosted_inclusive_descendant_navigables();
+    for (auto& navigable : navigables.in_reverse()) {
+        if (navigable.ptr() != this)
+            navigable->paint_next_frame_if_needed(DOM::UpdateLayoutReason::ProcessScreenshot);
     }
 
     if (!record_display_list_and_scroll_state(paint_config)) {
