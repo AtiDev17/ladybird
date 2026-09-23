@@ -17,6 +17,7 @@
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/FontFaceState.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/SharedCompiledStyleSheet.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleScope.h>
@@ -103,6 +104,7 @@ WebIDL::ExceptionOr<NonnullRefPtr<StyleSheetState>> StyleSheetState::create_cons
 
 StyleSheetState::StyleSheetState(RustRuleList rules, GC::Ptr<DOM::Document> document, RustMediaList media, Optional<::URL::URL> location)
     : m_native_sheet(move(rules), move(media))
+    , m_style_engine_occurrence_id(m_native_sheet.identity())
     , m_parsing_document(document)
 {
     if (location.has_value())
@@ -112,6 +114,11 @@ StyleSheetState::StyleSheetState(RustRuleList rules, GC::Ptr<DOM::Document> docu
 }
 
 StyleSheetState::~StyleSheetState() = default;
+
+void StyleSheetState::set_shared_compiled_style_sheet(RefPtr<SharedCompiledStyleSheet> shared_compiled_style_sheet)
+{
+    m_shared_compiled_style_sheet = move(shared_compiled_style_sheet);
+}
 
 void StyleSheetState::disconnect_font_faces_in_rule(RustRule const& rule)
 {
@@ -193,6 +200,8 @@ void StyleSheetState::visit_edges(GC::Cell::Visitor& visitor)
     visitor.visit(m_rules.ptr());
     visitor.visit(m_parsing_document);
     visitor.visit(m_constructor_document);
+    if (m_shared_compiled_style_sheet)
+        m_shared_compiled_style_sheet->contents().visit_edges(visitor);
     for (auto const& import : m_imports)
         import.value->visit_edges(visitor);
     visitor.visit(m_owning_documents_or_shadow_roots);

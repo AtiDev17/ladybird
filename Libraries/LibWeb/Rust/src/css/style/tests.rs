@@ -829,7 +829,7 @@ fn retained_answer_delta_memo_accounts_its_tuple_capacity() {
             winner_state: None,
             winners_updated: false,
             cascade_winners_are_complete: false,
-            pseudo_winner_states: Arc::from(Vec::new()),
+            pseudo_winner_states: Box::default(),
         },
     };
 
@@ -6900,7 +6900,10 @@ fn partial_match_answer_completion_shares_prefix_states_between_nodes() {
     assert!(answer.cascade_winners_are_complete);
     assert_eq!(engine.match_element(nodes[3]).unwrap().len(), 1);
     engine.end_published_match_answer_completion_batch();
-    assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+    assert_eq!(
+        engine.memory().bytes_in_category(MemoryCategory::BatchScratch),
+        engine.cascade_compaction_scratch.capacity_bytes()
+    );
 }
 
 #[test]
@@ -11728,4 +11731,67 @@ fn relational_routing_checks_an_absent_anchor_posting_once() {
     );
     assert!(regions.regions().is_empty());
     assert_eq!(engine.facts.postings().take_benefit_lookups(), (1, 0));
+}
+
+#[test]
+fn sheet_occurrences_update_retained_cascade_order_without_recompiling() {
+    let (mut engine, nodes) = linear_document();
+    let target = StyleAtomID(200);
+    let shared_rule = add_target_rule(&mut engine, StyleSheetObjectID(1), target);
+    let middle_rule = add_target_rule(&mut engine, StyleSheetObjectID(2), target);
+    engine.set_rule_declared_properties(shared_rule, &[(1, false)], true);
+    engine.set_rule_declared_properties(middle_rule, &[(1, false)], true);
+    let shared = engine.program.rule_sheet(shared_rule);
+    let middle = engine.program.rule_sheet(middle_rule);
+    let scope = TreeScopeID::DOCUMENT;
+    engine.detach_sheet(shared, scope);
+    engine.detach_sheet(middle, scope);
+    engine.attach_sheet_occurrence(shared, scope, 1, 0, true);
+    engine.attach_sheet_occurrence(middle, scope, 2, 0, true);
+    engine.attach_sheet_occurrence(shared, scope, 3, 0, true);
+    add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(target));
+    discard_transaction(&mut engine);
+    let exact = engine.match_element(nodes[1]).unwrap();
+    let old = engine.matches_for_cascade(exact.clone(), false, Some(nodes[1]));
+    assert_eq!(old.len(), 1);
+    assert_eq!(old[0].rule, shared_rule);
+    engine.remember_retained_match_answer(nodes[1], &exact);
+    engine.remember_cascade_input(nodes[1], &old);
+    let version = engine.program.rule_version(shared_rule);
+
+    engine.set_sheet_occurrence_conditions(scope, 3, false);
+    let mut planned = Vec::new();
+    assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
+    assert_eq!(planned, vec![nodes[1].raw()]);
+    engine.begin_adaptive_cold_matching_batch(nodes[0]);
+    let answer = engine.match_element_for_cascade(nodes[1]).unwrap();
+    engine.end_cold_matching_batch();
+    assert_eq!(answer.len(), 1);
+    assert_eq!(answer[0].rule, middle_rule);
+    assert_eq!(engine.program.rule_version(shared_rule), version);
+}
+
+#[test]
+fn retiring_the_last_sheet_occurrence_invalidates_its_winners() {
+    let (mut engine, nodes) = linear_document();
+    let target = StyleAtomID(200);
+    let rule = add_target_rule(&mut engine, StyleSheetObjectID(1), target);
+    engine.set_rule_declared_properties(rule, &[(1, false)], true);
+    let sheet = engine.program.rule_sheet(rule);
+    let scope = TreeScopeID::DOCUMENT;
+    engine.detach_sheet(sheet, scope);
+    engine.attach_sheet_occurrence(sheet, scope, 1, 0, true);
+    add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(target));
+    discard_transaction(&mut engine);
+    let exact = engine.match_element(nodes[1]).unwrap();
+    let old = engine.matches_for_cascade(exact.clone(), false, Some(nodes[1]));
+    engine.remember_retained_match_answer(nodes[1], &exact);
+    engine.remember_cascade_input(nodes[1], &old);
+
+    engine.detach_sheet_occurrence(scope, 1);
+    engine.begin_sheet_rules_replacement(sheet);
+    engine.finish_sheet_rules_replacement(sheet, 0);
+    let mut planned = Vec::new();
+    assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
+    assert_eq!(planned, vec![nodes[1].raw()]);
 }

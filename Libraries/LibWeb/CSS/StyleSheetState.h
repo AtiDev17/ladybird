@@ -38,6 +38,7 @@ class ViewTransition;
 
 namespace Web::CSS {
 
+class SharedCompiledStyleSheet;
 class StyleSheetImport;
 class StyleScope;
 struct StyleCache;
@@ -154,9 +155,17 @@ public:
     LoadingState loading_state() const;
     void check_if_loading_completed();
 
+    u64 style_engine_occurrence_id() const { return m_style_engine_occurrence_id; }
+    void set_style_engine_occurrence_id(u64 identity) { m_style_engine_occurrence_id = identity; }
+
     // The sheet's StyleEngine program handle, one-based, or 0 while it has none.
     [[nodiscard]] SheetID style_engine_sheet_id() const { return m_style_engine_sheet_id; }
     void set_style_engine_sheet_id(SheetID sheet_id) { m_style_engine_sheet_id = sheet_id; }
+
+    [[nodiscard]] SharedCompiledStyleSheet* shared_compiled_style_sheet() const { return m_shared_compiled_style_sheet.ptr(); }
+    void set_shared_compiled_style_sheet(RefPtr<SharedCompiledStyleSheet>);
+    [[nodiscard]] bool compiled_style_sheet_is_unshareable() const { return m_compiled_style_sheet_is_unshareable; }
+    void mark_compiled_style_sheet_unshareable() { m_compiled_style_sheet_is_unshareable = true; }
 
     DOM::Element* owner_node() { return m_owner_node.ptr(); }
     DOM::Element const* owner_node() const { return m_owner_node.ptr(); }
@@ -202,6 +211,7 @@ private:
     Parser::ParsingParams make_parsing_params() const;
 
     RustStyleSheet m_native_sheet;
+    u64 m_style_engine_occurrence_id;
     struct DocumentMediaState {
         AK_ALLOC_WITH_KMALLOC;
 
@@ -240,6 +250,8 @@ private:
     bool m_needs_image_resource_registration { true };
 
     SheetID m_style_engine_sheet_id;
+    RefPtr<SharedCompiledStyleSheet> m_shared_compiled_style_sheet;
+    bool m_compiled_style_sheet_is_unshareable { false };
     bool m_visiting_edges { false };
 };
 

@@ -62,4 +62,123 @@ describe("basic functionality", () => {
         expect(RegExp.input).toBe("");
         expect(RegExp.$1).toBe("");
     });
+
+    test("observes a replaced inherited flags getter", () => {
+        const originalFlags = Object.getOwnPropertyDescriptor(RegExp.prototype, "flags");
+        try {
+            Object.defineProperty(RegExp.prototype, "flags", {
+                configurable: true,
+                get() {
+                    throw new Error("BLOCKED");
+                },
+            });
+
+            expect(() => "SAFE".replace(/x/, "y")).toThrowWithMessage(Error, "BLOCKED");
+        } finally {
+            Object.defineProperty(RegExp.prototype, "flags", originalFlags);
+        }
+    });
+
+    test("observes an own flag property", () => {
+        const regexp = /^SAFE$/;
+        Object.defineProperty(regexp, "dotAll", {
+            configurable: true,
+            get() {
+                throw new Error("BLOCKED");
+            },
+        });
+
+        expect(() => "SAFE".replace(regexp, "y")).toThrowWithMessage(Error, "BLOCKED");
+    });
+
+    test("observes a non-writable lastIndex on a global pattern", () => {
+        const pattern = /a/g;
+        Object.defineProperty(pattern, "lastIndex", { writable: false });
+
+        expect(() => "aaa".replace(pattern, "b")).toThrowWithMessage(
+            TypeError,
+            "Cannot set property 'lastIndex' of [object RegExpObject]"
+        );
+    });
+
+    test("observes a replaced inherited flag accessor", () => {
+        const flags = [
+            "flags",
+            "hasIndices",
+            "global",
+            "ignoreCase",
+            "multiline",
+            "dotAll",
+            "unicode",
+            "unicodeSets",
+            "sticky",
+        ];
+
+        for (const flag of flags) {
+            const original = Object.getOwnPropertyDescriptor(RegExp.prototype, flag);
+            try {
+                Object.defineProperty(RegExp.prototype, flag, {
+                    configurable: true,
+                    get() {
+                        throw new Error("BLOCKED " + flag);
+                    },
+                });
+
+                expect(() => "x x".replace(/x/g, "y")).toThrowWithMessage(Error, "BLOCKED " + flag);
+            } finally {
+                Object.defineProperty(RegExp.prototype, flag, original);
+            }
+        }
+    });
+
+    test("revalidates global after replacement coercion", () => {
+        const regexp = /x/g;
+        const replacement = {
+            toString() {
+                Object.defineProperty(regexp, "global", {
+                    configurable: true,
+                    get() {
+                        throw new Error("BLOCKED");
+                    },
+                });
+                return "y";
+            },
+        };
+
+        expect(() => "x x".replace(regexp, replacement)).toThrowWithMessage(Error, "BLOCKED");
+    });
+
+    test("revalidates exec after replacement coercion", () => {
+        const regexp = /^SAFE$/;
+        let execCalls = 0;
+        const replacement = {
+            toString() {
+                regexp.exec = () => {
+                    ++execCalls;
+                    return Object.assign(["unsafe"], { index: 0 });
+                };
+                return "BLOCKED";
+            },
+        };
+
+        expect("unsafe".replace(regexp, replacement)).toBe("BLOCKED");
+        expect(execCalls).toBe(1);
+    });
+
+    test("coerces the replacement exactly once", () => {
+        const counted = pattern => {
+            let calls = 0;
+            const replacement = {
+                toString() {
+                    ++calls;
+                    return "$&!";
+                },
+            };
+            "aa".replace(pattern, replacement);
+            return calls;
+        };
+
+        expect(counted(/a/)).toBe(1);
+        expect(counted(/a/g)).toBe(1);
+    });
 });

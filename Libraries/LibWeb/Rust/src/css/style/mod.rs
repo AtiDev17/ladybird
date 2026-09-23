@@ -146,6 +146,7 @@ pub mod relative_selector;
 pub mod selector;
 mod shareable;
 mod shared_vector;
+mod sheet_occurrences;
 mod specified_value;
 pub mod transaction;
 mod transaction_view;
@@ -160,6 +161,7 @@ use column::Column;
 use fast_hash::FastMap as HashMap;
 use fast_hash::FastSet as HashSet;
 use planning::*;
+use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
@@ -827,6 +829,8 @@ pub struct RetainedState {
     query_workspace_generation: u64,
     /// Scratch for the fact rows one exact candidate evaluation covers, reused across candidates.
     exact_covered_scratch: Vec<StyleNodeID>,
+    cascade_compaction_scratch: ordering::CascadeCompactionWorkspace,
+    cascade_compaction_scratch_memory: MemoryLease,
     /// Monotonic identity assigned to each non-empty normalized style transaction.
     next_style_transaction_version: StyleTransactionVersion,
     /// Latest document-wide scalar computation facts, copied at the transaction boundary.
@@ -864,7 +868,7 @@ pub struct RetainedState {
     /// and answer consumption follow C++'s acknowledgement, and a discarded transaction reverts
     /// the columns of the ones it never installed. Group records by node so acknowledging or
     /// abandoning one element visits only its own record and pseudo-elements.
-    engine_computed_records_pending: HashMap<StyleNodeID, Vec<publication::PendingEngineComputedRecord>>,
+    engine_computed_records_pending: HashMap<StyleNodeID, SmallVec<[publication::PendingEngineComputedRecord; 1]>>,
     /// First records derived earlier, by what they were derived from, for later elements alike.
     /// Pseudo-element records the engine derived, by what they were derived from, for elements
     /// alike in that to share.
@@ -1029,6 +1033,9 @@ pub struct HostState {
     tree_staging_memory: MemoryLease,
     /// Program-family before/after rows retained until the transaction is released.
     program_staging: ProgramStaging,
+    sheet_occurrences: HashMap<TreeScopeID, sheet_occurrences::ScopeSheetOccurrences>,
+    sheet_occurrence_storage_bytes: u64,
+    sheet_occurrence_memory: MemoryLease,
     /// The old dense rule sequence while one sheet is synchronously reparsed.
     sheet_rule_replacement: Option<SheetRuleReplacement>,
     /// Borrowed FFI result storage for the most recently published style transaction.

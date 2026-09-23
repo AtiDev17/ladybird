@@ -156,7 +156,7 @@ impl RetainedState {
         &self,
         effects: &AnswerEffects,
         node: StyleNodeID,
-    ) -> Arc<[(tree::PseudoElementTarget, CascadeStateID)]> {
+    ) -> Vec<(tree::PseudoElementTarget, CascadeStateID)> {
         effects
             .winners
             .view(&self.winner_groups)
@@ -3310,7 +3310,7 @@ impl RetainedState {
                     .set(&mut self.winner_groups, node, state, version, &mut self.memory);
             }
             // Pseudo-element rows are independent of the element's sparse winner row.
-            for &(pseudo, state) in transition.pseudo_winner_states.iter() {
+            for &(pseudo, state) in &transition.pseudo_winner_states {
                 let _ = effects.winners.set_pseudo(
                     &mut self.winner_groups,
                     node,
@@ -3375,7 +3375,7 @@ impl RetainedState {
                         new_answer: new_identity,
                         new_cascade_input: old_cascade_input,
                         winner_state,
-                        pseudo_winner_states,
+                        pseudo_winner_states: pseudo_winner_states.into_boxed_slice(),
                         winners_updated: false,
                         cascade_winners_are_complete: false,
                     },
@@ -3388,16 +3388,13 @@ impl RetainedState {
             });
         }
 
-        let materialized: Vec<RuleMatch> = answer
-            .iter()
-            .copied()
-            .map(|entry| {
-                let cascade_order = patch
-                    .dispatch
-                    .cascade_order_for_entry(entry.rule, entry.program, entry.entry)?;
-                entry.materialize(node, &self.programs, cascade_order)
-            })
-            .collect::<Option<_>>()?;
+        let mut materialized: Vec<RuleMatch> = Vec::with_capacity(answer.len());
+        for &entry in &answer {
+            let cascade_order = patch
+                .dispatch
+                .cascade_order_for_entry(entry.rule, entry.program, entry.entry)?;
+            materialized.push(entry.materialize(node, &self.programs, cascade_order)?);
+        }
         let materialized = self.in_cascade_order(materialized, false);
         let cascade_winners_are_complete = self.cascade_winner_inventory_is_complete(&materialized, Some(node));
 
@@ -3461,7 +3458,7 @@ impl RetainedState {
                     new_answer: new_identity,
                     new_cascade_input,
                     winner_state,
-                    pseudo_winner_states,
+                    pseudo_winner_states: pseudo_winner_states.into_boxed_slice(),
                     winners_updated: cascade_winners_updated,
                     cascade_winners_are_complete,
                 },
@@ -4816,11 +4813,29 @@ impl RetainedState {
         };
         let mut verification_winner_groups = self.winner_groups.verification_copy();
         let mut verification_memory = self.memory.verification_copy();
+        let mut verification_compaction_scratch = ordering::CascadeCompactionWorkspace::default();
+        let mut verification_compaction_scratch_memory = MemoryLease::new(MemoryCategory::BatchScratch);
         std::mem::swap(&mut self.winner_groups, &mut verification_winner_groups);
         std::mem::swap(&mut self.memory, &mut verification_memory);
+        std::mem::swap(
+            &mut self.cascade_compaction_scratch,
+            &mut verification_compaction_scratch,
+        );
+        std::mem::swap(
+            &mut self.cascade_compaction_scratch_memory,
+            &mut verification_compaction_scratch_memory,
+        );
         let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.matches_for_cascade_immediately(exact_answer, false, Some(node), counters)
         }));
+        std::mem::swap(
+            &mut self.cascade_compaction_scratch_memory,
+            &mut verification_compaction_scratch_memory,
+        );
+        std::mem::swap(
+            &mut self.cascade_compaction_scratch,
+            &mut verification_compaction_scratch,
+        );
         std::mem::swap(&mut self.memory, &mut verification_memory);
         std::mem::swap(&mut self.winner_groups, &mut verification_winner_groups);
         *counters = counters_before_verification;
@@ -5363,7 +5378,7 @@ impl RetainedState {
                                 // element would only cost the memory the winner groups have.
                                 let pseudo_winner_groups = self.settled_pseudo_winner_states(effects, node);
                                 let pseudo_winner_groups = (!pseudo_winner_groups.is_empty())
-                                    .then(|| (self.winner_groups.generation(), pseudo_winner_groups));
+                                    .then(|| (self.winner_groups.generation(), Arc::from(pseudo_winner_groups)));
                                 let answer_cascade_input = self.intern_cascade_input(&answer, counters);
                                 let cascade_winner_inventory_is_complete =
                                     self.cascade_winner_inventory_is_complete(&answer, Some(node));

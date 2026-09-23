@@ -70,6 +70,7 @@ impl ElementCascadeCompactionTop1 {
 pub(super) struct CascadeCompactionWorkspace {
     top_1: CascadeCompactionTop1,
     element_top_1: ElementCascadeCompactionTop1,
+    keep: Vec<bool>,
 }
 
 impl Default for CascadeCompactionWorkspace {
@@ -80,13 +81,16 @@ impl Default for CascadeCompactionWorkspace {
                 winners: Vec::new(),
                 winner_by_property: Vec::new(),
             },
+            keep: Vec::new(),
         }
     }
 }
 
 impl CascadeCompactionWorkspace {
     pub(super) fn capacity_bytes(&self) -> u64 {
-        self.top_1.capacity_bytes() as u64 + self.element_top_1.capacity_bytes()
+        self.top_1.capacity_bytes() as u64
+            + self.element_top_1.capacity_bytes()
+            + (self.keep.capacity() * size_of::<bool>()) as u64
     }
 }
 
@@ -373,7 +377,7 @@ impl RetainedState {
         publish_winners_for: Option<StyleNodeID>,
         counters: &mut Counters,
     ) {
-        let mut workspace = CascadeCompactionWorkspace::default();
+        let mut workspace = std::mem::take(&mut self.cascade_compaction_scratch);
         self.compact_matches_for_cascade_with_scratch(
             effects,
             all,
@@ -382,10 +386,9 @@ impl RetainedState {
             &mut workspace,
             counters,
         );
-        let workspace_bytes = workspace.capacity_bytes();
-        self.memory
-            .reserve_required(MemoryCategory::BatchScratch, workspace_bytes);
-        self.memory.release(MemoryCategory::BatchScratch, workspace_bytes);
+        self.cascade_compaction_scratch_memory
+            .resize_required_to(&mut self.memory, workspace.capacity_bytes());
+        self.cascade_compaction_scratch = workspace;
     }
 
     pub(super) fn compact_matches_for_cascade_with_scratch(
@@ -514,7 +517,7 @@ impl RetainedState {
         let mut scratch_bytes = 0;
 
         let published_winners = if let Some(node) = publish_winners_for {
-            let mut targets: SmallVec<[Option<tree::PseudoElementTarget>; 3]> = SmallVec::new();
+            let mut targets: SmallVec<[Option<tree::PseudoElementTarget>; 6]> = SmallVec::new();
             targets.push(None);
             for target in all.iter().filter_map(|entry| entry.pseudo_element) {
                 if !targets.contains(&Some(target)) {
@@ -537,7 +540,7 @@ impl RetainedState {
                             let winners = self.resolved_cascade_winners_for_properties(node, all, target, None);
                             (target, winners)
                         })
-                        .collect::<SmallVec<[_; 3]>>(),
+                        .collect::<SmallVec<[_; 6]>>(),
                 )
             } else {
                 Some(
@@ -588,7 +591,7 @@ impl RetainedState {
                             };
                             (target, winners)
                         })
-                        .collect::<SmallVec<[_; 3]>>(),
+                        .collect::<SmallVec<[_; 6]>>(),
                 )
             }
         } else {
@@ -653,11 +656,9 @@ impl RetainedState {
             return;
         }
 
-        let compaction_scratch_bytes = (all.len() * size_of::<bool>()) as u64;
-        self.memory
-            .reserve_required(MemoryCategory::BatchScratch, compaction_scratch_bytes);
-        scratch_bytes += compaction_scratch_bytes;
-        let mut keep = vec![false; all.len()];
+        let keep = &mut workspace.keep;
+        keep.clear();
+        keep.resize(all.len(), false);
         for (index, entry) in all.iter().enumerate() {
             if self.program.sheet_origin(self.program.rule_sheet(entry.rule)) != CascadeOrigin::Author {
                 keep[index] = true;
@@ -696,7 +697,7 @@ impl RetainedState {
             }
         }
 
-        let mut retained_pseudo_targets: SmallVec<[tree::PseudoElementTarget; 2]> = SmallVec::new();
+        let mut retained_pseudo_targets: SmallVec<[tree::PseudoElementTarget; 4]> = SmallVec::new();
         for (index, entry) in all.iter().enumerate() {
             if keep[index]
                 && let Some(target) = entry.pseudo_element
@@ -719,7 +720,7 @@ impl RetainedState {
         } else {
             0
         };
-        let actual_scratch_bytes = (keep.capacity() * size_of::<bool>() + pseudo_target_scratch_bytes) as u64;
+        let actual_scratch_bytes = pseudo_target_scratch_bytes as u64;
         if actual_scratch_bytes > scratch_bytes {
             self.memory
                 .reserve_required(MemoryCategory::BatchScratch, actual_scratch_bytes - scratch_bytes);
