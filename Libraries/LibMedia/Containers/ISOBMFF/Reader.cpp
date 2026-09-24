@@ -10,9 +10,11 @@
 #include <AK/GenericShorthands.h>
 #include <AK/SaturatingMath.h>
 #include <AK/StringBuilder.h>
+#include <LibMedia/Codecs/AAC.h>
 #include <LibMedia/Codecs/FLAC.h>
 #include <LibMedia/Codecs/H264.h>
 #include <LibMedia/Codecs/H265.h>
+#include <LibMedia/Codecs/MPEG4Audio.h>
 #include <LibMedia/Codecs/Opus.h>
 #include <LibMedia/Codecs/VP9.h>
 
@@ -68,17 +70,17 @@ static CodecID codec_id_from_sample_entry_format(FourCC format)
 static CodecID codec_id_from_object_type_indication(u8 object_type_indication)
 {
     switch (object_type_indication) {
-    case 0x21:
+    case Codecs::H264::OBJECT_TYPE_INDICATION:
         return CodecID::H264;
-    case 0x23:
+    case Codecs::H265::OBJECT_TYPE_INDICATION:
         return CodecID::H265;
-    case 0x40:
-    case 0x66:
-    case 0x67:
-    case 0x68:
+    case Codecs::AAC::MPEG4_AUDIO_OBJECT_TYPE_INDICATION:
+    case Codecs::AAC::MPEG2_MAIN_OBJECT_TYPE_INDICATION:
+    case Codecs::AAC::MPEG2_LOW_COMPLEXITY_OBJECT_TYPE_INDICATION:
+    case Codecs::AAC::MPEG2_SCALEABLE_SAMPLING_RATE_OBJECT_TYPE_INDICATION:
         return CodecID::AAC;
-    case 0x69:
-    case 0x6B:
+    case Codecs::MPEG4Audio::MPEG2_BACKWARDS_COMPATIBLE_AUDIO_OBJECT_TYPE_INDICATION:
+    case Codecs::MPEG4Audio::MPEG1_AUDIO_OBJECT_TYPE_INDICATION:
         return CodecID::MP3;
     default:
         return CodecID::Unknown;
@@ -264,6 +266,40 @@ DecoderErrorOr<Movie> Reader::parse_movie_box(Streamer& streamer, BoxHeader cons
     return movie;
 }
 
+static void synthesize_missing_aac_configurations(TrackEntry& track)
+{
+    for (auto& entry : track.sample_entries) {
+        if (entry.format != MPEG4_AUDIO_SAMPLE_ENTRY || !entry.codec_initialization_data.is_empty())
+            continue;
+        if (!entry.audio.has_value() || entry.audio->sample_rate == 0)
+            continue;
+        auto channel_count = entry.audio->channel_count;
+        if (channel_count == 0 || channel_count > NumericLimits<u8>::max())
+            continue;
+
+        // Each frame encodes 1024 frames at the core sample rate, but AAC-HE can double that before output. Check the
+        // time base to see whether it appears to match that core sample rate, and set the SBR rate to the doubled
+        // rate.
+        auto core_sample_rate = entry.audio->sample_rate;
+        Optional<u32> spectral_band_replication_sample_rate;
+        if (static_cast<u64>(track.timescale) * 2 == entry.audio->sample_rate) {
+            core_sample_rate = track.timescale;
+            spectral_band_replication_sample_rate = entry.audio->sample_rate;
+        }
+
+        auto record = Codecs::AAC::create_configuration_record(Codecs::AAC::LOW_COMPLEXITY_AUDIO_OBJECT_TYPE, core_sample_rate, static_cast<u8>(channel_count), spectral_band_replication_sample_rate);
+        if (record.is_error()) {
+            dbgln_if(ISOBMFF_DEBUG, "Could not describe track {}'s AAC stream: {}", track.track_id, record.error().description());
+            continue;
+        }
+
+        entry.codec_initialization_data = record.release_value();
+        entry.codec_id = CodecID::AAC;
+        if (auto parameters = Codecs::AAC::parse_configuration_record(entry.codec_initialization_data.span(), Codecs::AAC::MPEG4_AUDIO_OBJECT_TYPE_INDICATION); parameters.has_value())
+            entry.parsed_codec = ParsedCodec { *parameters };
+    }
+}
+
 DecoderErrorOr<NonnullRefPtr<TrackEntry>> Reader::parse_track_box(Streamer& streamer, BoxHeader const& header)
 {
     auto track = DECODER_TRY_ALLOC(try_make_ref_counted<TrackEntry>());
@@ -298,6 +334,8 @@ DecoderErrorOr<NonnullRefPtr<TrackEntry>> Reader::parse_track_box(Streamer& stre
 
     if (!found_track_header)
         return DecoderError::corrupted("Track box contains no Track Header box"sv);
+
+    synthesize_missing_aac_configurations(*track);
 
     dbgln_if(ISOBMFF_DEBUG, "Read track {} with codec {}", track->track_id, track->sample_entries.is_empty() ? CodecID::Unknown : track->sample_entries[0].codec_id);
     return track;

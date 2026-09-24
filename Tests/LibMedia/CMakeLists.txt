@@ -1,6 +1,9 @@
 include(audio)
 
 set(TEST_SOURCES
+    TestADTSDemuxer.cpp
+    TestADTSFrameHeader.cpp
+    TestADTSReader.cpp
     TestAudioBlockTimingRing.cpp
     TestAudioServerPath.cpp
     TestBitReader.cpp
@@ -17,9 +20,15 @@ set(TEST_SOURCES
     TestFFmpegAudioNormalization.cpp
     TestFFmpegDemuxer.cpp
     TestH264Decode.cpp
+    TestID3.cpp
     TestIncrementallyPopulatedStream.cpp
     TestISOBMFF.cpp
     TestMatroskaDemuxer.cpp
+    TestFrameScanTimeline.cpp
+    TestMP3Demuxer.cpp
+    TestMP3FrameHeader.cpp
+    TestMP3Reader.cpp
+    TestMP3StreamInfo.cpp
     TestMediaSupport.cpp
     TestMediaTime.cpp
     TestParseMatroska.cpp
@@ -36,7 +45,10 @@ set(TEST_SOURCES
 )
 
 if (APPLE)
-    list(APPEND TEST_SOURCES TestVideoToolboxDecode.cpp)
+    list(APPEND TEST_SOURCES
+        TestAudioToolboxDecode.cpp
+        TestVideoToolboxDecode.cpp
+    )
 endif()
 
 foreach(source IN LISTS TEST_SOURCES)

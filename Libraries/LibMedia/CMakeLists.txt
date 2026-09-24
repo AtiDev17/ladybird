@@ -22,8 +22,13 @@ set(SOURCES
     Codecs/Vorbis.cpp
     Codecs/VP9.cpp
     ContainerID.cpp
+    Containers/ADTS/ADTSDemuxer.cpp
+    Containers/ADTS/FrameHeader.cpp
+    Containers/ADTS/Reader.cpp
     Containers/ConstantBitrateContainerNavigator.cpp
     Containers/FLACNavigator.cpp
+    Containers/FrameScanTimeline.cpp
+    Containers/ID3.cpp
     Containers/IndexedContainerNavigator.cpp
     Containers/ISOBMFF/FragmentSampleIterator.cpp
     Containers/ISOBMFF/Reader.cpp
@@ -33,7 +38,10 @@ set(SOURCES
     Containers/Matroska/SampleIterator.cpp
     Containers/Matroska/Streamer.cpp
     Containers/Matroska/TrackBlockContext.cpp
-    Containers/MP3Navigator.cpp
+    Containers/MP3/FrameHeader.cpp
+    Containers/MP3/MP3Demuxer.cpp
+    Containers/MP3/Reader.cpp
+    Containers/MP3/StreamInfo.cpp
     Containers/OggNavigator.cpp
     DecodeAudioStream.cpp
     DecoderRegistry.cpp
@@ -74,7 +82,11 @@ set(GENERATED_SOURCES
 )
 
 if (APPLE)
-    list(APPEND SOURCES VideoToolbox/VideoToolboxVideoDecoder.mm)
+    list(APPEND SOURCES
+        Audio/CoreAudioChannelLayout.cpp
+        AudioToolbox/AudioToolboxAudioDecoder.cpp
+        VideoToolbox/VideoToolboxVideoDecoder.mm
+    )
 endif()
 
 compile_ipc(VideoPresentation/VideoPresentationClient.ipc VideoPresentation/VideoPresentationClientEndpoint.h)
@@ -84,7 +96,7 @@ ladybird_lib(LibMedia media EXPLICIT_SYMBOL_EXPORT)
 target_link_libraries(LibMedia PRIVATE LibCore LibCrypto LibIPC LibGfx LibThreading LibUnicode)
 
 if (APPLE)
-    target_link_libraries(LibMedia PRIVATE "-framework VideoToolbox" "-framework CoreMedia" "-framework CoreVideo")
+    target_link_libraries(LibMedia PRIVATE "-framework AudioToolbox" "-framework VideoToolbox" "-framework CoreMedia" "-framework CoreVideo")
 endif()
 
 target_sources(LibMedia PRIVATE

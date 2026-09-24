@@ -35,9 +35,11 @@ void TrackBufferDemuxer::extend_run_bounds_for_frame(FrameRun& run, Media::Coded
     auto end = start + frame.duration();
     if (run.frames.is_empty()) {
         run.presentation_start = start;
+        run.highest_presentation_start = start;
         run.presentation_end = end;
     } else {
         run.presentation_start = min(run.presentation_start, start);
+        run.highest_presentation_start = max(run.highest_presentation_start, start);
         run.presentation_end = max(run.presentation_end, end);
     }
 }
@@ -46,6 +48,7 @@ void TrackBufferDemuxer::recalculate_run_bounds(FrameRun& run)
 {
     VERIFY(!run.frames.is_empty());
     run.presentation_start = run.frames.first().presentation_timestamp();
+    run.highest_presentation_start = run.presentation_start;
     run.presentation_end = run.presentation_start;
     for (auto const& frame : run.frames)
         extend_run_bounds_for_frame(run, frame);
@@ -62,6 +65,15 @@ Optional<ReadonlyBytes> TrackBufferDemuxer::codec_configuration_after_frame_pref
             return configuration;
     }
     return {};
+}
+
+AK::Duration TrackBufferDemuxer::highest_presentation_timestamp() const
+{
+    MutexLocker locker { m_mutex };
+    AK::Duration highest_presentation_timestamp;
+    for (auto const& run : m_runs)
+        highest_presentation_timestamp = max(highest_presentation_timestamp, run.highest_presentation_start);
+    return highest_presentation_timestamp;
 }
 
 void TrackBufferDemuxer::add_coded_frame(Media::CodedFrame frame)
@@ -631,7 +643,7 @@ Media::DecoderErrorOr<AK::Duration> TrackBufferDemuxer::duration_of_track(Media:
 
 Media::DecoderErrorOr<AK::Duration> TrackBufferDemuxer::total_duration()
 {
-    return AK::Duration::zero();
+    return track_buffer_ranges().highest_end_time();
 }
 
 Media::DemuxerScanState const& TrackBufferDemuxer::scan_state() const
@@ -663,8 +675,10 @@ void TrackBufferDemuxer::queue_scan_state_change_dispatch_while_locked()
             reached_end_of_stream = self->m_reached_end_of_stream;
         }
         Vector<Media::DemuxerTrackScanState> tracks;
-        tracks.empend(self->m_track, self->track_buffer_ranges(), reached_end_of_stream);
-        self->m_scan_state = { move(tracks), AK::Duration::zero() };
+        auto ranges = self->track_buffer_ranges();
+        auto highest_end_time = ranges.highest_end_time();
+        tracks.empend(self->m_track, move(ranges), reached_end_of_stream);
+        self->m_scan_state = { move(tracks), highest_end_time };
         if (self->m_scan_state_change_handler)
             self->m_scan_state_change_handler();
     });

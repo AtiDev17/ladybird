@@ -176,7 +176,7 @@ void SourceBufferProcessor::run_segment_parser_loop()
 
     while (true) {
         // 1. Loop Top: If the [[input buffer]] is empty, then jump to the need more data step below.
-        if (m_cursor->position() >= m_cursor->size())
+        if (m_cursor->position() >= m_cursor->blocking_size())
             goto need_more_data;
 
         // 2. If the [[input buffer]] contains bytes that violate the SourceBuffer byte stream format specification,
@@ -850,16 +850,30 @@ void SourceBufferProcessor::clear_reached_end_of_stream()
         track_buffer->demuxer().clear_reached_end_of_stream();
 }
 
-// https://w3c.github.io/media-source/#dom-sourcebuffer-buffered
-Media::TimeRanges SourceBufferProcessor::buffered_ranges() const
+AK::Duration SourceBufferProcessor::highest_presentation_timestamp() const
 {
-    // 2. Let highest end time be the largest track buffer ranges end time across all the track buffers
-    //    managed by this SourceBuffer object.
+    AK::Duration highest_presentation_timestamp;
+    for (auto const& [track_id, track_buffer] : m_track_buffers)
+        highest_presentation_timestamp = max(highest_presentation_timestamp, track_buffer->demuxer().highest_presentation_timestamp());
+    return highest_presentation_timestamp;
+}
+
+AK::Duration SourceBufferProcessor::highest_end_time() const
+{
     AK::Duration highest_end_time;
     for (auto const& [track_id, track_buffer] : m_track_buffers) {
         auto end_time = track_buffer->demuxer().track_buffer_ranges().highest_end_time();
         highest_end_time = max(highest_end_time, end_time);
     }
+    return highest_end_time;
+}
+
+// https://w3c.github.io/media-source/#dom-sourcebuffer-buffered
+Media::TimeRanges SourceBufferProcessor::buffered_ranges() const
+{
+    // 2. Let highest end time be the largest track buffer ranges end time across all the track buffers
+    //    managed by this SourceBuffer object.
+    auto highest_end_time = this->highest_end_time();
 
     // 3. Let intersection ranges equal a TimeRanges object containing a single range from 0 to highest end time.
     Media::TimeRanges intersection;

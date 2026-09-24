@@ -15,10 +15,10 @@
 #include <AK/Stream.h>
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
+#include <LibMedia/Codecs/AAC.h>
 #include <LibMedia/Containers/ConstantBitrateContainerNavigator.h>
 #include <LibMedia/Containers/FLACNavigator.h>
 #include <LibMedia/Containers/IndexedContainerNavigator.h>
-#include <LibMedia/Containers/MP3Navigator.h>
 #include <LibMedia/Containers/OggNavigator.h>
 #include <LibMedia/FFmpeg/FFmpegDemuxer.h>
 #include <LibMedia/FFmpeg/FFmpegHelpers.h>
@@ -38,13 +38,13 @@ bool FFmpegDemuxer::supports_container_mime_type(ContainerMimeType mime_type)
         return true;
     case ContainerID::ISOBMFF:
         return mime_type.media_type != ContainerMediaType::Application;
-    case ContainerID::MPEGAudio:
-    case ContainerID::ADTS:
     case ContainerID::FLAC:
     case ContainerID::WAV:
         return mime_type.media_type == ContainerMediaType::Audio;
     case ContainerID::Matroska:
     case ContainerID::WebM:
+    case ContainerID::ADTS:
+    case ContainerID::MPEGAudio:
         return false;
     }
     VERIFY_NOT_REACHED();
@@ -57,16 +57,14 @@ bool FFmpegDemuxer::supports_codec_in_container(ContainerID container_id, CodecI
         return first_is_one_of(codec_id, CodecID::VP8, CodecID::VP9, CodecID::H264, CodecID::H265, CodecID::MP3, CodecID::AAC, CodecID::AV1, CodecID::Opus, CodecID::FLAC);
     case ContainerID::Ogg:
         return first_is_one_of(codec_id, CodecID::Theora, CodecID::Vorbis, CodecID::Opus, CodecID::FLAC);
-    case ContainerID::MPEGAudio:
-        return codec_id == CodecID::MP3;
-    case ContainerID::ADTS:
-        return codec_id == CodecID::AAC;
     case ContainerID::FLAC:
         return codec_id == CodecID::FLAC;
     case ContainerID::WAV:
         return first_is_one_of(codec_id, CodecID::U8, CodecID::S16LE, CodecID::S24LE, CodecID::S32LE, CodecID::F32LE, CodecID::ALaw, CodecID::MuLaw);
+    case ContainerID::ADTS:
     case ContainerID::Matroska:
     case ContainerID::WebM:
+    case ContainerID::MPEGAudio:
         return false;
     }
     VERIFY_NOT_REACHED();
@@ -148,7 +146,7 @@ static DecoderErrorOr<void> initialize_format_context(AVFormatContext*& format_c
     AVDictionary* options = nullptr;
     ScopeGuard free_options = [&] { av_dict_free(&options); };
 
-    if (av_dict_set(&options, "format_whitelist", "aac,flac,mov,mp3,ogg,wav", 0) < 0)
+    if (av_dict_set(&options, "format_whitelist", "flac,mov,ogg,wav", 0) < 0)
         return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate FFmpeg format whitelist"sv);
 
     auto const& codecs = codec_whitelist();
@@ -160,7 +158,7 @@ static DecoderErrorOr<void> initialize_format_context(AVFormatContext*& format_c
 
     auto open_result = avformat_open_input(&format_context, nullptr, nullptr, &options);
     if (open_result < 0)
-        return DecoderError::with_description(DecoderErrorCategory::Corrupted, "Failed to open input for format parsing"sv);
+        return DecoderError::with_description(DecoderErrorCategory::UnrecognizedFormat, "Failed to open input for format parsing"sv);
 
     // Read stream info; doing this is required for headerless formats like MPEG
     if (avformat_find_stream_info(format_context, nullptr) < 0)
@@ -241,10 +239,25 @@ static DecoderErrorOr<Track> create_track_from_stream(AVStream const& stream, St
     return track;
 }
 
-bool FFmpegDemuxer::should_attempt(NonnullRefPtr<MediaStream> const&)
+static DecoderErrorOr<ByteBuffer> synthesize_aac_configuration_record(AVStream const& stream)
 {
-    // FIXME: Sniff the stream so that a format we cannot demux is rejected before a demuxer is created.
-    return true;
+    auto channel_count = stream.codecpar->ch_layout.nb_channels;
+    if (stream.codecpar->sample_rate <= 0 || channel_count <= 0 || channel_count > NumericLimits<u8>::max())
+        return DecoderError::with_description(DecoderErrorCategory::Invalid, "An AAC track states no usable sample rate and channel count"sv);
+
+    auto declared_sample_rate = static_cast<u32>(stream.codecpar->sample_rate);
+
+    // Each frame encodes 1024 frames at the core sample rate, but AAC-HE can double that before output. Check the
+    // time base to see whether it appears to match that core sample rate, and set the SBR rate to the doubled rate.
+    auto core_sample_rate = declared_sample_rate;
+    Optional<u32> spectral_band_replication_sample_rate;
+    if (stream.time_base.num == 1 && stream.time_base.den > 0 && static_cast<u32>(stream.time_base.den) * 2 == declared_sample_rate) {
+        core_sample_rate = static_cast<u32>(stream.time_base.den);
+        spectral_band_replication_sample_rate = declared_sample_rate;
+    }
+
+    auto record = TRY(Codecs::AAC::create_configuration_record(Codecs::AAC::LOW_COMPLEXITY_AUDIO_OBJECT_TYPE, core_sample_rate, static_cast<u8>(channel_count), spectral_band_replication_sample_rate));
+    return DECODER_TRY_ALLOC(ByteBuffer::copy(record.span()));
 }
 
 DecoderErrorOr<NonnullRefPtr<Demuxer>> FFmpegDemuxer::from_stream(NonnullRefPtr<MediaStream> const& stream)
@@ -271,6 +284,13 @@ DecoderErrorOr<NonnullRefPtr<Demuxer>> FFmpegDemuxer::from_stream(NonnullRefPtr<
         auto track = TRY(create_track_from_stream(stream, format_name, seen_types));
         auto codec_id = media_codec_id_from_ffmpeg_codec_id(stream.codecpar->codec_id);
         auto codec_initialization_data = DECODER_TRY_ALLOC(ByteBuffer::copy(stream.codecpar->extradata, stream.codecpar->extradata_size));
+        if (codec_id == CodecID::AAC && codec_initialization_data.is_empty()) {
+            auto synthesized = synthesize_aac_configuration_record(stream);
+            if (synthesized.is_error())
+                dbgln("FFmpegDemuxer: Could not describe an AAC track that carries no configuration: {}", synthesized.error().description());
+            else
+                codec_initialization_data = synthesized.release_value();
+        }
 
         AK::Duration duration;
         if (stream.duration >= 0)
@@ -327,7 +347,7 @@ static inline i64 duration_to_time_units(AK::Duration duration, AVRational const
     return duration.to_time_units(time_base.num, time_base.den);
 }
 
-OwnPtr<ContainerNavigator> FFmpegDemuxer::create_single_track_container_navigator(AVFormatContext& context, AK::Duration total_duration, NonnullRefPtr<MediaStream> const& stream)
+OwnPtr<ContainerNavigator> FFmpegDemuxer::create_single_track_container_navigator(AVFormatContext& context, NonnullRefPtr<MediaStream> const& stream)
 {
     auto format_name = StringView(context.iformat->name, strlen(context.iformat->name));
 
@@ -362,14 +382,6 @@ OwnPtr<ContainerNavigator> FFmpegDemuxer::create_single_track_container_navigato
             return nullptr;
         auto data_offset = avformat_index_get_entry(stream, 0)->pos;
         return make<ConstantBitrateContainerNavigator>(data_offset, bytes_per_second, codec_par->block_align);
-    }
-
-    if (format_name == "mp3"sv && context.nb_streams == 1) {
-        AVPacket* packet = av_packet_alloc();
-        ScopeGuard free_packet = [&] { av_packet_free(&packet); };
-
-        if (av_read_frame(&context, packet) >= 0 && packet->pos >= 0)
-            return make<MP3Navigator>(stream, static_cast<size_t>(packet->pos), total_duration);
     }
 
     if (format_name == "ogg"sv) {
@@ -413,7 +425,7 @@ void FFmpegDemuxer::start_buffered_scan_thread(AVFormatContext& context)
     if (m_stream_info.is_empty())
         return;
 
-    OwnPtr<ContainerNavigator> navigator = create_single_track_container_navigator(context, m_total_duration, m_stream);
+    OwnPtr<ContainerNavigator> navigator = create_single_track_container_navigator(context, m_stream);
     if (navigator == nullptr) {
         Vector<IndexedContainerNavigator::TrackIndex> track_indices;
         for (u32 i = 0; i < context.nb_streams; i++) {
