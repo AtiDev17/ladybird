@@ -24,8 +24,8 @@ use crate::layout::ComputedValuesView;
 use crate::layout::CssPixels;
 use crate::layout::FfiReplacedContentFacts;
 use crate::layout::node_data::{
-    DomPaintFact, FfiNodeConstructionFacts, FfiNodeLink, FfiStylePayloads, MAX_NODE_SLOT_COUNT, NodeData, NodeFlag,
-    NodeKind, NodeSlotId,
+    AncestorFact, DomPaintFact, FfiNodeConstructionFacts, FfiNodeLink, FfiStylePayloads, MAX_NODE_SLOT_COUNT, NodeData,
+    NodeFlag, NodeKind, NodeSlotId,
 };
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -538,6 +538,8 @@ pub(crate) struct LayoutNodeArena {
     dom_nodes_whose_bound_row_was_freed: Vec<*mut c_void>,
     fc_run_cache_store: super::fc_run_cache::FcRunCacheArenaStore,
     pub(super) layout_trace: super::trace::LayoutTrace,
+    #[cfg(debug_assertions)]
+    pub(super) read_scope: Cell<super::read_scope::ReadScope>,
     inline_item_stashes: RefCell<HashMap<NodeSlotId, super::inline_level_iterator::StashedInlineItems>>,
     pub(crate) paintable_rows: crate::painting::paintable_rows::PaintableRowStore,
     paint_state: RefCell<crate::painting::paint_state::PaintState>,
@@ -618,6 +620,8 @@ impl LayoutNodeArena {
             dom_nodes_whose_bound_row_was_freed: Vec::new(),
             fc_run_cache_store: super::fc_run_cache::FcRunCacheArenaStore::default(),
             layout_trace: super::trace::LayoutTrace::default(),
+            #[cfg(debug_assertions)]
+            read_scope: Cell::new(super::read_scope::ReadScope::default()),
             inline_item_stashes: RefCell::new(HashMap::default()),
             paintable_rows: crate::painting::paintable_rows::PaintableRowStore::default(),
             paint_state: RefCell::new(crate::painting::paint_state::PaintState::default()),
@@ -1361,6 +1365,7 @@ impl LayoutNodeArena {
             NodeFlag::HasPreserve3dTransformStyle,
             style.transform().transform_style == crate::css::css_enums::transform_style::PRESERVE_3D,
         );
+        self.refresh_ancestor_facts_of_anonymous_children(slot);
     }
 
     pub(crate) fn enroll_text_node_for_content_sync(&self, node: NodeSlotId) {
@@ -1902,6 +1907,62 @@ impl LayoutNodeArena {
         }
     }
 
+    /// Returns whether the node's ancestor facts changed.
+    fn derive_ancestor_facts_for_node(&self, node: NodeSlotId) -> bool {
+        let data = self.data(node);
+        let parent = data.parent.get();
+        let mut facts = 0;
+        if !parent.is_invalid() {
+            let parent_data = self.data(parent);
+            let parent_style = super::node_facts::node_style_view(parent_data);
+            if super::node_facts::node_is_flex_or_grid_container(parent_style) {
+                facts |= AncestorFact::ParentIsFlexOrGridContainer as u8;
+            }
+            if parent_style.is_none_or(|style| {
+                !style.is_floating() && (style.display().is_flow_inside() || style.display().is_flow_root_inside())
+            }) {
+                facts |= AncestorFact::ParentIsUnfloatedFlowContainer as u8;
+            }
+            if super::node_facts::has_flag(data, NodeFlag::Anonymous) {
+                if super::node_facts::has_flag(parent_data, NodeFlag::UsesButtonLayout) {
+                    facts |= AncestorFact::IsAnonymousButtonContentWrapper as u8;
+                }
+                if super::node_facts::has_ancestor_fact(parent_data, AncestorFact::IsAnonymousButtonContentWrapper) {
+                    facts |= AncestorFact::IsAnonymousButtonContentBox as u8;
+                }
+                let inherits_text_overflow_ellipsis = if super::node_facts::has_flag(parent_data, NodeFlag::Anonymous) {
+                    super::node_facts::has_ancestor_fact(parent_data, AncestorFact::InheritsTextOverflowEllipsis)
+                } else {
+                    super::node_facts::node_applies_text_overflow_ellipsis(parent_style)
+                };
+                if inherits_text_overflow_ellipsis {
+                    facts |= AncestorFact::InheritsTextOverflowEllipsis as u8;
+                }
+            }
+            if super::node_facts::has_ancestor_fact(parent_data, AncestorFact::HasInlineLevelInclusiveAncestor) {
+                facts |= AncestorFact::HasInlineLevelInclusiveAncestor as u8;
+            }
+        }
+        if super::node_facts::node_is_inline_outside(super::node_facts::node_style_view(data)) {
+            facts |= AncestorFact::HasInlineLevelInclusiveAncestor as u8;
+        }
+        data.ancestor_facts.replace(facts) != facts
+    }
+
+    /// A style change reaches the anonymous boxes below the node without rebuilding them, and
+    /// they take some of their ancestor facts from it.
+    fn refresh_ancestor_facts_of_anonymous_children(&self, parent: NodeSlotId) {
+        let mut child = self.data(parent).first_child.get();
+        while !child.is_invalid() {
+            let data = self.data(child);
+            if super::node_facts::has_flag(data, NodeFlag::Anonymous) && self.derive_ancestor_facts_for_node(child) {
+                self.bump_fragment_cache_epoch_of_self_and_ancestors(child);
+                self.refresh_ancestor_facts_of_anonymous_children(child);
+            }
+            child = data.next_sibling.get();
+        }
+    }
+
     /// Returns every attached subtree root the recomputation visited.
     pub(crate) fn recompute_containing_blocks_after_tree_update(
         &self,
@@ -1933,12 +1994,13 @@ impl LayoutNodeArena {
     }
 
     /// Recomputes `containing_block` and `inline_containing_block` and derives
-    /// the `AbsposDescendantEscapes` flag for every node in the inclusive
-    /// subtree of `root`. The pre-order traversal visits ancestors before the
-    /// descendants that mark them, so clearing the flag on visit and marking
-    /// upwards compose within one walk; the marking follows plain parent links
-    /// and so reaches ancestors above `root` when the containing block lies
-    /// outside the subtree.
+    /// the `AbsposDescendantEscapes` flag and the ancestor facts for every node
+    /// in the inclusive subtree of `root`. The pre-order traversal visits
+    /// ancestors before the descendants that mark them, so clearing the flag on
+    /// visit and marking upwards compose within one walk; the marking follows
+    /// plain parent links and so reaches ancestors above `root` when the
+    /// containing block lies outside the subtree. Ancestor facts read the
+    /// parent, which the same walk visited first.
     pub(crate) fn recompute_containing_blocks_in_subtree(
         &self,
         root: NodeSlotId,
@@ -1956,6 +2018,7 @@ impl LayoutNodeArena {
                 self.scrollable_overflow.contained_boxes_dirty.set(true);
             }
             self.derive_abspos_escape_flags_for_node(node);
+            self.derive_ancestor_facts_for_node(node);
         });
     }
 
@@ -2021,7 +2084,7 @@ impl LayoutNodeArena {
         }
     }
 
-    fn pre_order_label_of_subtree_successor(&self, node: NodeSlotId) -> u64 {
+    pub(super) fn pre_order_label_of_subtree_successor(&self, node: NodeSlotId) -> u64 {
         let mut current = node;
         loop {
             let data = self.data(current);

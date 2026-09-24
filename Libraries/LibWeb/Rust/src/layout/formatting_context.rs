@@ -978,7 +978,7 @@ enum FormattingContextImplementation<'pass> {
 pub(crate) fn formatting_context_type_created_by_node_data(
     data: &NodeData,
     style: Option<ComputedValuesView<'_>>,
-    parent_style: Option<ComputedValuesView<'_>>,
+    parent_is_flex_or_grid_container: bool,
 ) -> Option<FormattingContextType> {
     if data.kind.get() == crate::layout::node_data::NodeKind::SVGSVGBox {
         return Some(FormattingContextType::Svg);
@@ -1024,7 +1024,7 @@ pub(crate) fn formatting_context_type_created_by_node_data(
         return Some(FormattingContextType::Grid);
     }
     if display.is_some_and(|display| display.is_math_inside())
-        || node_facts::node_creates_block_formatting_context(data, style, parent_style)
+        || node_facts::node_creates_block_formatting_context(data, style, parent_is_flex_or_grid_container)
     {
         return Some(FormattingContextType::Block);
     }
@@ -1050,7 +1050,7 @@ pub(crate) fn formatting_context_type_created_by_box(facts: NodeFacts<'_>) -> Op
     formatting_context_type_created_by_node_data(
         facts.data(),
         facts.computed_values_view_if_styled(),
-        facts.parent_computed_values_view_if_styled(),
+        facts.parent_is_flex_or_grid_container(),
     )
 }
 
@@ -2357,27 +2357,18 @@ unsafe fn commit_entry_pass<'a>(
 
 /// # Safety
 ///
-/// `arena` must be a live handle with a registered layout host, used on the document thread;
-/// `root` must be a live partial relayout boundary and `viewport` the arena's live viewport box.
+/// `arena` must be a live handle with a registered layout host, used on the document thread, and
+/// `root` must be a live partial relayout boundary.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_compute_subtree_layout(
     arena: *mut c_void,
     root: NodeSlotId,
-    viewport: NodeSlotId,
     viewport_inline_size_raw: i32,
-    viewport_block_size_raw: i32,
     document_in_quirks_mode: bool,
 ) {
     // SAFETY: Guaranteed by the entry point's contract.
     unsafe {
-        compute_subtree_layout(
-            arena,
-            root,
-            viewport,
-            viewport_inline_size_raw,
-            viewport_block_size_raw,
-            document_in_quirks_mode,
-        );
+        compute_subtree_layout(arena, root, viewport_inline_size_raw, document_in_quirks_mode);
     }
 }
 
@@ -2387,13 +2378,11 @@ pub unsafe extern "C" fn layout_arena_compute_subtree_layout(
 /// # Safety
 ///
 /// `arena_handle` must be a live handle with a registered layout host, used on the document
-/// thread; `root` must be a live partial relayout boundary and `viewport` the live viewport box.
+/// thread, and `root` must be a live partial relayout boundary.
 pub(crate) unsafe fn compute_subtree_layout(
     arena_handle: *mut c_void,
     root: NodeSlotId,
-    viewport: NodeSlotId,
     viewport_inline_size_raw: i32,
-    viewport_block_size_raw: i32,
     document_in_quirks_mode: bool,
 ) {
     assert!(!arena_handle.is_null(), "layout node arena handle is null");
@@ -2416,6 +2405,7 @@ pub(crate) unsafe fn compute_subtree_layout(
     // the incremental tree build created; refresh the containing blocks of the whole subtree.
     arena.recompute_containing_blocks_in_subtree(root, host.inline_containing_block_lookup);
 
+    let read_scope = arena.enter_read_scope(root);
     // Abspos boundaries recompute their size and position in their containing block's space.
     // In-flow SVG boundaries keep their committed geometry and lay out only their contents.
     let root_is_absolutely_positioned = NodeFacts::new(&callbacks, root).is_absolutely_positioned();
@@ -2443,15 +2433,11 @@ pub(crate) unsafe fn compute_subtree_layout(
         if root_is_absolutely_positioned {
             abspos_engine::AbsposEngine::for_run(&entry_run).replay(&entry_run, root);
         } else {
-            layout_subtree_with_frozen_root_geometry(
-                &entry_run,
-                viewport,
-                CssPixels::from_raw(viewport_inline_size_raw),
-                CssPixels::from_raw(viewport_block_size_raw),
-            );
+            layout_subtree_with_frozen_root_geometry(&entry_run);
         }
         finish_entry_pass(entry_records, &entry_fragments, &callbacks, false)
     });
+    drop(read_scope);
     // SAFETY: Computation has finished and its input borrows are no longer used.
     let arena = unsafe { commit_entry_pass(arena_handle, &host, root, &pass_fragments) };
     // Commit reset the subtree's rows, and its new size may affect ancestor scrollable overflow.
@@ -2462,31 +2448,13 @@ pub(crate) unsafe fn compute_subtree_layout(
     arena.end_active_layout_pass();
 }
 
-fn layout_subtree_with_frozen_root_geometry(
-    run: &FormattingContextRun<'_>,
-    viewport: Node,
-    viewport_inline_size: CssPixels,
-    viewport_block_size: CssPixels,
-) {
+fn layout_subtree_with_frozen_root_geometry(run: &FormattingContextRun<'_>) {
     let root = run.box_;
     let callbacks = &run.callbacks;
     let root_used = used_values::used_values_from_committed_fragment_link(callbacks, root)
         .expect("partial relayout root must have committed geometry");
     run.records.register(root, root_used.clone());
     let fragments = run.fragments.as_deref().expect("partial relayout must build fragments");
-    if !viewport.is_invalid() && viewport != root {
-        let viewport_constraints = ContainingBlockConstraints {
-            percentage_basis_inline_size: Some(viewport_inline_size),
-            percentage_basis_block_size: Some(viewport_block_size),
-            ..ContainingBlockConstraints::default()
-        };
-        let viewport_used = run
-            .records
-            .create_used_values(callbacks, viewport, viewport_constraints);
-        viewport_used.set_content_inline_size(viewport_inline_size);
-        viewport_used.set_content_block_size(viewport_block_size);
-        place_child(run, viewport, FfiCssPixelPoint::default(), None);
-    }
     let input = LayoutInput::new(
         AvailableSpace {
             inline_size: AvailableSize::definite(root_used.content_inline_size.get()),
