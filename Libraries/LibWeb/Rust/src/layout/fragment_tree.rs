@@ -51,6 +51,7 @@ pub(crate) struct FragmentLink {
     pub(crate) inset_bottom: CssPixels,
     pub(crate) containing_line_box_index: Option<usize>,
     pub(crate) abspos_layout_inputs: Option<abspos_inputs::AbsposLayoutInputs>,
+    pub(crate) containing_block: crate::layout::node_data::NodeSlotId,
 }
 
 fn same_allocation<T>(left: Option<&std::rc::Rc<T>>, right: Option<&std::rc::Rc<T>>) -> bool {
@@ -142,6 +143,7 @@ impl FragmentLink {
             && self.inset_bottom == previous.inset_bottom
             && self.containing_line_box_index == previous.containing_line_box_index
             && self.abspos_layout_inputs == previous.abspos_layout_inputs
+            && self.containing_block == previous.containing_block
     }
 }
 
@@ -245,7 +247,8 @@ fn propagate_payload_toward_run_root_space<Payload: PropagatedPayload>(
             break;
         };
         payload.translate_by(used.content_offset.get());
-        let containing_block = callbacks.containing_block(payload.coordinate_space_box());
+        let containing_block =
+            formatting_context::placement_containing_block(records, callbacks, payload.coordinate_space_box());
         if containing_block.is_invalid() {
             break;
         }
@@ -358,6 +361,7 @@ pub(crate) struct PlacementData {
     pub(crate) inset_bottom: CssPixels,
     pub(crate) containing_line_box_index: Option<usize>,
     pub(crate) abspos_layout_inputs: Option<abspos_inputs::AbsposLayoutInputs>,
+    pub(crate) containing_block: crate::layout::node_data::NodeSlotId,
 }
 
 impl PlacementData {
@@ -374,6 +378,7 @@ impl PlacementData {
             inset_bottom: used.inset_bottom.get(),
             containing_line_box_index,
             abspos_layout_inputs: used.rare_data.get().and_then(|cell| cell.borrow().abspos_layout_inputs),
+            containing_block: used.placed_in.get(),
         }
     }
 }
@@ -388,6 +393,7 @@ fn link_fragment(fragment: std::rc::Rc<Fragment>, placement: PlacementData) -> F
         inset_bottom: placement.inset_bottom,
         containing_line_box_index: placement.containing_line_box_index,
         abspos_layout_inputs: placement.abspos_layout_inputs,
+        containing_block: placement.containing_block,
     }
 }
 
@@ -613,12 +619,10 @@ impl RunFragmentBuilder {
     pub(crate) fn pending_abspos_children_awaiting_containing_block_info(
         &self,
         containing_block: crate::layout::node_data::NodeSlotId,
-        callbacks: &LayoutPass<'_>,
     ) -> Vec<crate::layout::node_data::NodeSlotId> {
         let inner = self.inner.borrow();
         let awaits_info = |entry: &abspos_inputs::PendingAbsposChild| {
-            entry.containing_block_info_override.is_none()
-                && callbacks.containing_block(entry.child_box) == containing_block
+            entry.containing_block_info_override.is_none() && entry.containing_block() == containing_block
         };
         debug_assert!(
             !inner
@@ -670,7 +674,7 @@ impl RunFragmentBuilder {
         self.inner
             .borrow()
             .iter_pending_abspos()
-            .any(|entry| !entry.inline_containing_block.is_invalid())
+            .any(|entry| !entry.inline_containing_block().is_invalid())
     }
 
     pub(crate) fn any_pending_abspos_names_inline_containing_block(
@@ -680,7 +684,7 @@ impl RunFragmentBuilder {
         self.inner
             .borrow()
             .iter_pending_abspos()
-            .any(|entry| entry.inline_containing_block == inline_box)
+            .any(|entry| entry.inline_containing_block() == inline_box)
     }
 
     pub(crate) fn anchor_candidate_shells(&self, callbacks: &LayoutPass<'_>) -> Vec<*mut c_void> {
@@ -710,7 +714,7 @@ impl RunFragmentBuilder {
     ) -> Vec<abspos_inputs::PendingAbsposChild> {
         let mut inner = self.inner.borrow_mut();
         let containing_block_is_owned_and_placed = |entry: &abspos_inputs::PendingAbsposChild| {
-            let containing_block = callbacks.containing_block(entry.child_box);
+            let containing_block = entry.containing_block();
             !containing_block.is_invalid()
                 && (self.is_entry_accumulator || containing_block != self.root_node)
                 && records
@@ -773,7 +777,11 @@ impl RunFragmentBuilder {
         inner.pending_fragments.remove(&slot);
     }
 
-    pub(crate) fn normalize_arrivals_for_placement(&self, node: crate::layout::node_data::NodeSlotId) {
+    pub(crate) fn normalize_arrivals_for_placement(
+        &self,
+        node: crate::layout::node_data::NodeSlotId,
+        callbacks: &LayoutPass<'_>,
+    ) {
         let mut inner = self.inner.borrow_mut();
         let slot = node.slot_index();
         let root = inner.child_roots_awaiting_placement.remove(&slot);
@@ -797,7 +805,12 @@ impl RunFragmentBuilder {
         } else {
             pending_fragment.children.extend(root.scoped_descendants);
         }
-        pending_fragment.pending_abspos.extend(root.propagated_pending_abspos);
+        pending_fragment
+            .pending_abspos
+            .extend(root.propagated_pending_abspos.into_iter().map(|mut entry| {
+                formatting_context::resolve_pending_abspos_containing_block(callbacks, &mut entry, self.root_node);
+                entry
+            }));
         pending_fragment
             .anchor_candidates
             .extend(root.propagated_anchor_candidates);
@@ -847,7 +860,7 @@ impl RunFragmentBuilder {
         let content_offset = used.content_offset.get();
         for mut entry in pending_abspos_from_placed_box {
             debug_assert!(
-                callbacks.containing_block(entry.child_box) != node,
+                entry.containing_block() != node,
                 "an abspos registration outlived its containing block's placement drain (slot {})",
                 entry.child_box.slot_index()
             );
@@ -975,7 +988,7 @@ impl RunFragmentBuilder {
         for entry in &mut propagated_pending_abspos {
             #[cfg(debug_assertions)]
             {
-                let containing_block = callbacks.containing_block(entry.child_box);
+                let containing_block = entry.containing_block();
                 debug_assert!(
                     containing_block.is_invalid()
                         || containing_block == self.root_node

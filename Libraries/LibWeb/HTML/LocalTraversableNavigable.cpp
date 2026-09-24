@@ -7,7 +7,6 @@
  */
 
 #include <AK/HashMap.h>
-#include <AK/NeverDestroyed.h>
 #include <LibGC/RootVector.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/DOM/Document.h>
@@ -43,12 +42,6 @@ LocalTraversableNavigable::LocalTraversableNavigable(GC::Ref<Page> page)
 }
 
 LocalTraversableNavigable::~LocalTraversableNavigable() = default;
-
-static OrderedHashTable<LocalTraversableNavigable*>& user_agent_top_level_traversable_set()
-{
-    static NeverDestroyed<OrderedHashTable<LocalTraversableNavigable*>> set;
-    return *set;
-}
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-top-level-browsing-context
 BrowsingContextAndDocument create_a_new_top_level_browsing_context_and_document(GC::Ref<Page> page)
@@ -128,41 +121,29 @@ GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_new_top_l
     // NB: This is done by the canonical traversable.
 
     // 11. Append traversable to the user agent's top-level traversable set.
-    user_agent_top_level_traversable_set().set(traversable.ptr());
+    // NB: The UI process holds the user agent's top-level traversable set.
 
     // 12. Return traversable.
     return traversable;
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#create-a-fresh-top-level-traversable
-GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_fresh_top_level_traversable(GC::Ref<Page> page, URL::URL const& initial_navigation_url, DocumentResource initial_navigation_post_resource, SessionHistoryEntryDescriptor initial_history_entry, VisibilityState system_visibility_state)
+GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_fresh_top_level_traversable(GC::Ref<Page> page, SessionHistoryEntryDescriptor initial_history_entry, VisibilityState system_visibility_state)
 {
     // 1. Let traversable be the result of creating a new top-level traversable given null and the empty string.
     auto traversable = create_a_new_top_level_traversable(page, nullptr, move(initial_history_entry), system_visibility_state);
     page->set_top_level_traversable(traversable);
 
-    // AD-HOC: Mark the about:blank document as finished parsing if we're only going to about:blank
-    //         Skip the initial navigation as well. This matches the behavior of the window open steps.
+    // AD-HOC: Mark the about:blank document as finished parsing. This matches the behavior of the window open steps.
+    auto document = GC::Ref(*traversable->active_document());
+    auto completion_token = HTML::HTMLParser::parserless_completion_token(document);
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(traversable->heap(), [document, completion_token] {
+        // FIXME: We do this other places too when creating a new about:blank document. Perhaps it's worth a spec issue?
+        HTML::HTMLParser::the_end(document, completion_token);
+    }));
 
-    if (url_matches_about_blank(initial_navigation_url)) {
-        auto document = GC::Ref(*traversable->active_document());
-        auto completion_token = HTML::HTMLParser::parserless_completion_token(document);
-        Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(traversable->heap(), [document, completion_token, initial_navigation_url] {
-            // FIXME: We do this other places too when creating a new about:blank document. Perhaps it's worth a spec issue?
-            HTML::HTMLParser::the_end(document, completion_token);
-
-            // FIXME: If we perform the URL and history update steps here, we start hanging tests and the UI process will
-            //        try to load() the initial URLs passed on the command line before we finish processing the events here.
-            //        However, because we call this before the PageClient is fully initialized... that gets awkward.
-        }));
-    }
-
-    else {
-        // 2. Navigate traversable to initialNavigationURL using traversable's active document, with documentResource set to initialNavigationPostResource.
-        MUST(traversable->navigate({ .url = initial_navigation_url,
-            .source_document = *traversable->active_document(),
-            .document_resource = initial_navigation_post_resource }));
-    }
+    // 2. Navigate traversable to initialNavigationURL using traversable's active document, with documentResource set to initialNavigationPostResource.
+    // NB: The UI process navigates the canonical traversable.
 
     // 3. Return traversable.
     return traversable;
@@ -387,7 +368,7 @@ void LocalTraversableNavigable::destroy_top_level_traversable()
     page().client().page_did_close();
 
     // 5. Remove traversable from the user agent's top-level traversable set.
-    user_agent_top_level_traversable_set().remove(this);
+    // NB: The UI process holds the user agent's top-level traversable set.
 
     // FIXME: 6. Invoke WebDriver BiDi navigable destroyed with traversable.
 
@@ -395,11 +376,6 @@ void LocalTraversableNavigable::destroy_top_level_traversable()
     //        However, without this, we can keep stale destroyed navigables around.
     set_has_been_destroyed();
     remove_from_all_local_navigables();
-}
-
-void LocalTraversableNavigable::remove_from_user_agent_top_level_traversable_set()
-{
-    user_agent_top_level_traversable_set().remove(this);
 }
 
 }

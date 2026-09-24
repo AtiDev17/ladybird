@@ -2463,7 +2463,9 @@ impl<'pass> GridFormattingContext<'pass> {
         scratch_root
             .has_definite_block_size
             .set(live.has_definite_block_size.get());
-        RunRecords::with_root(self.callbacks.arena(), subgrid.box_, scratch_root, |records| {
+        let arena = self.callbacks.arena();
+        let containing_block = self.callbacks.in_flow_containing_block(subgrid.box_);
+        RunRecords::with_root(arena, subgrid.box_, containing_block, scratch_root, |records| {
             let scratch_run = FormattingContextRun {
                 purpose: formatting_context::LayoutPurpose::Measurement,
                 records,
@@ -3533,8 +3535,11 @@ impl<'pass> GridFormattingContext<'pass> {
                 };
                 // The grid area supplies both the containing block and the
                 // static position for the grid's own abspos children.
-                let containing_block_info = (self.callbacks.containing_block(child) == self.grid_container)
-                    .then(|| self.abspos_containing_block_info(child));
+                let containing_block_info = node_facts::has_flag(
+                    self.callbacks.node_data(self.grid_container),
+                    node_facts::containing_block_establishment_flag(self.facts(child).is_fixed_position()),
+                )
+                .then(|| self.abspos_containing_block_info(child));
                 formatting_context::register_contained_abspos_child(
                     &self.callbacks,
                     self.fragments.as_deref(),
@@ -3547,9 +3552,7 @@ impl<'pass> GridFormattingContext<'pass> {
             child = next;
         }
         if let Some(fragments) = self.fragments.as_deref() {
-            for child in
-                fragments.pending_abspos_children_awaiting_containing_block_info(self.grid_container, &self.callbacks)
-            {
+            for child in fragments.pending_abspos_children_awaiting_containing_block_info(self.grid_container) {
                 // Deeper descendants inside grid items still get the grid area
                 // as their containing block, but their static position comes
                 // from their in-flow ancestor, so axis modes fall back to

@@ -540,6 +540,7 @@ pub(crate) struct LayoutNodeArena {
     pub(super) layout_trace: super::trace::LayoutTrace,
     #[cfg(debug_assertions)]
     pub(super) read_scope: Cell<super::read_scope::ReadScope>,
+    pub(super) innermost_run: Cell<(NodeSlotId, NodeSlotId)>,
     inline_item_stashes: RefCell<HashMap<NodeSlotId, super::inline_level_iterator::StashedInlineItems>>,
     pub(crate) paintable_rows: crate::painting::paintable_rows::PaintableRowStore,
     paint_state: RefCell<crate::painting::paint_state::PaintState>,
@@ -554,13 +555,15 @@ pub(crate) struct LayoutNodeArena {
     layout_update_flag_node_indices: RefCell<HashMap<NodeSlotId, usize>>,
     #[cfg(test)]
     layout_update_flag_ancestor_visits: Cell<u64>,
-    pub(super) pending_containing_block_roots: RefCell<Vec<NodeSlotId>>,
+    pub(super) pending_attached_subtree_roots: RefCell<Vec<NodeSlotId>>,
     /// Boxes whose child lists gained children since the last layout tree build, held back from
     /// layout invalidation until the build shows what the new children are.
     pub(crate) deferred_child_list_insertion_parents: RefCell<Vec<(NodeSlotId, NodeSlotId)>>,
     /// Layout inputs for new absolutely positioned boxes that the build confined to themselves.
     /// They stand in for the committed inputs such a box does not have yet.
     pub(crate) confined_abspos_layout_inputs: RefCell<HashMap<NodeSlotId, AbsposLayoutInputs>>,
+    pub(crate) inline_boxes_lifted_out_of: RefCell<HashMap<NodeSlotId, NodeSlotId>>,
+    pub(crate) out_of_flow_positioning_contained: RefCell<HashMap<NodeSlotId, u32>>,
     /// Attribution of pending updates for partial relayout. Invariant: every update recorded
     /// since the last layout pass is either attributed to a boundary in the root set above, or
     /// this escape bit is set. Partial relayout may only run while the bit is clear; a full
@@ -622,6 +625,7 @@ impl LayoutNodeArena {
             layout_trace: super::trace::LayoutTrace::default(),
             #[cfg(debug_assertions)]
             read_scope: Cell::new(super::read_scope::ReadScope::default()),
+            innermost_run: Cell::new((NodeSlotId::INVALID, NodeSlotId::INVALID)),
             inline_item_stashes: RefCell::new(HashMap::default()),
             paintable_rows: crate::painting::paintable_rows::PaintableRowStore::default(),
             paint_state: RefCell::new(crate::painting::paint_state::PaintState::default()),
@@ -634,9 +638,11 @@ impl LayoutNodeArena {
             layout_update_flag_node_indices: RefCell::new(HashMap::default()),
             #[cfg(test)]
             layout_update_flag_ancestor_visits: Cell::new(0),
-            pending_containing_block_roots: RefCell::new(Vec::new()),
+            pending_attached_subtree_roots: RefCell::new(Vec::new()),
             deferred_child_list_insertion_parents: RefCell::new(Vec::new()),
             confined_abspos_layout_inputs: RefCell::new(HashMap::default()),
+            inline_boxes_lifted_out_of: RefCell::new(HashMap::default()),
+            out_of_flow_positioning_contained: RefCell::new(HashMap::default()),
             pending_updates_escape_partial_relayout: Cell::new(false),
             boxes_needing_scrollable_overflow_recalculation: RefCell::new(Vec::new()),
             needs_full_scrollable_overflow_recalculation: Cell::new(false),
@@ -923,6 +929,8 @@ impl LayoutNodeArena {
             self.paintable_row_freed(reset);
         }
         self.anchor_positioning_nodes.get_mut().remove(&id);
+        self.inline_boxes_lifted_out_of.get_mut().remove(&id);
+        self.out_of_flow_positioning_contained.get_mut().remove(&id);
         self.pre_order_labels[index as usize].set(0);
         self.metadata_mut(index).occupied = false;
         self.forget_row_sharing_dom_node(id);
@@ -1351,8 +1359,197 @@ impl LayoutNodeArena {
         }
     }
 
+    pub(crate) fn continue_containing_block_search(
+        &self,
+        search: &mut super::abspos_inputs::ContainingBlockSearch,
+        limit: NodeSlotId,
+    ) {
+        if !search.containing_block.is_invalid() {
+            return;
+        }
+        let establishes_containing_block =
+            super::node_facts::containing_block_establishment_flag(search.is_fixed_position);
+        let looks_for_inline_containing_block = !search.is_fixed_position;
+        let has_lifted_boxes = !self.inline_boxes_lifted_out_of.borrow().is_empty();
+        let mut node = search.frontier;
+        while node != limit {
+            self.assert_layout_read_is_in_scope(node);
+            let ancestor = self.data(node).parent.get();
+            if ancestor.is_invalid() {
+                break;
+            }
+            if looks_for_inline_containing_block
+                && has_lifted_boxes
+                && search.inline_containing_block.is_invalid()
+                && let Some(inline_box) = self.inline_box_lifted_out_of(node)
+            {
+                search.inline_containing_block = self.nearest_inline_containing_block_from(inline_box);
+            }
+            node = ancestor;
+            self.assert_layout_read_is_in_scope(node);
+            let data = self.data(node);
+            let kind = data.kind.get();
+            if super::node_facts::kind_is_box(kind) {
+                if super::node_facts::has_flag(data, establishes_containing_block) {
+                    search.containing_block = node;
+                    break;
+                }
+            } else if looks_for_inline_containing_block
+                && search.inline_containing_block.is_invalid()
+                && kind == NodeKind::InlineNode
+                && super::node_facts::has_flag(data, NodeFlag::EstablishesAbsolutePositionContainingBlock)
+            {
+                search.inline_containing_block = node;
+            }
+        }
+        search.frontier = node;
+        if search.containing_block.is_invalid() && search.is_fixed_position && self.data(node).parent.get().is_invalid()
+        {
+            search.containing_block = node;
+        }
+    }
+
+    fn nearest_inline_containing_block_from(&self, inline_box: NodeSlotId) -> NodeSlotId {
+        let mut inline_ancestor = inline_box;
+        while !inline_ancestor.is_invalid() {
+            self.assert_layout_read_is_in_scope(inline_ancestor);
+            let data = self.data(inline_ancestor);
+            if data.kind.get() != NodeKind::InlineNode {
+                break;
+            }
+            if super::node_facts::has_flag(data, NodeFlag::EstablishesAbsolutePositionContainingBlock) {
+                return inline_ancestor;
+            }
+            inline_ancestor = data.parent.get();
+        }
+        NodeSlotId::INVALID
+    }
+
+    fn derive_containing_block_establishment_flags(&self, node: NodeSlotId) {
+        let data = self.data(node);
+        let previous_flags = data.flags.get();
+        let (absolute, fixed) = if data.kind.get() == NodeKind::InlineNode {
+            let absolute = !super::node_facts::has_flag(data, NodeFlag::Anonymous)
+                && self
+                    .node_style_if_live(node)
+                    .is_some_and(crate::painting::style_queries::inline_establishes_absolute_position_containing_block);
+            (absolute, false)
+        } else {
+            crate::painting::style_queries::establishes_positioning_containing_blocks(self, node)
+        };
+        let establishment_flags = NodeFlag::EstablishesAbsolutePositionContainingBlock as u32
+            | NodeFlag::EstablishesFixedPositionContainingBlock as u32;
+        let mut flags = previous_flags & !establishment_flags;
+        if absolute {
+            flags |= NodeFlag::EstablishesAbsolutePositionContainingBlock as u32;
+        }
+        if fixed {
+            flags |= NodeFlag::EstablishesFixedPositionContainingBlock as u32;
+        }
+        data.flags.set(flags);
+
+        let previous = previous_flags & establishment_flags;
+        let current = flags & establishment_flags;
+        let gained = current & !previous;
+        let lost = previous & !current;
+        let catches_escaping_boxes = gained != 0 && previous_flags & NodeFlag::AbsposDescendantEscapes as u32 != 0;
+        let releases_contained_boxes = lost != 0
+            && self
+                .out_of_flow_positioning_contained
+                .borrow()
+                .get(&node)
+                .is_some_and(|contained| contained & lost != 0);
+        if !catches_escaping_boxes && !releases_contained_boxes {
+            return;
+        }
+        self.set_needs_layout_update(node, true);
+        self.scrollable_overflow.contained_boxes_dirty.set(true);
+        if releases_contained_boxes {
+            self.record_partial_relayout_escape();
+        }
+    }
+
+    pub(crate) fn containing_block_by_walking_ancestors(&self, node: NodeSlotId) -> NodeSlotId {
+        use crate::css::css_enums::positioning;
+        let position = if super::node_facts::kind_is_text(self.data(node).kind.get()) {
+            positioning::STATIC
+        } else {
+            crate::painting::style_queries::position(self, node)
+        };
+        if position != positioning::ABSOLUTE && position != positioning::FIXED {
+            return self.nearest_ancestor_capable_of_forming_a_containing_block(node);
+        }
+        let mut search = super::abspos_inputs::ContainingBlockSearch::starting_at(node, position == positioning::FIXED);
+        self.continue_containing_block_search(&mut search, NodeSlotId::INVALID);
+        search.containing_block
+    }
+
+    fn mark_nodes_escaped_by_out_of_flow_box(&self, node: NodeSlotId, containing_block: NodeSlotId) {
+        if let Some(inline_box) = self.inline_box_lifted_out_of(node) {
+            let mut inline_ancestor = inline_box;
+            while !inline_ancestor.is_invalid() && self.data(inline_ancestor).kind.get() == NodeKind::InlineNode {
+                self.set_node_flag(inline_ancestor, NodeFlag::AbsposDescendantEscapes, true);
+                inline_ancestor = self.data(inline_ancestor).parent.get();
+            }
+        }
+        let mut ancestor = self.data(node).parent.get();
+        while !ancestor.is_invalid() && ancestor != containing_block {
+            self.set_node_flag(ancestor, NodeFlag::AbsposDescendantEscapes, true);
+            ancestor = self.data(ancestor).parent.get();
+        }
+    }
+
+    fn mark_nodes_escaped_by_attached_out_of_flow_box(&self, node: NodeSlotId) {
+        if !super::node_facts::kind_is_box(self.data(node).kind.get())
+            || !self
+                .node_style_if_live(node)
+                .is_some_and(|style| style.is_absolutely_positioned())
+        {
+            return;
+        }
+        let containing_block = self.containing_block_by_walking_ancestors(node);
+        self.mark_nodes_escaped_by_out_of_flow_box(node, containing_block);
+    }
+
+    pub(crate) fn forget_committed_out_of_flow_facts(&self, node: NodeSlotId) {
+        let data = self.data(node);
+        data.flags
+            .set(data.flags.get() & !(NodeFlag::AbsposDescendantEscapes as u32));
+        let mut contained = self.out_of_flow_positioning_contained.borrow_mut();
+        if !contained.is_empty() {
+            contained.remove(&node);
+        }
+    }
+
+    pub(crate) fn note_committed_out_of_flow_box(&self, node: NodeSlotId, inputs: &AbsposLayoutInputs) {
+        let positioning = super::node_facts::containing_block_establishment_flag(
+            crate::painting::style_queries::is_fixed_position(self, node),
+        ) as u32;
+        {
+            let mut contained = self.out_of_flow_positioning_contained.borrow_mut();
+            *contained.entry(inputs.containing_block).or_default() |= positioning;
+            if !inputs.inline_containing_block.is_invalid() {
+                *contained.entry(inputs.inline_containing_block).or_default() |=
+                    NodeFlag::EstablishesAbsolutePositionContainingBlock as u32;
+            }
+        }
+        self.mark_nodes_escaped_by_out_of_flow_box(node, inputs.containing_block);
+    }
+
+    fn derive_containing_block_establishment_flags_of_children(&self, parent: NodeSlotId) {
+        self.for_each_node_in_layout_subtree_in_pre_order_with_pruning(parent, |node| {
+            if node == parent {
+                return true;
+            }
+            self.derive_containing_block_establishment_flags(node);
+            super::node_facts::has_flag(self.data(node), NodeFlag::Anonymous)
+        });
+    }
+
     fn refresh_style_flags(&self, slot: NodeSlotId) {
         let style = self.node_style_if_live(slot).expect("styled layout node");
+        let had_preserve_3d_transform_style =
+            super::node_facts::has_flag(self.data(slot), NodeFlag::HasPreserve3dTransformStyle);
         self.set_node_flag(
             slot,
             NodeFlag::HasAnchorNames,
@@ -1365,6 +1562,14 @@ impl LayoutNodeArena {
             NodeFlag::HasPreserve3dTransformStyle,
             style.transform().transform_style == crate::css::css_enums::transform_style::PRESERVE_3D,
         );
+        if !self.data(slot).parent.get().is_invalid() || self.data(slot).kind.get() == NodeKind::Viewport {
+            self.derive_containing_block_establishment_flags(slot);
+        }
+        if had_preserve_3d_transform_style
+            || super::node_facts::has_flag(self.data(slot), NodeFlag::HasPreserve3dTransformStyle)
+        {
+            self.derive_containing_block_establishment_flags_of_children(slot);
+        }
         self.refresh_ancestor_facts_of_anonymous_children(slot);
     }
 
@@ -1813,100 +2018,6 @@ impl LayoutNodeArena {
         NodeSlotId::INVALID
     }
 
-    fn recompute_containing_block_for_node(
-        &self,
-        node: NodeSlotId,
-        inline_cb_lookup: unsafe extern "C" fn(*mut c_void, *mut c_void) -> NodeSlotId,
-    ) {
-        use crate::css::css_enums::positioning;
-        use crate::painting::style_queries::establishes_positioning_containing_blocks;
-
-        let data = self.data(node);
-        // Reset the inline containing block - we'll set it below if applicable.
-        data.inline_containing_block.set(NodeSlotId::INVALID);
-
-        let kind = data.kind.get();
-        if super::node_facts::kind_is_text(kind) {
-            let containing_block = self.nearest_ancestor_capable_of_forming_a_containing_block(node);
-            data.containing_block.set(containing_block);
-            return;
-        }
-
-        let position = self
-            .node_style_if_live(node)
-            .map_or(positioning::STATIC, |style| style.box_values().position);
-
-        // https://drafts.csswg.org/css-position-3/#absolute-cb
-        if position == positioning::ABSOLUTE {
-            let mut ancestor = data.parent.get();
-            while !ancestor.is_invalid() && !establishes_positioning_containing_blocks(self, ancestor).0 {
-                ancestor = self.data(ancestor).parent.get();
-            }
-            data.containing_block.set(ancestor);
-            if !ancestor.is_invalid() {
-                // SAFETY: Both slots are live; the callback only reads DOM ancestry
-                // and per-node facts through the shells and does not mutate the tree.
-                let inline_containing_block = unsafe {
-                    let node_shell = self.node_shell(node);
-                    let ancestor_shell = self.node_shell(ancestor);
-                    inline_cb_lookup(node_shell, ancestor_shell)
-                };
-                data.inline_containing_block.set(inline_containing_block);
-            }
-            return;
-        }
-
-        // https://drafts.csswg.org/css-position-3/#fixed-cb
-        if position == positioning::FIXED {
-            // The containing block is established by the nearest ancestor box that establishes an fixed positioning
-            // containing block, with the bounds of the containing block determined identically to the absolute positioning
-            // containing block.
-            let mut last_visited = node;
-            let mut ancestor = data.parent.get();
-            while !ancestor.is_invalid() && !establishes_positioning_containing_blocks(self, ancestor).1 {
-                last_visited = ancestor;
-                ancestor = self.data(ancestor).parent.get();
-            }
-            // If no ancestor establishes one, the box's fixed positioning containing block is the initial fixed containing
-            // block:
-            //  - in continuous media, the layout viewport (whose size matches the dynamic viewport size); as a result,
-            //    fixed boxes do not move when the document is scrolled.
-            // FIXME: - in paged media, the page area of each page; fixed positioned boxes are thus replicated on every
-            //   page. (They are fixed with respect to the page box only, and are not affected by being seen through a
-            //   viewport; as in the case of print preview, for example.)
-            let containing_block = if ancestor.is_invalid() { last_visited } else { ancestor };
-            data.containing_block.set(containing_block);
-            return;
-        }
-
-        let containing_block = self.nearest_ancestor_capable_of_forming_a_containing_block(node);
-        data.containing_block.set(containing_block);
-    }
-
-    fn derive_abspos_escape_flags_for_node(&self, node: NodeSlotId) {
-        let data = self.data(node);
-        let kind = data.kind.get();
-        if !super::node_facts::kind_is_box(kind) {
-            return;
-        }
-        self.set_node_flag(node, NodeFlag::AbsposDescendantEscapes, false);
-        if !self
-            .node_style_if_live(node)
-            .is_some_and(|style| style.is_absolutely_positioned())
-        {
-            return;
-        }
-        let containing_block = data.containing_block.get();
-        let mut ancestor = data.parent.get();
-        while !ancestor.is_invalid() && ancestor != containing_block {
-            let ancestor_kind = self.data(ancestor).kind.get();
-            if super::node_facts::kind_is_box(ancestor_kind) {
-                self.set_node_flag(ancestor, NodeFlag::AbsposDescendantEscapes, true);
-            }
-            ancestor = self.data(ancestor).parent.get();
-        }
-    }
-
     /// Returns whether the node's ancestor facts changed.
     fn derive_ancestor_facts_for_node(&self, node: NodeSlotId) -> bool {
         let data = self.data(node);
@@ -1963,15 +2074,11 @@ impl LayoutNodeArena {
         }
     }
 
-    /// Returns every attached subtree root the recomputation visited.
-    pub(crate) fn recompute_containing_blocks_after_tree_update(
-        &self,
-        rebuilt_roots: &[NodeSlotId],
-        inline_cb_lookup: unsafe extern "C" fn(*mut c_void, *mut c_void) -> NodeSlotId,
-    ) -> HashSet<NodeSlotId> {
+    /// Returns every attached subtree root the derivation visited.
+    pub(crate) fn derive_facts_after_tree_update(&self, rebuilt_roots: &[NodeSlotId]) -> HashSet<NodeSlotId> {
         // NB: Anonymous wrappers, generated content, and table fixup can attach nodes
         // outside the builder's reported rebuild roots. Include every attached subtree.
-        let mut pending = self.pending_containing_block_roots.borrow_mut();
+        let mut pending = self.pending_attached_subtree_roots.borrow_mut();
         let roots: HashSet<_> = pending
             .drain(..)
             .chain(rebuilt_roots.iter().copied())
@@ -1987,37 +2094,20 @@ impl LayoutNodeArena {
                 ancestor = self.data(ancestor).parent.get();
             }
             if ancestor.is_invalid() {
-                self.recompute_containing_blocks_in_subtree(root, inline_cb_lookup);
+                self.derive_facts_in_subtree(root);
             }
         }
         roots
     }
 
-    /// Recomputes `containing_block` and `inline_containing_block` and derives
-    /// the `AbsposDescendantEscapes` flag and the ancestor facts for every node
-    /// in the inclusive subtree of `root`. The pre-order traversal visits
-    /// ancestors before the descendants that mark them, so clearing the flag on
-    /// visit and marking upwards compose within one walk; the marking follows
-    /// plain parent links and so reaches ancestors above `root` when the
-    /// containing block lies outside the subtree. Ancestor facts read the
-    /// parent, which the same walk visited first.
-    pub(crate) fn recompute_containing_blocks_in_subtree(
-        &self,
-        root: NodeSlotId,
-        inline_cb_lookup: unsafe extern "C" fn(*mut c_void, *mut c_void) -> NodeSlotId,
-    ) {
+    /// Derives what the nodes in the inclusive subtree of `root` take from their ancestors: whether they
+    /// establish containing blocks, and their ancestor facts, which the pre-order walk finds already derived
+    /// for the parent. Out-of-flow boxes in the subtree also mark the ancestors they escape.
+    pub(crate) fn derive_facts_in_subtree(&self, root: NodeSlotId) {
         self.assert_owner_thread();
         self.for_each_node_in_layout_subtree_in_pre_order(root, |node| {
-            let previous_containing_block = self.data(node).containing_block.get();
-            self.recompute_containing_block_for_node(node, inline_cb_lookup);
-            let data = self.data(node);
-            if data.containing_block.get() != previous_containing_block
-                && (data.containing_block.get() != data.parent.get()
-                    || !self.scrollable_overflow.non_child_boxes.borrow().is_empty())
-            {
-                self.scrollable_overflow.contained_boxes_dirty.set(true);
-            }
-            self.derive_abspos_escape_flags_for_node(node);
+            self.derive_containing_block_establishment_flags(node);
+            self.mark_nodes_escaped_by_attached_out_of_flow_box(node);
             self.derive_ancestor_facts_for_node(node);
         });
     }
@@ -2884,17 +2974,11 @@ impl LayoutNodeArena {
 
         self.assign_pre_order_labels_to_inserted_subtree(parent, child);
         self.note_layout_subtree_attached(child);
-        self.pending_containing_block_roots.borrow_mut().push(child);
+        self.pending_attached_subtree_roots.borrow_mut().push(child);
         self.note_structural_change_at_and_above(parent);
     }
 
     pub(crate) fn remove_child(&self, parent: NodeSlotId, child: NodeSlotId) {
-        if self.data(parent).flags.get() & NodeFlag::AbsposDescendantEscapes as u32 != 0 {
-            // NB: Detaching an escaping descendant can leave flags on ancestors outside
-            // the rebuilt subtree. Re-derive them, including unaffected descendants'
-            // contributions, before qualifying future partial-relayout boundaries.
-            self.record_partial_relayout_escape();
-        }
         if self.paintable_row_count() > 0 {
             self.push_enclosing_paint_order_damage(child);
         }
@@ -3010,11 +3094,31 @@ impl LayoutNodeArena {
             .is_some_and(|data| super::node_facts::node_is_out_of_flow(data, self.node_style_if_live(id)))
     }
 
+    pub(crate) fn note_inline_box_lifted_out_of(&self, node: NodeSlotId, inline_box: Option<NodeSlotId>) {
+        let mut lifted = self.inline_boxes_lifted_out_of.borrow_mut();
+        match inline_box {
+            Some(inline_box) => {
+                lifted.insert(node, inline_box);
+            }
+            None => {
+                lifted.remove(&node);
+            }
+        }
+    }
+
+    pub(crate) fn inline_box_lifted_out_of(&self, node: NodeSlotId) -> Option<NodeSlotId> {
+        self.inline_boxes_lifted_out_of
+            .borrow()
+            .get(&node)
+            .copied()
+            .filter(|&inline_box| self.slot_is_live(inline_box))
+    }
+
     pub(crate) fn node_containing_block_if_live(&self, id: NodeSlotId) -> Option<NodeSlotId> {
         if !self.slot_is_live(id) {
             return None;
         }
-        let block = self.data(id).containing_block.get();
+        let block = self.containing_block_by_walking_ancestors(id);
         (!block.is_invalid()).then_some(block)
     }
 
@@ -3139,8 +3243,10 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn node_containing_block_shell_if_live(&self, id: NodeSlotId) -> *mut c_void {
-        let containing_block = self.data(id).containing_block.get();
-        self.shell_if_live(containing_block)
+        self.node_containing_block_if_live(id)
+            .map_or(std::ptr::null_mut(), |containing_block| {
+                self.shell_if_live(containing_block)
+            })
     }
 
     pub(crate) fn node_flags(&self, id: NodeSlotId) -> u32 {
@@ -4001,6 +4107,7 @@ mod tests {
             inset_bottom: CssPixels::default(),
             containing_line_box_index: None,
             abspos_layout_inputs: None,
+            containing_block: NodeSlotId::INVALID,
         }
     }
 
@@ -4270,6 +4377,8 @@ mod tests {
 
     fn test_abspos_layout_inputs() -> AbsposLayoutInputs {
         AbsposLayoutInputs {
+            containing_block: NodeSlotId::INVALID,
+            inline_containing_block: NodeSlotId::INVALID,
             static_position_rect: StaticPositionRect {
                 rect: Default::default(),
                 inline_alignment: StaticPositionAlignment::Center,

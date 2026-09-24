@@ -1499,10 +1499,8 @@ fn transfer_fragments_to_replacement_box(
     old_layout_node: LayoutNode,
     new_layout_node: LayoutNode,
 ) {
-    let Some(containing_block) = arena.node_containing_block_if_live(old_layout_node) else {
-        return;
-    };
-    if !arena.slot_is_live(containing_block) {
+    let containing_block = arena.containing_block_by_walking_ancestors(old_layout_node);
+    if containing_block.is_invalid() {
         return;
     }
     let paintable_rows = arena.paintable_rows();
@@ -1887,15 +1885,14 @@ pub unsafe extern "C" fn rust_build_layout_tree(
 
     if rebuilt_subtrees_were_updated_individually {
         let layout_host = host.layout();
-        let attached_roots = layout_host.arena().recompute_containing_blocks_after_tree_update(
-            &state.rebuilt_subtree_roots,
-            layout_host.callbacks.inline_containing_block_lookup,
-        );
+        let attached_roots = layout_host
+            .arena()
+            .derive_facts_after_tree_update(&state.rebuilt_subtree_roots);
         layout_host
             .arena()
             .resolve_deferred_child_list_insertions(&attached_roots);
     } else {
-        // NB: The full layout entry must initialize containing blocks for this tree.
+        // NB: The full layout entry must derive the facts of this tree.
         host.layout().arena().record_partial_relayout_escape();
         host.layout()
             .arena()
@@ -2340,8 +2337,6 @@ pub(crate) enum FfiInsertionMode {
 pub struct FfiTreeBuilderCallbacks {
     pub context: *mut c_void,
     pub prepare_subtree_for_detach: unsafe extern "C" fn(*mut c_void, *mut c_void),
-    /// The DOM-ancestry half of containing-block recomputation; see the layout callback table.
-    pub inline_containing_block_lookup: unsafe extern "C" fn(*mut c_void, *mut c_void) -> NodeSlotId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3099,6 +3094,12 @@ fn insert_node_into_inline_or_block_ancestor(
     } else {
         insertion_parent_for_block_node(host, state, nearest_insertion_ancestor, node_slot, mode)
     };
+    layout.arena().note_inline_box_lifted_out_of(
+        node_slot,
+        (insertion_point != nearest_insertion_ancestor
+            && layout.data(nearest_insertion_ancestor).kind.get() == NodeKind::InlineNode)
+            .then_some(nearest_insertion_ancestor),
+    );
 
     // Insertion parents can be above the subtree being rebuilt in place: inline ancestors are
     // skipped, and out-of-flow boxes can join a trailing anonymous sibling. InDomOrder is only

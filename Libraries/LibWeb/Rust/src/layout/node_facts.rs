@@ -91,9 +91,9 @@ pub(crate) fn node_can_have_children(data: &NodeData) -> bool {
     }
 }
 
-/// Whether a box's in-flow descendants name it as their containing block. This is the question LayoutNodeArena answers
-/// when it assigns containing blocks, so anything that walks past a box on behalf of an enclosing formatting context
-/// has to ask it too: the boxes inside such a box are laid out against it, not against the block container of the
+/// Whether a box's in-flow descendants name it as their containing block. This is the question the walks that find
+/// in-flow containing blocks ask, so anything that walks past a box on behalf of an enclosing formatting context has
+/// to ask it too: the boxes inside such a box are laid out against it, not against the block container of the
 /// context the walk started in.
 pub(crate) fn node_forms_containing_block_for_children(data: &NodeData, style: Option<ComputedValuesView<'_>>) -> bool {
     if kind_is_block_container(data.kind.get()) && !node_is_fragmented_inline(data, style) {
@@ -223,6 +223,14 @@ pub(crate) fn construction_flags(facts: &FfiNodeConstructionFacts) -> u32 {
     .into_iter()
     .filter(|(_, is_set)| *is_set)
     .fold(0, |flags, (flag, _)| flags | flag as u32)
+}
+
+pub(crate) fn containing_block_establishment_flag(is_fixed_position: bool) -> NodeFlag {
+    if is_fixed_position {
+        NodeFlag::EstablishesFixedPositionContainingBlock
+    } else {
+        NodeFlag::EstablishesAbsolutePositionContainingBlock
+    }
 }
 
 pub(crate) fn has_flag(data: &NodeData, flag: NodeFlag) -> bool {
@@ -422,6 +430,11 @@ impl<'pass> NodeFacts<'pass> {
     pub(crate) fn is_absolutely_positioned(&self) -> bool {
         self.computed_values_view_if_styled()
             .is_some_and(|style| style.is_absolutely_positioned())
+    }
+
+    pub(crate) fn is_fixed_position(&self) -> bool {
+        self.computed_values_view_if_styled()
+            .is_some_and(|style| style.position() == crate::css::css_enums::positioning::FIXED)
     }
 
     pub(crate) fn is_relatively_positioned(&self) -> bool {
