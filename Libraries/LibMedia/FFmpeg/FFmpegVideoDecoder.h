@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <AK/HashTable.h>
+#include <AK/HashMap.h>
 #include <LibMedia/CodecID.h>
 #include <LibMedia/CodecParameters.h>
 #include <LibMedia/DecoderCapabilities.h>
@@ -22,9 +22,11 @@ class MEDIA_API FFmpegVideoDecoder final : public VideoDecoder {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
+    static Optional<DecoderCapabilities> capabilities(FFmpegFunctions const&, ParsedCodec const&);
     static Optional<DecoderCapabilities> capabilities(ParsedCodec const&);
+    static DecoderErrorOr<NonnullOwnPtr<FFmpegVideoDecoder>> try_create(FFmpegFunctions const&, CodecID, ReadonlyBytes codec_initialization_data);
     static DecoderErrorOr<NonnullOwnPtr<FFmpegVideoDecoder>> try_create(CodecID, ReadonlyBytes codec_initialization_data);
-    FFmpegVideoDecoder(AVCodecContext* codec_context, AVPacket* packet, AVFrame* frame, NonnullRefPtr<VideoFramePool> frame_pool);
+    FFmpegVideoDecoder(FFmpegFunctions const&, AVCodecContext* codec_context, AVPacket* packet, AVFrame* frame, NonnullRefPtr<VideoFramePool> frame_pool);
     virtual ~FFmpegVideoDecoder() override;
 
     virtual void set_storage_freed_callback(Function<void()> callback) override { m_frame_pool->set_slot_freed_callback(move(callback)); }
@@ -36,15 +38,25 @@ public:
     virtual void flush() override;
 
 private:
-    DecoderErrorOr<void> copy_pending_frame_into(Gfx::YUVData&);
+    struct InFlightFrame {
+        AK::Duration timestamp;
+        AK::Duration duration;
+        DecodeIntent intent;
+    };
 
+    DecoderErrorOr<void> copy_pending_frame_into(Gfx::YUVData&);
+    i64 codec_context_option(char const* name) const;
+
+    FFmpegFunctions const& m_functions;
     AVCodecContext* m_codec_context;
     AVPacket* m_packet;
     AVFrame* m_frame;
     NonnullRefPtr<VideoFramePool> m_frame_pool;
-    bool m_has_pending_frame { false };
+    Optional<InFlightFrame> m_pending_frame;
 
-    HashTable<i64> m_reference_only_presentation_timestamps;
+    // The decoder returns a packet's timestamp with the frame it produces, so a key stands in for it.
+    u64 m_next_frame_key { 0 };
+    HashMap<u64, InFlightFrame> m_frames_in_flight;
 };
 
 }

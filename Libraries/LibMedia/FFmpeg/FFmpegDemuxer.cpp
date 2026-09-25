@@ -156,6 +156,9 @@ static DecoderErrorOr<void> initialize_format_context(AVFormatContext*& format_c
     // Reduce the maximum packet size for the WAV demuxer, so that playback begins sooner.
     av_dict_set(&options, "max_size", "4096", 0);
 
+    // The smallest probe FFmpeg allows, so a format it was built without fails here instead of a mebibyte in.
+    av_dict_set(&options, "formatprobesize", "2048", 0);
+
     auto open_result = avformat_open_input(&format_context, nullptr, nullptr, &options);
     if (open_result < 0)
         return DecoderError::with_description(DecoderErrorCategory::UnrecognizedFormat, "Failed to open input for format parsing"sv);
@@ -223,7 +226,7 @@ static DecoderErrorOr<Track> create_track_from_stream(AVStream const& stream, St
 
         auto& channel_layout = stream.codecpar->ch_layout;
         if (channel_layout.nb_channels != 0) {
-            auto channel_map_result = av_channel_layout_to_channel_map(channel_layout);
+            auto channel_map_result = av_channel_layout_to_channel_map(FFmpegFunctions::bundled(), channel_layout);
             if (channel_map_result.is_error())
                 return DecoderError::with_description(DecoderErrorCategory::Invalid, channel_map_result.error().string_literal());
             channel_map = channel_map_result.release_value();

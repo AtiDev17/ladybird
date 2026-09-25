@@ -1,0 +1,29 @@
+ffmpeg provides CMake integration:
+
+  find_package(FFMPEG REQUIRED)
+  target_include_directories(main PRIVATE ${FFMPEG_INCLUDE_DIRS})
+  target_link_directories(main PRIVATE ${FFMPEG_LIBRARY_DIRS})
+  target_link_libraries(main PRIVATE ${FFMPEG_LIBRARIES})
+
+ffmpeg provides pkg-config modules:
+
+  # FFmpeg codec library
+  libavcodec-ladybird
+
+  # FFmpeg device handling library
+  libavdevice-ladybird
+
+  # FFmpeg audio/video filtering library
+  libavfilter-ladybird
+
+  # FFmpeg container format library
+  libavformat-ladybird
+
+  # FFmpeg utility library
+  libavutil-ladybird
+
+  # FFmpeg audio resampling library
+  libswresample-ladybird
+
+  # FFmpeg image rescaling library
+  libswscale-ladybird
