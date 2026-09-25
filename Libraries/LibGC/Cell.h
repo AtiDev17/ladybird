@@ -35,12 +35,14 @@ public:                                            \
     {                                              \
         return #class_##sv;                        \
     }                                              \
-    friend class GC::Heap;
+    friend class GC::Heap;                         \
+    friend struct GC::CellTypeThunks;
 
 #define GC_CELL_WITH_CUSTOM_CLASS_NAME(class_, base_class) \
 public:                                                    \
     using Base = base_class;                               \
-    friend class GC::Heap;
+    friend class GC::Heap;                                 \
+    friend struct GC::CellTypeThunks;
 
 // A coarse class tag stored in every cell header. It lets a holder of a cell pointer confirm what
 // the cell really is with a single byte compare, without reading a vtable. Only the classes a
@@ -59,8 +61,6 @@ class GC_API Cell {
     AK_MAKE_NONMOVABLE(Cell);
 
 public:
-    static constexpr bool OVERRIDES_FINALIZE = false;
-
     // Heap::allocate() copies this into the header of every cell it creates. A class that a
     // JS::Value can point at overrides it, and its subclasses inherit the override.
     static constexpr CellKind cell_kind_for_class = CellKind::Other;
@@ -266,6 +266,7 @@ public:
     virtual size_t external_memory_size() const { return 0; }
 
     ALWAYS_INLINE Heap& heap() const { return HeapBlockBase::from_cell(this)->heap(); }
+    ALWAYS_INLINE CellTypeInfo const& type_info() const { return HeapBlockBase::from_cell(this)->type_info(); }
 
 protected:
     Cell() = default;
@@ -285,14 +286,14 @@ struct IsVisitable {
     static constexpr bool value = requires(Cell::Visitor& visitor, T const& value) { visitor.visit(value); };
 };
 
+GC_API StringView class_name_of(Cell const&);
+
 }
 
 template<>
 struct AK::Formatter<GC::Cell> : AK::Formatter<FormatString> {
-    ErrorOr<void> format(FormatBuilder& builder, GC::Cell const* cell)
+    ErrorOr<void> format(FormatBuilder& builder, GC::Cell const& cell)
     {
-        if (!cell)
-            return builder.put_string("Cell{nullptr}"sv);
-        return Formatter<FormatString>::format(builder, "{}({})"sv, cell->class_name(), cell);
+        return Formatter<FormatString>::format(builder, "{}({})"sv, GC::class_name_of(cell), &cell);
     }
 };
