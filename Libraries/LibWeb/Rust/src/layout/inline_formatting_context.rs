@@ -800,7 +800,7 @@ pub(crate) fn compute(
         if node_is_inline_containing_block
             && let Some(rect) = padding_box_rect_spanning_first_and_last_content_lines(
                 &corners,
-                &used,
+                used,
                 horizontal,
                 reversed,
                 container_inline_axis_is_reverse,
@@ -975,7 +975,7 @@ pub(crate) struct InlineFormattingContext<'context> {
     pub(crate) input: LayoutInput,
     pub(crate) callbacks: LayoutPass<'context>,
     pub(crate) parent: &'context block_formatting_context::BlockFormattingContext<'context>,
-    pub(crate) containing_used_values: std::rc::Rc<UsedValues>,
+    pub(crate) containing_used_values: &'context UsedValues,
     pub(crate) fragmented_inlines_in_pre_order: Vec<Node>,
     pub(crate) automatic_content_inline_size: CssPixels,
     pub(crate) min_content_inline_size_from_max_content_layout: Option<CssPixels>,
@@ -993,7 +993,7 @@ impl<'context> InlineFormattingContext<'context> {
         parent: &'context block_formatting_context::BlockFormattingContext<'context>,
     ) -> Self {
         let containing_used_values = run.records.used_values(containing_block);
-        containing_used_values.line_data_cell();
+        containing_used_values.ensure_line_data();
         Self {
             run,
             containing_block,
@@ -1091,24 +1091,19 @@ impl<'context> InlineFormattingContext<'context> {
     }
 
     pub(crate) fn line_data(&self) -> Ref<'_, used_values::LineData> {
-        Ref::map(self.containing_used_values.line_data_cell().borrow(), |shared| {
-            shared.building()
-        })
+        self.containing_used_values.building_line_data()
     }
 
     pub(crate) fn line_data_mut(&self) -> RefMut<'_, used_values::LineData> {
-        RefMut::map(
-            self.containing_used_values.line_data_cell().borrow_mut(),
-            used_values::LineDataState::building_mut,
-        )
+        self.containing_used_values.building_line_data_mut()
     }
 
-    pub(crate) fn containing_used(&self) -> std::rc::Rc<UsedValues> {
-        self.containing_used_values.clone()
+    pub(crate) fn containing_used(&self) -> &'context UsedValues {
+        self.containing_used_values
     }
 
     #[track_caller]
-    pub(crate) fn used(&self, node: Node) -> std::rc::Rc<UsedValues> {
+    pub(crate) fn used(&self, node: Node) -> &'context UsedValues {
         self.run.records.used_values(node)
     }
 
@@ -1116,7 +1111,7 @@ impl<'context> InlineFormattingContext<'context> {
         &self,
         node: Node,
         constraints: ContainingBlockConstraints,
-    ) -> std::rc::Rc<UsedValues> {
+    ) -> &'context UsedValues {
         self.run.records.create_used_values(&self.callbacks, node, constraints)
     }
 
@@ -1486,10 +1481,7 @@ impl<'context> InlineFormattingContext<'context> {
             match item.type_ {
                 inline_level_iterator::ItemType::ForcedBreak => lines.finish(),
                 inline_level_iterator::ItemType::Element => {
-                    if container_wraps && lines.breaks_before_next_fragment() {
-                        lines.finish();
-                    }
-                    lines.append(border_box_inline_size, false, CssPixels::default());
+                    lines.append_atomic_inline(border_box_inline_size, container_wraps);
                 }
                 // An absolutely positioned box only takes a static position, which the pending inline edges attach to.
                 inline_level_iterator::ItemType::AbsolutelyPositionedElement => {}
@@ -1544,8 +1536,7 @@ impl<'context> InlineFormattingContext<'context> {
                 }
             }
         }
-        lines.finish();
-        Some(lines.greatest_inline_size)
+        Some(lines.finish_measurement())
     }
 
     fn text_item_wrap_opportunity(
@@ -2040,7 +2031,7 @@ impl<'context> InlineFormattingContext<'context> {
         if self.containing_block == self.parent.root_box() {
             self.parent.record_derived_baselines_of_root_box(baselines);
         } else {
-            formatting_context::store_derived_baselines(&self.used(self.containing_block), baselines);
+            formatting_context::store_derived_baselines(self.used(self.containing_block), baselines);
         }
     }
 
@@ -2135,7 +2126,7 @@ pub(crate) enum ItemMeasurement {
 }
 
 #[derive(Default)]
-struct LinesWithoutLineBoxes {
+pub(super) struct LinesWithoutLineBoxes {
     breaks_at_every_opportunity: bool,
     greatest_inline_size: CssPixels,
     inline_size: CssPixels,
@@ -2145,11 +2136,23 @@ struct LinesWithoutLineBoxes {
 }
 
 impl LinesWithoutLineBoxes {
-    fn new(breaks_at_every_opportunity: bool) -> Self {
+    pub(super) fn new(breaks_at_every_opportunity: bool) -> Self {
         Self {
             breaks_at_every_opportunity,
             ..Self::default()
         }
+    }
+
+    pub(super) fn append_atomic_inline(&mut self, border_box_inline_size: CssPixels, container_wraps: bool) {
+        if container_wraps && self.breaks_before_next_fragment() {
+            self.finish();
+        }
+        self.append(border_box_inline_size, false, CssPixels::default());
+    }
+
+    pub(super) fn finish_measurement(mut self) -> CssPixels {
+        self.finish();
+        self.greatest_inline_size
     }
 
     fn is_empty_or_ends_in_whitespace(&self) -> bool {

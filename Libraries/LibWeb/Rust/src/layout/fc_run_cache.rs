@@ -10,7 +10,7 @@ use super::*;
 pub(super) enum FcRunCacheMode {
     Disabled,
     Enabled,
-    /// Hits do not replay: the real layout runs and the entry is verified
+    /// Hits do not replay: the real layout runs and the reused result is verified
     /// against it, panicking on any divergence.
     Shadow,
 }
@@ -230,37 +230,44 @@ pub(super) struct FcRunCacheEntry {
 
 impl FcRunCacheEntry {
     pub(super) fn can_reuse_committed_subtree(&self) -> bool {
-        self.outputs
-            .root
-            .as_ref()
-            .is_none_or(|root| root.propagated_pending_abspos.is_empty())
+        outputs_allow_committed_subtree_reuse(&self.outputs)
     }
 
     pub(super) fn outputs_for_reused_subtree(&self) -> formatting_context::RunOutputs {
         debug_assert!(self.can_reuse_committed_subtree());
-        let root = self
-            .outputs
-            .root
-            .as_ref()
-            .map(|root| fragment_tree::UnplacedRootFragment {
-                node: root.node,
-                // Commit stops at the reused root, so descendant fragments and nested reuse markers never
-                // enter its scopes. Only payloads that escape the run still have to reach the parent.
-                scoped_descendants: Vec::new(),
-                reused_subtree_roots: HashSet::default(),
-                propagated_pending_abspos: root.propagated_pending_abspos.clone(),
-                propagated_anchor_candidates: root.propagated_anchor_candidates.clone(),
-                propagated_inline_containing_block_rects: root.propagated_inline_containing_block_rects.clone(),
-                propagated_abspos_containing_block_info: root.propagated_abspos_containing_block_info.clone(),
-            });
-        formatting_context::RunOutputs {
-            result: self.outputs.result,
-            root,
-            root_outcome: self.outputs.root_outcome.clone(),
-            atomic_root_sizing_repeats_for_available_inline_sizes_at_or_above: self
-                .outputs
-                .atomic_root_sizing_repeats_for_available_inline_sizes_at_or_above,
+        // Outside shadow mode, conclude() already stored this entry without its descendant fragments.
+        if fc_run_cache_mode_from_environment() == FcRunCacheMode::Shadow {
+            return outputs_without_descendant_fragments(&self.outputs);
         }
+        self.outputs.clone()
+    }
+}
+
+fn outputs_allow_committed_subtree_reuse(outputs: &formatting_context::RunOutputs) -> bool {
+    outputs
+        .root
+        .as_ref()
+        .is_none_or(|root| root.propagated_pending_abspos.is_empty())
+}
+
+fn outputs_without_descendant_fragments(outputs: &formatting_context::RunOutputs) -> formatting_context::RunOutputs {
+    let root = outputs.root.as_ref().map(|root| fragment_tree::UnplacedRootFragment {
+        node: root.node,
+        // Commit stops at the reused root, so descendant fragments and nested reuse markers never
+        // enter its scopes. Only payloads that escape the run still have to reach the parent.
+        scoped_descendants: Vec::new(),
+        reused_subtree_roots: HashSet::default(),
+        propagated_pending_abspos: root.propagated_pending_abspos.clone(),
+        propagated_anchor_candidates: root.propagated_anchor_candidates.clone(),
+        propagated_inline_containing_block_rects: root.propagated_inline_containing_block_rects.clone(),
+        propagated_abspos_containing_block_info: root.propagated_abspos_containing_block_info.clone(),
+    });
+    formatting_context::RunOutputs {
+        result: outputs.result,
+        root,
+        root_outcome: outputs.root_outcome.clone(),
+        atomic_root_sizing_repeats_for_available_inline_sizes_at_or_above: outputs
+            .atomic_root_sizing_repeats_for_available_inline_sizes_at_or_above,
     }
 }
 
@@ -410,12 +417,16 @@ impl FcRunCacheArenaStore {
         Some(entry.clone())
     }
 
-    fn store(&self, slot: u32, entry: std::rc::Rc<FcRunCacheEntry>) {
+    fn store(&self, slot: u32, entry: FcRunCacheEntry) {
         let mut entries = self.entries.borrow_mut();
         if entries.len() <= slot as usize {
             entries.resize_with(slot as usize + 1, || None);
         }
-        entries[slot as usize] = Some(entry);
+        match entries[slot as usize].as_mut().and_then(std::rc::Rc::get_mut) {
+            Some(stored) => *stored = entry,
+            None => entries[slot as usize] = Some(std::rc::Rc::new(entry)),
+        }
+        drop(entries);
         // NB: Invalidation can occur between probing a run and storing its result.
         self.enqueue_for_sweep(slot);
     }
@@ -581,11 +592,13 @@ impl FcRunCacheAttempt {
         let Self::Store {
             validity,
             shadow_entry,
-            structurally_damaged_entry: _,
+            structurally_damaged_entry,
         } = self
         else {
             return;
         };
+        // Release the probed entry so that store() can replace it in place.
+        drop(structurally_damaged_entry);
         // Every path out of here belongs to a run that has committed its subtree, so an entry left
         // behind without being replaced would describe paintables that no longer exist.
         let store = callbacks.arena().fc_run_cache_store();
@@ -603,12 +616,18 @@ impl FcRunCacheAttempt {
         let entry = FcRunCacheEntry {
             key,
             validity,
-            outputs: outputs.clone(),
+            outputs: if fc_run_cache_mode_from_environment() == FcRunCacheMode::Shadow
+                || !outputs_allow_committed_subtree_reuse(outputs)
+            {
+                outputs.clone()
+            } else {
+                outputs_without_descendant_fragments(outputs)
+            },
         };
         if let Some(cached) = shadow_entry {
             verify_cached_entry_against_fresh_run(box_.slot_index(), &cached, &entry);
         }
-        store.store(box_.slot_index(), std::rc::Rc::new(entry));
+        store.store(box_.slot_index(), entry);
     }
 }
 
@@ -898,25 +917,23 @@ mod tests {
     #[test]
     fn sweep_checks_changed_entries_without_discarding_reusable_stale_data_early() {
         let store = FcRunCacheArenaStore::default();
-        let entry = |epoch| {
-            std::rc::Rc::new(FcRunCacheEntry {
-                key: key(AvailableSize::definite(px(300)), Some(px(300))),
-                validity: FcRunCacheValidity {
-                    slot_generation: 1,
-                    fragment_cache_epoch: epoch,
+        let entry = |epoch| FcRunCacheEntry {
+            key: key(AvailableSize::definite(px(300)), Some(px(300))),
+            validity: FcRunCacheValidity {
+                slot_generation: 1,
+                fragment_cache_epoch: epoch,
+            },
+            outputs: formatting_context::RunOutputs {
+                result: formatting_context::ChildLayoutResult::default(),
+                root: None,
+                root_outcome: formatting_context::RunRootOutcome {
+                    cells: used_values::UsedValuesCellState::capture(&UsedValues::default()),
+                    own_metrics_sealed: false,
+                    line_data: None,
+                    rare: None,
                 },
-                outputs: formatting_context::RunOutputs {
-                    result: formatting_context::ChildLayoutResult::default(),
-                    root: None,
-                    root_outcome: formatting_context::RunRootOutcome {
-                        cells: used_values::UsedValuesCellState::capture(&UsedValues::default()),
-                        own_metrics_sealed: false,
-                        line_data: None,
-                        rare: None,
-                    },
-                    atomic_root_sizing_repeats_for_available_inline_sizes_at_or_above: None,
-                },
-            })
+                atomic_root_sizing_repeats_for_available_inline_sizes_at_or_above: None,
+            },
         };
         store.store(0, entry(1));
         store.store(1, entry(1));

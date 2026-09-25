@@ -1826,7 +1826,7 @@ void Element::set_needs_layout_tree_rebuild(SetNeedsLayoutTreeUpdateReason reaso
         set_needs_layout_tree_update(true, reason);
         return;
     }
-    if (auto parent = parent_element())
+    if (auto* parent = parent_or_shadow_host_element())
         parent->set_needs_layout_tree_update(true, reason);
     else
         set_needs_layout_tree_update(true, reason);
@@ -1954,8 +1954,9 @@ bool Element::apply_box_presence_change_in_place(SetNeedsLayoutTreeUpdateReason 
 {
     if (is_html_html_element() || is_html_body_element() || rendered_in_top_layer() || is<SVG::SVGElement>(*this))
         return false;
-    GC::Ptr<Element> parent = parent_element();
-    if (!parent || parent->shadow_root() || assigned_slot() || is<HTML::HTMLSlotElement>(*parent))
+    bool is_shadow_root_child = is<ShadowRoot>(this->parent());
+    GC::Ptr<Element> parent = parent_or_shadow_host_element();
+    if (!parent || (parent->shadow_root() && !is_shadow_root_child) || assigned_slot() || is<HTML::HTMLSlotElement>(*parent))
         return false;
     auto* parent_layout_node = parent->unsafe_layout_node();
     if (!parent_layout_node)
@@ -1991,7 +1992,7 @@ bool Element::apply_box_presence_change_in_place(SetNeedsLayoutTreeUpdateReason 
         return true;
     }
 
-    if (unsafe_layout_node())
+    if (unsafe_layout_node() || is_shadow_root_child)
         return false;
     if (style->position() == CSS::Positioning::Fixed || style->float_() != CSS::Float::None)
         return false;
@@ -2103,6 +2104,22 @@ void Element::record_style_query_custom_property_reference(Optional<CSS::PseudoE
         return;
     }
     consumer_data.style_query_references.append(name);
+}
+
+void Element::set_style_uses_if_css_function()
+{
+    if (m_style_uses_if_css_function)
+        return;
+    m_style_uses_if_css_function = true;
+    document().add_element_with_viewport_dependent_style(*this);
+}
+
+void Element::set_style_depends_on_viewport_metrics()
+{
+    if (m_style_depends_on_viewport_metrics)
+        return;
+    m_style_depends_on_viewport_metrics = true;
+    document().add_element_with_viewport_dependent_style(*this);
 }
 
 void Element::finish_recording_style_dependencies()

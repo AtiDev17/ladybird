@@ -211,34 +211,44 @@ pub(crate) struct LineData {
     pub(crate) inline_box_pieces: Vec<inline_formatting_context::InlineBoxPieceData>,
 }
 
+#[derive(Default)]
 pub(crate) enum LineDataState {
-    Building(LineData),
+    #[default]
+    Empty,
+    Building(Box<LineData>),
     Finished(std::rc::Rc<inline_content::InlineContent>),
 }
 
-impl Default for LineDataState {
-    fn default() -> Self {
-        Self::Building(LineData::default())
+impl std::fmt::Debug for LineDataState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "Empty",
+            Self::Building(_) => "Building",
+            Self::Finished(_) => "Finished",
+        })
     }
 }
 
 impl LineDataState {
     pub(crate) fn building(&self) -> &LineData {
-        let Self::Building(data) = self else {
-            panic!("line building accessed finalized inline content")
-        };
-        data
+        match self {
+            Self::Building(data) => data,
+            Self::Empty => panic!("line building accessed line data before it began"),
+            Self::Finished(_) => panic!("line building accessed finalized inline content"),
+        }
     }
 
     pub(crate) fn building_mut(&mut self) -> &mut LineData {
-        let Self::Building(data) = self else {
-            panic!("line building mutated finalized inline content")
-        };
-        data
+        match self {
+            Self::Building(data) => data,
+            Self::Empty => panic!("line building mutated line data before it began"),
+            Self::Finished(_) => panic!("line building mutated finalized inline content"),
+        }
     }
 
     pub(crate) fn lines(&self) -> impl DoubleEndedIterator<Item = inline_content::LineRecord> + '_ {
         let (building, finished) = match self {
+            Self::Empty => (&[][..], &[][..]),
             Self::Building(data) => (data.line_boxes.as_slice(), &[][..]),
             Self::Finished(data) => (&[][..], data.lines.as_slice()),
         };
@@ -413,7 +423,7 @@ pub(crate) struct UsedValues {
     pub depends_on_percentage_block_size: Cell<bool>,
     pub has_descendant_that_depends_on_percentage_block_size: Cell<bool>,
 
-    pub(crate) line_data: LazyRefCell<LineDataState>,
+    pub(crate) line_data: RefCell<LineDataState>,
     pub(crate) rare_data: LazyRefCell<UsedValuesRareData>,
 }
 
@@ -460,7 +470,7 @@ impl Default for UsedValues {
             last_baseline: Cell::new(zero),
             depends_on_percentage_block_size: Cell::new(false),
             has_descendant_that_depends_on_percentage_block_size: Cell::new(false),
-            line_data: LazyRefCell::new(),
+            line_data: RefCell::new(LineDataState::Empty),
             rare_data: LazyRefCell::new(),
         }
     }
@@ -472,22 +482,39 @@ impl UsedValues {
     }
 
     pub(crate) fn line_data_ref(&self) -> Option<Ref<'_, LineDataState>> {
-        self.line_data.get().map(RefCell::borrow)
+        let state = self.line_data.borrow();
+        (!matches!(*state, LineDataState::Empty)).then_some(state)
     }
 
-    pub(crate) fn line_data_cell(&self) -> &RefCell<LineDataState> {
-        self.line_data.get_or_init(LineDataState::default)
+    pub(crate) fn ensure_line_data(&self) {
+        let mut state = self.line_data.borrow_mut();
+        if matches!(*state, LineDataState::Empty) {
+            *state = LineDataState::Building(Box::default());
+        }
+    }
+
+    pub(crate) fn building_line_data(&self) -> Ref<'_, LineData> {
+        Ref::map(self.line_data.borrow(), LineDataState::building)
+    }
+
+    pub(crate) fn building_line_data_mut(&self) -> RefMut<'_, LineData> {
+        RefMut::map(self.line_data.borrow_mut(), LineDataState::building_mut)
+    }
+
+    pub(crate) fn set_finished_line_data(&self, content: std::rc::Rc<inline_content::InlineContent>) {
+        *self.line_data.borrow_mut() = LineDataState::Finished(content);
     }
 
     pub(crate) fn finish_line_data(
         &self,
         callbacks: &LayoutPass<'_>,
     ) -> Option<std::rc::Rc<inline_content::InlineContent>> {
-        let mut state = self.line_data.get()?.borrow_mut();
+        let mut state = self.line_data.borrow_mut();
         let content = match &mut *state {
+            LineDataState::Empty => return None,
             LineDataState::Finished(content) => return Some(content.clone()),
             LineDataState::Building(data) => std::rc::Rc::new(inline_content::InlineContent::finish(
-                std::mem::take(data),
+                std::mem::take(data.as_mut()),
                 callbacks.arena(),
                 self.content_inline_size.get(),
             )),
@@ -669,6 +696,23 @@ impl UsedValues {
             .set(clamp_to_max_dimension_value(value.max(CssPixels::default())));
     }
 
+    pub(crate) fn set_box_metrics_from_fragment(&self, fragment: &fragment_tree::Fragment) {
+        self.set_content_inline_size(fragment.content_inline_size);
+        self.set_content_block_size(fragment.content_block_size);
+        self.margin_left.set(fragment.margin_left);
+        self.margin_right.set(fragment.margin_right);
+        self.margin_top.set(fragment.margin_top);
+        self.margin_bottom.set(fragment.margin_bottom);
+        self.border_left.set(fragment.border_left);
+        self.border_right.set(fragment.border_right);
+        self.border_top.set(fragment.border_top);
+        self.border_bottom.set(fragment.border_bottom);
+        self.padding_left.set(fragment.padding_left);
+        self.padding_right.set(fragment.padding_right);
+        self.padding_top.set(fragment.padding_top);
+        self.padding_bottom.set(fragment.padding_bottom);
+    }
+
     fn collapsed_border_share(&self, width: CssPixels, start_edge: bool) -> CssPixels {
         collapsed_border_share(width, start_edge, self.is_collapsed_borders_table_box.get())
     }
@@ -834,7 +878,7 @@ pub(crate) fn create_used_values(
     callbacks: &LayoutPass<'_>,
     node: Node,
     constraints: ContainingBlockConstraints,
-) -> std::rc::Rc<UsedValues> {
+) -> UsedValues {
     assert!(!node.is_invalid());
     let facts = NodeFacts::new(callbacks, node);
 
@@ -968,13 +1012,10 @@ pub(crate) fn create_used_values(
     used.content_inline_size.set(content_inline_size.unwrap_or_default());
     used.content_block_size.set(content_block_size.unwrap_or_default());
 
-    std::rc::Rc::new(used)
+    used
 }
 
-pub(crate) fn used_values_from_committed_fragment_link(
-    callbacks: &LayoutPass<'_>,
-    node: Node,
-) -> Option<std::rc::Rc<UsedValues>> {
+pub(crate) fn used_values_from_committed_fragment_link(callbacks: &LayoutPass<'_>, node: Node) -> Option<UsedValues> {
     let link = callbacks.committed_fragment_link(node)?;
     let fragment = &link.fragment;
 
@@ -982,24 +1023,11 @@ pub(crate) fn used_values_from_committed_fragment_link(
     // percentage bases, and every resulting geometry field is replaced by
     // the previously committed value immediately.
     let used = UsedValues::default();
-    used.set_content_inline_size(fragment.content_inline_size);
-    used.set_content_block_size(fragment.content_block_size);
+    used.set_box_metrics_from_fragment(fragment);
     used.has_definite_inline_size.set(true);
     used.has_definite_block_size.set(true);
     used.content_offset.set(link.committed_offset);
     used.placed_in.set(link.containing_block);
-    used.margin_left.set(fragment.margin_left);
-    used.margin_right.set(fragment.margin_right);
-    used.margin_top.set(fragment.margin_top);
-    used.margin_bottom.set(fragment.margin_bottom);
-    used.border_left.set(fragment.border_left);
-    used.border_right.set(fragment.border_right);
-    used.border_top.set(fragment.border_top);
-    used.border_bottom.set(fragment.border_bottom);
-    used.padding_left.set(fragment.padding_left);
-    used.padding_right.set(fragment.padding_right);
-    used.padding_top.set(fragment.padding_top);
-    used.padding_bottom.set(fragment.padding_bottom);
     used.table_column_index.set(fragment.table_column_index);
     used.table_column_span.set(fragment.table_column_span);
     used.hidden_by_collapsed_columns
@@ -1013,5 +1041,5 @@ pub(crate) fn used_values_from_committed_fragment_link(
     used.has_content_offset.set(true);
     used.seal_committed_box_metrics();
 
-    Some(std::rc::Rc::new(used))
+    Some(used)
 }
