@@ -805,17 +805,12 @@ set(SOURCES
     MediaCapture/MediaStreamTrackEvent.cpp
     MediaSourceExtensions/BufferedChangeEvent.cpp
     MediaSourceExtensions/EventNames.cpp
-    MediaSourceExtensions/ISOBMFFByteStreamParser.cpp
     MediaSourceExtensions/ManagedMediaSource.cpp
     MediaSourceExtensions/ManagedSourceBuffer.cpp
     MediaSourceExtensions/MediaSource.cpp
     MediaSourceExtensions/MediaSourceHandle.cpp
     MediaSourceExtensions/SourceBuffer.cpp
     MediaSourceExtensions/SourceBufferList.cpp
-    MediaSourceExtensions/SourceBufferProcessor.cpp
-    MediaSourceExtensions/WebMByteStreamParser.cpp
-    MediaSourceExtensions/TrackBuffer.cpp
-    MediaSourceExtensions/TrackBufferDemuxer.cpp
     MimeSniff/MimeType.cpp
     MimeSniff/Resource.cpp
     MixedContent/AbstractOperations.cpp
@@ -1229,7 +1224,7 @@ set(GENERATED_SOURCES
 ladybird_lib(LibWeb web EXPLICIT_SYMBOL_EXPORT)
 target_link_libraries(LibWeb PUBLIC LibCompositing)
 
-target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibJS LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibMedia LibWasm LibXML LibURL LibTLS LibRequests LibGC LibThreading skia SDL3::SDL3 LibXml2::LibXml2)
+target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibJS LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibMedia LibMediaClient LibWasm LibXML LibURL LibTLS LibRequests LibGC LibThreading skia SDL3::SDL3 LibXml2::LibXml2)
 
 # LibWeb still includes ANGLE's GLES headers for WebGL constants and types, but
 # the actual GL entry points live in the Compositor. Copy only ANGLE's compile

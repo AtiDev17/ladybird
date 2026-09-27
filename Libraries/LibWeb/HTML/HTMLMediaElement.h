@@ -21,6 +21,7 @@
 #include <LibJS/Forward.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/VideoSinkHandle.h>
+#include <LibMediaClient/Forward.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/FileAPI/Blob.h>
@@ -171,7 +172,7 @@ public:
 
     void set_duration(Badge<MediaSourceExtensions::MediaSource>, double duration) { set_duration(duration); }
 
-    Media::PlaybackManager& playback_manager()
+    MediaClient::RemotePlaybackManager& playback_manager()
     {
         VERIFY(m_playback_manager);
         return *m_playback_manager;
@@ -237,10 +238,11 @@ private:
     bool should_hold_screen_wake_lock() const;
     void update_screen_wake_lock();
 
-    void restart_fetch_at_offset(u64 offset);
+    void handle_data_request(Optional<u64> offset);
 
     void set_up_playback_manager_for_remote();
-    void set_up_playback_manager_for_local();
+    void set_up_playback_manager_for_local(Function<void(Utf16String)> failure_callback);
+    void set_up_playback_manager_error_handler(Function<void(Utf16String)> failure_callback);
     enum class FetchingStatus : u8 {
         Ongoing,
         Complete,
@@ -422,7 +424,7 @@ private:
     bool m_waiting_for_an_implementation_defined_event_to_fetch_the_resource { false };
     bool m_current_resource_selection_is_explicit { false };
 
-    OwnPtr<Media::PlaybackManager> m_playback_manager;
+    OwnPtr<MediaClient::RemotePlaybackManager> m_playback_manager;
 
     RefPtr<Core::Timer> m_playback_position_update_timer;
     GC::Ptr<VideoTrack> m_selected_video_track;

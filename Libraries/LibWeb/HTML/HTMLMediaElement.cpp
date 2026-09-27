@@ -10,12 +10,12 @@
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/Date.h>
 #include <LibJS/Runtime/Promise.h>
-#include <LibMedia/IncrementallyPopulatedStream.h>
 #include <LibMedia/MediaSupport.h>
-#include <LibMedia/PlaybackManager.h>
-#include <LibMedia/Sinks/DisplayingVideoSink.h>
 #include <LibMedia/Track.h>
 #include <LibMedia/VideoFrame.h>
+#include <LibMediaClient/Client.h>
+#include <LibMediaClient/RemoteMediaStream.h>
+#include <LibMediaClient/RemotePlaybackManager.h>
 #include <LibURL/Parser.h>
 #include <LibWeb/Bindings/HTMLMediaElement.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
@@ -112,7 +112,7 @@ struct HTMLMediaElement::RemoteFetchData {
     AK_ALLOC_WITH_KMALLOC;
 
     URL::URL url_record;
-    RefPtr<Media::IncrementallyPopulatedStream> stream;
+    RefPtr<MediaClient::RemoteMediaStream> stream;
     GC::Weak<Fetch::Infrastructure::FetchController> fetch_controller;
     Function<void(Utf16String)> failure_callback;
     bool accepts_byte_ranges { false };
@@ -168,23 +168,19 @@ void HTMLMediaElement::initialize_element()
         // the document is active again.
         pause_element();
 
-        // AD-HOC: Stop the fetch here so that the element can be reclaimed by GC. The fetch callbacks hold a strong
+        // AD-HOC: Let the fetch stop so that the element can be reclaimed by GC. The fetch callbacks hold a strong
         //         reference to their media element to ensure that load/error events are fired as expected.
-        if (m_remote_fetch_data && m_remote_fetch_data->fetch_controller) {
-            m_remote_fetch_data->fetch_controller->stop_fetch();
-            m_remote_fetch_data->fetch_controller = nullptr;
-        }
+        // FIXME: Add a heuristic to also go idle when enough data is buffered ahead.
+        if (m_remote_fetch_data)
+            m_remote_fetch_data->stream->set_may_idle(true);
 
         detach_video_sink_edge();
     });
 
     m_document_observer->set_document_became_active([this]() {
-        // AD-HOC: Restart the fetch from where the stream last received data so that playback can continue.
-        if (m_remote_fetch_data && !m_waiting_for_an_implementation_defined_event_to_fetch_the_resource) {
-            VERIFY(!m_remote_fetch_data->fetch_controller);
-            if (m_remote_fetch_data->stream->next_chunk_start() != m_remote_fetch_data->stream->expected_size())
-                load_remote_resource(UntilEnd { m_remote_fetch_data->stream->next_chunk_start() });
-        }
+        // AD-HOC: Now that the document is active again, let the stream notify us when to start fetching again.
+        if (m_remote_fetch_data)
+            m_remote_fetch_data->stream->set_may_idle(false);
 
         add_current_video_sink();
     });
@@ -394,8 +390,7 @@ void HTMLMediaElement::set_decoder_error(Utf16String error_message)
     // resource is usable (i.e. once the media element's readyState attribute is no longer HAVE_NOTHING) must cause the
     // user agent to execute the following steps:
 
-    // NB: This is only invoked by PlaybackManager after the metadata has been retrieved, so we should be sure that
-    //     the ready state indicates we have that metadata.
+    // NB: The playback manager's error handler only takes this branch once the ready state says we have the metadata.
     VERIFY(m_ready_state != ReadyState::HaveNothing);
 
     // 1. The user agent should cancel the fetching process.
@@ -468,7 +463,10 @@ Bindings::CanPlayTypeResult HTMLMediaElement::can_play_type(Utf16View type) cons
     if (!mime_type.has_value())
         return Bindings::CanPlayTypeResult::Empty;
 
-    auto support = Media::file_media_support({ mime_type->type(), mime_type->subtype(), mime_type->parameters() });
+    auto media_client = MediaClient::Client::acquire();
+    if (media_client.is_error())
+        return Bindings::CanPlayTypeResult::Empty;
+    auto support = media_client.value()->query_file_media_support(mime_type->type(), mime_type->subtype(), mime_type->parameters().get("codecs"sv).copy());
     switch (support.support) {
     case Media::MediaSupport::NotSupported:
         return Bindings::CanPlayTypeResult::Empty;
@@ -1310,9 +1308,9 @@ void HTMLMediaElement::load_url_resource(URL::URL const& url_record, Function<vo
 
     m_remote_fetch_data = make<RemoteFetchData>();
     m_remote_fetch_data->url_record = url_record;
-    m_remote_fetch_data->stream = Media::IncrementallyPopulatedStream::create_empty();
-    m_remote_fetch_data->stream->set_data_request_callback(GC::weak_callback(*this, [](auto& self, u64 offset) {
-        self.restart_fetch_at_offset(offset);
+    m_remote_fetch_data->stream = MediaClient::RemoteMediaStream::create();
+    m_remote_fetch_data->stream->set_data_request_callback(GC::weak_callback(*this, [](auto& self, Optional<u64> offset) {
+        self.handle_data_request(offset);
     }));
     m_remote_fetch_data->failure_callback = move(failure_callback);
 
@@ -1491,11 +1489,6 @@ void HTMLMediaElement::run_remote_mode_resource_fetch_steps(ByteRange byte_range
         // 1. Let global be the media element's node document's relevant global object.
         auto& global = HTML::relevant_realm(*self).global_object();
 
-        if (auto content_length = response->header_list()->extract_length(); content_length.template has<u64>()) {
-            auto actual_length = fetch_data->offset + content_length.template get<u64>();
-            fetch_data->stream->set_expected_size(actual_length);
-        }
-
         if (auto accept_ranges = response->header_list()->extract_header_list_values("Accept-Ranges"sv); accept_ranges.template has<Vector<ByteString>>())
             fetch_data->accepts_byte_ranges = accept_ranges.template get<Vector<ByteString>>().contains([](auto const& units) { return units == "bytes"sv; });
 
@@ -1539,6 +1532,7 @@ void HTMLMediaElement::run_remote_mode_resource_fetch_steps(ByteRange byte_range
             if (fetch_generation != weak_self->m_current_fetch_generation)
                 return;
 
+            weak_self->m_remote_fetch_data->fetch_controller = nullptr;
             weak_self->m_remote_fetch_data->stream->close();
             weak_self->queue_a_media_element_task([](HTMLMediaElement& self) {
                 self.process_media_data(FetchingStatus::Complete);
@@ -1554,6 +1548,7 @@ void HTMLMediaElement::run_remote_mode_resource_fetch_steps(ByteRange byte_range
             if (fetch_generation != weak_self->m_current_fetch_generation)
                 return;
 
+            weak_self->m_remote_fetch_data->fetch_controller = nullptr;
             weak_self->m_remote_fetch_data->stream->close();
             weak_self->queue_a_media_element_task([](HTMLMediaElement& self) {
                 self.process_media_data(FetchingStatus::Interrupted);
@@ -1644,7 +1639,7 @@ void HTMLMediaElement::load_local_resource(MediaProvider const& media_provider, 
 
                 media_source->set_assigned_to_media_element({}, *this);
                 m_attached_media_source = media_source;
-                set_up_playback_manager_for_local();
+                set_up_playback_manager_for_local(move(failure_callback));
 
                 // 4. Set the readyState attribute to "open".
                 // 5. Queue a task to fire an event named sourceopen at the MediaSource.
@@ -1699,16 +1694,26 @@ Optional<Utf16String> HTMLMediaElement::verify_response_or_get_failure_reason(GC
         return Utf16String::from_utf8(*response->network_error_message());
     }
 
+    auto set_expected_size_from_content_length = [&] {
+        if (auto content_length = response->header_list()->extract_length(); content_length.has<u64>())
+            m_remote_fetch_data->stream->set_expected_size(content_length.get<u64>());
+    };
+
     // 2. If byteRange is "entire resource", then return true.
-    if (byte_range.has<EntireResource>())
+    if (byte_range.has<EntireResource>()) {
+        set_expected_size_from_content_length();
         return {};
+    }
 
     // 3. Let internalResponse be response's unsafe response.
     auto internal_response = response->unsafe_response();
 
     // 4. If internalResponse's status is 200, then return true.
-    if (internal_response->status() == 200)
+    if (internal_response->status() == 200) {
+        m_remote_fetch_data->offset = 0;
+        set_expected_size_from_content_length();
         return {};
+    }
 
     // 5. If internalResponse's status is not 206, then return false.
     if (internal_response->status() != 206)
@@ -1750,22 +1755,35 @@ void HTMLMediaElement::update_screen_wake_lock()
     m_screen_wake_lock.clear();
 }
 
-void HTMLMediaElement::restart_fetch_at_offset(u64 offset)
+void HTMLMediaElement::handle_data_request(Optional<u64> offset)
 {
     VERIFY(m_remote_fetch_data);
 
     if (m_error)
         return;
 
-    if (!m_remote_fetch_data->accepts_byte_ranges)
-        return;
+    auto& fetch_controller = m_remote_fetch_data->fetch_controller;
 
-    if (m_remote_fetch_data->fetch_controller) {
-        m_remote_fetch_data->fetch_controller->stop_fetch();
-        m_remote_fetch_data->fetch_controller = nullptr;
+    if (!offset.has_value()) {
+        if (fetch_controller) {
+            fetch_controller->stop_fetch();
+            fetch_controller = nullptr;
+        }
+        return;
     }
 
-    load_remote_resource(UntilEnd { offset });
+    if (!m_remote_fetch_data->accepts_byte_ranges) {
+        if (!fetch_controller)
+            load_remote_resource(EntireResource {});
+        return;
+    }
+
+    if (fetch_controller) {
+        fetch_controller->stop_fetch();
+        fetch_controller = nullptr;
+    }
+
+    load_remote_resource(UntilEnd { *offset });
 }
 
 void HTMLMediaElement::set_audio_track_enabled(Badge<AudioTrack>, GC::Ptr<HTML::AudioTrack> audio_track, bool enabled)
@@ -1804,19 +1822,18 @@ RefPtr<Media::VideoFrame> HTMLMediaElement::current_presented_frame() const
     if (!m_playback_manager || !handle.has_value())
         return nullptr;
     note_frame_captured();
-    return Media::PlaybackManager::current_presented_frame(*handle);
+    return m_playback_manager->current_presented_frame(*handle);
 }
 
 void HTMLMediaElement::attach_selected_video_track_sink(Media::Track const& track)
 {
-    auto previous_handle = video_sink_handle();
+    if (video_sink_handle().has_value())
+        release_active_video_sink();
     auto handle = m_playback_manager->reserve_video_sink_handle(track);
     m_playback_manager->set_video_resize_handler(handle, GC::weak_callback(*this, [](auto& self, Gfx::Size<u32> size) {
         if (auto* video_element = as_if<HTMLVideoElement>(&self))
             video_element->set_intrinsic_video_dimensions(size);
     }));
-    if (previous_handle.has_value())
-        release_active_video_sink();
     m_active_video_sink = make<ActiveVideoSink>(handle, Compositing::allocate_video_sink_resource_id());
     m_video_sink_is_ticking = true;
     add_current_video_sink(handle);
@@ -2113,8 +2130,7 @@ void HTMLMediaElement::on_metadata_parsed(SourceType source_type)
 // https://html.spec.whatwg.org/multipage/media.html#media-data-processing-steps-list
 void HTMLMediaElement::set_up_playback_manager_for_remote()
 {
-    m_playback_manager = Media::PlaybackManager::create();
-    m_playback_manager->set_audio_output_disabled(document().page().client().is_headless());
+    m_playback_manager = MediaClient::RemotePlaybackManager::create(document().page().client().is_headless());
 
     m_playback_manager->set_playback_rate(static_cast<float>(m_playback_rate));
 
@@ -2141,40 +2157,15 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
         self.on_metadata_parsed(SourceType::Remote);
     });
 
-    // -> If the media data can be fetched but is found by inspection to be in an unsupported format, or can otherwise not be rendered at all
-    m_playback_manager->on_unsupported_format_error = GC::weak_callback(*this, [](auto& self, Media::DecoderError&& error) mutable {
-        auto const* playback_manager_ptr = self.m_playback_manager.ptr();
+    set_up_playback_manager_error_handler(GC::weak_callback(*this, [](auto& self, Utf16String error_message) {
+        // 1. The user agent should cancel the fetching process.
+        VERIFY(self.m_remote_fetch_data);
+        auto failure_callback = move(self.m_remote_fetch_data->failure_callback);
+        self.cancel_the_fetching_process();
 
-        // NB: Queue a task for this so that we don't destroy the PlaybackManager within one of its callbacks when we
-        //     call forget_media_resource_specific_tracks().
-        self.queue_a_media_element_task([error = move(error), playback_manager_ptr = move(playback_manager_ptr)](HTMLMediaElement& self) {
-            if (self.m_error)
-                return;
-            if (playback_manager_ptr != self.m_playback_manager.ptr())
-                return;
-
-            // 1. The user agent should cancel the fetching process.
-            VERIFY(self.m_remote_fetch_data);
-            auto failure_callback = move(self.m_remote_fetch_data->failure_callback);
-            self.cancel_the_fetching_process();
-
-            // 2. Abort this subalgorithm, returning to the resource selection algorithm.
-            failure_callback(Utf16String::from_utf8(error.description()));
-        });
-    });
-
-    // -> If the media data is corrupted
-    m_playback_manager->on_error = GC::weak_callback(*this, [](auto& self, Media::DecoderError&& error) {
-        auto const* playback_manager_ptr = self.m_playback_manager.ptr();
-
-        self.queue_a_media_element_task([error = move(error), playback_manager_ptr = move(playback_manager_ptr)](HTMLMediaElement& self) {
-            if (self.m_error)
-                return;
-            if (playback_manager_ptr != self.m_playback_manager.ptr())
-                return;
-            self.set_decoder_error(Utf16String::from_utf8(error.description()));
-        });
-    });
+        // 2. Abort this subalgorithm, returning to the resource selection algorithm.
+        failure_callback(move(error_message));
+    }));
 
     m_playback_manager->add_media_source(*m_remote_fetch_data->stream);
 
@@ -2190,10 +2181,39 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#media-data-processing-steps-list
-void HTMLMediaElement::set_up_playback_manager_for_local()
+void HTMLMediaElement::set_up_playback_manager_error_handler(Function<void(Utf16String)> failure_callback)
 {
-    m_playback_manager = Media::PlaybackManager::create();
-    m_playback_manager->set_audio_output_disabled(document().page().client().is_headless());
+    m_playback_manager->on_error = GC::weak_callback(*this, [failure_callback = move(failure_callback)](auto& self, Media::DecoderError&& error) mutable {
+        auto const* playback_manager_ptr = self.m_playback_manager.ptr();
+
+        // NB: Queue a task for this so that we don't destroy the PlaybackManager within one of its callbacks when we
+        //     call forget_media_resource_specific_tracks().
+        self.queue_a_media_element_task([error = move(error), playback_manager_ptr, failure_callback = move(failure_callback)](HTMLMediaElement& self) {
+            if (self.m_error)
+                return;
+            if (playback_manager_ptr != self.m_playback_manager.ptr())
+                return;
+
+            // NB: The playback manager reports every failure through one callback, so the ready state decides which of the
+            //     failure steps below apply: until metadata arrives the resource was never established as usable.
+
+            // -> If the media data is corrupted
+            if (self.m_ready_state != ReadyState::HaveNothing) {
+                self.set_decoder_error(Utf16String::from_utf8(error.description()));
+                return;
+            }
+
+            // -> If the media data can be fetched but is found by inspection to be in an unsupported format, or can otherwise not be rendered at all
+            VERIFY(failure_callback);
+            failure_callback(Utf16String::from_utf8(error.description()));
+        });
+    });
+}
+
+// https://html.spec.whatwg.org/multipage/media.html#media-data-processing-steps-list
+void HTMLMediaElement::set_up_playback_manager_for_local(Function<void(Utf16String)> failure_callback)
+{
+    m_playback_manager = MediaClient::RemotePlaybackManager::create(document().page().client().is_headless());
 
     m_playback_manager->set_playback_rate(static_cast<float>(m_playback_rate));
 
@@ -2239,12 +2259,13 @@ void HTMLMediaElement::set_up_playback_manager_for_local()
         self.on_metadata_parsed(SourceType::Local);
     });
 
-    // -> If the media data is corrupted
-    m_playback_manager->on_error = GC::weak_callback(*this, [](auto& self, Media::DecoderError&& error) {
-        self.queue_a_media_element_task([error = move(error)](HTMLMediaElement& self) {
-            self.set_decoder_error(Utf16String::from_utf8(error.description()));
-        });
-    });
+    set_up_playback_manager_error_handler(GC::weak_callback(*this, [failure_callback = move(failure_callback)](auto& self, Utf16String error_message) {
+        // 1. The user agent should cancel the fetching process.
+        self.cancel_the_fetching_process();
+
+        // 2. Abort this subalgorithm, returning to the resource selection algorithm.
+        failure_callback(move(error_message));
+    }));
 
     m_playback_manager->on_playback_state_change = GC::weak_callback(*this, [](auto& self) {
         self.on_playback_manager_state_change();
@@ -2616,7 +2637,8 @@ void HTMLMediaElement::sync_video_sink_ticking() const
         return;
     m_video_sink_is_ticking = should_tick;
 
-    Media::PlaybackManager::set_video_sink_ticking(*handle, should_tick);
+    if (m_playback_manager)
+        m_playback_manager->set_video_sink_ticking(*handle, should_tick);
     if (auto navigable = document().navigable(); navigable && navigable->has_compositor_context())
         navigable->compositor_context().set_video_sink_ticking(*handle, should_tick);
 }

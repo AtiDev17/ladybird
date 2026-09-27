@@ -479,9 +479,6 @@ void ConnectionFromClient::connect_to_compositor_process(IPC::TransportHandle ha
         m_compositor_connection->transport().set_peer_pid(response->compositor_pid());
     }
 #endif
-
-    // Establish the video presentation channel now that the Compositor connection is up.
-    m_compositor_connection->ensure_video_presentation_channel();
 }
 
 void ConnectionFromClient::compositor_process_reconnected()
@@ -493,6 +490,14 @@ void ConnectionFromClient::connect_to_request_server(IPC::TransportHandle handle
 {
     if (on_request_server_connection)
         on_request_server_connection(handle);
+}
+
+ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_media_server_transport()
+{
+    auto response = send_sync_but_allow_failure<Messages::WebContentClient::RequestMediaServerConnection>();
+    if (!response || !response->handle().has_value())
+        return Error::from_string_literal("The Browser did not connect a media server");
+    return response->take_handle()->create_transport();
 }
 
 TestConnection* ConnectionFromClient::test_connection()

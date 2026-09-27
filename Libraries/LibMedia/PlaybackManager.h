@@ -7,6 +7,8 @@
 #pragma once
 
 #include <AK/AtomicRefCounted.h>
+#include <AK/Badge.h>
+#include <AK/Debug.h>
 #include <AK/Forward.h>
 #include <AK/HashTable.h>
 #include <AK/Mutex.h>
@@ -27,6 +29,8 @@
 #include <LibMedia/Sinks/RemoteVideoSink.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibMedia/Track.h>
+#include <LibMedia/VideoFrameHandle.h>
+#include <LibMedia/VideoPresentation/PresentedFramePage.h>
 #include <LibMedia/VideoSinkHandle.h>
 
 namespace Media {
@@ -70,13 +74,18 @@ public:
     Optional<Track> preferred_video_track() { return m_preferred_video_track; }
     Optional<Track> preferred_audio_track() { return m_preferred_audio_track; }
 
+    // Playback that ended because nothing was enabled may resume only while the owner has not observed the end.
+    enum class ResumeEndedPlayback : u8 {
+        No,
+        Yes,
+    };
     VideoSinkHandle reserve_video_sink_handle(Track const&);
     void disable_video_sink_by_handle(VideoSinkHandle);
     static void set_video_sink_ticking(VideoSinkHandle, bool);
     void detach_video_sink(VideoSinkHandle);
     void set_video_resize_handler(VideoSinkHandle, Function<void(Gfx::Size<u32>)>);
 
-    void enable_an_audio_track(Track const&);
+    void enable_an_audio_track(Track const&, ResumeEndedPlayback);
     void disable_an_audio_track(Track const&);
 
     bool track_is_enabled(Track const&) const;
@@ -95,7 +104,6 @@ public:
     void set_playback_rate(float);
 
     Function<void()> on_metadata_parsed;
-    Function<void(DecoderError&&)> on_unsupported_format_error;
     Function<void(Track const&)> on_track_added;
     Function<void()> on_playback_state_change;
     Function<void(AK::Duration)> on_duration_change;
@@ -111,10 +119,23 @@ public:
     };
     // The edge is created unattached, so the caller can transmit it to its consumer before the pump
     // can produce any traffic; attach_video_edge() then starts the flow.
-    static ErrorOr<RemoteVideoEdge> create_video_edge(VideoSinkHandle, RemoteVideoSink::Delegates);
-    static void attach_video_edge(VideoSinkHandle, NonnullRefPtr<RemoteVideoSink> const&);
+    static bool has_video_sink_handle(Badge<VideoPresentationServerConnection>, VideoSinkHandle);
+    static ErrorOr<RemoteVideoEdge> create_video_edge(Badge<VideoPresentationServerConnection>, VideoSinkHandle, RemoteVideoSink::Delegates);
+    static void attach_video_edge(Badge<VideoPresentationServerConnection>, VideoSinkHandle, NonnullRefPtr<RemoteVideoSink> const&);
     static RefPtr<VideoFrame> current_presented_frame(VideoSinkHandle);
-    static void release_video_edge(VideoSinkHandle, VideoSink const& released_sink);
+    static Optional<RemoteVideoSink::SlotStorage> presented_frame_slot_storage(VideoSinkHandle, VideoFramePoolID, u32 slot_index);
+    static void release_video_edge(Badge<VideoPresentationServerConnection>, VideoSinkHandle, VideoSink const& released_sink);
+
+    // For a process hosting playback on behalf of an owner in another process; not owner API.
+    struct HostHooks {
+        Function<void(MediaTimeReader const&)> on_clock_changed;
+        Function<void(VideoSinkHandle, PresentedFramePage const&)> on_video_edge_attached;
+        Function<void(VideoSinkHandle, VideoFramePoolID)> on_video_frame_pool_retired;
+    };
+    void set_host_hooks(HostHooks);
+    MediaTimeReader const& time_reader() const { return m_time_reader; }
+    // Registers a handle allocated by the owner's process for the track's producer.
+    void reserve_video_sink_handle(Track const&, VideoSinkHandle, ResumeEndedPlayback);
 
 private:
     struct VideoTrackData {
@@ -122,6 +143,8 @@ private:
         NonnullRefPtr<DecodedVideoProducer> producer;
         Optional<VideoSinkHandle> handle { OptionalNone() };
         RefPtr<VideoSink> video_sink { nullptr };
+        // The sink above, when it is the pump of a cross-process edge.
+        RefPtr<RemoteVideoSink> video_edge_sink { nullptr };
         PipelineStatus sink_status { PipelineStatus::Pending };
         // While ticking, the sink's dispatched status is live and remains the sole ending
         // authority; while unticked, it is stale and the track ends at its verified end time.
@@ -143,6 +166,9 @@ private:
 
     WeakPlaybackManager weak();
 
+    void apply_track_change_to_ended_state(ResumeEndedPlayback);
+    void seek_clock_and_video_sinks(AK::Duration);
+
     void set_clock(NonnullRefPtr<MediaClock> const&);
     void disable_audio();
 
@@ -158,6 +184,7 @@ private:
     PipelineStatus combined_pipeline_status() const;
     void check_for_demuxed_duration_change(AK::Duration);
     void dispatch_error(DecoderError&&);
+    static void dispatch_media_init_error(WeakPlaybackManager, Core::EventLoop& main_thread_event_loop, DecoderError);
     void dispatch_buffered_ranges_change();
 
     template<typename Self>
@@ -210,9 +237,11 @@ private:
 
     NonnullRefPtr<MediaClock> m_clock;
     MediaTimeReader m_time_reader;
+    HostHooks m_host_hooks;
     float m_playback_rate { 1.0f };
 
     bool m_audio_output_disabled { false };
+    bool m_started { false };
 
     Vector<NonnullRefPtr<Demuxer>> m_demuxers;
 
@@ -233,6 +262,7 @@ private:
     Optional<AK::UnixDateTime> m_start_time_realtime;
 
     PipelineStatus m_audio_sink_status { PipelineStatus::HaveData };
+    PipelineStatus m_last_traced_combined_status { PipelineStatus::Pending };
 
     bool m_is_in_error_state { false };
 };
@@ -240,12 +270,14 @@ private:
 template<typename T, typename... Args>
 void PlaybackManager::replace_state_handler(Args&&... args)
 {
+    auto previous_state = m_handler->state();
     m_handler->on_exit();
 
     OwnPtr<PlaybackStateHandler> new_handler = make<T>(*this, args...);
     m_handler.swap(new_handler);
 
     m_handler->on_enter();
+    dbgln_if(PLAYBACK_MANAGER_DEBUG, "PlaybackManager({:p}): {} -> {}", this, previous_state, m_handler->state());
     dispatch_state_change();
 }
 

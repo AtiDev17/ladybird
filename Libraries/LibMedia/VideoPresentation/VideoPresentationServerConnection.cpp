@@ -25,13 +25,13 @@ void VideoPresentationServerConnection::die()
 {
     revoke_weak_refs();
     for (auto& entry : m_edge_states)
-        PlaybackManager::release_video_edge(entry.value.handle, *entry.value.pump);
+        PlaybackManager::release_video_edge({}, entry.value.handle, *entry.value.pump);
     m_edge_states.clear();
 }
 
 void VideoPresentationServerConnection::create_video_edge(VideoSinkHandle video_sink_handle, u64 edge_id)
 {
-    if (m_edge_states.contains(edge_id)) {
+    if (m_edge_states.contains(edge_id) || m_pending_edge_handles_by_edge_id.contains(edge_id)) {
         did_misbehave("create_video_edge: edge ID already exists");
         return;
     }
@@ -41,7 +41,33 @@ void VideoPresentationServerConnection::create_video_edge(VideoSinkHandle video_
             return;
         }
     }
+    for (auto const& entry : m_pending_edge_handles_by_edge_id) {
+        if (entry.value == video_sink_handle) {
+            did_misbehave("create_video_edge: video sink handle already has a pending edge");
+            return;
+        }
+    }
 
+    if (!PlaybackManager::has_video_sink_handle({}, video_sink_handle)) {
+        m_pending_edge_handles_by_edge_id.set(edge_id, video_sink_handle);
+        return;
+    }
+    create_registered_video_edge(video_sink_handle, edge_id);
+}
+
+void VideoPresentationServerConnection::retry_pending_video_edges()
+{
+    auto pending_edges = move(m_pending_edge_handles_by_edge_id);
+    for (auto const& [edge_id, video_sink_handle] : pending_edges) {
+        if (PlaybackManager::has_video_sink_handle({}, video_sink_handle))
+            create_registered_video_edge(video_sink_handle, edge_id);
+        else
+            m_pending_edge_handles_by_edge_id.set(edge_id, video_sink_handle);
+    }
+}
+
+void VideoPresentationServerConnection::create_registered_video_edge(VideoSinkHandle video_sink_handle, u64 edge_id)
+{
     auto weak_connection = make_weak_ref();
 
     RemoteVideoSink::Delegates delegates;
@@ -79,7 +105,7 @@ void VideoPresentationServerConnection::create_video_edge(VideoSinkHandle video_
         });
     };
 
-    auto remote_edge_or_error = PlaybackManager::create_video_edge(video_sink_handle, move(delegates));
+    auto remote_edge_or_error = PlaybackManager::create_video_edge({}, video_sink_handle, move(delegates));
     if (remote_edge_or_error.is_error()) {
         dbgln("VideoPresentation: failed to create video edge: {}", remote_edge_or_error.error());
         return;
@@ -88,18 +114,19 @@ void VideoPresentationServerConnection::create_video_edge(VideoSinkHandle video_
 
     m_edge_states.set(edge_id, EdgeState { remote_edge.sink, video_sink_handle });
     async_video_edge_ready(edge_id, remote_edge.sink->edge(), remote_edge.sink->presented_frame_page(), remote_edge.time_reader);
-    PlaybackManager::attach_video_edge(video_sink_handle, remote_edge.sink);
+    PlaybackManager::attach_video_edge({}, video_sink_handle, remote_edge.sink);
 }
 
 void VideoPresentationServerConnection::release_video_edge(u64 edge_id)
 {
+    m_pending_edge_handles_by_edge_id.remove(edge_id);
     auto it = m_edge_states.find(edge_id);
     if (it == m_edge_states.end())
         return;
     auto handle = it->value.handle;
     auto pump = it->value.pump;
     m_edge_states.remove(it);
-    PlaybackManager::release_video_edge(handle, *pump);
+    PlaybackManager::release_video_edge({}, handle, *pump);
 }
 
 void VideoPresentationServerConnection::request_start(u64 edge_id)

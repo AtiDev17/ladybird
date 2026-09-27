@@ -742,6 +742,16 @@ Messages::WebContentClient::DidLoseRequestServerConnectionResponse WebContentCli
     return handle.release_value();
 }
 
+Messages::WebContentClient::RequestMediaServerConnectionResponse WebContentClient::request_media_server_connection()
+{
+    auto handle = connect_new_media_server_client(m_media_server_client);
+    if (handle.is_error()) {
+        warnln("Unable to connect a MediaServer client: {}", handle.error());
+        return OptionalNone {};
+    }
+    return handle.release_value();
+}
+
 Optional<u64> WebContentClient::exclusive_performance_owner() const
 {
     Optional<u64> owner;

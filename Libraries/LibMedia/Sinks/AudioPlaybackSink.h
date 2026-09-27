@@ -33,13 +33,16 @@ public:
     virtual ~AudioPlaybackSink() override;
 
     virtual ErrorOr<void> connect_input(NonnullRefPtr<AudioProducer> const&) override;
-    void disconnect_input_while_locked(NonnullRefPtr<AudioProducer> const&);
     virtual void disconnect_input(NonnullRefPtr<AudioProducer> const&) override;
+
+    void start();
 
     virtual MediaTimeReader time_reader() const override;
     virtual void resume() override;
     virtual void pause() override;
     virtual void seek(AK::Duration) override;
+
+    void invalidate_status_changes_in_flight();
 
     virtual void set_playback_rate(float) override;
 

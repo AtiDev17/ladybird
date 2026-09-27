@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Debug.h>
 #include <AK/Mutex.h>
 #include <LibCore/EventLoop.h>
 #include <LibMedia/Audio/SampleSpecification.h>
@@ -138,8 +137,7 @@ ErrorOr<void> DecodedAudioProducer::ThreadData::set_output_sample_specification(
 
 void DecodedAudioProducer::ThreadData::set_wake_handler(PipelineWakeHandler handler)
 {
-    auto locker = take_lock();
-    m_wake_handler = move(handler);
+    m_wake_handler.set(move(handler));
 }
 
 void DecodedAudioProducer::ThreadData::dispatch_wake_if_needed_while_locked()
@@ -150,8 +148,7 @@ void DecodedAudioProducer::ThreadData::dispatch_wake_if_needed_while_locked()
     invoke_on_main_thread_while_locked([seek_id](auto& self) {
         if (self->m_seek_id != seek_id)
             return;
-        if (self->m_wake_handler)
-            self->m_wake_handler();
+        self->m_wake_handler.dispatch();
     });
     m_downstream_needs_wake = false;
 }
@@ -211,6 +208,11 @@ DecoderErrorOr<void> DecodedAudioProducer::ThreadData::receive_into_decoder(Code
     if (receive_result.is_error() && receive_result.error().category() == DecoderErrorCategory::NotImplemented) {
         m_decoder_that_failed_due_to_missing_features = m_decoder_selection;
         replace_decoder_once_drained(frame);
+        return {};
+    }
+
+    if (receive_result.is_error() && receive_result.error().category() == DecoderErrorCategory::EndOfStream) {
+        dbgln("DecodedAudioProducer: Decoder refused a frame at {} after reaching EOS", frame.presentation_timestamp());
         return {};
     }
 
@@ -604,7 +606,6 @@ void DecodedAudioProducer::ThreadData::push_data_and_decode_a_block()
         auto locker = take_lock();
         enter_halting_state(status, move(error));
 
-        dbgln_if(PLAYBACK_MANAGER_DEBUG, "Decoded Audio Producer: Reached a halting pull status, waiting for a seek to start decoding again...");
         while (true) {
             if (m_seek_id != m_last_processed_seek_id)
                 return;

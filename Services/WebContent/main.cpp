@@ -19,6 +19,7 @@
 #include <LibIPC/ConnectionFromClient.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibMain/Main.h>
+#include <LibMediaClient/Client.h>
 #include <LibRequests/RequestClient.h>
 #include <LibSandbox/ConnectBroker.h>
 #include <LibUnicode/TimeZone.h>
@@ -35,9 +36,6 @@
 #include <LibWebView/Plugins/ImageCodecPlugin.h>
 #include <LibWebView/Utilities.h>
 #include <Services/RendererSandbox.h>
-#if defined(AK_OS_LINUX)
-#    include <LibMedia/FFmpeg/SystemFFmpeg.h>
-#endif
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/PageClient.h>
 #include <WebContent/WebContentCompositorHost.h>
@@ -234,8 +232,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 #if defined(AK_OS_LINUX)
     if (connect_broker_fd != -1)
         Sandbox::set_connect_broker_fd(connect_broker_fd);
-    // FIXME: Remove once media decoding runs in its own sandboxed process; the library's dependencies need more than this sandbox allows.
-    (void)Media::FFmpeg::SystemFFmpeg::the();
 #endif
 
     if (!disable_sandbox)
@@ -259,6 +255,10 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         if (auto result = connect_to_image_decoder(handle); result.is_error())
             dbgln("Failed to connect to image decoder: {}", result.error());
     };
+
+    MediaClient::Client::set_transport_factory([webcontent_client] {
+        return webcontent_client->request_media_server_transport();
+    });
 
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     WasmCompilerClient::compiler_state().install_compiler_callback();
