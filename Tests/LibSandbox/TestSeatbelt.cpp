@@ -17,6 +17,7 @@
 #    include <IOKit/kext/KextManager.h>
 #    include <IOSurface/IOSurface.h>
 #    include <LibCore/MachPort.h>
+#    include <LibCore/Platform/TaskRole.h>
 #    include <LibCore/System.h>
 #    include <LibSandbox/Sandbox.h>
 #    include <LibTest/TestCase.h>
@@ -27,9 +28,12 @@
 #    include <mach-o/dyld.h>
 #    include <mach-o/loader.h>
 #    include <mach/mach.h>
+#    include <mach/task_policy.h>
+#    include <mach/thread_info.h>
 #    include <net/route.h>
 #    include <netinet/in.h>
 #    include <pthread.h>
+#    include <pthread/qos.h>
 #    include <servers/bootstrap.h>
 #    include <signal.h>
 #    include <spawn.h>
@@ -154,6 +158,90 @@ TEST_CASE(sandboxed_process_can_do_ordinary_work)
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0)
             return false;
         return write(sockets[0], "x", 1) == 1;
+    }),
+        Outcome::Allowed);
+}
+
+// The helpers raise their main thread's QoS before the sandbox is applied, but every thread they create afterwards,
+// including the IPC IO threads, gets its QoS class through pthread_create() attributes. Both calls run on a new
+// thread here: the main thread of a fork()ed child refuses QoS changes with EPERM even without a sandbox.
+TEST_CASE(sandboxed_process_can_set_thread_qos)
+{
+    EXPECT_EQ(run_sandboxed([] {
+        pthread_t thread;
+        auto create_result = pthread_create(&thread, nullptr, [](void*) -> void* {
+            if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, -1) != 0)
+                return reinterpret_cast<void*>(static_cast<uintptr_t>(QOS_CLASS_UNSPECIFIED));
+            return reinterpret_cast<void*>(static_cast<uintptr_t>(qos_class_self())); }, nullptr);
+        if (create_result != 0)
+            return false;
+        void* thread_qos_class = nullptr;
+        pthread_join(thread, &thread_qos_class);
+        return reinterpret_cast<uintptr_t>(thread_qos_class) == QOS_CLASS_USER_INTERACTIVE;
+    }),
+        Outcome::Allowed);
+
+    EXPECT_EQ(run_sandboxed([] {
+        pthread_attr_t attributes;
+        if (pthread_attr_init(&attributes) != 0)
+            return false;
+        if (pthread_attr_set_qos_class_np(&attributes, QOS_CLASS_USER_INITIATED, 0) != 0)
+            return false;
+        pthread_t thread;
+        auto create_result = pthread_create(&thread, &attributes, [](void*) -> void* { return reinterpret_cast<void*>(static_cast<uintptr_t>(qos_class_self())); }, nullptr);
+        pthread_attr_destroy(&attributes);
+        if (create_result != 0)
+            return false;
+        void* thread_qos_class = nullptr;
+        pthread_join(thread, &thread_qos_class);
+        return reinterpret_cast<uintptr_t>(thread_qos_class) == QOS_CLASS_USER_INITIATED;
+    }),
+        Outcome::Allowed);
+}
+
+static int scheduling_priority_of_current_thread()
+{
+    thread_extended_info_data_t info {};
+    mach_msg_type_number_t count = THREAD_EXTENDED_INFO_COUNT;
+    auto thread = mach_thread_self();
+    auto result = thread_info(thread, THREAD_EXTENDED_INFO, reinterpret_cast<thread_info_t>(&info), &count);
+    mach_port_deallocate(mach_task_self(), thread);
+    if (result != KERN_SUCCESS)
+        return -1;
+    return info.pth_priority;
+}
+
+// Without an application role the kernel squashes user-interactive threads down to the default class. The helpers
+// adopt the role before the sandbox, but the policy calls are plain Mach messages that the profile leaves open.
+TEST_CASE(sandboxed_process_can_adopt_the_foreground_application_task_role)
+{
+    static constexpr int priority_of_a_user_interactive_thread_in_a_foreground_application = 47;
+
+    EXPECT_EQ(run_sandboxed([] {
+        if (Core::Platform::adopt_foreground_application_task_role().is_error())
+            return false;
+
+        task_category_policy_data_t category_policy {};
+        mach_msg_type_number_t count = TASK_CATEGORY_POLICY_COUNT;
+        boolean_t get_default = FALSE;
+        if (task_policy_get(mach_task_self(), TASK_CATEGORY_POLICY, reinterpret_cast<task_policy_t>(&category_policy), &count, &get_default) != KERN_SUCCESS)
+            return false;
+        if (category_policy.role != TASK_FOREGROUND_APPLICATION)
+            return false;
+
+        pthread_attr_t attributes;
+        if (pthread_attr_init(&attributes) != 0)
+            return false;
+        if (pthread_attr_set_qos_class_np(&attributes, QOS_CLASS_USER_INTERACTIVE, 0) != 0)
+            return false;
+        pthread_t thread;
+        auto create_result = pthread_create(&thread, &attributes, [](void*) -> void* { return reinterpret_cast<void*>(static_cast<intptr_t>(scheduling_priority_of_current_thread())); }, nullptr);
+        pthread_attr_destroy(&attributes);
+        if (create_result != 0)
+            return false;
+        void* thread_priority = nullptr;
+        pthread_join(thread, &thread_priority);
+        return reinterpret_cast<intptr_t>(thread_priority) == priority_of_a_user_interactive_thread_in_a_foreground_application;
     }),
         Outcome::Allowed);
 }
