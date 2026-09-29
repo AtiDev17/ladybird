@@ -20,7 +20,6 @@
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/Focus.h>
@@ -128,7 +127,6 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
         visitor.visit(m_context_menu_request->target);
     visitor.visit(m_top_level_traversable);
     visitor.visit(m_navigables_being_destroyed);
-    visitor.visit(m_browsing_context_group);
     visitor.visit(m_history_executor);
     visitor.visit(m_client);
     visitor.visit(m_window_rect_observer);
@@ -553,7 +551,7 @@ void Page::invalidate_compositor_keyboard_scroll_state()
         return;
     m_keyboard_scroll_state_is_current = false;
     ++m_keyboard_scroll_state_generation;
-    if (m_async_scrolling_enabled && has_local_traversable() && local_traversable()->has_compositor_context()) {
+    if (has_local_traversable() && local_traversable()->has_compositor_context()) {
         // No synchronous barrier is needed if the last publication already disabled keyboard scrolling.
         if (m_keyboard_scroll_state_is_scrollable)
             local_traversable()->compositor_context().invalidate_keyboard_scroll_state(m_keyboard_scroll_state_generation);
@@ -604,7 +602,7 @@ void Page::keyboard_scroll_editability_changed(DOM::Document& document)
 
 Compositing::KeyboardScrollState Page::take_keyboard_scroll_state_for_compositor(u64 visual_context_tree_structural_epoch)
 {
-    if (!m_async_scrolling_enabled || !has_local_traversable() || !local_traversable()->has_compositor_context())
+    if (!has_local_traversable() || !local_traversable()->has_compositor_context())
         return {};
     auto snapshot = local_traversable()->event_handler().keyboard_scroll_snapshot();
     m_keyboard_scroll_event_path = move(snapshot.event_path);
@@ -622,9 +620,6 @@ Compositing::KeyboardScrollState Page::take_keyboard_scroll_state_for_compositor
 void Page::invalidate_compositor_wheel_event_listener_state()
 {
     ++m_wheel_event_listener_state_generation;
-
-    if (!m_async_scrolling_enabled)
-        return;
 
     for (auto const& root : local_roots()) {
         if (root->has_compositor_context())
@@ -801,6 +796,14 @@ void Page::discard_provisional_navigable_of(HTML::RemoteNavigable& remote_naviga
     navigable->remove_from_all_local_navigables();
 }
 
+// A tab's traversable created before a view displayed it joins the group the UI process creates for the tab then.
+void Page::set_browsing_context_group(u64 browsing_context_group_id)
+{
+    auto* traversable = as_if<HTML::LocalTraversableNavigable>(m_top_level_traversable.ptr());
+    if (auto browsing_context = traversable ? traversable->active_browsing_context() : nullptr)
+        browsing_context->set_browsing_context_group_id(browsing_context_group_id);
+}
+
 GC::Ref<HTML::LocalNavigable> Page::begin_hosting(HTML::CrossProcessId id, HTML::SessionHistoryEntryDescriptor const& current_history_entry)
 {
     auto navigable = HTML::remote_navigable_with_id(*this, id);
@@ -811,6 +814,7 @@ GC::Ref<HTML::LocalNavigable> Page::begin_hosting(HTML::CrossProcessId id, HTML:
     // displays the tab through it until the document it populates activates, or the stand-in is discarded.
     if (!navigable->parent()) {
         auto stand_in = HTML::LocalTraversableNavigable::create_stand_in({}, *navigable, current_history_entry);
+        stand_in->active_browsing_context()->set_browsing_context_group_id(navigable->replicated_state().browsing_context_group_id);
         VERIFY(m_top_level_traversable.ptr() == navigable.ptr());
         m_top_level_traversable = stand_in;
         update_needs_beforeunload_check();
@@ -1002,20 +1006,6 @@ void Page::hold_navigable_being_destroyed(Badge<HTML::NavigableContainer>, GC::R
 void Page::release_navigable_being_destroyed(Badge<HTML::NavigableContainer>, HTML::Navigable& navigable)
 {
     m_navigables_being_destroyed.remove_first_matching([&](auto const& held) { return held.ptr() == &navigable; });
-}
-
-HTML::BrowsingContextGroup& Page::browsing_context_group()
-{
-    // NB: Created with the tab's top-level browsing context when this process holds it, and empty until then in a
-    //     process holding only parts of the tab under parents hosted elsewhere.
-    if (!m_browsing_context_group)
-        m_browsing_context_group = GC::Heap::the().allocate<HTML::BrowsingContextGroup>(*this);
-    return *m_browsing_context_group;
-}
-
-void Page::set_browsing_context_group(Badge<HTML::BrowsingContextGroup>, GC::Ref<HTML::BrowsingContextGroup> group)
-{
-    m_browsing_context_group = group;
 }
 
 HTML::HistoryExecutor& Page::history_executor()

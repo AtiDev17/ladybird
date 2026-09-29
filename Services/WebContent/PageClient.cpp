@@ -73,7 +73,6 @@
 namespace WebContent {
 
 static bool s_is_headless { false };
-static bool s_async_scrolling_enabled { false };
 static constexpr size_t s_max_download_data_ipc_chunk_size = 16 * MiB;
 
 GC_DEFINE_ALLOCATOR(PageClient);
@@ -130,11 +129,6 @@ void PageClient::set_is_headless(bool is_headless)
     s_is_headless = is_headless;
 }
 
-void PageClient::set_async_scrolling_enabled(bool enabled)
-{
-    s_async_scrolling_enabled = enabled;
-}
-
 GC::Ref<PageClient> PageClient::create(PageHost& page_host, Compositing::PageId id, Optional<Web::HTML::CrossProcessId> pending_root_navigable_id)
 {
     return GC::Heap::the().allocate<PageClient>(page_host, id, pending_root_navigable_id);
@@ -146,7 +140,6 @@ PageClient::PageClient(PageHost& owner, Compositing::PageId id, Optional<Web::HT
     , m_id(id)
     , m_pending_root_navigable_id(pending_root_navigable_id)
 {
-    m_page->set_async_scrolling_enabled(s_async_scrolling_enabled);
     setup_palette();
 
     m_frame_timer = Core::Timer::create_single_shot(0, [this] { frame_timer_fired(); });
@@ -401,9 +394,14 @@ void PageClient::page_did_change_navigable_container_state(Web::HTML::CrossProce
     client().async_did_change_navigable_container_state(m_id, navigable_id, state);
 }
 
-void PageClient::page_did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState const& replicated_state, Web::HTML::PendingSessionHistoryEntryDescriptor const& initial_history_entry)
+void PageClient::page_did_create_populated_document_with_an_origin_of_its_own(Web::HTML::CrossProcessId navigable_id, Web::HTML::PopulatedDocumentOrigin origin, Web::HTML::EnvironmentId const& environment_id)
 {
-    client().async_did_create_child_frame(m_id, parent_frame_id, frame_id, replicated_state, initial_history_entry);
+    client().async_did_create_populated_document_with_an_origin_of_its_own(m_id, navigable_id, origin, environment_id);
+}
+
+void PageClient::page_did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState const& replicated_state, Web::HTML::PendingSessionHistoryEntryDescriptor const& initial_history_entry, URL::Origin const& origin, Web::HTML::EnvironmentId const& environment_id)
+{
+    client().async_did_create_child_frame(m_id, parent_frame_id, frame_id, replicated_state, initial_history_entry, origin, environment_id);
 }
 
 void PageClient::page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Compositing::DevicePixelRect viewport_rect, Compositing::DevicePixelRect viewport_intersection)
@@ -1236,10 +1234,10 @@ void PageClient::page_did_receive_document_cookie_version_buffer(Core::Anonymous
     m_document_cookie_version_buffer = move(document_cookie_version_buffer);
 }
 
-void PageClient::page_did_request_document_cookie_version_index(Compositing::UniqueNodeID document_id, String const& domain)
+void PageClient::page_did_request_document_cookie_version_index(Web::HTML::EnvironmentSettingsObject const& environment, Compositing::UniqueNodeID document_id, String const& domain)
 {
     // FIXME: Support transferring DistinctNumeric over IPC.
-    client().async_did_request_document_cookie_version_index(m_id, document_id.value(), domain);
+    client().async_did_request_document_cookie_version_index(m_id, environment.id, document_id.value(), domain);
 }
 
 void PageClient::page_did_receive_document_cookie_version_index(Compositing::UniqueNodeID document_id, Core::SharedVersionIndex document_index)
@@ -1255,7 +1253,7 @@ Vector<HTTP::Cookie::Cookie> PageClient::page_did_request_all_cookies_webdriver(
 
 Vector<HTTP::Cookie::Cookie> PageClient::page_did_request_all_cookies_cookiestore(URL::URL const& url)
 {
-    return client().did_request_all_cookies_cookiestore(url);
+    return client().did_request_all_cookies_cookiestore(m_id, url);
 }
 
 Optional<HTTP::Cookie::Cookie> PageClient::page_did_request_named_cookie(URL::URL const& url, String const& name)
@@ -1275,7 +1273,7 @@ HTTP::Cookie::VersionedCookie PageClient::page_did_request_cookie(URL::URL const
 
 void PageClient::page_did_set_cookie(URL::URL const& url, HTTP::Cookie::ParsedCookie const& cookie, HTTP::Cookie::Source source)
 {
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidSetCookie>(url, cookie, source);
+    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidSetCookie>(m_id, url, cookie, source);
     if (!response) {
         dbgln("WebContent client disconnected during DidSetCookie. Exiting peacefully.");
         Core::Process::terminate_immediately(0);
@@ -1372,9 +1370,9 @@ bool PageClient::page_did_is_known_hsts_host(String const& domain)
     return response->result();
 }
 
-Optional<Utf16String> PageClient::page_did_request_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, Utf16String const& bottle_key)
+Optional<Utf16String> PageClient::page_did_request_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id, Utf16String const& bottle_key)
 {
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestStorageItem>(m_id, storage_endpoint, storage_key, bottle_key);
+    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestStorageItem>(m_id, storage_endpoint, environment_id, bottle_key);
     if (!response) {
         dbgln("WebContent client disconnected during DidRequestStorageItem. Exiting peacefully.");
         Core::Process::terminate_immediately(0);
@@ -1382,9 +1380,9 @@ Optional<Utf16String> PageClient::page_did_request_storage_item(Web::StorageAPI:
     return response->take_value();
 }
 
-WebView::StorageSetResult PageClient::page_did_set_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, Utf16String const& bottle_key, Utf16String const& value)
+WebView::StorageSetResult PageClient::page_did_set_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id, Utf16String const& bottle_key, Utf16String const& value)
 {
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidSetStorageItem>(m_id, storage_endpoint, storage_key, bottle_key, value);
+    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidSetStorageItem>(m_id, storage_endpoint, environment_id, bottle_key, value);
     if (!response) {
         dbgln("WebContent client disconnected during DidSetStorageItem. Exiting peacefully.");
         Core::Process::terminate_immediately(0);
@@ -1392,18 +1390,18 @@ WebView::StorageSetResult PageClient::page_did_set_storage_item(Web::StorageAPI:
     return response->result();
 }
 
-void PageClient::page_did_remove_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, Utf16String const& bottle_key)
+void PageClient::page_did_remove_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id, Utf16String const& bottle_key)
 {
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRemoveStorageItem>(m_id, storage_endpoint, storage_key, bottle_key);
+    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRemoveStorageItem>(m_id, storage_endpoint, environment_id, bottle_key);
     if (!response) {
         dbgln("WebContent client disconnected during DidRemoveStorageItem. Exiting peacefully.");
         Core::Process::terminate_immediately(0);
     }
 }
 
-Vector<Utf16String> PageClient::page_did_request_storage_keys(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key)
+Vector<Utf16String> PageClient::page_did_request_storage_keys(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id)
 {
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestStorageKeys>(m_id, storage_endpoint, storage_key);
+    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestStorageKeys>(m_id, storage_endpoint, environment_id);
     if (!response) {
         dbgln("WebContent client disconnected during DidRequestStorageKeys. Exiting peacefully.");
         Core::Process::terminate_immediately(0);
@@ -1411,9 +1409,9 @@ Vector<Utf16String> PageClient::page_did_request_storage_keys(Web::StorageAPI::S
     return response->take_keys();
 }
 
-u64 PageClient::page_did_request_storage_usage(String const& storage_key)
+u64 PageClient::page_did_request_storage_usage(Web::HTML::EnvironmentId const& environment_id)
 {
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestStorageUsage>(m_id, storage_key);
+    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestStorageUsage>(m_id, environment_id);
     if (!response) {
         dbgln("WebContent client disconnected during DidRequestStorageUsage. Exiting peacefully.");
         Core::Process::terminate_immediately(0);
@@ -1421,9 +1419,9 @@ u64 PageClient::page_did_request_storage_usage(String const& storage_key)
     return response->usage();
 }
 
-void PageClient::page_did_clear_storage(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key)
+void PageClient::page_did_clear_storage(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id)
 {
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidClearStorage>(m_id, storage_endpoint, storage_key);
+    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidClearStorage>(m_id, storage_endpoint, environment_id);
     if (!response) {
         dbgln("WebContent client disconnected during DidClearStorage. Exiting peacefully.");
         Core::Process::terminate_immediately(0);
@@ -1447,7 +1445,7 @@ void PageClient::page_did_update_indexed_database(String const& url, Web::Indexe
     client().async_did_update_indexed_database(m_id, update.serialized());
 }
 
-void PageClient::page_did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage const& message)
+void PageClient::page_did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage const& message)
 {
     client().async_did_post_broadcast_channel_message(m_id, message);
 }
@@ -1473,10 +1471,11 @@ PageClient::NewWebViewResult PageClient::page_did_request_new_web_view(Web::HTML
         return {};
     VERIFY(response->root_navigable_id().has_value());
     VERIFY(response->initial_history_entry().has_value());
+    VERIFY(response->initial_environment_id().has_value());
 
     auto& new_client = m_owner.create_page(*response->new_page_id(), *response->root_navigable_id());
     new_client.page().set_system_visibility_state(response->system_visibility_state());
-    return { &new_client.page(), response->take_handle(), response->take_initial_history_entry() };
+    return { &new_client.page(), response->take_handle(), response->take_initial_history_entry(), response->take_initial_environment_id(), response->browsing_context_group_id() };
 }
 
 void PageClient::page_did_request_activate_tab()
@@ -1641,6 +1640,12 @@ void PageClient::crash_remote_frame_processes_for_testing()
         test_connection->async_did_request_crash_of_remote_frame_processes_for_testing(m_id);
 }
 
+void PageClient::page_did_spoof_document_origin_for_testing(Web::HTML::EnvironmentSettingsObject const& environment, URL::Origin const& origin)
+{
+    if (auto* test_connection = client().test_connection())
+        test_connection->did_spoof_document_origin_for_testing(m_id, environment.id, origin);
+}
+
 void PageClient::send_bad_ipc_message_for_testing(StringView kind, URL::URL const& active_document_url)
 {
     if (kind == "cookie-request-unknown-page-id"sv)
@@ -1691,9 +1696,9 @@ void PageClient::request_file(Web::FileRequest file_request)
     client().request_file(m_id, move(file_request));
 }
 
-URL::BlobURLEntry::Token PageClient::page_did_add_blob_url_entry(Utf16String const& url, Web::FileAPI::SerializedBlobURLEntry const& entry)
+URL::BlobURLEntry::Token PageClient::page_did_add_blob_url_entry(Web::HTML::EnvironmentSettingsObject const& environment, Utf16String const& url, Web::FileAPI::SerializedBlobURLEntry const& entry)
 {
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidAddBlobUrlEntry>(url, entry);
+    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidAddBlobUrlEntry>(m_id, environment.id, url, entry);
     if (!response) {
         dbgln("WebContent client disconnected during DidAddBlobUrlEntry");
         return 0;
@@ -1701,9 +1706,9 @@ URL::BlobURLEntry::Token PageClient::page_did_add_blob_url_entry(Utf16String con
     return response->token();
 }
 
-void PageClient::page_did_remove_blob_url_entries(Vector<Utf16String> const& urls, URL::Origin const& origin)
+void PageClient::page_did_remove_blob_url_entries(Web::HTML::EnvironmentSettingsObject const& environment, Vector<Utf16String> const& urls)
 {
-    if (!client().send_sync_but_allow_failure<Messages::WebContentClient::DidRemoveBlobUrlEntries>(urls, origin))
+    if (!client().send_sync_but_allow_failure<Messages::WebContentClient::DidRemoveBlobUrlEntries>(m_id, environment.id, urls))
         dbgln("WebContent client disconnected during DidRemoveBlobUrlEntries");
 }
 

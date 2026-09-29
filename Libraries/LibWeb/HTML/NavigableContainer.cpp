@@ -13,7 +13,6 @@
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
@@ -115,7 +114,7 @@ void NavigableContainer::create_new_child_navigable()
     // 10. Let historyEntry be navigable's active session history entry.
     auto history_entry = navigable->active_session_history_entry();
 
-    page.client().page_did_create_child_frame(parent_navigable->id(), navigable->id(), navigable->hosted_state(), create_pending_session_history_entry_descriptor(*history_entry));
+    page.client().page_did_create_child_frame(parent_navigable->id(), navigable->id(), navigable->hosted_state(), create_pending_session_history_entry_descriptor(*history_entry), document->origin(), document->relevant_settings_object().id);
 
     // 12. Append the following session history traversal steps to traversable:
     page.history_executor().request_history_operation(
@@ -528,6 +527,11 @@ void NavigableContainer::report_content_navigable_viewport_rect()
 {
     if (!m_content_navigable)
         return;
+    // A hit test records the display list of its own document only, so another document under the same local root
+    // may still be waiting for layout. Its containers report on the next rendering update, which lays out every
+    // document before it records.
+    if (!document().layout_is_up_to_date())
+        return;
     auto const* layout_node = this->layout_node();
     if (!layout_node || !Painting::is_navigable_container_viewport_paintable(*layout_node))
         return;
@@ -542,6 +546,8 @@ void NavigableContainer::report_content_navigable_viewport_rect()
     auto navigable = document().navigable();
     for (; navigable && !navigable->is_local_root();) {
         auto container = navigable->container();
+        if (container && !container->document().layout_is_up_to_date())
+            return;
         auto const* container_layout_node = container ? container->layout_node() : nullptr;
         if (!container_layout_node || !Painting::is_navigable_container_viewport_paintable(*container_layout_node))
             return;

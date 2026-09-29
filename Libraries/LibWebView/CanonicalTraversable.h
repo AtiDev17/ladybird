@@ -105,14 +105,14 @@ public:
     Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigable_graph() const;
 
     void for_each_hosting_page(Function<void(WebContentPage&)> const&) const;
-    void for_each_opener_traversable(Function<void(CanonicalTraversable&)> const&) const;
-    void represent_openers_in(WebContentClient&);
-    bool is_opener_page(WebContentPage const& page) const
+    void represent_group_in(WebContentClient&);
+    void represent_group_everywhere();
+    bool is_representing_page(WebContentPage const& page) const
     {
-        return any_of(m_opener_pages, [&](auto const& opener_page) { return opener_page.ptr() == &page; });
+        return any_of(m_representing_pages, [&](auto const& representing_page) { return representing_page.ptr() == &page; });
     }
-    void forget_opener_page(WebContentPage&);
-    void discard_opener_pages();
+    void forget_representing_page(WebContentPage&);
+    void discard_representing_pages();
     void for_each_page_representing(CanonicalNavigable const&, Function<void(WebContentPage&)> const&) const;
     bool hosts(CanonicalNavigable const&, WebContentPage const&) const;
     bool represents(CanonicalNavigable const&, WebContentPage const&) const;
@@ -159,6 +159,7 @@ public:
 
     void reload(OnHistoryOperationComplete = nullptr);
     static CanonicalTraversable& create_a_new_top_level_traversable(Web::HTML::CrossProcessId id, Optional<CanonicalNavigable&> opener, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry);
+    static bool is_origin_held_by_a_document(URL::Origin const&);
     static CanonicalTraversable* traversable_containing(Web::HTML::CrossProcessId navigable_id);
     static CanonicalNavigable* navigable_with_active_browsing_context(CanonicalBrowsingContext const&);
     static void remove_from_user_agent_top_level_traversable_set(CanonicalTraversable&);
@@ -269,8 +270,8 @@ private:
     };
     HashMap<Web::HTML::CrossProcessId, PendingUnload> m_pending_unloads;
 
-    // Pages that hold this tab, and host none of it, in a process holding part of a tab this tab opened.
-    Vector<NonnullRefPtr<WebContentPage>> m_opener_pages;
+    // Pages that hold this tab, and host none of it, in a process holding part of a tab of its group.
+    Vector<NonnullRefPtr<WebContentPage>> m_representing_pages;
 
     struct BeforeunloadGroup {
         NonnullRefPtr<WebContentPage> endpoint;

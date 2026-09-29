@@ -54,8 +54,6 @@ public:
     virtual bool is_headless() const override;
     static void set_is_headless(bool);
 
-    static void set_async_scrolling_enabled(bool);
-
     virtual Web::Page& page() override { return *m_page; }
     virtual Web::Page const& page() const override { return *m_page; }
     virtual bool has_focus() const override { return m_has_focus; }
@@ -200,12 +198,14 @@ private:
     virtual void page_did_set_opener_browsing_context(Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::CrossProcessId> opener_navigable_id) override;
     virtual void page_did_completely_finish_loading(Web::HTML::CrossProcessId navigable_id) override;
     virtual void page_did_change_navigable_container_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedContainerState const&) override;
-    virtual void page_did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState const&, Web::HTML::PendingSessionHistoryEntryDescriptor const& initial_history_entry) override;
+    virtual void page_did_create_populated_document_with_an_origin_of_its_own(Web::HTML::CrossProcessId navigable_id, Web::HTML::PopulatedDocumentOrigin, Web::HTML::EnvironmentId const& environment_id) override;
+    virtual void page_did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState const&, Web::HTML::PendingSessionHistoryEntryDescriptor const& initial_history_entry, URL::Origin const& origin, Web::HTML::EnvironmentId const& environment_id) override;
     virtual void page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Compositing::DevicePixelRect viewport_rect, Compositing::DevicePixelRect viewport_intersection) override;
     virtual void forward_mouse_event_to_remote_navigable(Compositing::PageId, Web::HTML::CrossProcessId navigable_id, Compositing::MouseEvent) override;
     virtual void page_did_destroy_child_frame(Web::HTML::CrossProcessId frame_id) override;
     virtual String dump_site_isolation_process_tree_for_testing() override;
     virtual void crash_remote_frame_processes_for_testing() override;
+    virtual void page_did_spoof_document_origin_for_testing(Web::HTML::EnvironmentSettingsObject const&, URL::Origin const&) override;
     virtual void send_bad_ipc_message_for_testing(StringView kind, URL::URL const& active_document_url) override;
     virtual Gfx::Palette palette() const override;
     virtual Compositing::DevicePixelRect screen_rect() const override { return m_all_screen_rects[m_main_screen_index]; }
@@ -265,7 +265,7 @@ private:
     virtual void page_did_change_favicon(Gfx::Bitmap const&) override;
     virtual Optional<Core::SharedVersion> page_did_request_document_cookie_version(Core::SharedVersionIndex document_index) override;
     virtual void page_did_receive_document_cookie_version_buffer(Core::AnonymousBuffer document_cookie_version_buffer) override;
-    virtual void page_did_request_document_cookie_version_index(Compositing::UniqueNodeID document_id, String const& domain) override;
+    virtual void page_did_request_document_cookie_version_index(Web::HTML::EnvironmentSettingsObject const&, Compositing::UniqueNodeID document_id, String const& domain) override;
     virtual void page_did_receive_document_cookie_version_index(Compositing::UniqueNodeID document_id, Core::SharedVersionIndex document_index) override;
     virtual Vector<HTTP::Cookie::Cookie> page_did_request_all_cookies_webdriver(URL::URL const&) override;
     virtual Vector<HTTP::Cookie::Cookie> page_did_request_all_cookies_cookiestore(URL::URL const&) override;
@@ -279,12 +279,12 @@ private:
     virtual void page_did_simulate_worker_request_server_connection_loss() override;
     virtual void page_did_store_hsts_policy_for_testing(String const&, HTTP::HSTS::ParsedHSTSPolicy const&) override;
     virtual bool page_did_is_known_hsts_host(String const&) override;
-    virtual Optional<Utf16String> page_did_request_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, Utf16String const& bottle_key) override;
-    virtual WebView::StorageSetResult page_did_set_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, Utf16String const& bottle_key, Utf16String const& value) override;
-    virtual void page_did_remove_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, Utf16String const& bottle_key) override;
-    virtual Vector<Utf16String> page_did_request_storage_keys(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key) override;
-    virtual u64 page_did_request_storage_usage(String const& storage_key) override;
-    virtual void page_did_clear_storage(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key) override;
+    virtual Optional<Utf16String> page_did_request_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id, Utf16String const& bottle_key) override;
+    virtual WebView::StorageSetResult page_did_set_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id, Utf16String const& bottle_key, Utf16String const& value) override;
+    virtual void page_did_remove_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id, Utf16String const& bottle_key) override;
+    virtual Vector<Utf16String> page_did_request_storage_keys(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id) override;
+    virtual u64 page_did_request_storage_usage(Web::HTML::EnvironmentId const& environment_id) override;
+    virtual void page_did_clear_storage(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId const& environment_id) override;
     virtual void page_did_broadcast_storage_change(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& url, Optional<Utf16String> const& key, Optional<Utf16String> const& old_value, Optional<Utf16String> const& new_value) override;
     virtual void page_did_update_indexed_database(String const& url, Web::IndexedDB::TransactionChanges const&) override;
     virtual void page_did_update_resource_count(i32) override;
@@ -317,8 +317,8 @@ private:
     virtual bool page_did_request_register_session_store_tab_for_testing() override;
     virtual String page_did_request_session_store_tab_state_for_testing() override;
     virtual void request_file(Web::FileRequest) override;
-    virtual URL::BlobURLEntry::Token page_did_add_blob_url_entry(Utf16String const& url, Web::FileAPI::SerializedBlobURLEntry const&) override;
-    virtual void page_did_remove_blob_url_entries(Vector<Utf16String> const& urls, URL::Origin const&) override;
+    virtual URL::BlobURLEntry::Token page_did_add_blob_url_entry(Web::HTML::EnvironmentSettingsObject const&, Utf16String const& url, Web::FileAPI::SerializedBlobURLEntry const&) override;
+    virtual void page_did_remove_blob_url_entries(Web::HTML::EnvironmentSettingsObject const&, Vector<Utf16String> const& urls) override;
     virtual void page_did_retain_blob_url_token(Web::HTML::CrossProcessId navigable_id, URL::BlobURLEntry::Token) override;
     virtual Optional<Web::FileAPI::SerializedBlobURLEntry> page_did_request_blob_url_entry(Utf16String const& url, Optional<URL::BlobURLEntry::Token> token) override;
     virtual void page_did_request_color_picker(Color current_color) override;
@@ -353,7 +353,7 @@ private:
     virtual void page_did_receive_network_response_body(u64 request_id, ReadonlyBytes) override;
     virtual void page_did_finish_network_request(u64 request_id, u64 body_size, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const&) override;
     virtual void page_did_register_javascript_source(Web::DOM::Document&, Web::HTML::ScriptRegistry::Description const&) override;
-    virtual void page_did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage const&) override;
+    virtual void page_did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage const&) override;
 
     void setup_palette();
     ConnectionFromClient& client() const;

@@ -141,7 +141,6 @@
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/BeforeUnloadEvent.h>
 #include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/CustomElements/CustomElementDefinition.h>
 #include <LibWeb/HTML/CustomElements/CustomElementReactionNames.h>
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
@@ -363,7 +362,9 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
 
         // FIXME: 3. If navigationParams's reserved environment is a non-secure context, then set requestsOAC to false.
 
-        // FIXME: 4. Let agent be the result of obtaining a similar-origin window agent given navigationParams's origin, browsingContext's group, and requestsOAC.
+        // 4. Let agent be the result of obtaining a similar-origin window agent given navigationParams's origin, browsingContext's group, and requestsOAC.
+        // NB: The UI process obtains the agent, and names its agent cluster.
+        auto agent_cluster_id = navigation_params.agent_cluster_id;
 
         // 5. Let realm execution context be the result of creating a new JavaScript realm given agent and the following customizations:
         auto realm_execution_context = HTML::create_window_realm(window, *browsing_context);
@@ -401,7 +402,8 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
             move(realm_execution_context),
             navigation_params.reserved_environment,
             top_level_creation_url.value(),
-            top_level_origin);
+            top_level_origin,
+            agent_cluster_id);
     }
 
     // AD-HOC: The fetch controller is only available in the process that ran the navigation fetch. Navigation params
@@ -2340,6 +2342,13 @@ void Document::flush_throttled_animation_style_update()
 
 void Document::flush_throttled_animation_style_update_for_node(Node const& node)
 {
+    // Only an animation that skipped a per-frame style update has anything for this read to catch
+    // up on. The last sampling pass recorded whether any did, and the document-wide flush above
+    // already trusts that record, so walking every associated animation to find none is wasted on
+    // every synchronous geometry read of a page that animates.
+    if (!m_has_throttled_animation_style_update)
+        return;
+
     auto task_generation = relevant_settings_object().responsible_event_loop().task_generation();
     for (auto& animation : m_associated_animations) {
         if (!animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
@@ -6327,9 +6336,11 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
 
         // Pre-compute per-observer values to avoid repeated work in the per-target loop.
         auto intersection_root_node = observer->intersection_root_node();
+        // An inline element root has a committed box but no Layout::Box. No containing block chain passes
+        // through it, so it stops no walk.
         Layout::Box const* root_layout_box = nullptr;
         if (auto const* root_layout_node = intersection_root_node->layout_node(); root_layout_node && Painting::has_committed_box(*root_layout_node))
-            root_layout_box = as<Layout::Box>(root_layout_node);
+            root_layout_box = as_if<Layout::Box>(root_layout_node);
         bool is_implicit_root = observer->is_implicit_root();
         bool root_is_element = intersection_root_node->is_element();
 
@@ -10579,7 +10590,7 @@ void Document::ensure_cookie_version_index(URL::URL const& new_url, URL::URL con
     if (m_cookie_version_index.has_value() && *new_domain == HTTP::Cookie::canonicalize_domain(old_url))
         return;
 
-    page().client().page_did_request_document_cookie_version_index(unique_id(), *new_domain);
+    page().client().page_did_request_document_cookie_version_index(relevant_settings_object(), unique_id(), *new_domain);
     m_cookie_version_index = {};
 }
 

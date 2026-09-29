@@ -4,11 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/ByteBuffer.h>
 #include <AK/Math.h>
 #include <AK/Queue.h>
 #include <AK/Stream.h>
 #include <Compositor/CompositorState.h>
+#include <Compositor/FramePacer.h>
 #include <LibCompositing/DisplayList/DisplayListDamage.h>
 #include <LibCompositing/DisplayList/DisplayListPlayerSkia.h>
 #include <LibCompositing/DisplayList/VisualContextTreeTestBuilder.h>
@@ -16,6 +18,7 @@
 #include <LibCompositing/PausedDebuggerOverlay.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Timer.h>
+#include <LibGfx/SharedImageBuffer.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibIPC/Message.h>
@@ -42,6 +45,26 @@ struct TestWebContentClient final : public Compositor::CompositorStateWebContent
     Vector<Compositing::MouseEvent> forwarded_mouse_events;
 };
 
+// Importing consumes the send rights a publication carries. Until then they keep IOSurfaceIsInUse reporting the
+// surfaces as in use, exactly as they do for the UI process before it imports them.
+static Vector<Gfx::SharedImageBuffer> import_shared_images(Vector<Gfx::SharedImage>& shared_images)
+{
+    Vector<Gfx::SharedImageBuffer> shared_image_buffers;
+    for (auto& shared_image : shared_images)
+        shared_image_buffers.append(Gfx::SharedImageBuffer::import_from_shared_image(move(shared_image)));
+    shared_images.clear();
+    return shared_image_buffers;
+}
+
+#ifdef AK_OS_MACOS
+// The handle a presenting process would hold. Use counts are system-wide, so marking the surface in use through it
+// is what the compositor's own handle observes.
+static Core::IOSurfaceHandle handle_for_marking_in_use(Gfx::SharedImageBuffer const& shared_image_buffer)
+{
+    return Core::IOSurfaceHandle::from_ref(shared_image_buffer.iosurface_handle().core_foundation_pointer());
+}
+#endif
+
 struct TestCompositorClient final : public Compositor::CompositorStateClient {
     struct PresentedFrame {
         Gfx::IntRect content_rect;
@@ -49,9 +72,10 @@ struct TestCompositorClient final : public Compositor::CompositorStateClient {
         i32 bitmap_id { 0 };
     };
 
-    virtual void did_allocate_backing_stores(Compositing::CompositorContextId, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>&&) override
+    virtual void did_allocate_backing_stores(Compositing::CompositorContextId, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>&& shared_images) override
     {
         allocated_bitmap_ids = move(bitmap_ids);
+        allocated_shared_image_buffers = import_shared_images(shared_images);
     }
 
     virtual void did_present_frame(Compositing::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id) override
@@ -70,6 +94,7 @@ struct TestCompositorClient final : public Compositor::CompositorStateClient {
     }
 
     Vector<i32> allocated_bitmap_ids;
+    Vector<Gfx::SharedImageBuffer> allocated_shared_image_buffers;
     Vector<PresentedFrame> presented_frames;
     Vector<u64> consumed_input_event_ids;
     Vector<u64> undispatched_input_event_ids;
@@ -239,7 +264,7 @@ TEST_CASE(rasterization_clears_damaged_pixels_to_the_canvas_color_in_presentatio
 {
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, false };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
     Compositing::DisplayListPlayerSkia display_list_player { RefPtr<Gfx::SkiaBackendContext> {} };
     auto visual_context_tree = Compositing::VisualContextTreeTestBuilder().finish();
     auto viewport_rect = Gfx::IntRect { 0, 0, 4, 4 };
@@ -247,6 +272,7 @@ TEST_CASE(rasterization_clears_damaged_pixels_to_the_canvas_color_in_presentatio
     context.viewport_size_updated(viewport_rect.size(), Compositing::WindowResizingInProgress::No);
     auto publication = context.resize_backing_stores_if_needed({}, Compositor::BackingStoreManager::GpuSharing::Disallowed);
     VERIFY(publication.has_value());
+    auto imported_backing_stores = import_shared_images(publication->shared_images);
 
     auto paint_frame = [&](NonnullRefPtr<Compositing::DisplayList> display_list) {
         context.install_display_list_update(move(display_list), visual_context_tree, {});
@@ -254,7 +280,7 @@ TEST_CASE(rasterization_clears_damaged_pixels_to_the_canvas_color_in_presentatio
         EXPECT(context.present_synchronously(display_list_player, nullptr));
     };
 
-    // Paint both backing stores red before reusing the first one for a frame with no commands.
+    // Paint the first two backing stores red before reusing the first one for a frame with no commands.
     paint_frame(make_display_list(visual_context_tree, Gfx::Color::Red));
     EXPECT(context.acknowledge_presented_bitmap(publication->bitmap_ids[0]));
     paint_frame(make_display_list(visual_context_tree, Gfx::Color::Red));
@@ -272,7 +298,7 @@ TEST_CASE(wheel_hit_testing_ignores_targets_from_a_larger_visual_context_tree)
 {
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, true };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
     Compositing::VisualContextTreeTestBuilder builder;
     auto scroll_node = builder.append_scroll(Compositing::VISUAL_VIEWPORT_NODE_INDEX);
     auto removed_transform = builder.append_transform(scroll_node, Gfx::FloatMatrix4x4::identity());
@@ -303,7 +329,7 @@ TEST_CASE(pinch_zoom_copies_the_visual_context_tree_once_per_update)
 {
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, true };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
     auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
     context.install_display_list_update(make_scrollable_viewport_display_list(visual_context_tree), visual_context_tree, {});
 
@@ -322,7 +348,7 @@ TEST_CASE(pinch_zoom_copies_the_visual_context_tree_once_per_update)
 TEST_CASE(oversized_backing_stores_are_rejected)
 {
     Compositor::BackingStoreManager manager;
-    auto allocation = manager.resize_backing_stores_if_needed({ 40'000, 40'000 }, Compositing::WindowResizingInProgress::No);
+    auto allocation = manager.resize_backing_stores_if_needed({ 40'000, 40'000 }, Compositing::WindowResizingInProgress::No, true);
     VERIFY(allocation.has_value());
 
     auto publication = manager.allocate_backing_stores(*allocation, {}, true, Compositor::BackingStoreManager::GpuSharing::Disallowed);
@@ -330,11 +356,56 @@ TEST_CASE(oversized_backing_stores_are_rejected)
     EXPECT(!publication.has_value());
     EXPECT(!manager.is_valid());
 }
+
+#ifdef AK_OS_MACOS
+TEST_CASE(a_released_backing_store_is_not_reused_while_its_surface_is_in_use)
+{
+    Compositor::BackingStoreManager manager;
+    auto allocation = manager.resize_backing_stores_if_needed({ 4, 4 }, Compositing::WindowResizingInProgress::No, true);
+    VERIFY(allocation.has_value());
+    auto publication = manager.allocate_backing_stores(*allocation, {}, true, Compositor::BackingStoreManager::GpuSharing::Disallowed);
+    VERIFY(publication.has_value());
+    EXPECT_EQ(publication->bitmap_ids.size(), 3u);
+
+    auto imported_backing_stores = import_shared_images(publication->shared_images);
+    Vector<Core::IOSurfaceHandle> surfaces_as_seen_by_the_presenting_process;
+    for (auto const& shared_image_buffer : imported_backing_stores)
+        surfaces_as_seen_by_the_presenting_process.append(handle_for_marking_in_use(shared_image_buffer));
+    for (auto const& surface : surfaces_as_seen_by_the_presenting_process)
+        EXPECT(!surface.is_in_use());
+
+    // The first store is reserved as the initial front buffer; the window server keeps reading the other two.
+    surfaces_as_seen_by_the_presenting_process[1].increment_use_count();
+    surfaces_as_seen_by_the_presenting_process[2].increment_use_count();
+    EXPECT(!manager.has_available_buffer());
+    EXPECT(!manager.acquire_render_target({}).has_value());
+
+    surfaces_as_seen_by_the_presenting_process[2].decrement_use_count();
+    EXPECT(manager.has_available_buffer());
+    auto render_target_skipping_the_surface_in_use = manager.acquire_render_target({});
+    VERIFY(render_target_skipping_the_surface_in_use.has_value());
+    EXPECT_EQ(render_target_skipping_the_surface_in_use->bitmap_id, publication->bitmap_ids[2]);
+    manager.complete_rendering(publication->bitmap_ids[2], true);
+    EXPECT(!manager.has_available_buffer());
+
+    VERIFY(manager.release_buffer(publication->bitmap_ids[0]));
+    EXPECT(manager.has_available_buffer());
+    surfaces_as_seen_by_the_presenting_process[0].increment_use_count();
+    EXPECT(!manager.has_available_buffer());
+    surfaces_as_seen_by_the_presenting_process[0].decrement_use_count();
+    surfaces_as_seen_by_the_presenting_process[1].decrement_use_count();
+    auto lowest_reusable_render_target = manager.acquire_render_target({});
+    VERIFY(lowest_reusable_render_target.has_value());
+    EXPECT_EQ(lowest_reusable_render_target->bitmap_id, publication->bitmap_ids[0]);
+    manager.complete_rendering(publication->bitmap_ids[0], true);
+}
+#endif
+
 TEST_CASE(viewport_scrollbar_collapses_when_drag_is_released_away_from_scrollbar)
 {
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, true };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
     auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
     context.install_display_list_update(make_scrollable_viewport_display_list(visual_context_tree), visual_context_tree, {});
 
@@ -361,7 +432,7 @@ TEST_CASE(viewport_scrollbar_drag_ignores_non_primary_mouse_up)
 {
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, true };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
     auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
     context.install_display_list_update(make_scrollable_viewport_display_list(visual_context_tree), visual_context_tree, {});
 
@@ -380,7 +451,7 @@ TEST_CASE(context_visibility_and_pending_frame_state)
 {
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 1 }, 1, client, canvas_surface_registry, false };
+    Compositor::ContextState context { Compositing::CompositorContextId { 1 }, 1, client, canvas_surface_registry };
     auto viewport_rect = Gfx::IntRect { 0, 0, 4, 4 };
 
     EXPECT(!context.set_visibility(Compositing::ContextVisibility::Visible));
@@ -400,12 +471,106 @@ TEST_CASE(context_visibility_and_pending_frame_state)
     EXPECT(context.can_schedule_pending_present_frame_if_unblocked());
 }
 
+// MonotonicTime has no fixed reference point, so the pacing tests offset from one taken once.
+static MonotonicTime monotonic_time_at(i64 nanoseconds)
+{
+    static auto const reference = MonotonicTime::now();
+    return reference + AK::Duration::from_nanoseconds(nanoseconds);
+}
+
+static size_t count_frames_paced_over_one_second(Compositor::FramePacer& pacer, double display_refresh_rate, i64 jitter_nanoseconds = 0)
+{
+    size_t frames = 0;
+    auto ticks = static_cast<i64>(display_refresh_rate);
+    for (i64 tick = 0; tick < ticks; ++tick) {
+        // Real display ticks wobble around their period; alternate early and late ticks by the jitter.
+        auto jitter = tick % 2 ? jitter_nanoseconds : -jitter_nanoseconds;
+        auto frame_time = monotonic_time_at(1'000'000'000 + tick * 1'000'000'000 / ticks + jitter);
+        if (!pacer.is_due(frame_time, display_refresh_rate))
+            continue;
+        pacer.did_deliver(frame_time);
+        ++frames;
+    }
+    return frames;
+}
+
+TEST_CASE(a_frame_pacer_rounds_its_interval_up_to_whole_display_ticks)
+{
+    Compositor::FramePacer pacer;
+    EXPECT_APPROXIMATE(pacer.frame_interval(60), 1000.0 / 60);
+
+    pacer.set_maximum_frames_per_second(30);
+    EXPECT_APPROXIMATE(pacer.frame_interval(60), 2000.0 / 60);
+    EXPECT_APPROXIMATE(pacer.frame_interval(120), 4000.0 / 120);
+
+    // A rate between two whole tick counts rounds down to the slower one.
+    pacer.set_maximum_frames_per_second(45);
+    EXPECT_APPROXIMATE(pacer.frame_interval(60), 2000.0 / 60);
+
+    // A rate above the display's delivers on every tick, never more often.
+    pacer.set_maximum_frames_per_second(120);
+    EXPECT_APPROXIMATE(pacer.frame_interval(60), 1000.0 / 60);
+    EXPECT_APPROXIMATE(pacer.frame_interval(120), 1000.0 / 120);
+}
+
+TEST_CASE(a_frame_pacer_delivers_its_rate_over_display_ticks)
+{
+    struct Case {
+        double maximum_frames_per_second;
+        double display_refresh_rate;
+        size_t expected_frames;
+    };
+    for (auto [maximum_frames_per_second, display_refresh_rate, expected_frames] : Array {
+             Case { 30, 60, 30 },
+             Case { 60, 60, 60 },
+             Case { 120, 60, 60 },
+             Case { 30, 120, 30 },
+             Case { 60, 120, 60 },
+             Case { 120, 120, 120 },
+         }) {
+        for (i64 jitter_nanoseconds : { 0, 1'000'000 }) {
+            Compositor::FramePacer pacer;
+            pacer.set_maximum_frames_per_second(maximum_frames_per_second);
+            EXPECT_EQ(count_frames_paced_over_one_second(pacer, display_refresh_rate, jitter_nanoseconds), expected_frames);
+        }
+    }
+}
+
+TEST_CASE(a_frame_pacer_delivers_its_first_frame_on_any_tick)
+{
+    Compositor::FramePacer pacer;
+    pacer.set_maximum_frames_per_second(1);
+    EXPECT(pacer.is_due(monotonic_time_at(0), 60));
+    pacer.did_deliver(monotonic_time_at(0));
+    EXPECT(!pacer.is_due(monotonic_time_at(500'000'000), 60));
+    EXPECT(pacer.is_due(monotonic_time_at(1'000'000'000), 60));
+}
+
+TEST_CASE(requesting_a_rendering_opportunity_again_only_updates_its_rate)
+{
+    TestWebContentClient client;
+    Compositing::CanvasSurfaceRegistry canvas_surface_registry;
+    Compositor::ContextState context { Compositing::CompositorContextId { 1 }, 1, client, canvas_surface_registry };
+
+    EXPECT(context.request_rendering_opportunity(60));
+    EXPECT(!context.request_rendering_opportunity(30));
+    EXPECT(context.rendering_opportunity_requested());
+    EXPECT_APPROXIMATE(context.rendering_opportunity_frame_interval(60), 2000.0 / 60);
+
+    auto frame_time = monotonic_time_at(1'000'000'000);
+    EXPECT(context.rendering_opportunity_is_due(frame_time, 60));
+    context.did_deliver_rendering_opportunity(frame_time);
+    EXPECT(!context.rendering_opportunity_requested());
+    EXPECT(!context.rendering_opportunity_is_due(frame_time + AK::Duration::from_milliseconds(17), 60));
+    EXPECT(context.rendering_opportunity_is_due(frame_time + AK::Duration::from_milliseconds(33), 60));
+}
+
 TEST_CASE(hidden_context_coalesces_presents_and_presents_once_when_shown)
 {
     Core::EventLoop event_loop;
     TestCompositorClient compositor_client;
     TestWebContentClient web_content_client;
-    auto compositor_state = Compositor::CompositorState::create({}, false);
+    auto compositor_state = Compositor::CompositorState::create({});
     compositor_state->set_client(compositor_client);
 
     u64 page_id = 1;
@@ -435,7 +600,7 @@ TEST_CASE(dragging_a_viewport_scrollbar_reports_a_user_scroll_gesture_until_it_i
 {
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, true };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
     auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
     context.install_display_list_update(make_scrollable_viewport_display_list(visual_context_tree), visual_context_tree, {});
 
@@ -488,7 +653,7 @@ TEST_CASE(pending_scroll_updates_go_ahead_of_a_rendering_update_request)
 {
     RecordingWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, true };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
     auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
     context.install_display_list_update(make_scrollable_viewport_display_list(visual_context_tree), visual_context_tree, {});
 
@@ -510,7 +675,7 @@ TEST_CASE(dragging_a_scrollbar_thumb_scrolls_its_scroller_to_where_the_thumb_was
 {
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, true };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
     auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
     context.install_display_list_update(make_scrollable_viewport_display_list(visual_context_tree), visual_context_tree, {});
 
@@ -542,7 +707,7 @@ TEST_CASE(losing_the_scrollbar_a_drag_holds_ends_its_user_scroll_gesture)
 {
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, true };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
     auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
     context.install_display_list_update(make_scrollable_viewport_display_list(visual_context_tree), visual_context_tree, {});
 
@@ -559,7 +724,7 @@ TEST_CASE(ui_overlay_uses_the_current_viewport_size)
 {
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, false };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
 
     context.viewport_size_updated({ 640, 480 }, Compositing::WindowResizingInProgress::No);
     context.did_submit_prepared_frame({ 12, 18, 640, 480 });
@@ -576,7 +741,7 @@ TEST_CASE(ui_overlay_hover_changes_require_repainting)
 {
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, false };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
 
     EXPECT(context.set_paused_debugger_overlay(true, 1.0, {}, {}));
     EXPECT(!context.set_paused_debugger_overlay(true, 1.0, {}, {}));
@@ -801,7 +966,7 @@ struct NestedScrollbarContextFixture {
 
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, true };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
 };
 
 TEST_CASE(dragging_a_nested_scrollbar_scrolls_its_scroller_and_names_it_for_the_main_thread)
@@ -849,7 +1014,7 @@ TEST_CASE(a_viewport_scrollbar_drag_is_not_named_for_the_main_thread)
 {
     TestWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, true };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
     auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
     context.install_display_list_update(make_scrollable_viewport_display_list(visual_context_tree), visual_context_tree, {});
 
@@ -1280,8 +1445,8 @@ struct PresentingContextFixture {
     Compositing::CompositorContextId context_id;
     Gfx::IntRect viewport_rect;
 
-    explicit PresentingContextFixture(Gfx::IntSize viewport_size = test_viewport_rect.size(), bool async_scrolling_enabled = false)
-        : compositor_state(Compositor::CompositorState::create({}, async_scrolling_enabled))
+    explicit PresentingContextFixture(Gfx::IntSize viewport_size = test_viewport_rect.size())
+        : compositor_state(Compositor::CompositorState::create({}))
         , context_id(Compositing::compositor_context_id_for_page(1))
         , viewport_rect({}, viewport_size)
     {
@@ -1330,6 +1495,24 @@ struct PresentingContextFixture {
         compositor_state->present_frame(context_id, rect.value_or(viewport_rect));
         return wait_for_frame(already_presented);
     }
+
+    TestCompositorClient::PresentedFrame present_without_releasing(Gfx::IntRect rect)
+    {
+        auto already_presented = compositor_client.presented_frames.size();
+        compositor_state->present_frame(context_id, rect);
+        compositor_state->present_pending_frames_for_testing();
+        VERIFY(spin_event_loop_until(event_loop, 2000, [&] { return compositor_client.presented_frames.size() > already_presented; }));
+        return compositor_client.presented_frames.last();
+    }
+
+#ifdef AK_OS_MACOS
+    Core::IOSurfaceHandle handle_for_marking_in_use(i32 bitmap_id)
+    {
+        auto index = compositor_client.allocated_bitmap_ids.find_first_index(bitmap_id);
+        VERIFY(index.has_value());
+        return ::handle_for_marking_in_use(compositor_client.allocated_shared_image_buffers[*index]);
+    }
+#endif
 };
 
 struct RasterizingContextFixture {
@@ -1340,7 +1523,7 @@ struct RasterizingContextFixture {
     Gfx::IntRect viewport_rect;
 
     explicit RasterizingContextFixture(Gfx::IntSize viewport_size = test_viewport_rect.size())
-        : context(Compositing::CompositorContextId { 1 }, 1, client, canvas_surface_registry, false)
+        : context(Compositing::CompositorContextId { 1 }, 1, client, canvas_surface_registry)
         , viewport_rect({}, viewport_size)
     {
         context.viewport_size_updated(viewport_size, Compositing::WindowResizingInProgress::No);
@@ -1538,29 +1721,79 @@ TEST_CASE(resize_frames_coalesce_while_waiting_for_a_backing_store)
     auto visual_context_tree = make_visual_context_tree();
     fixture.install(make_display_list(visual_context_tree, Gfx::Color::Red), visual_context_tree);
 
-    fixture.compositor_state->present_frame(fixture.context_id, fixture.viewport_rect);
-    EXPECT_EQ(fixture.compositor_state->pending_async_present_count_for_testing(), 1u);
-    VERIFY(spin_event_loop_until(fixture.event_loop, 2000, [&] { return fixture.compositor_client.presented_frames.size() == 1; }));
+    // The client holds the initial front buffer and every buffer it is presented afterwards, so one frame per
+    // remaining buffer leaves the compositor nothing to render into.
+    auto buffer_count = fixture.compositor_client.allocated_bitmap_ids.size();
+    for (size_t presented = 0; presented + 1 < buffer_count; ++presented) {
+        fixture.compositor_state->present_frame(fixture.context_id, { 0, static_cast<int>(presented), 32, 32 });
+        EXPECT_EQ(fixture.compositor_state->pending_async_present_count_for_testing(), 1u);
+        VERIFY(spin_event_loop_until(fixture.event_loop, 2000, [&] { return fixture.compositor_client.presented_frames.size() == presented + 1; }));
+    }
 
-    // Keep both buffers held by the client while newer content rectangles arrive.
+    // Newer content rectangles arriving while every buffer is held coalesce into one pending frame.
     fixture.compositor_state->present_frame(fixture.context_id, { 0, 5, 32, 32 });
     Gfx::IntRect latest_viewport_rect { 0, 10, 32, 32 };
     fixture.compositor_state->present_frame(fixture.context_id, latest_viewport_rect);
     fixture.compositor_state->present_pending_frames_for_testing();
     EXPECT_EQ(fixture.compositor_state->pending_async_present_count_for_testing(), 0u);
-    EXPECT_EQ(fixture.compositor_client.presented_frames.size(), 1u);
+    EXPECT_EQ(fixture.compositor_client.presented_frames.size(), buffer_count - 1);
 
     fixture.compositor_state->presented_bitmap_ready_to_paint(fixture.context_id, fixture.compositor_client.allocated_bitmap_ids[0]);
     fixture.compositor_state->present_pending_frames_for_testing();
     EXPECT_EQ(fixture.compositor_state->pending_async_present_count_for_testing(), 1u);
-    VERIFY(spin_event_loop_until(fixture.event_loop, 2000, [&] { return fixture.compositor_client.presented_frames.size() == 2; }));
+    VERIFY(spin_event_loop_until(fixture.event_loop, 2000, [&] { return fixture.compositor_client.presented_frames.size() == buffer_count; }));
     EXPECT_EQ(fixture.compositor_client.presented_frames.last().content_rect, latest_viewport_rect);
 
     fixture.release_all_buffers();
     fixture.compositor_state->present_pending_frames_for_testing();
     EXPECT_EQ(fixture.compositor_state->pending_async_present_count_for_testing(), 0u);
-    EXPECT_EQ(fixture.compositor_client.presented_frames.size(), 2u);
+    EXPECT_EQ(fixture.compositor_client.presented_frames.size(), buffer_count);
 }
+
+#ifdef AK_OS_MACOS
+TEST_CASE(a_released_buffer_the_window_server_still_reads_keeps_the_scheduled_frame_pending)
+{
+    PresentingContextFixture fixture;
+    fixture.compositor_state->set_display_metadata(fixture.context_id, {}, 1.0);
+    auto visual_context_tree = make_visual_context_tree();
+    fixture.install(make_display_list(visual_context_tree, Gfx::Color::Red), visual_context_tree);
+    EXPECT_EQ(fixture.compositor_client.allocated_bitmap_ids.size(), 3u);
+
+    // The client releases each presented buffer right away, but the window server keeps reading it, so every present
+    // has to skip the buffers released before it.
+    Vector<Core::IOSurfaceHandle> surfaces_still_read_by_the_window_server;
+    Vector<i32> presented_bitmap_ids;
+    for (int frame_index = 0; frame_index < 3; ++frame_index) {
+        auto frame = fixture.present_without_releasing({ 0, frame_index, 16, 16 });
+        EXPECT(!presented_bitmap_ids.contains_slow(frame.bitmap_id));
+        presented_bitmap_ids.append(frame.bitmap_id);
+        auto surface = fixture.handle_for_marking_in_use(frame.bitmap_id);
+        EXPECT(!surface.is_in_use());
+        surface.increment_use_count();
+        surfaces_still_read_by_the_window_server.append(move(surface));
+        fixture.compositor_state->presented_bitmap_ready_to_paint(fixture.context_id, frame.bitmap_id);
+    }
+
+    Gfx::IntRect blocked_viewport_rect { 0, 8, 16, 16 };
+    fixture.compositor_state->present_frame(fixture.context_id, blocked_viewport_rect);
+    for (int tick = 0; tick < 3; ++tick) {
+        fixture.compositor_state->present_pending_frames_for_testing();
+        EXPECT_EQ(fixture.compositor_state->pending_async_present_count_for_testing(), 0u);
+        EXPECT_EQ(fixture.compositor_client.presented_frames.size(), 3u);
+    }
+
+    // No further release message arrives; the next tick alone notices the window server let go of the first buffer.
+    surfaces_still_read_by_the_window_server[0].decrement_use_count();
+    fixture.compositor_state->present_pending_frames_for_testing();
+    EXPECT_EQ(fixture.compositor_state->pending_async_present_count_for_testing(), 1u);
+    VERIFY(spin_event_loop_until(fixture.event_loop, 2000, [&] { return fixture.compositor_client.presented_frames.size() == 4; }));
+    EXPECT_EQ(fixture.compositor_client.presented_frames.last().content_rect, blocked_viewport_rect);
+    EXPECT_EQ(fixture.compositor_client.presented_frames.last().bitmap_id, presented_bitmap_ids[0]);
+
+    for (auto& surface : surfaces_still_read_by_the_window_server.span().slice(1))
+        surface.decrement_use_count();
+}
+#endif
 
 TEST_CASE(screenshot_between_presents_does_not_advance_the_baseline)
 {
@@ -1612,8 +1845,7 @@ TEST_CASE(backing_store_resize_waits_for_render_completion)
     EXPECT_EQ(frame->rendered_surface->size(), fixture.viewport_rect.size());
 
     fixture.finish(*frame);
-    auto publication = fixture.context.resize_backing_stores_if_needed({}, Compositor::BackingStoreManager::GpuSharing::Disallowed);
-    VERIFY(publication.has_value());
+    EXPECT(fixture.context.resize_backing_stores_if_needed({}, Compositor::BackingStoreManager::GpuSharing::Disallowed).has_value());
     fixture.viewport_rect.set_size(resized_viewport_size);
     auto resized_frame = fixture.prepare();
     VERIFY(resized_frame.has_value());
@@ -1696,7 +1928,7 @@ static Compositing::MouseEvent ui_mouse_move_event(int x, int y, u64 id)
 
 TEST_CASE(ui_wheel_event_is_forwarded_flagged_after_the_scroll_updates_it_produced)
 {
-    PresentingContextFixture fixture { { 100, 100 }, true };
+    PresentingContextFixture fixture { { 100, 100 } };
     auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
     fixture.install(make_scrollable_viewport_display_list(visual_context_tree, true, Compositing::ContextRef {}), visual_context_tree);
     fixture.present();
@@ -1714,7 +1946,7 @@ TEST_CASE(ui_wheel_event_is_forwarded_flagged_after_the_scroll_updates_it_produc
 
 TEST_CASE(shift_swaps_the_wheel_axes_in_the_compositor)
 {
-    PresentingContextFixture fixture { { 100, 100 }, true };
+    PresentingContextFixture fixture { { 100, 100 } };
     auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
     fixture.install(make_scrollable_viewport_display_list(visual_context_tree, true, Compositing::ContextRef {}), visual_context_tree);
     fixture.present();
@@ -1736,7 +1968,7 @@ TEST_CASE(shift_swaps_the_wheel_axes_in_the_compositor)
 
 TEST_CASE(ui_mouse_move_over_a_compositor_painted_scrollbar_is_consumed)
 {
-    PresentingContextFixture fixture { { 100, 100 }, true };
+    PresentingContextFixture fixture { { 100, 100 } };
     auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
     fixture.install(make_scrollable_viewport_display_list(visual_context_tree), visual_context_tree);
     fixture.present();
@@ -1752,7 +1984,7 @@ TEST_CASE(ui_mouse_move_over_a_compositor_painted_scrollbar_is_consumed)
 
 TEST_CASE(ui_mouse_move_off_the_scrollbars_is_forwarded_unchanged)
 {
-    PresentingContextFixture fixture { { 100, 100 }, true };
+    PresentingContextFixture fixture { { 100, 100 } };
     auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
     fixture.install(make_scrollable_viewport_display_list(visual_context_tree), visual_context_tree);
     fixture.present();
@@ -1771,7 +2003,7 @@ TEST_CASE(ui_mouse_move_off_the_scrollbars_is_forwarded_unchanged)
 
 TEST_CASE(ui_mouse_event_for_a_missing_context_is_reported_as_not_dispatched)
 {
-    PresentingContextFixture fixture { { 100, 100 }, true };
+    PresentingContextFixture fixture { { 100, 100 } };
 
     fixture.compositor_state->handle_and_dispatch_mouse_event(Compositing::CompositorContextId { 999 }, ui_mouse_move_event(20, 20, 8));
 
@@ -1782,7 +2014,7 @@ TEST_CASE(ui_mouse_event_for_a_missing_context_is_reported_as_not_dispatched)
 
 TEST_CASE(compositor_initiated_presents_request_full_damage)
 {
-    PresentingContextFixture fixture { { 100, 100 }, true };
+    PresentingContextFixture fixture { { 100, 100 } };
     auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
     fixture.install(make_scrollable_viewport_display_list(visual_context_tree), visual_context_tree);
     fixture.present();
@@ -1826,7 +2058,7 @@ TEST_CASE(child_context_presents_repaint_the_parent)
 
 TEST_CASE(async_scroll_presents_report_the_damage_of_the_scrolled_content)
 {
-    PresentingContextFixture fixture { { 100, 100 }, true };
+    PresentingContextFixture fixture { { 100, 100 } };
     Compositing::VisualContextTreeTestBuilder builder;
     auto viewport_scroll_node_index = builder.append_scroll(Compositing::VISUAL_VIEWPORT_NODE_INDEX);
     auto nested_scroll_node_index = builder.append_scroll(viewport_scroll_node_index);
@@ -1992,7 +2224,7 @@ static constexpr Compositing::AsyncScrollNodeStableID snap_container_stable_id {
 struct SnapContainerContextFixture {
     RecordingWebContentClient client;
     Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry, true };
+    Compositor::ContextState context { Compositing::CompositorContextId { 0 }, 0, client, canvas_surface_registry };
     Compositing::AccumulatedVisualContextTree visual_context_tree { make_scrollable_viewport_visual_context_tree() };
     MonotonicTime now { MonotonicTime::now() };
 

@@ -283,6 +283,18 @@ UniqueNodeID Node::unique_id() const
     return *unique_id;
 }
 
+Optional<String> Node::webdriver_node_id() const
+{
+    if (!m_rare_data)
+        return {};
+    return m_rare_data->webdriver_node_id;
+}
+
+void Node::set_webdriver_node_id(String node_id) const
+{
+    ensure_rare_data().webdriver_node_id = move(node_id);
+}
+
 void Node::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -2446,8 +2458,21 @@ static bool is_structural_boundary_self_rebuild_reason(SetNeedsLayoutTreeUpdateR
     }
 }
 
+// Whether a layout tree build can produce anything for this node. Only an element, a text node, the
+// document and a shadow root ever reach the build as something that keeps or gets a box; a comment,
+// a doctype or a processing instruction never does.
+static bool can_have_a_layout_tree_update(Node const& node)
+{
+    return node.is_element() || node.is_text() || node.is_document() || node.is_shadow_root();
+}
+
 void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReason reason)
 {
+    // A node with no possible box has nothing for the build to rebuild, and the mutation that
+    // reached it has already dirtied its parent, which is where the child list is read again.
+    if (value && !can_have_a_layout_tree_update(*this))
+        return;
+
     if (value && reason == SetNeedsLayoutTreeUpdateReason::NodeInsertBefore) {
         if (auto* first_letter_owner = first_letter_owner_for_layout_subtree_from(*this); first_letter_owner && first_letter_owner != this)
             first_letter_owner->set_needs_layout_tree_update(true, reason);
@@ -4479,20 +4504,24 @@ Vector<GC::Ref<RegisteredObserver>> const* Node::registered_observer_list() cons
 
 Element const* Node::first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor) const
 {
-    auto const* layout_subtree_root = unsafe_layout_node();
-    if (!layout_subtree_root)
-        return nullptr;
-
+    // NB: Look the boxes up only once an ancestor has ::first-letter style, so an insertion without such an ancestor
+    //     does not reach the layout tree here.
+    Optional<Layout::Node const*> layout_subtree_root;
     for (auto const* ancestor = &inclusive_ancestor; ancestor; ancestor = ancestor->parent_or_shadow_host_node()) {
         auto const* element = as_if<Element>(*ancestor);
         if (!element || !element->has_style(CSS::PseudoElement::FirstLetter))
             continue;
 
+        if (!layout_subtree_root.has_value())
+            layout_subtree_root = unsafe_layout_node();
+        if (!*layout_subtree_root)
+            return nullptr;
+
         auto const* first_letter_layout_node = element->pseudo_element_unsafe_layout_node(CSS::PseudoElement::FirstLetter);
         if (!first_letter_layout_node)
             return element;
         for (auto const* layout_ancestor = first_letter_layout_node; layout_ancestor; layout_ancestor = layout_ancestor->parent()) {
-            if (layout_ancestor == layout_subtree_root)
+            if (layout_ancestor == *layout_subtree_root)
                 return element;
         }
     }

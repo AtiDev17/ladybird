@@ -16,9 +16,12 @@
 #include <LibWebCommon/WebDriver/Error.h>
 #include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/BlobURLStore.h>
+#include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalBrowsingContextGroup.h>
 #include <LibWebView/CanonicalDocument.h>
+#include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/CanonicalWindow.h>
 #include <LibWebView/CookieJar.h>
@@ -213,6 +216,58 @@ Optional<CanonicalNavigable&> WebContentPage::hosted_navigable(Web::HTML::CrossP
     return *navigable;
 }
 
+// The environments a page names are the window environments of the documents it hosts, and of those populated for it
+// to host.
+void WebContentPage::for_each_hosted_document(Function<IterationDecision(CanonicalDocument&)> const& callback) const
+{
+    traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
+        auto decision = IterationDecision::Continue;
+        if (traversable().hosts(navigable, *this))
+            decision = callback(navigable.active_document());
+        navigable.for_each_populated_document([&](PopulatedDocument const& populated_document) {
+            if (decision == IterationDecision::Continue && populated_document.document->host() == this)
+                decision = callback(*populated_document.document);
+        });
+        return decision;
+    });
+}
+
+Optional<CanonicalDocument&> WebContentPage::document_with_hosted_environment(Web::HTML::EnvironmentId const& environment_id) const
+{
+    Optional<CanonicalDocument&> found_document;
+    for_each_hosted_document([&](CanonicalDocument& document) {
+        if (document.relevant_global_object().relevant_settings_object().id() != environment_id)
+            return IterationDecision::Continue;
+        found_document = document;
+        return IterationDecision::Break;
+    });
+    return found_document;
+}
+
+bool WebContentPage::hosts_an_environment_with_storage_key(Web::StorageAPI::StorageKey const& storage_key) const
+{
+    bool hosts_one = false;
+    for_each_hosted_document([&](CanonicalDocument& document) {
+        hosts_one = obtain_a_storage_key_for_non_storage_purposes(document.relevant_global_object().relevant_settings_object()) == storage_key;
+        return hosts_one ? IterationDecision::Break : IterationDecision::Continue;
+    });
+    return hosts_one;
+}
+
+Optional<CanonicalEnvironmentSettingsObject const&> WebContentPage::hosted_environment(Web::HTML::EnvironmentId const& environment_id) const
+{
+    auto document = document_with_hosted_environment(environment_id);
+    if (!document.has_value())
+        return {};
+    return document->relevant_global_object().relevant_settings_object();
+}
+
+void WebContentPage::spoof_document_origin_for_testing(Web::HTML::EnvironmentId const& environment_id, URL::Origin origin)
+{
+    if (auto document = document_with_hosted_environment(environment_id); document.has_value())
+        document->set_origin_for_testing(move(origin));
+}
+
 RefPtr<WebContentPage> WebContentPage::endpoint_hosting_navigable_represented_by(Web::HTML::CrossProcessId navigable_id) const
 {
     auto target = traversable().find(navigable_id);
@@ -250,9 +305,15 @@ bool WebContentPage::continue_navigation_population_in_selected_process(Web::HTM
     if (response_document.has_value()) {
         auto const& request = navigable->ongoing_navigation()->loader->request();
         auto document = navigable->create_and_initialize_a_document(*response_document);
+        navigable->ongoing_navigation()->loader->set_window(document->relevant_global_object());
         // NB: A navigation reconstructing a child navigable's history populates the entry it reconstructs.
         auto const& reconstructed_entry = navigable->ongoing_navigation()->reconstructed_entry;
-        navigable->populate_document_for_ongoing_navigation(reconstructed_entry ? reconstructed_entry->document_state : CanonicalDocumentState::create(request.history_entry.document_state.id), *document);
+        auto document_state = reconstructed_entry ? reconstructed_entry->document_state : CanonicalDocumentState::create(request.history_entry.document_state.id);
+        if (!reconstructed_entry) {
+            document_state->initiator_origin = request.history_entry.document_state.initiator_origin;
+            document_state->origin = request.history_entry.document_state.origin;
+        }
+        navigable->populate_document_for_ongoing_navigation(move(document_state), *document, navigable->ongoing_navigation()->loader->result().inline_content_origin);
 
         // A document created for inline content stands in for the resource the process that fetched it could not
         // load; that process hosts it.
@@ -294,6 +355,18 @@ StorageJar* WebContentPage::storage_jar(Web::StorageAPI::StorageEndpointType sto
     if (storage_endpoint == Web::StorageAPI::StorageEndpointType::SessionStorage)
         return &traversable().top_level_traversable().session_storage();
     return client().session().storage_jar.ptr();
+}
+
+// The browser process obtains a key a page names again from the environment it was obtained for.
+Optional<String> WebContentPage::canonical_storage_key(Web::HTML::EnvironmentId const& environment_id) const
+{
+    auto environment = hosted_environment(environment_id);
+    if (!environment.has_value())
+        return {};
+    auto storage_key = obtain_a_storage_key(*environment);
+    if (!storage_key.has_value())
+        return {};
+    return storage_key->to_string();
 }
 
 // A position a page sends is in the viewport of a local root it hosts, which the tab's view places in its own.
@@ -565,7 +638,13 @@ void WebContentPage::did_completely_finish_loading(Web::HTML::CrossProcessId nav
     navigable->active_document_completely_finished_loading();
 }
 
-void WebContentPage::did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState hosted_state, Web::HTML::PendingSessionHistoryEntryDescriptor initial_history_entry)
+void WebContentPage::did_create_populated_document_with_an_origin_of_its_own(Web::HTML::CrossProcessId navigable_id, Web::HTML::PopulatedDocumentOrigin origin, Web::HTML::EnvironmentId environment_id)
+{
+    if (auto navigable = traversable().find(navigable_id); navigable.has_value())
+        navigable->did_create_populated_document_with_an_origin_of_its_own(*this, origin, environment_id);
+}
+
+void WebContentPage::did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState hosted_state, Web::HTML::PendingSessionHistoryEntryDescriptor initial_history_entry, URL::Origin origin, Web::HTML::EnvironmentId environment_id)
 {
     auto& traversable = this->traversable();
 
@@ -599,7 +678,7 @@ void WebContentPage::did_create_child_frame(Web::HTML::CrossProcessId parent_fra
     auto group = container_document.browsing_context().top_level_browsing_context().group();
 
     // 3. Let browsingContext and document be the result of creating a new browsing context and document given element's node document, element, and group.
-    auto document = CanonicalBrowsingContext::create_a_new_browsing_context_and_document(&container_document, hosted_state.container, *group).document;
+    auto document = CanonicalBrowsingContext::create_a_new_browsing_context_and_document(&container_document, hosted_state.container, *group, move(environment_id), move(origin)).document;
 
     // 6. Let documentState be a new document state, with
     //    document: document
@@ -609,6 +688,10 @@ void WebContentPage::did_create_child_frame(Web::HTML::CrossProcessId parent_fra
     //    about base URL: document's about base URL
     // NB: The process creating the navigable holds documentState's other fields, and reports its ID with the navigable's
     //     state.
+    auto& document_state = *initial_entry.value()->document_state;
+    document_state.initiator_origin = document->origin();
+    document_state.origin = document->origin();
+
     // 7. Let navigable be a new navigable.
     // 8. Initialize the navigable navigable given documentState and parentNavigable.
     traversable.insert(*this, parent_navigable, container_document, frame_id, move(hosted_state), initial_entry.release_value(), move(document));
@@ -925,48 +1008,59 @@ void WebContentPage::did_request_dismiss_dialog()
         view().on_request_dismiss_dialog();
 }
 
-void WebContentPage::did_request_document_cookie_version_index(i64 document_id, String domain)
+void WebContentPage::did_request_document_cookie_version_index(Web::HTML::EnvironmentId environment_id, i64 document_id, String domain)
 {
+    auto environment = hosted_environment(environment_id);
+    if (!environment.has_value() || environment->origin().is_opaque() || domain != environment->origin().host().serialize().to_ascii_lowercase())
+        return;
+
     if (displays_tab()) {
         if (auto document_index = view().ensure_document_cookie_version_index({}, domain); !document_index.is_error())
             async_set_document_cookie_version_index(document_id, document_index.value());
     }
 }
 
-Messages::WebContentClient::DidRequestStorageItemResponse WebContentPage::did_request_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key)
+Messages::WebContentClient::DidRequestStorageItemResponse WebContentPage::did_request_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key)
 {
+    auto canonical_key = canonical_storage_key(environment_id);
     auto* storage_jar = this->storage_jar(storage_endpoint);
-    if (!storage_jar)
+    if (!canonical_key.has_value() || !storage_jar)
         return Optional<Utf16String> {};
-    return storage_jar->get_item(storage_endpoint, storage_key, bottle_key);
+    return storage_jar->get_item(storage_endpoint, *canonical_key, bottle_key);
 }
 
-Messages::WebContentClient::DidSetStorageItemResponse WebContentPage::did_set_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key, Utf16String value)
+Messages::WebContentClient::DidSetStorageItemResponse WebContentPage::did_set_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key, Utf16String value)
 {
+    auto canonical_key = canonical_storage_key(environment_id);
     auto* storage_jar = this->storage_jar(storage_endpoint);
-    if (!storage_jar)
+    if (!canonical_key.has_value() || !storage_jar)
         return WebView::StorageOperationError::QuotaExceededError;
-    return storage_jar->set_item(storage_endpoint, storage_key, bottle_key, value);
+    return storage_jar->set_item(storage_endpoint, *canonical_key, bottle_key, value);
 }
 
-void WebContentPage::did_remove_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key)
+void WebContentPage::did_remove_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key)
 {
-    if (auto* storage_jar = this->storage_jar(storage_endpoint))
-        storage_jar->remove_item(storage_endpoint, storage_key, bottle_key);
-}
-
-Messages::WebContentClient::DidRequestStorageKeysResponse WebContentPage::did_request_storage_keys(Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key)
-{
+    auto canonical_key = canonical_storage_key(environment_id);
     auto* storage_jar = this->storage_jar(storage_endpoint);
-    if (!storage_jar)
-        return Vector<Utf16String> {};
-    return storage_jar->get_all_keys(storage_endpoint, storage_key);
+    if (canonical_key.has_value() && storage_jar)
+        storage_jar->remove_item(storage_endpoint, *canonical_key, bottle_key);
 }
 
-void WebContentPage::did_clear_storage(Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key)
+Messages::WebContentClient::DidRequestStorageKeysResponse WebContentPage::did_request_storage_keys(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id)
 {
-    if (auto* storage_jar = this->storage_jar(storage_endpoint))
-        storage_jar->clear_storage_key(storage_endpoint, storage_key);
+    auto canonical_key = canonical_storage_key(environment_id);
+    auto* storage_jar = this->storage_jar(storage_endpoint);
+    if (!canonical_key.has_value() || !storage_jar)
+        return Vector<Utf16String> {};
+    return storage_jar->get_all_keys(storage_endpoint, *canonical_key);
+}
+
+void WebContentPage::did_clear_storage(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id)
+{
+    auto canonical_key = canonical_storage_key(environment_id);
+    auto* storage_jar = this->storage_jar(storage_endpoint);
+    if (canonical_key.has_value() && storage_jar)
+        storage_jar->clear_storage_key(storage_endpoint, *canonical_key);
 }
 
 void WebContentPage::did_request_activate_tab()
@@ -1452,6 +1546,28 @@ void WebContentPage::did_request_set_system_visibility_state(Web::HTML::Visibili
     view().set_system_visibility_state(visibility_state);
 }
 
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
+// NB: initiatorOriginSnapshot is sourceDocument's origin. The process names sourceDocument's relevant settings object as
+//     the fetch client, an environment that a process hosts, and the UI process takes the origin from it. Without a
+//     sourceDocument, the process gives a new opaque origin, which no document may hold yet.
+static Optional<URL::Origin> initiator_origin_snapshot(URL::Origin const& given_origin, Web::HTML::NavigationSourceSnapshot const& source_snapshot_params)
+{
+    if (!source_snapshot_params.fetch_client.has_value()) {
+        if (!given_origin.is_opaque() || CanonicalTraversable::is_origin_held_by_a_document(given_origin))
+            return {};
+        return given_origin;
+    }
+    Optional<URL::Origin> origin;
+    WebContentClient::for_each_client([&](WebContentClient& client) {
+        auto source_settings = client.hosted_environment(source_snapshot_params.fetch_client->id);
+        if (!source_settings.has_value())
+            return IterationDecision::Continue;
+        origin = source_settings->origin();
+        return IterationDecision::Break;
+    });
+    return origin;
+}
+
 void WebContentPage::did_request_navigation_start(Web::HTML::CrossProcessId navigable_id, Web::NavigationTarget target, URL::URL url, Utf16String navigation_id, Optional<Web::HTML::NavigationStartRequest> start_request)
 {
     CanonicalNavigable* target_navigable = &traversable();
@@ -1464,13 +1580,19 @@ void WebContentPage::did_request_navigation_start(Web::HTML::CrossProcessId navi
     //         Recheck it here so navigation admission and history traversal remain ordered by the UI process.
     auto navigation_is_blocked_by_history_traversal = target_navigable
         && target_navigable->ongoing_navigation_is_traversal();
+    Optional<URL::Origin> initiator_origin;
+    if (start_request.has_value())
+        initiator_origin = initiator_origin_snapshot(start_request->initiator_origin, start_request->source_snapshot_params);
     if (!target_navigable
         || target_navigable->id() != navigable_id
         || (start_request.has_value() && start_request->navigable_id != navigable_id)
+        || (start_request.has_value() && !initiator_origin.has_value())
         || navigation_is_blocked_by_history_traversal) {
         async_cancel_navigation_params_creation(navigable_id, navigation_id);
         return;
     }
+    if (start_request.has_value())
+        start_request->initiator_origin = initiator_origin.release_value();
 
     auto sequence_number = target_navigable->top_level_traversable().next_sequence_number();
 
@@ -2095,7 +2217,7 @@ Messages::WebContentClient::DidRequestNewWebViewResponse WebContentPage::did_req
     if (opener_navigable_id.has_value()) {
         opener = hosted_navigable(*opener_navigable_id);
         if (!opener.has_value())
-            return { {}, {}, {}, Web::HTML::VisibilityState::Hidden, {} };
+            return { {}, {}, {}, {}, {}, Web::HTML::VisibilityState::Hidden, {} };
     }
 
     auto root_navigable_id = Application::the().allocate_ui_process_cross_process_id();
@@ -2114,11 +2236,15 @@ Messages::WebContentClient::DidRequestNewWebViewResponse WebContentPage::did_req
     if (!traversable.view().has_value()) {
         client().discard_page_of_undisplayed_top_level_traversable(new_page_id);
         CanonicalTraversable::remove_from_user_agent_top_level_traversable_set(traversable);
-        return { {}, {}, {}, Web::HTML::VisibilityState::Hidden, move(window_handle) };
+        return { {}, {}, {}, {}, {}, Web::HTML::VisibilityState::Hidden, move(window_handle) };
     }
     new_page.view().update_navigation_action_state();
 
-    return { new_page_id, root_navigable_id, traversable.active_session_history_entry()->descriptor(), traversable.system_visibility_state(), move(window_handle) };
+    traversable.represent_group_everywhere();
+
+    auto environment_id = traversable.active_document().relevant_global_object().relevant_settings_object().id();
+    Optional<u64> browsing_context_group_id = traversable.active_browsing_context().group()->id();
+    return { new_page_id, root_navigable_id, traversable.active_session_history_entry()->descriptor(), move(environment_id), browsing_context_group_id, traversable.system_visibility_state(), move(window_handle) };
 }
 
 void WebContentPage::did_close_browsing_context()
@@ -2203,26 +2329,23 @@ void WebContentPage::request_unload_check(Web::HTML::CrossProcessId navigable_id
 Messages::WebContentClient::StartWorkerAgentResponse WebContentPage::start_worker_agent(Web::HTML::WorkerAgentStartRequest request)
 {
     // A page hosting an isolated iframe's document belongs to its tab's view as much as the view's own page does.
-    auto agent_id = WorkerProcessManager::the().start_worker_agent(client(), m_id, move(request));
+    auto outside_settings = hosted_environment(request.outside_settings.id);
+    auto agent_id = WorkerProcessManager::the().start_worker_agent(client(), m_id, outside_settings, move(request));
     return { agent_id };
 }
 
-Messages::WebContentClient::DidRequestStorageUsageResponse WebContentPage::did_request_storage_usage(String storage_key)
+Messages::WebContentClient::DidRequestStorageUsageResponse WebContentPage::did_request_storage_usage(Web::HTML::EnvironmentId environment_id)
 {
-    return client().session().storage_jar->usage(storage_key);
+    auto canonical_key = canonical_storage_key(environment_id);
+    if (!canonical_key.has_value())
+        return 0;
+    return client().session().storage_jar->usage(*canonical_key);
 }
 
-void WebContentPage::did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage message)
+void WebContentPage::did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message)
 {
-    WebContentClient::for_each_client([&](auto& client) {
-        if (client.pid() == message.source_process_id)
-            return IterationDecision::Continue;
-        if (client.is_private() != this->client().is_private())
-            return IterationDecision::Continue;
-        client.async_broadcast_channel_message(message);
-        return IterationDecision::Continue;
-    });
-    WorkerProcessManager::the().broadcast_channel_message_from_web_content(message, client().is_private());
+    if (auto settings = hosted_environment(message.environment_id); settings.has_value())
+        WorkerProcessManager::the().post_broadcast_channel_message(move(message), *settings, client().pid(), client().is_private());
 }
 
 void WebContentPage::close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token)
@@ -2312,8 +2435,54 @@ Messages::WebContentTestClient::DidRequestSessionStoreTabStateForTestingResponse
     return { "{}"_string };
 }
 
+// https://w3c.github.io/FileAPI/#add-an-entry
+Messages::WebContentClient::DidAddBlobUrlEntryResponse WebContentPage::did_add_blob_url_entry(Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry)
+{
+    // 3. Let entry be a new blob URL entry consisting of object and the current settings object.
+    auto environment = hosted_environment(environment_id);
+    if (!environment.has_value())
+        return URL::BlobURLEntry::Token { 0 };
+    entry.origin = environment->origin();
+
+    // 4. Set store[url] to entry.
+    return client().session().blob_url_store->add_entry(move(url), move(entry), WeakPtr<WebContentClient> { client() });
+}
+
+// https://w3c.github.io/FileAPI/#dfn-revokeObjectURL
+void WebContentPage::did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls)
+{
+    auto environment = hosted_environment(environment_id);
+    if (!environment.has_value())
+        return;
+    client().session().blob_url_store->remove_entries(urls, environment->origin(), WeakPtr<WebContentClient> { client() });
+}
+
+void WebContentPage::did_set_cookie(URL::URL url, HTTP::Cookie::ParsedCookie cookie, HTTP::Cookie::Source source)
+{
+    if (source == HTTP::Cookie::Source::Http) {
+        if (!WebContentClient::renderers_may_access_cookies_like_http()) {
+            client().did_misbehave("did_set_cookie"sv, "HTTP cookie source"sv);
+            return;
+        }
+    } else if (!client().hosts_an_environment_that_may_use_cookies_of(url)) {
+        return;
+    }
+
+    client().session().cookie_jar->set_cookie(url, cookie, source);
+}
+
+Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse WebContentPage::did_request_all_cookies_cookiestore(URL::URL url)
+{
+    if (!client().hosts_an_environment_that_may_use_cookies_of(url))
+        return Vector<HTTP::Cookie::Cookie> {};
+    return client().session().cookie_jar->get_all_cookies_cookiestore(url);
+}
+
 Messages::WebContentClient::DidRequestCookieResponse WebContentPage::did_request_cookie(URL::URL url, HTTP::Cookie::Source source)
 {
+    if (source == HTTP::Cookie::Source::NonHttp && !client().hosts_an_environment_that_may_use_cookies_of(url))
+        return HTTP::Cookie::VersionedCookie {};
+
     HTTP::Cookie::VersionedCookie cookie;
     cookie.cookie = client().session().cookie_jar->get_cookie(url, source);
     if (source == HTTP::Cookie::Source::NonHttp)

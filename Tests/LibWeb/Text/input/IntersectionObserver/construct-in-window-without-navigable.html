@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<body>
+<script src="../include.js"></script>
+<script>
+    asyncTest(done => {
+        // The iframe is inserted once its load handler is in place, so the first document cannot load before it.
+        const iframe = document.createElement("iframe");
+        iframe.onload = () => {
+            const oldWindow = iframe.contentWindow;
+            const OldIntersectionObserver = oldWindow.IntersectionObserver;
+            const oldTarget = iframe.contentDocument.getElementById("target");
+            const attachedObserver = new OldIntersectionObserver(() => {});
+            attachedObserver.observe(oldTarget);
+
+            iframe.onload = () => {
+                // The first document is no longer any navigable's active document, so its window has no navigable.
+                const observer = new OldIntersectionObserver(() => {});
+                observer.observe(oldTarget);
+                println(`root: ${observer.root}`);
+                println(`records: ${observer.takeRecords().length}`);
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(() => {
+                        println(`records after a frame: ${observer.takeRecords().length} ${attachedObserver.takeRecords().length}`);
+                        done();
+                    });
+                });
+            };
+            iframe.srcdoc = "<div>second</div>";
+        };
+        iframe.srcdoc = "<div id=target>first</div>";
+        document.body.appendChild(iframe);
+    });
+</script>
+</body>

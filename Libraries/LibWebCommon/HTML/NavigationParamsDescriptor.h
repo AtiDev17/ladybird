@@ -27,6 +27,7 @@
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicyEnforcementResult.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
+#include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
 #include <LibWebCommon/HTML/SerializedPolicyContainer.h>
 #include <LibWebCommon/HTML/UserNavigationInvolvement.h>
 #include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
@@ -94,7 +95,7 @@ struct NavigationFetchTimingInfoDescriptor {
 };
 
 struct NavigationEnvironmentDescriptor {
-    Utf16String id;
+    EnvironmentId id;
     URL::URL creation_url;
     Optional<URL::URL> top_level_creation_url;
     Optional<URL::Origin> top_level_origin;
@@ -117,6 +118,7 @@ struct NavigationParamsDescriptor {
     Bindings::NavigationTimingType navigation_timing_type { Bindings::NavigationTimingType::Navigate };
     Optional<URL::URL> about_base_url;
     UserNavigationInvolvement user_involvement { UserNavigationInvolvement::None };
+    Optional<u64> agent_cluster_id;
 };
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#non-fetch-scheme-navigation-params

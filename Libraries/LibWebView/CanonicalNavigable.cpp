@@ -276,7 +276,7 @@ void CanonicalNavigable::begin_navigation_waiting_for_traversal()
 
 // https://html.spec.whatwg.org/multipage/browsers.html#obtain-browsing-context-navigation
 // NB: The browsing context is returned with its active document, which nothing else holds for a new one.
-CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalNavigable::obtain_a_browsing_context_to_use_for_a_navigation_response(Web::HTML::OpenerPolicyEnforcementResult const& coop_enforcement_result)
+CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalNavigable::obtain_a_browsing_context_to_use_for_a_navigation_response(NavigationLoader::ResponseDocument const& navigation_params)
 {
     // 1. Let browsingContext be navigationParams's navigable's active browsing context.
     CanonicalBrowsingContext::BrowsingContextAndDocument browsing_context { active_browsing_context(), active_document() };
@@ -286,6 +286,8 @@ CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalNavigable::obtain_
         return browsing_context;
 
     // 3. Let coopEnforcementResult be navigationParams's COOP enforcement result.
+    auto const& coop_enforcement_result = navigation_params.coop_enforcement_result;
+
     // 4. Let swapGroup be coopEnforcementResult's needs a browsing context group switch.
     auto swap_group = coop_enforcement_result.needs_a_browsing_context_group_switch;
 
@@ -305,9 +307,12 @@ CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalNavigable::obtain_
     auto new_browsing_context = CanonicalBrowsingContext::create_a_new_top_level_browsing_context_and_document();
 
     // 11. Let navigationCOOP be navigationParams's cross-origin opener policy.
-    // FIXME: 12. If navigationCOOP's value is "same-origin-plus-COEP", then set newBrowsingContext's group's
-    //            cross-origin isolation mode to either "logical" or "concrete". The choice of which is
-    //            implementation-defined.
+    auto const& navigation_coop = navigation_params.opener_policy;
+
+    // 12. If navigationCOOP's value is "same-origin-plus-COEP", then set newBrowsingContext's group's cross-origin
+    //     isolation mode to either "logical" or "concrete". The choice of which is implementation-defined.
+    if (navigation_coop.value == Web::HTML::OpenerPolicyValue::SameOriginPlusCOEP)
+        new_browsing_context.browsing_context->group()->set_cross_origin_isolation_mode(CrossOriginIsolationMode::Concrete);
 
     // 13. Let sandboxFlags be a clone of navigationParams's final sandboxing flag set.
     // FIXME: 14. If sandboxFlags is not empty, then:
@@ -323,7 +328,7 @@ CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalNavigable::obtain_
 NonnullRefPtr<CanonicalDocument> CanonicalNavigable::create_and_initialize_a_document(NavigationLoader::ResponseDocument const& navigation_params)
 {
     // 1. Let browsingContext be the result of obtaining a browsing context to use for a navigation response given navigationParams.
-    auto browsing_context_and_document = obtain_a_browsing_context_to_use_for_a_navigation_response(navigation_params.coop_enforcement_result);
+    auto browsing_context_and_document = obtain_a_browsing_context_to_use_for_a_navigation_response(navigation_params);
     auto& browsing_context = browsing_context_and_document.browsing_context;
 
     // 3. Let creationURL be navigationParams's response's URL.
@@ -362,6 +367,10 @@ NonnullRefPtr<CanonicalDocument> CanonicalNavigable::create_and_initialize_a_doc
         // 6. Set window to the global object of realmExecutionContext's Realm component.
         // NB: The realm is in the process hosting agent, which runs steps 7 to 10.
         window = CanonicalWindow::create(agent);
+
+        // 10. Set up a window environment settings object with creationURL, realmExecutionContext, navigationParams's
+        //     reserved environment, topLevelCreationURL, and topLevelOrigin.
+        window->set_up_a_window_environment_settings_object(navigation_params.environment_id);
     }
 
     // 9. Let document be a new Document, with
@@ -433,6 +442,13 @@ NonnullOwnPtr<CanonicalNavigable> CanonicalNavigable::remove_child(CanonicalNavi
     }
 
     VERIFY_NOT_REACHED();
+}
+
+// https://html.spec.whatwg.org/multipage/document-sequences.html#nav-target-name
+Utf16String const& CanonicalNavigable::target_name() const
+{
+    // A navigable's target name is its active session history entry's document state's navigable target name.
+    return active_session_history_entry()->document_state->navigable_target_name;
 }
 
 bool CanonicalNavigable::is_ancestor_of(CanonicalNavigable const& potential_descendant) const
@@ -652,13 +668,13 @@ ErrorOr<NonnullRefPtr<WebContentPage>> CanonicalNavigable::obtain_page_to_host(C
         page_id = Application::the().allocate_page_id();
         host->async_create_embedded_page(page_id, traversable.remote_navigable_graph(), id(), current_entry_descriptor(), traversable.system_visibility_state());
         host->register_embedded_page(page_id, traversable);
-        traversable.represent_openers_in(*host);
+        traversable.represent_group_in(*host);
     } else {
         auto process = TRY(Application::the().launch_child_frame_web_content_process(reporting_page()->client().is_private(), traversable.remote_navigable_graph(), id(), current_entry_descriptor(), traversable.system_visibility_state()));
         host = move(process.client);
         page_id = process.page_id;
         host->register_embedded_page(page_id, traversable);
-        traversable.represent_openers_in(*host);
+        traversable.represent_group_in(*host);
     }
 
     return *host->page(page_id);
@@ -693,36 +709,70 @@ RefPtr<CanonicalDocument> CanonicalNavigable::document_populated_for(CanonicalDo
     return document;
 }
 
-void CanonicalNavigable::populate_document(NonnullRefPtr<CanonicalDocumentState> document_state, NonnullRefPtr<CanonicalDocument> document)
+void CanonicalNavigable::populate_document(NonnullRefPtr<CanonicalDocumentState> document_state, NonnullRefPtr<CanonicalDocument> document, Optional<URL::Origin> inline_content_origin)
 {
     abandon_populated_document(m_document_populated_by_history_job);
-    m_document_populated_by_history_job = PopulatedDocument { move(document_state), move(document) };
+    m_document_populated_by_history_job = PopulatedDocument { move(document_state), move(document), move(inline_content_origin) };
 }
 
-void CanonicalNavigable::populate_document_for_ongoing_navigation(NonnullRefPtr<CanonicalDocumentState> document_state, NonnullRefPtr<CanonicalDocument> document)
+void CanonicalNavigable::populate_document_for_ongoing_navigation(NonnullRefPtr<CanonicalDocumentState> document_state, NonnullRefPtr<CanonicalDocument> document, Optional<URL::Origin> inline_content_origin)
 {
     VERIFY(m_ongoing_navigation.has_value());
     abandon_populated_document(m_ongoing_navigation->populated_document);
-    m_ongoing_navigation->populated_document = PopulatedDocument { move(document_state), move(document) };
+    m_ongoing_navigation->populated_document = PopulatedDocument { move(document_state), move(document), move(inline_content_origin) };
+}
+
+// The process hosting a document populated for the navigable created it with an origin other than its navigation
+// params': a document for inline content in place of a response it found blocked, or the PDF viewer.
+void CanonicalNavigable::did_create_populated_document_with_an_origin_of_its_own(WebContentPage const& host, Web::HTML::PopulatedDocumentOrigin populated_document_origin, Web::HTML::EnvironmentId const& environment_id)
+{
+    auto replace = [&](Optional<PopulatedDocument>& populated_document) {
+        if (!populated_document.has_value() || populated_document->document->host() != &host)
+            return false;
+
+        auto is_inline_content = populated_document_origin == Web::HTML::PopulatedDocumentOrigin::InlineContent;
+        if (is_inline_content && !populated_document->inline_content_origin.has_value())
+            return false;
+        // AD-HOC: The PDF viewer runs with an origin of its own.
+        auto origin = is_inline_content ? *populated_document->inline_content_origin : URL::Origin { "resource"_string, String {}, {} };
+
+        auto url = is_inline_content ? URL::about_error() : populated_document->document->creation_url();
+        NavigationLoader::ResponseDocument response_document {
+            .is_inline_content = is_inline_content,
+            .coop_enforcement_result = { .url = url, .origin = origin, .opener_policy = {} },
+            .response_url = url,
+            .request_current_url = {},
+            .origin = origin,
+            .opener_policy = {},
+            .environment_id = environment_id,
+        };
+        auto document = create_and_initialize_a_document(response_document);
+        document->set_host(populated_document->document->host());
+        populated_document->document = move(document);
+        return true;
+    };
+    if (m_ongoing_navigation.has_value() && replace(m_ongoing_navigation->populated_document))
+        return;
+    replace(m_document_populated_by_history_job);
 }
 
 // The history job finalizing the ongoing navigation is going to activate the document populated for it, even if a
 // newer navigation starts before it does.
-void CanonicalNavigable::claim_document_populated_for_ongoing_navigation(CanonicalDocumentState const& document_state)
+void CanonicalNavigable::claim_document_populated_for_ongoing_navigation(CanonicalDocument const& document)
 {
     if (!m_ongoing_navigation.has_value() || !m_ongoing_navigation->populated_document.has_value())
         return;
-    if (m_ongoing_navigation->populated_document->document_state != &document_state)
+    if (m_ongoing_navigation->populated_document->document != &document)
         return;
     abandon_populated_document(m_document_populated_by_history_job);
     m_document_populated_by_history_job = m_ongoing_navigation->populated_document.release_value();
 }
 
-void CanonicalNavigable::abandon_document_populated_for(CanonicalDocumentState const& document_state)
+void CanonicalNavigable::abandon_populated_document(CanonicalDocument const& document)
 {
-    if (m_ongoing_navigation.has_value() && m_ongoing_navigation->populated_document.has_value() && m_ongoing_navigation->populated_document->document_state == &document_state)
+    if (m_ongoing_navigation.has_value() && m_ongoing_navigation->populated_document.has_value() && m_ongoing_navigation->populated_document->document == &document)
         abandon_populated_document(m_ongoing_navigation->populated_document);
-    if (m_document_populated_by_history_job.has_value() && m_document_populated_by_history_job->document_state == &document_state)
+    if (m_document_populated_by_history_job.has_value() && m_document_populated_by_history_job->document == &document)
         abandon_populated_document(m_document_populated_by_history_job);
 }
 
@@ -848,14 +898,19 @@ Optional<Web::HTML::ReplicatedNavigableState> CanonicalNavigable::replicated_sta
             opener_navigable_id = opener->id();
     }
 
+    Optional<u64> browsing_context_group_id;
+    if (auto group = traversable.active_browsing_context().group())
+        browsing_context_group_id = group->id();
+
     return Web::HTML::ReplicatedNavigableState {
-        .target_name = active_session_history_entry()->document_state->navigable_target_name,
+        .target_name = target_name(),
         .active_document_url = hosted_state.active_document_url,
         .active_document_origin = active_document().origin(),
         .active_document_is_fully_active = hosted_state.active_document_is_fully_active,
         .top_level_creation_url = traversable.active_document().creation_url(),
         .top_level_origin = traversable.active_document().origin(),
         .has_cross_site_ancestor = active_document_has_cross_site_ancestor(),
+        .browsing_context_group_id = browsing_context_group_id,
         .opener_policy = hosted_state.opener_policy,
         .active_browsing_context_is_auxiliary = browsing_context.is_auxiliary(),
         .active_browsing_context_has_opener = opener_browsing_context != nullptr,
@@ -902,14 +957,14 @@ void CanonicalNavigable::did_set_opener_browsing_context(Optional<Web::HTML::Cro
     // Every process holding part of the tab holds the tab of a new opener before it hears of it.
     if (opener_browsing_context) {
         for (auto& client : clients)
-            traversable.represent_openers_in(client);
+            traversable.represent_group_in(client);
     }
 
     send_replicated_state();
 
     // A process can stop needing the tab of the previous opener.
     for (auto& client : clients)
-        client->release_unneeded_opener_pages();
+        client->release_unneeded_representing_pages();
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#script-settings-for-window-objects:concept-settings-object-has-cross-site-ancestor
@@ -972,6 +1027,11 @@ void CanonicalNavigable::did_commit_navigation(CanonicalSessionHistoryEntry& ent
 
     // The document populated for the entry becomes its document state's document below.
     RefPtr<CanonicalDocument> document = document_populated_for(*entry.document_state);
+    auto save_extra_document_state = true;
+    for_each_populated_document([&](PopulatedDocument const& populated_document) {
+        if (populated_document.document_state == entry.document_state && populated_document.inline_content_origin.has_value() && populated_document.document->origin().is_same_origin(*populated_document.inline_content_origin))
+            save_extra_document_state = false;
+    });
     if (m_ongoing_navigation.has_value() && m_ongoing_navigation->populated_document.has_value() && m_ongoing_navigation->populated_document->document_state == entry.document_state)
         m_ongoing_navigation->populated_document.clear();
     if (m_document_populated_by_history_job.has_value() && m_document_populated_by_history_job->document_state == entry.document_state)
@@ -994,6 +1054,14 @@ void CanonicalNavigable::did_commit_navigation(CanonicalSessionHistoryEntry& ent
         m_active_session_history_entry->document_state->document = nullptr;
     entry.document_state->document = document;
     m_active_session_history_entry = entry;
+
+    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#attempt-to-populate-the-history-entry's-document
+    // 7. If entry's document state's document is not null, then:
+    //    2. If saveExtraDocumentState is true:
+    //       1. Set entry's document state's origin to document's origin.
+    // NB: The process hosting the document ran these steps for the entry it holds.
+    if (did_populate_document == DidPopulateDocument::Yes && document != previous_document && save_extra_document_state)
+        entry.document_state->origin = document->origin();
     if (document != previous_document) {
         document->make_active();
         if (!document->host())

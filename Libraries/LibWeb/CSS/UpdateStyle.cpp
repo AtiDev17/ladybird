@@ -45,6 +45,7 @@ static void finish_complete_style_update()
 
 static void update_style(DOM::Document&);
 static bool update_style_for_element(DOM::Document&, DOM::AbstractElement const&, StyleUpdateMode);
+static bool embedding_document_chain_has_no_pending_style_or_layout_work(DOM::Document const&);
 
 static void apply_element_style_invalidation_after_style_change(DOM::Element& element, RequiredInvalidationAfterStyleChange const& invalidation)
 {
@@ -486,11 +487,13 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
     ChangedCustomPropertyNames changed_custom_property_names;
     // Unstyled descendants of display:none need no record until a targeted read or visibility
     // change asks for one. SVG resources and existing animations can still consume style while
-    // hidden, so retain their inheritance prerequisites in this batch.
+    // hidden, so retain their inheritance prerequisites in this batch. An element has animations when
+    // any animation is associated with it, relevant or not: a timeline can make one relevant later,
+    // and the style engine keeps the same rows.
     HashTable<StyleNodeID> required_in_hidden_subtrees;
     for (auto const& reaction : reactions) {
         auto element = document.style_computer().element_for_style_node(reaction.style_node);
-        if (!element || (!element->is_svg_element() && !element->has_relevant_animations()))
+        if (!element || (!element->is_svg_element() && !element->has_associated_animations()))
             continue;
         for (Optional<DOM::AbstractElement> ancestor = DOM::AbstractElement { *element }; ancestor.has_value(); ancestor = ancestor->element_to_inherit_style_from()) {
             if (required_in_hidden_subtrees.set(ancestor->element().style_node_id()) == HashSetResult::KeptExistingEntry)
@@ -853,7 +856,10 @@ static void update_style(DOM::Document& document)
 
     // NOTE: If our parent document needs a relayout, we must do that *first*. This is required as it may cause the
     // viewport to change which will can affect media query evaluation and the value of the `vw` unit.
-    if (auto navigable = document.navigable(); navigable && navigable->container() && &navigable->container()->document() != &document)
+    // OPTIMIZATION: A settled embedding chain has no relayout to do, and finding that out by laying it out publishes
+    //               its whole style environment.
+    if (auto navigable = document.navigable(); navigable && navigable->container() && &navigable->container()->document() != &document
+        && !embedding_document_chain_has_no_pending_style_or_layout_work(document))
         navigable->container()->document().update_layout(DOM::UpdateLayoutReason::ChildDocumentStyleUpdate);
 
     if (!document.browsing_context())
@@ -1183,14 +1189,31 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
     // OPTIMIZATION: When nothing style-related is pending anywhere that could affect this document, the only question
     // left is, if the element's inheritance chain already has style. If it does, the walk below would conclude there's
     // nothing to recompute. So answer that directly — without constructing a style record view for every ancestor.
-    if (mode == StyleUpdateMode::OnlyIfNeeded
+    // Stopping at display:none, the walk also answers no as soon as it meets a display:none element above every
+    // element that has no style yet, so that is answered directly too.
+    if ((mode == StyleUpdateMode::OnlyIfNeeded || mode == StyleUpdateMode::StopAtDisplayNone)
         && !abstract_element.pseudo_element().has_value()
         && document_has_no_pending_style_work(document)
         && embedding_document_chain_has_no_pending_style_or_layout_work(document)) {
-        bool inheritance_chain_has_style = abstract_element.element().has_style();
-        for (auto cursor = abstract_element.element_to_inherit_style_from(); inheritance_chain_has_style && cursor.has_value(); cursor = cursor->element_to_inherit_style_from())
-            inheritance_chain_has_style = cursor->element().has_style();
-        if (inheritance_chain_has_style)
+        Optional<size_t> topmost_element_without_style;
+        Optional<size_t> topmost_display_none_element;
+        size_t depth = 0;
+        for (Optional<DOM::AbstractElement> cursor = abstract_element; cursor.has_value(); cursor = cursor->element_to_inherit_style_from(), ++depth) {
+            auto const& element = cursor->element();
+            if (!element.has_style()) {
+                topmost_element_without_style = depth;
+                continue;
+            }
+            if (mode != StyleUpdateMode::StopAtDisplayNone)
+                continue;
+            auto const* box_values = element.style_group<ComputedValues::BoxValues>();
+            if (box_values && display_from_ffi_display(box_values->display).is_none())
+                topmost_display_none_element = depth;
+        }
+        if (topmost_display_none_element.has_value()
+            && (!topmost_element_without_style.has_value() || *topmost_display_none_element > *topmost_element_without_style))
+            return false;
+        if (!topmost_element_without_style.has_value())
             return true;
     }
 
@@ -1212,7 +1235,11 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
     // re-cascades the target path under display:none ancestors.
 
     bool embedding_document_layout_was_stale = false;
-    if (auto navigable = document.navigable(); navigable && navigable->container() && &navigable->container()->document() != &document) {
+    // OPTIMIZATION: An embedding chain with no style or layout work anywhere has nothing to bring up to date, and a
+    //               style and layout update of a settled document still publishes its whole environment to find that
+    //               out. A page that focuses elements in a frame asks this once per focus.
+    if (auto navigable = document.navigable(); navigable && navigable->container() && &navigable->container()->document() != &document
+        && !embedding_document_chain_has_no_pending_style_or_layout_work(document)) {
         auto& container = *navigable->container();
         auto& embedding_document = container.document();
         update_style_for_element(embedding_document, DOM::AbstractElement { container }, StyleUpdateMode::OnlyIfNeeded);

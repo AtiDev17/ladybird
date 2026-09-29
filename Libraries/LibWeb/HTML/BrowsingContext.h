@@ -29,7 +29,7 @@ public:
         GC::Ref<DOM::Document> document;
     };
 
-    static BrowsingContextAndDocument create_a_new_browsing_context_and_document(GC::Ref<Page> page, GC::Ptr<DOM::Document> creator, GC::Ptr<DOM::Element> embedder, GC::Ptr<WindowProxy> existing_window_proxy = {});
+    static BrowsingContextAndDocument create_a_new_browsing_context_and_document(GC::Ref<Page> page, GC::Ptr<DOM::Document> creator, GC::Ptr<DOM::Element> embedder, GC::Ptr<WindowProxy> existing_window_proxy = {}, Optional<URL::Origin> determined_origin = {});
     static BrowsingContextAndDocument create_a_new_auxiliary_browsing_context_and_document(GC::Ref<Page> page, GC::Ref<HTML::BrowsingContext> opener);
 
     virtual ~BrowsingContext() override;
@@ -58,12 +58,8 @@ public:
 
     GC::Ptr<BrowsingContext> top_level_browsing_context() const;
 
-    BrowsingContextGroup* group();
-    BrowsingContextGroup const* group() const;
-    void set_group(BrowsingContextGroup*);
-
-    // https://html.spec.whatwg.org/multipage/browsers.html#bcg-remove
-    void remove();
+    Optional<u64> browsing_context_group_id() const { return m_browsing_context_group_id; }
+    void set_browsing_context_group_id(Optional<u64> id) { m_browsing_context_group_id = id; }
 
     // https://html.spec.whatwg.org/multipage/origin.html#one-permitted-sandboxed-navigator
     BrowsingContext const* the_one_permitted_sandboxed_navigator() const;
@@ -115,7 +111,7 @@ private:
     bool m_is_auxiliary { false };
 
     // https://html.spec.whatwg.org/multipage/browsers.html#tlbc-group
-    GC::Ptr<BrowsingContextGroup> m_group;
+    Optional<u64> m_browsing_context_group_id;
 };
 
 SandboxingFlagSet determine_the_creation_sandboxing_flags(BrowsingContext const&, GC::Ptr<DOM::Element> embedder);

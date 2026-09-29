@@ -58,6 +58,8 @@ public:
     Utf16String const& window_handle() const { return m_window_handle; }
     void set_window_handle(Utf16String window_handle) { m_window_handle = move(window_handle); }
 
+    virtual Optional<u64> browsing_context_group_id() const override;
+
 private:
     LocalTraversableNavigable(GC::Ref<Page>);
 
@@ -74,13 +76,6 @@ private:
 
     Utf16String m_window_handle;
 };
-
-struct BrowsingContextAndDocument {
-    GC::Ref<HTML::BrowsingContext> browsing_context;
-    GC::Ref<DOM::Document> document;
-};
-
-BrowsingContextAndDocument create_a_new_top_level_browsing_context_and_document(GC::Ref<Page> page, GC::Ptr<WindowProxy> existing_window_proxy = {});
 
 template<>
 inline bool LocalNavigable::fast_is<LocalTraversableNavigable>() const { return is_traversable(); }

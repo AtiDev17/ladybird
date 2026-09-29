@@ -26,6 +26,7 @@
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicyEnforcementResult.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
+#include <LibWebCommon/HTML/PopulatedDocumentOrigin.h>
 #include <LibWebCommon/HTML/PreparedNavigationDescriptor.h>
 #include <LibWebCommon/HTML/ReplicatedNavigableState.h>
 #include <LibWebCommon/HTML/SameDocumentNavigationEntry.h>
@@ -85,6 +86,9 @@ public:
     // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-document
     CanonicalDocument& active_document() const;
 
+    // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-target-name
+    Utf16String const& target_name() const;
+
     // The document state of the session history entry the navigable is navigating or traversing to, and the document
     // populated for it, which becomes the document state's document when the entry is activated. A document populated
     // for a navigation goes with the navigation until a history job claims it to activate it; one a history job
@@ -93,10 +97,11 @@ public:
     RefPtr<CanonicalDocumentState> populating_document_state() const;
     RefPtr<CanonicalDocument> pending_document() const;
     RefPtr<CanonicalDocument> document_populated_for(CanonicalDocumentState const&) const;
-    void populate_document(NonnullRefPtr<CanonicalDocumentState>, NonnullRefPtr<CanonicalDocument>);
-    void populate_document_for_ongoing_navigation(NonnullRefPtr<CanonicalDocumentState>, NonnullRefPtr<CanonicalDocument>);
-    void claim_document_populated_for_ongoing_navigation(CanonicalDocumentState const&);
-    void abandon_document_populated_for(CanonicalDocumentState const&);
+    void populate_document(NonnullRefPtr<CanonicalDocumentState>, NonnullRefPtr<CanonicalDocument>, Optional<URL::Origin> inline_content_origin = {});
+    void populate_document_for_ongoing_navigation(NonnullRefPtr<CanonicalDocumentState>, NonnullRefPtr<CanonicalDocument>, Optional<URL::Origin> inline_content_origin = {});
+    void did_create_populated_document_with_an_origin_of_its_own(WebContentPage const& host, Web::HTML::PopulatedDocumentOrigin, Web::HTML::EnvironmentId const& environment_id);
+    void claim_document_populated_for_ongoing_navigation(CanonicalDocument const&);
+    void abandon_populated_document(CanonicalDocument const&);
     void place_pending_document(WebContentPage&);
 
     template<typename Callback>
@@ -117,7 +122,7 @@ public:
     bool has_navigation_waiting_for_traversal() const { return m_navigation_waiting_for_traversal.has_value(); }
     void begin_navigation_waiting_for_traversal();
 
-    CanonicalBrowsingContext::BrowsingContextAndDocument obtain_a_browsing_context_to_use_for_a_navigation_response(Web::HTML::OpenerPolicyEnforcementResult const&);
+    CanonicalBrowsingContext::BrowsingContextAndDocument obtain_a_browsing_context_to_use_for_a_navigation_response(NavigationLoader::ResponseDocument const&);
     NonnullRefPtr<CanonicalDocument> create_and_initialize_a_document(NavigationLoader::ResponseDocument const&);
 
     CanonicalNavigable& append_child(NonnullOwnPtr<CanonicalNavigable>);

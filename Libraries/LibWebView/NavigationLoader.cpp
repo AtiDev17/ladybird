@@ -6,8 +6,12 @@
 
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
+#include <LibWebCommon/HTML/BrowsingContext.h>
 #include <LibWebCommon/HTML/NavigationParamsDescriptor.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/CanonicalBrowsingContextGroup.h>
+#include <LibWebView/CanonicalEnvironmentSettingsObject.h>
+#include <LibWebView/CanonicalWindow.h>
 #include <LibWebView/NavigationLoader.h>
 
 namespace WebView {
@@ -32,16 +36,18 @@ Optional<NavigationLoader::ResponseDocument> NavigationLoader::response_document
     //    1. Set entry's document state's document to the result of creating a document for inline content that
     //       doesn't have a DOM, given navigable, null, navTimingType, and userInvolvement. The inline content
     //       should indicate to the user the sort of error that occurred.
-    // NB: That document is created with a new opaque origin, a new opener policy enforcement result, and
-    //     about:error as its URL.
+    // NB: That document is created with the new opaque origin the result carries to the process creating it, a new
+    //     opener policy enforcement result, and about:error as its URL.
     if (navigation_params.has<Web::HTML::NavigationParamsNullOrError>()) {
-        auto origin = URL::Origin::create_opaque();
+        auto origin = *result().inline_content_origin;
         return ResponseDocument {
             .is_inline_content = true,
             .coop_enforcement_result = { .url = URL::about_error(), .origin = origin, .opener_policy = {} },
             .response_url = URL::about_error(),
             .request_current_url = {},
             .origin = origin,
+            .opener_policy = {},
+            .environment_id = {},
         };
     }
 
@@ -66,6 +72,8 @@ Optional<NavigationLoader::ResponseDocument> NavigationLoader::response_document
             ? Optional<URL::URL> { fetched_navigation_params.request->url_list.last() }
             : Optional<URL::URL> {},
         .origin = fetched_navigation_params.origin,
+        .opener_policy = fetched_navigation_params.opener_policy,
+        .environment_id = {},
     };
 }
 
@@ -90,6 +98,46 @@ void NavigationLoader::did_finish_navigation_params_creation(Web::HTML::Navigati
 
     Web::HTML::apply_navigation_population_result(m_request, result);
     m_result = move(result);
+    m_result->inline_content_origin = URL::Origin::create_opaque();
+    determine_the_origin_of_the_response();
+}
+
+// NB: The process that created the navigation params determined responseOrigin for its own checks. The UI process
+//     runs the step again with what it holds, and the process creating the document takes the origin from here.
+void NavigationLoader::determine_the_origin_of_the_response()
+{
+    auto* navigation_params = m_result->navigation_params.get_pointer<Web::HTML::NavigationParamsDescriptor>();
+    if (!navigation_params)
+        return;
+
+    auto const& entry = m_request.history_entry;
+    auto const& target_snapshot_params = m_request.target_snapshot_params;
+    auto response_url = navigation_params->response.url_list.is_empty() ? entry.url : navigation_params->response.url_list.last();
+
+    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#create-navigation-params-from-a-srcdoc-resource
+    if (Web::HTML::url_matches_about_srcdoc(response_url)) {
+        // 3. Let responseOrigin be the result of determining the origin given response's URL, targetSnapshotParams's
+        //    sandboxing flags, and entry's document state's origin.
+        // AD-HOC: Determining the origin asserts that sourceOrigin is non-null for about:srcdoc, which the process that
+        //         gave entry need not uphold. Such a document gets a new opaque origin.
+        if (!entry.document_state.origin.has_value()) {
+            navigation_params->origin = URL::Origin::create_opaque();
+            return;
+        }
+        navigation_params->origin = Web::HTML::determine_the_origin(response_url, target_snapshot_params.sandboxing_flags, entry.document_state.origin);
+        return;
+    }
+
+    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#create-navigation-params-by-fetching
+    // 10. Set finalSandboxFlags to the union of targetSnapshotParams's sandboxing flags and responsePolicyContainer's CSP
+    //     list's CSP-derived sandboxing flags.
+    // NB: The process that fetched the response created responsePolicyContainer, and its finalSandboxFlags hold the
+    //     CSP-derived sandboxing flags. Sandboxing flags only ever make an origin opaque, so the UI process takes them.
+    navigation_params->final_sandboxing_flag_set |= target_snapshot_params.sandboxing_flags;
+
+    // 11. Set responseOrigin to the result of determining the origin given response's URL, finalSandboxFlags, and
+    //     entry's document state's initiator origin.
+    navigation_params->origin = Web::HTML::determine_the_origin(response_url, navigation_params->final_sandboxing_flag_set, entry.document_state.initiator_origin);
 }
 
 void NavigationLoader::acquire_response_body(Function<void(bool)> completion_steps)
@@ -161,6 +209,27 @@ Web::HTML::NavigationPopulationResult const& NavigationLoader::result() const
 {
     VERIFY(m_result.has_value());
     return *m_result;
+}
+
+// The window of the document the navigation params create takes over their reserved environment's id, which the UI
+// process generates, and is in the agent cluster of the agent the UI process obtained for it. A navigation without a
+// reserved environment gets one with the id.
+void NavigationLoader::set_window(CanonicalWindow const& window)
+{
+    VERIFY(m_result.has_value());
+    auto* navigation_params = m_result->navigation_params.get_pointer<Web::HTML::NavigationParamsDescriptor>();
+    if (!navigation_params)
+        return;
+    if (!navigation_params->reserved_environment.has_value()) {
+        navigation_params->reserved_environment = Web::HTML::NavigationEnvironmentDescriptor {
+            .id = {},
+            .creation_url = m_request.history_entry.url,
+            .top_level_creation_url = {},
+            .top_level_origin = {},
+        };
+    }
+    navigation_params->reserved_environment->id = window.relevant_settings_object().id();
+    navigation_params->agent_cluster_id = window.agent().agent_cluster_id();
 }
 
 void NavigationLoader::discard(IsPrivate is_private, Web::HTML::NavigationPopulationResult& result)

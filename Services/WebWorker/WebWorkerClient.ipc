@@ -15,8 +15,8 @@ endpoint WebWorkerClient {
     match_system_font_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) => (Gfx::BrokeredFont font)
     resolve_generic_font(String family, u16 weight, u8 slope) => (Optional<String> resolved_family)
 
-    did_add_blob_url_entry(Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) => (URL::BlobURLEntry::Token token)
-    did_remove_blob_url_entries(Vector<Utf16String> urls, URL::Origin origin) => ()
+    did_add_blob_url_entry(Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) => (URL::BlobURLEntry::Token token)
+    did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) => ()
     did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) => (Optional<Web::FileAPI::SerializedBlobURLEntry> entry)
 
     did_close_worker() =|
@@ -27,7 +27,7 @@ endpoint WebWorkerClient {
     did_request_file(ByteString path, i32 request_id) =|
     did_is_known_hsts_host(String domain) => (bool result)
     request_media_server_connection() => (Optional<IPC::TransportHandle> handle)
-    did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage message) =|
+    did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message) =|
     start_worker_agent(Web::HTML::WorkerAgentStartRequest request) => (Web::HTML::WorkerAgentId agent_id)
     close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) =|
 }

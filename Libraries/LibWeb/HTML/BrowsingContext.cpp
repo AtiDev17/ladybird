@@ -13,7 +13,6 @@
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
 #include <LibWeb/HTML/HTMLDocument.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
@@ -40,8 +39,7 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_auxili
     // 1. Let openerTopLevelBrowsingContext be opener's top-level traversable's active browsing context.
     // 2. Let group be openerTopLevelBrowsingContext's group.
     // 3. Assert: group is non-null, as navigating invokes this directly.
-    // NB: The group is the tab's as opener's page knows it, whether or not the top-level browsing context is here.
-    auto& group = opener->page().browsing_context_group();
+    // NB: The UI process holds the group.
 
     // 4. Set browsingContext and document be the result of creating a new browsing context and document with opener's active document, null, and group.
     auto [browsing_context, document] = create_a_new_browsing_context_and_document(page, opener->active_document(), nullptr);
@@ -50,7 +48,7 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_auxili
     browsing_context->m_is_auxiliary = true;
 
     // 6. Append browsingContext to group.
-    group.append(browsing_context);
+    // NB: The UI process appends its browsing context to the group.
 
     // 7. Set browsingContext's opener browsing context to opener.
     browsing_context->set_opener_browsing_context(opener);
@@ -74,7 +72,7 @@ static void populate_with_html_head_body(GC::Ref<DOM::Document> document)
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-browsing-context
-BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsing_context_and_document(GC::Ref<Page> page, GC::Ptr<DOM::Document> creator, GC::Ptr<DOM::Element> embedder, GC::Ptr<WindowProxy> existing_window_proxy)
+BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsing_context_and_document(GC::Ref<Page> page, GC::Ptr<DOM::Document> creator, GC::Ptr<DOM::Element> embedder, GC::Ptr<WindowProxy> existing_window_proxy, Optional<URL::Origin> determined_origin)
 {
     // 1. Let browsingContext be a new browsing context.
     GC::Ref<BrowsingContext> browsing_context = *GC::Heap::the().allocate<BrowsingContext>(page);
@@ -104,11 +102,17 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
     auto sandbox_flags = determine_the_creation_sandboxing_flags(*browsing_context, embedder);
 
     // 7. Let origin be the result of determining the origin given about:blank, sandboxFlags, and creatorOrigin.
-    auto origin = determine_the_origin(URL::about_blank(), sandbox_flags, creator_origin);
+    // NB: The UI process determined the origin of a document it held first.
+    auto origin = determined_origin.has_value() ? determined_origin.release_value() : determine_the_origin(URL::about_blank(), sandbox_flags, creator_origin);
 
     // FIXME: 8. Let permissionsPolicy be the result of creating a permissions policy given embedder and origin. [PERMISSIONSPOLICY]
 
-    // FIXME: 9. Let agent be the result of obtaining a similar-origin window agent given origin, group, and false.
+    // 9. Let agent be the result of obtaining a similar-origin window agent given origin, group, and false.
+    // NB: The UI process obtains the agent. For creator's origin, that is creator's agent. Any other origin is a new
+    //     opaque one, whose agent cluster nothing else can reach.
+    Optional<u64> agent_cluster_id;
+    if (creator && origin.is_same_origin(*creator_origin))
+        agent_cluster_id = creator->relevant_settings_object().agent_cluster_id();
 
     GC::Ptr<Window> window;
 
@@ -136,7 +140,7 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
     auto top_level_creation_url = !embedder ? URL::about_blank() : relevant_settings_object(*embedder).top_level_creation_url.value();
 
     // 12. Let topLevelOrigin be origin if embedder is null; otherwise embedder's relevant settings object's top-level origin.
-    auto top_level_origin = !embedder ? origin : relevant_settings_object(*embedder).origin();
+    auto top_level_origin = !embedder ? origin : relevant_settings_object(*embedder).top_level_origin.value();
 
     // 13. Set up a window environment settings object with about:blank, realm execution context, null, topLevelCreationURL, and topLevelOrigin.
     WindowEnvironmentSettingsObject::setup(
@@ -145,7 +149,8 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
         move(realm_execution_context),
         {},
         top_level_creation_url,
-        top_level_origin);
+        top_level_origin,
+        agent_cluster_id);
 
     // 14. Let loadTimingInfo be a new document load timing info with its navigation start time set to the result of calling
     //     coarsen time with unsafeContextCreationTime and the new environment settings object's cross-origin isolated capability.
@@ -273,7 +278,6 @@ void BrowsingContext::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_page);
     visitor.visit(m_window_proxy);
     visitor.visit(m_active_document);
-    visitor.visit(m_group);
     visitor.visit(m_opener_browsing_context_window_proxy);
 }
 
@@ -380,40 +384,6 @@ void BrowsingContext::set_active_window(GC::Ref<HTML::Window> window)
 void BrowsingContext::set_window_proxy(GC::Ptr<WindowProxy> window_proxy)
 {
     m_window_proxy = move(window_proxy);
-}
-
-BrowsingContextGroup* BrowsingContext::group()
-{
-    return m_group.ptr();
-}
-
-BrowsingContextGroup const* BrowsingContext::group() const
-{
-    return m_group.ptr();
-}
-
-void BrowsingContext::set_group(BrowsingContextGroup* group)
-{
-    m_group = group;
-}
-
-// https://html.spec.whatwg.org/multipage/browsers.html#bcg-remove
-void BrowsingContext::remove()
-{
-    // 1. Assert: browsingContext's group is non-null, because a browsing context only gets discarded once.
-    VERIFY(group());
-
-    // 2. Let group be browsingContext's group.
-    GC::Ref<BrowsingContextGroup> group = *this->group();
-
-    // 3. Set browsingContext's group to null.
-    set_group(nullptr);
-
-    // 4. Remove browsingContext from group's browsing context set.
-    group->browsing_context_set().remove(*this);
-
-    // 5. If group's browsing context set is empty, then remove group from the user agent's browsing context group set.
-    // NOTE: This is done by ~BrowsingContextGroup() when the refcount reaches 0.
 }
 
 // https://html.spec.whatwg.org/multipage/origin.html#one-permitted-sandboxed-navigator

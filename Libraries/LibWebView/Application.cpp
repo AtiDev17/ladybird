@@ -334,7 +334,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     bool force_fontconfig = false;
     bool collect_garbage_on_every_allocation = false;
     bool disable_scrollbar_painting = false;
-    bool disable_async_scrolling = false;
     bool file_scheme_urls_have_tuple_origins = false;
 
     Core::ArgsParser args_parser;
@@ -439,7 +438,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
     args_parser.add_option(collect_garbage_on_every_allocation, "Collect garbage after every JS heap allocation", "collect-garbage-on-every-allocation", 'g');
     args_parser.add_option(disable_scrollbar_painting, "Don't paint horizontal or vertical scrollbars on the main viewport", "disable-scrollbar-painting");
-    args_parser.add_option(disable_async_scrolling, "Disable async scrolling", "disable-async-scrolling");
     args_parser.add_option(dns_server_address, "Set the DNS server address", "dns-server", 0, "host|address");
     args_parser.add_option(dns_server_port, "Set the DNS server port", "dns-port", 0, "port (default: 53 or 853 if --dot)");
     args_parser.add_option(use_dns_over_tls, "Use DNS over TLS", "dot");
@@ -657,7 +655,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .enable_autoplay = enable_autoplay ? EnableAutoplay::Yes : EnableAutoplay::No,
         .collect_garbage_on_every_allocation = collect_garbage_on_every_allocation ? CollectGarbageOnEveryAllocation::Yes : CollectGarbageOnEveryAllocation::No,
         .paint_viewport_scrollbars = disable_scrollbar_painting ? PaintViewportScrollbars::No : PaintViewportScrollbars::Yes,
-        .enable_async_scrolling = disable_async_scrolling ? EnableAsyncScrolling::No : EnableAsyncScrolling::Yes,
         .file_scheme_urls_have_tuple_origins = file_scheme_urls_have_tuple_origins ? FileSchemeUrlsHaveTupleOrigins::Yes : FileSchemeUrlsHaveTupleOrigins::No,
         .default_time_zone = default_time_zone,
     };
@@ -1043,9 +1040,15 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
 
     // A view's first process creates its traversable from this entry. A process hosting a navigable of an existing tab
     // stands in for the canonical current entry.
-    auto initial_history_entry = canonical_initial_history_entry.has_value()
-        ? canonical_initial_history_entry.release_value()
-        : Web::HTML::create_initial_session_history_entry_descriptor(*initial_document_state_id, {}, {});
+    auto initial_history_entry = [&] {
+        if (canonical_initial_history_entry.has_value())
+            return canonical_initial_history_entry.release_value();
+        // The UI process determines the origin of the traversable's first document, which has no creator, before the
+        // process creates it.
+        auto entry = Web::HTML::create_initial_session_history_entry_descriptor(*initial_document_state_id, {}, {});
+        entry.document_state.origin = URL::Origin::create_opaque();
+        return entry;
+    }();
     client->async_initialize(initial_page_id, move(remote_navigables), root_navigable_id, cross_process_id_allocator, initial_history_entry, system_visibility_state);
 
     if (!navigable_to_adopt.has_value())

@@ -10,7 +10,6 @@
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
@@ -37,7 +36,7 @@ void WindowEnvironmentSettingsObject::visit_edges(JS::Cell::Visitor& visitor)
 }
 
 // https://html.spec.whatwg.org/multipage/window-object.html#set-up-a-window-environment-settings-object
-void WindowEnvironmentSettingsObject::setup(Page& page, URL::URL const& creation_url, NonnullOwnPtr<JS::ExecutionContext> execution_context, GC::Ptr<Environment> reserved_environment, URL::URL top_level_creation_url, URL::Origin top_level_origin)
+void WindowEnvironmentSettingsObject::setup(Page& page, URL::URL const& creation_url, NonnullOwnPtr<JS::ExecutionContext> execution_context, GC::Ptr<Environment> reserved_environment, URL::URL top_level_creation_url, URL::Origin top_level_origin, Optional<u64> agent_cluster_id)
 {
     // 1. Let realm be the value of execution context's Realm component.
     auto realm = execution_context->realm;
@@ -50,6 +49,7 @@ void WindowEnvironmentSettingsObject::setup(Page& page, URL::URL const& creation
     // 3. Let settings object be a new environment settings object whose algorithms are defined as follows:
     // NOTE: See the functions defined for this class.
     auto settings_object = realm->create<WindowEnvironmentSettingsObject>(*window, move(execution_context));
+    settings_object->m_agent_cluster_id = agent_cluster_id;
 
     // 4. If reservedEnvironment is non-null, then:
     if (reserved_environment) {
@@ -60,17 +60,15 @@ void WindowEnvironmentSettingsObject::setup(Page& page, URL::URL const& creation
         settings_object->target_browsing_context = reserved_environment->target_browsing_context;
 
         // 2. Set reservedEnvironment's id to the empty string.
-        reserved_environment->id = Utf16String {};
+        reserved_environment->id = {};
     }
 
-    // 5. Otherwise, ...
+    // 5. Otherwise, set settings object's id to a new unique opaque string, settings object's target browsing context to
+    //    null, and settings object's active service worker to null.
     else {
-        // FIXME: ...set settings object's id to a new unique opaque string,
-        //        settings object's target browsing context to null,
-        //        and settings object's active service worker to null.
-        static i64 next_id = 1;
-        settings_object->id = Utf16String::number(next_id++);
+        settings_object->id = EnvironmentId::generate();
         settings_object->target_browsing_context = nullptr;
+        // FIXME: Set settings object's active service worker to null.
     }
 
     // 6. Set settings object's creation URL to creationURL,
@@ -163,16 +161,6 @@ CanUseCrossOriginIsolatedAPIs WindowEnvironmentSettingsObject::cross_origin_isol
     if (document && document->opener_policy().value == OpenerPolicyValue::SameOriginPlusCOEP)
         return CanUseCrossOriginIsolatedAPIs::Yes;
     return CanUseCrossOriginIsolatedAPIs::No;
-}
-
-Optional<u64> WindowEnvironmentSettingsObject::agent_cluster_id() const
-{
-    // The document names its cluster through its browsing context's group. A window whose document has no browsing
-    // context anymore is in no cluster anything can reach.
-    auto document = m_window ? m_window->associated_document_if_any() : nullptr;
-    if (!document || !document->browsing_context() || !document->browsing_context()->group())
-        return {};
-    return document->browsing_context()->group()->agent_cluster_id(document->origin(), cross_origin_isolated_capability());
 }
 
 }

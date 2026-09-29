@@ -70,8 +70,10 @@
 #include <LibWebCommon/HTML/HistoryHandlingBehavior.h>
 #include <LibWebCommon/HTML/HistoryOperation.h>
 #include <LibWebCommon/HTML/POSTResource.h>
+#include <LibWebCommon/HTML/PopulatedDocumentOrigin.h>
 #include <LibWebCommon/HTML/PostedMessageDescriptor.h>
 #include <LibWebCommon/HTML/ReplicatedNavigableState.h>
+#include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
 #include <LibWebCommon/HTML/SelectItem.h>
 #include <LibWebCommon/HTML/UserActivationConsumption.h>
 #include <LibWebCommon/HTML/VisibilityState.h>
@@ -142,6 +144,7 @@ public:
     void content_navigable_completely_finished_loading(HTML::CrossProcessId);
 
     GC::Ref<HTML::LocalNavigable> begin_hosting(HTML::CrossProcessId, HTML::SessionHistoryEntryDescriptor const& current_history_entry);
+    void set_browsing_context_group(u64 browsing_context_group_id);
     void adopt_hosted(HTML::LocalNavigable&);
     void discard_provisional_navigable(HTML::CrossProcessId);
     void stop_hosting(HTML::CrossProcessId, HTML::ReplicatedNavigableState);
@@ -157,12 +160,6 @@ public:
     GC::Ptr<HTML::LocalNavigable> fullscreen_element_and_its_containers(GC::Ref<DOM::Element>, Fullscreen::RequestType, ElementIsRequestedElement);
 
     void discard();
-
-    // https://html.spec.whatwg.org/multipage/document-sequences.html#browsing-context-group
-    // The group of the tab's top-level browsing context, as this process knows it: the top-level browsing contexts
-    // it holds of this tab and of the tabs the tab opened, or none of them when other processes hold them all.
-    HTML::BrowsingContextGroup& browsing_context_group();
-    void set_browsing_context_group(Badge<HTML::BrowsingContextGroup>, GC::Ref<HTML::BrowsingContextGroup>);
 
     HTML::HistoryExecutor& history_executor();
 
@@ -231,8 +228,6 @@ public:
     bool enable_primary_paste() const { return m_enable_primary_paste; }
     void set_enable_primary_paste(bool b) { m_enable_primary_paste = b; }
 
-    bool async_scrolling_enabled() const { return m_async_scrolling_enabled; }
-    void set_async_scrolling_enabled(bool b) { m_async_scrolling_enabled = b; }
     u64 wheel_event_listener_state_generation() const { return m_wheel_event_listener_state_generation; }
     void invalidate_compositor_wheel_event_listener_state();
     void invalidate_compositor_keyboard_scroll_state();
@@ -451,7 +446,6 @@ private:
     Vector<GC::Ref<HTML::Navigable>> m_navigables_being_destroyed;
 
     HTML::VisibilityState m_system_visibility_state { HTML::VisibilityState::Hidden };
-    GC::Ptr<HTML::BrowsingContextGroup> m_browsing_context_group;
 
     GC::Ref<HTML::HistoryExecutor> m_history_executor;
 
@@ -464,7 +458,6 @@ private:
     bool m_should_block_pop_ups { true };
     bool m_enable_autoscroll { true };
     bool m_enable_primary_paste { true };
-    bool m_async_scrolling_enabled { false };
     u64 m_wheel_event_listener_state_generation { 0 };
     u64 m_keyboard_scroll_state_generation { 0 };
     bool m_keyboard_scroll_state_is_current { false };
@@ -596,7 +589,8 @@ public:
     virtual void navigation_params_creation_finished(HTML::LocalNavigable&, HTML::NavigationPopulationRequest, HTML::NavigationPopulationResult);
     virtual void history_navigation_params_creation_finished(HTML::CrossProcessId operation_id, HTML::HistoryNavigationPopulation);
     virtual void navigation_population_failed(HTML::CrossProcessId, Utf16String const&) { }
-    virtual void page_did_create_child_frame(HTML::CrossProcessId, HTML::CrossProcessId, HTML::HostedNavigableState const&, HTML::PendingSessionHistoryEntryDescriptor const&) { }
+    virtual void page_did_create_populated_document_with_an_origin_of_its_own(HTML::CrossProcessId, HTML::PopulatedDocumentOrigin, HTML::EnvironmentId const&) { }
+    virtual void page_did_create_child_frame(HTML::CrossProcessId, HTML::CrossProcessId, HTML::HostedNavigableState const&, HTML::PendingSessionHistoryEntryDescriptor const&, URL::Origin const&, HTML::EnvironmentId const&) { }
     virtual void page_did_change_hosted_navigable_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::HostedNavigableState const& state) { }
     virtual void page_did_set_opener_browsing_context([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Optional<HTML::CrossProcessId> opener_navigable_id) { }
     virtual void page_did_completely_finish_loading([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
@@ -605,6 +599,7 @@ public:
     virtual void page_did_destroy_child_frame(HTML::CrossProcessId) { }
     virtual String dump_site_isolation_process_tree_for_testing() { return {}; }
     virtual void crash_remote_frame_processes_for_testing() { }
+    virtual void page_did_spoof_document_origin_for_testing(HTML::EnvironmentSettingsObject const&, URL::Origin const&) { }
     virtual void send_bad_ipc_message_for_testing([[maybe_unused]] StringView kind, [[maybe_unused]] URL::URL const& active_document_url) { }
     virtual Gfx::Palette palette() const = 0;
     virtual DevicePixelRect screen_rect() const = 0;
@@ -699,7 +694,7 @@ public:
     virtual void page_did_request_dismiss_dialog() { }
     virtual Optional<Core::SharedVersion> page_did_request_document_cookie_version([[maybe_unused]] Core::SharedVersionIndex document_index) { return {}; }
     virtual void page_did_receive_document_cookie_version_buffer([[maybe_unused]] Core::AnonymousBuffer document_cookie_version_buffer) { }
-    virtual void page_did_request_document_cookie_version_index([[maybe_unused]] UniqueNodeID document_id, [[maybe_unused]] String const& domain) { }
+    virtual void page_did_request_document_cookie_version_index(HTML::EnvironmentSettingsObject const&, [[maybe_unused]] UniqueNodeID document_id, [[maybe_unused]] String const& domain) { }
     virtual void page_did_receive_document_cookie_version_index([[maybe_unused]] UniqueNodeID document_id, [[maybe_unused]] Core::SharedVersionIndex document_index) { }
     virtual Vector<HTTP::Cookie::Cookie> page_did_request_all_cookies_webdriver(URL::URL const&) { return {}; }
     virtual Vector<HTTP::Cookie::Cookie> page_did_request_all_cookies_cookiestore(URL::URL const&) { return {}; }
@@ -713,16 +708,16 @@ public:
     virtual void page_did_simulate_worker_request_server_connection_loss() { }
     virtual void page_did_store_hsts_policy_for_testing(String const&, HTTP::HSTS::ParsedHSTSPolicy const&) { }
     virtual bool page_did_is_known_hsts_host(String const&) { return false; }
-    virtual Optional<Utf16String> page_did_request_storage_item([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] String const& storage_key, [[maybe_unused]] Utf16String const& bottle_key) { return {}; }
-    virtual WebView::StorageSetResult page_did_set_storage_item([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] String const& storage_key, [[maybe_unused]] Utf16String const& bottle_key, [[maybe_unused]] Utf16String const& value) { return WebView::StorageOperationError::QuotaExceededError; }
-    virtual void page_did_remove_storage_item([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] String const& storage_key, [[maybe_unused]] Utf16String const& bottle_key) { }
-    virtual Vector<Utf16String> page_did_request_storage_keys([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] String const& storage_key) { return {}; }
-    virtual u64 page_did_request_storage_usage([[maybe_unused]] String const& storage_key) { return {}; }
-    virtual void page_did_clear_storage([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] String const& storage_key) { }
+    virtual Optional<Utf16String> page_did_request_storage_item([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] Web::HTML::EnvironmentId const& environment_id, [[maybe_unused]] Utf16String const& bottle_key) { return {}; }
+    virtual WebView::StorageSetResult page_did_set_storage_item([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] Web::HTML::EnvironmentId const& environment_id, [[maybe_unused]] Utf16String const& bottle_key, [[maybe_unused]] Utf16String const& value) { return WebView::StorageOperationError::QuotaExceededError; }
+    virtual void page_did_remove_storage_item([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] Web::HTML::EnvironmentId const& environment_id, [[maybe_unused]] Utf16String const& bottle_key) { }
+    virtual Vector<Utf16String> page_did_request_storage_keys([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] Web::HTML::EnvironmentId const& environment_id) { return {}; }
+    virtual u64 page_did_request_storage_usage([[maybe_unused]] Web::HTML::EnvironmentId const& environment_id) { return {}; }
+    virtual void page_did_clear_storage([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] Web::HTML::EnvironmentId const& environment_id) { }
     virtual void page_did_broadcast_storage_change([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] String const& url, [[maybe_unused]] Optional<Utf16String> const& key, [[maybe_unused]] Optional<Utf16String> const& old_value, [[maybe_unused]] Optional<Utf16String> const& new_value) { }
 
-    virtual URL::BlobURLEntry::Token page_did_add_blob_url_entry([[maybe_unused]] Utf16String const& url, [[maybe_unused]] FileAPI::SerializedBlobURLEntry const& entry) { return 0; }
-    virtual void page_did_remove_blob_url_entries([[maybe_unused]] Vector<Utf16String> const& urls, [[maybe_unused]] URL::Origin const& origin) { }
+    virtual URL::BlobURLEntry::Token page_did_add_blob_url_entry(HTML::EnvironmentSettingsObject const&, [[maybe_unused]] Utf16String const& url, [[maybe_unused]] FileAPI::SerializedBlobURLEntry const& entry) { return 0; }
+    virtual void page_did_remove_blob_url_entries(HTML::EnvironmentSettingsObject const&, [[maybe_unused]] Vector<Utf16String> const& urls) { }
     virtual void page_did_retain_blob_url_token([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] URL::BlobURLEntry::Token token) { }
     virtual Optional<FileAPI::SerializedBlobURLEntry> page_did_request_blob_url_entry([[maybe_unused]] Utf16String const& url, [[maybe_unused]] Optional<URL::BlobURLEntry::Token> token) { return {}; }
     virtual void page_did_update_indexed_database([[maybe_unused]] String const& url, [[maybe_unused]] IndexedDB::TransactionChanges const&) { }
@@ -731,6 +726,8 @@ public:
         GC::Ptr<Page> page;
         String window_handle;
         Optional<HTML::SessionHistoryEntryDescriptor> initial_history_entry;
+        Optional<Web::HTML::EnvironmentId> initial_environment_id;
+        Optional<u64> browsing_context_group_id;
     };
     virtual NewWebViewResult page_did_request_new_web_view(HTML::ActivateTab, HTML::WebViewHints, [[maybe_unused]] Optional<HTML::CrossProcessId> opener_navigable_id, [[maybe_unused]] Optional<URL::URL> opener_base_url, [[maybe_unused]] Utf16String const& target_name, [[maybe_unused]] HTML::SandboxingFlagSet popup_sandboxing_flag_set) { return {}; }
     virtual void page_did_request_activate_tab() { }
@@ -797,7 +794,7 @@ public:
     virtual void page_did_finish_network_request([[maybe_unused]] u64 request_id, [[maybe_unused]] u64 body_size, [[maybe_unused]] Requests::RequestTimingInfo const& timing_info, [[maybe_unused]] Optional<Requests::NetworkError> const& network_error) { }
     virtual void page_did_report_worker_exception([[maybe_unused]] Utf16String const& message, [[maybe_unused]] Utf16String const& filename, [[maybe_unused]] u32 lineno, [[maybe_unused]] u32 colno) { }
     virtual void page_did_register_javascript_source([[maybe_unused]] DOM::Document&, [[maybe_unused]] HTML::ScriptRegistry::Description const&) { }
-    virtual void page_did_post_broadcast_channel_message([[maybe_unused]] HTML::BroadcastChannelMessage const& message) { }
+    virtual void page_did_post_broadcast_channel_message([[maybe_unused]] HTML::PostedBroadcastChannelMessage const& message) { }
 
     virtual HTML::WorkerAgentId start_worker_agent([[maybe_unused]] HTML::WorkerAgentStartRequest&& request) { return {}; }
     virtual void close_worker_agent([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] HTML::WorkerAgentOwnerToken owner_token) { }

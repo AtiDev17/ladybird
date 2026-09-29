@@ -17,6 +17,7 @@
 #include <AK/QuickSort.h>
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
+#include <LibCore/EventLoop.h>
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
 #include <LibDevTools/IndexedDBSerialization.h>
@@ -2947,6 +2948,12 @@ void ConnectionFromClient::set_system_visibility_state(Compositing::PageId page_
 {
     if (auto page = this->page(page_id); page.has_value())
         page->page().set_system_visibility_state(system_visibility_state);
+}
+
+void ConnectionFromClient::set_browsing_context_group(Compositing::PageId page_id, u64 browsing_context_group_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().set_browsing_context_group(browsing_context_group_id);
 }
 
 void ConnectionFromClient::update_visibility_state(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::VisibilityState visibility_state)

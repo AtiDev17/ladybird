@@ -63,6 +63,7 @@ namespace Web::HTML {
 enum class AllowMultipleFiles;
 struct BroadcastChannelMessage;
 struct EmbedderPolicy;
+class EnvironmentId;
 struct HistoryNavigationPopulation;
 enum class HistoryStepResult;
 struct NavigationPopulationRequest;
@@ -71,6 +72,7 @@ struct NavigationStartRequest;
 struct OpenerPolicy;
 struct OpenerPolicyEnforcementResult;
 struct POSTResource;
+struct PostedBroadcastChannelMessage;
 struct PostedMessageDescriptor;
 struct PreparedNavigationDescriptor;
 struct ReplicatedContainerState;

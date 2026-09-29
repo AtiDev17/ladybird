@@ -100,7 +100,7 @@ ViewImplementation::~ViewImplementation()
 
     if (m_top_level_traversable) {
         m_top_level_traversable->discard_pending_host();
-        m_top_level_traversable->discard_opener_pages();
+        m_top_level_traversable->discard_representing_pages();
     }
     if (has_display_page())
         client().unregister_view(page_id());
@@ -683,8 +683,7 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
         // navigable another page hosts scrolls there.
         if (&focused_navigable_host() == &page()
             && (key_event->type == Compositing::KeyEvent::Type::KeyUp
-                || (Application::web_content_options().enable_async_scrolling == EnableAsyncScrolling::Yes
-                    && m_client_state.has_usable_bitmap && !preceding_input_may_change_target))) {
+                || (m_client_state.has_usable_bitmap && !preceding_input_may_change_target))) {
             auto handled = page().handle_key_event_in_compositor(*key_event);
             key_event->async_scroll_performed_default_action = handled && key_event->type == Compositing::KeyEvent::Type::KeyDown;
         }
@@ -2743,7 +2742,7 @@ void ViewImplementation::did_close_browsing_context(Badge<WebContentPage>)
     // with the close cannot be sent to a page that no longer exists.
     all_views().remove(m_view_id);
     traversable().discard_pending_host();
-    traversable().discard_opener_pages();
+    traversable().discard_representing_pages();
     if (has_display_page())
         client().unregister_view(page_id());
 

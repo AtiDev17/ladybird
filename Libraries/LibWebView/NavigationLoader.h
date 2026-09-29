@@ -14,8 +14,10 @@
 #include <LibRequests/Forward.h>
 #include <LibRequests/Request.h>
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
+#include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Export.h>
+#include <LibWebView/Forward.h>
 
 namespace WebView {
 
@@ -39,8 +41,12 @@ public:
         URL::URL response_url;
         Optional<URL::URL> request_current_url;
         URL::Origin origin;
+        Web::HTML::OpenerPolicy opener_policy;
+        // The id of the window environment a process created the document with before the UI process heard of it.
+        Optional<Web::HTML::EnvironmentId> environment_id;
     };
     Optional<ResponseDocument> response_document() const;
+    void set_window(CanonicalWindow const&);
 
     void did_finish_navigation_params_creation(Web::HTML::NavigationPopulationResult);
     void acquire_response_body(Function<void(bool)> completion_steps);
@@ -59,6 +65,7 @@ private:
     {
     }
 
+    void determine_the_origin_of_the_response();
     void did_acquire(bool succeeded);
     void release_response_body();
 

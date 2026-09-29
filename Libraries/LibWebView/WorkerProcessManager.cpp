@@ -9,6 +9,7 @@
 #include <LibCore/File.h>
 #include <LibIPC/File.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CanonicalNavigable.h>
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/ViewImplementation.h>
@@ -24,7 +25,7 @@ WorkerProcessManager& WorkerProcessManager::the()
     return manager;
 }
 
-Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(WebContentClient& owner, Compositing::PageId page_id, Web::HTML::WorkerAgentStartRequest request)
+Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(WebContentClient& owner, Compositing::PageId page_id, Optional<CanonicalEnvironmentSettingsObject const&> outside_settings, Web::HTML::WorkerAgentStartRequest request)
 {
     auto abstract_owner = Owner {
         .client = WebContentOwner {
@@ -33,10 +34,10 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(WebContentClie
         },
         .token = request.owner_token,
     };
-    return start_worker_agent(move(abstract_owner), move(request), owner.is_private());
+    return start_worker_agent(move(abstract_owner), outside_settings, move(request), owner.is_private());
 }
 
-Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(WebWorkerClient& owner, Web::HTML::WorkerAgentStartRequest request)
+Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(WebWorkerClient& owner, Optional<CanonicalEnvironmentSettingsObject const&> outside_settings, Web::HTML::WorkerAgentStartRequest request)
 {
     auto abstract_owner = Owner {
         .client = WebWorkerOwner {
@@ -44,17 +45,38 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(WebWorkerClien
         },
         .token = request.owner_token,
     };
-    return start_worker_agent(move(abstract_owner), move(request), owner.is_private());
+    return start_worker_agent(move(abstract_owner), outside_settings, move(request), owner.is_private());
+}
+
+Optional<CanonicalWorkerEnvironmentSettingsObject const&> WorkerProcessManager::inside_settings(Web::HTML::WorkerAgentId agent_id) const
+{
+    auto agent = m_agents.find(agent_id);
+    if (agent == m_agents.end())
+        return {};
+    return *agent->value.inside_settings;
 }
 
 // https://html.spec.whatwg.org/multipage/workers.html#dom-sharedworker
-Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, Web::HTML::WorkerAgentStartRequest request, IsPrivate is_private)
+Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, Optional<CanonicalEnvironmentSettingsObject const&> outside_settings, Web::HTML::WorkerAgentStartRequest request, IsPrivate is_private)
 {
+    // The owner names outside settings, which must be an environment it holds.
+    // FIXME: The worker takes the rest of the outside settings, such as their top-level origin, policy container and
+    //        cross-origin isolated capability, as the owner's process gave them.
+    if (!outside_settings.has_value()) {
+        notify_worker_script_load_failure(owner);
+        return 0;
+    }
+    request.outside_settings.origin = outside_settings->origin();
+
+    // 9. Let outsideStorageKey be the result of running obtain a storage key for non-storage purposes given
+    //    outsideSettings.
+    auto outside_storage_key = obtain_a_storage_key_for_non_storage_purposes(*outside_settings);
+
     // 11.1. Let workerGlobalScope be null.
     if (request.agent_type == Web::HTML::AgentType::SharedWorker) {
         SharedWorkerKey key {
             .is_private = is_private,
-            .storage_key = request.storage_key,
+            .storage_key = outside_storage_key,
             .url = request.url,
             .name = Utf16String::from_utf8(request.name),
         };
@@ -140,6 +162,15 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, W
     Vector<Owner> owners;
     owners.append(owner);
 
+    // https://html.spec.whatwg.org/multipage/workers.html#set-up-a-worker-environment-settings-object
+    // 3. Let origin be a unique opaque origin if worker global scope's url's scheme is "data"; otherwise outside
+    //    settings's origin.
+    auto origin = request.url.scheme() == "data"sv ? URL::Origin::create_opaque() : outside_settings->origin();
+
+    // 5. Set settings object's id to a new unique opaque string, [...]
+    auto inside_settings = make<CanonicalWorkerEnvironmentSettingsObject>(move(origin), Web::HTML::EnvironmentId::generate());
+    auto environment_id = inside_settings->id();
+
     // AD-HOC: Seed worker_is_secure_context with the caller's value so reuse requests arriving before
     //         the worker finishes loading still get a mismatch check.
     //         worker_did_finish_loading_script overwrites this with the worker's actual value (which
@@ -155,20 +186,22 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, W
         .is_private = is_private,
         .shared_worker_key = {},
         .owners = move(owners),
+        .inside_settings = move(inside_settings),
     };
 
     if (request.agent_type == Web::HTML::AgentType::SharedWorker) {
         agent.shared_worker_key = SharedWorkerKey {
             .is_private = is_private,
-            .storage_key = request.storage_key,
+            .storage_key = move(outside_storage_key),
             .url = request.url,
             .name = Utf16String::from_utf8(request.name),
         };
         m_shared_workers.set(*agent.shared_worker_key, agent_id);
     }
 
+    auto inside_origin = agent.inside_settings->origin();
     m_agents.set(agent_id, move(agent));
-    client->async_start_worker(request.url, request.type, request.credentials, request.name, move(request.outside_port), request.outside_settings, request.agent_type);
+    client->async_start_worker(request.url, request.type, request.credentials, request.name, move(request.outside_port), request.outside_settings, request.agent_type, move(inside_origin), move(environment_id));
 
     return agent_id;
 }
@@ -231,15 +264,40 @@ void WorkerProcessManager::remove_web_worker_owner(WebWorkerClient& client)
         remove_agent(agent_id, AgentRemovalCause::OwnerSetEmptied);
 }
 
-void WorkerProcessManager::broadcast_channel_message_from_web_content(Web::HTML::BroadcastChannelMessage const& message, IsPrivate is_private)
+// https://html.spec.whatwg.org/multipage/web-messaging.html#dom-broadcastchannel-postmessage
+// NB: The processes holding the destinations of step 6 are those hosting an environment whose storage key is
+//     sourceStorageKey. Each finds the destinations among its own BroadcastChannel objects.
+void WorkerProcessManager::post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage posted_message, CanonicalEnvironmentSettingsObject const& source_settings, pid_t source_process_id, IsPrivate is_private)
 {
+    // 4. Let sourceOrigin be this's relevant settings object's origin.
+    // 5. Let sourceStorageKey be the result of running obtain a storage key for non-storage purposes with this's relevant
+    //    settings object.
+    // NB: The process posting the message names this's relevant settings object.
+    auto source_storage_key = obtain_a_storage_key_for_non_storage_purposes(source_settings);
+    Web::HTML::BroadcastChannelMessage message {
+        .storage_key = source_storage_key,
+        .channel_name = move(posted_message.channel_name),
+        .source_origin = source_settings.origin(),
+        .serialized_message = move(posted_message.serialized_message),
+        .shared_buffers = move(posted_message.shared_buffers),
+        .source_process_id = source_process_id,
+        .source_channel_id = posted_message.source_channel_id,
+    };
+
+    WebContentClient::for_each_client([&](auto& client) {
+        if (client.pid() == source_process_id || client.is_private() != is_private)
+            return IterationDecision::Continue;
+        if (client.hosts_an_environment_with_storage_key(source_storage_key))
+            client.async_broadcast_channel_message(message);
+        return IterationDecision::Continue;
+    });
+
     for (auto& entry : m_agents) {
         auto& agent = entry.value;
-        if (agent.client->pid() == message.source_process_id)
+        if (agent.client->pid() == source_process_id || agent.is_private != is_private)
             continue;
-        if (agent.is_private != is_private)
-            continue;
-        agent.client->async_broadcast_channel_message(message);
+        if (obtain_a_storage_key_for_non_storage_purposes(*agent.inside_settings) == source_storage_key)
+            agent.client->async_broadcast_channel_message(message);
     }
 }
 
@@ -436,34 +494,6 @@ void WorkerProcessManager::worker_did_request_file(Web::HTML::WorkerAgentId agen
         maybe_agent->value.client->async_handle_file_return(file.error().code(), {}, request_id);
     else
         maybe_agent->value.client->async_handle_file_return(0, IPC::File::adopt_file(file.release_value()), request_id);
-}
-
-void WorkerProcessManager::worker_did_post_broadcast_channel_message(Web::HTML::WorkerAgentId agent_id, Web::HTML::BroadcastChannelMessage message)
-{
-    auto source_agent = m_agents.find(agent_id);
-    if (source_agent == m_agents.end())
-        return;
-    auto source_is_private = source_agent->value.is_private;
-
-    WebContentClient::for_each_client([&](auto& client) {
-        if (client.pid() == message.source_process_id)
-            return IterationDecision::Continue;
-        if (client.is_private() != source_is_private)
-            return IterationDecision::Continue;
-        client.async_broadcast_channel_message(message);
-        return IterationDecision::Continue;
-    });
-
-    for (auto& entry : m_agents) {
-        if (entry.key == agent_id)
-            continue;
-        auto& agent = entry.value;
-        if (agent.client->pid() == message.source_process_id)
-            continue;
-        if (agent.is_private != source_is_private)
-            continue;
-        agent.client->async_broadcast_channel_message(message);
-    }
 }
 
 void WorkerProcessManager::remove_agent(Web::HTML::WorkerAgentId agent_id, AgentRemovalCause cause)

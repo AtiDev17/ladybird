@@ -1,0 +1,4 @@
+style updates: 20
+focused: b
+focused after hiding: b
+focused after showing: inLater

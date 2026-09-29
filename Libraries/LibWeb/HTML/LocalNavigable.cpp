@@ -45,7 +45,6 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/URL.h>
 #include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/DragDataStore.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
@@ -902,6 +901,7 @@ void LocalNavigable::continue_navigation_at_population(NavigationPopulationReque
     output->redirected_url = move(result.redirected_url);
     output->classic_history_api_state = move(result.classic_history_api_state);
     output->resource_cleared = result.resource_cleared;
+    output->inline_content_origin = move(result.inline_content_origin);
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#attempt-to-populate-the-history-entry's-document
     // 5. Queue a global task on the navigation and traversal task source, given navigable's active window, to run
@@ -1433,6 +1433,7 @@ ReplicatedNavigableState LocalNavigable::replicated_state() const
         .top_level_creation_url = settings.top_level_creation_url.value(),
         .top_level_origin = settings.top_level_origin.value(),
         .has_cross_site_ancestor = active_document_has_cross_site_ancestor(),
+        .browsing_context_group_id = browsing_context_group_id(),
         .opener_policy = m_active_document->opener_policy(),
         .active_browsing_context_is_auxiliary = active_browsing_context_is_auxiliary(),
         .active_browsing_context_has_opener = active_browsing_context_opener_window_proxy() != nullptr,
@@ -1543,6 +1544,16 @@ void LocalNavigable::set_active_document(GC::Ptr<DOM::Document> document)
     if (document)
         document_id = document->unique_id();
     m_active_session_history_entry->document_state()->set_document_id(document_id);
+}
+
+Optional<u64> LocalNavigable::browsing_context_group_id() const
+{
+    Navigable const* top_level_traversable = this;
+    while (top_level_traversable->parent())
+        top_level_traversable = top_level_traversable->parent().ptr();
+    if (top_level_traversable == this)
+        return {};
+    return top_level_traversable->browsing_context_group_id();
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-bc
@@ -1831,6 +1842,8 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(Utf16View nam
 
             auto create_new_traversable = [&](GC::Ptr<BrowsingContext> opener) -> GC::Ref<LocalTraversableNavigable> {
                 auto traversable = LocalTraversableNavigable::create_a_new_top_level_traversable(*new_web_view.page, opener, new_web_view.initial_history_entry.release_value());
+                traversable->active_document()->relevant_settings_object().id = new_web_view.initial_environment_id.release_value();
+                traversable->active_browsing_context()->set_browsing_context_group_id(new_web_view.browsing_context_group_id);
                 new_web_view.page->set_top_level_traversable(traversable);
                 traversable->set_window_handle(Utf16String::from_ascii_without_validation(new_web_view.window_handle.bytes()));
                 return traversable;
@@ -1912,25 +1925,22 @@ GC::Ptr<Navigable> LocalNavigable::find_a_navigable_by_target_name(Utf16View nam
     }
 
     // 5. Let currentTopLevelBrowsingContext be currentNavigable's active browsing context's top-level browsing context.
-    // NB: This is null if another process hosts the top-level traversable.
-    auto current_top_level_browsing_context = active_browsing_context()->top_level_browsing_context();
+    auto current_top_level_traversable = top_level_traversable();
 
     // 6. Let group be currentTopLevelBrowsingContext's group.
-    // NB: The group as this page knows it, whether or not currentTopLevelBrowsingContext is here: the top-level
-    //     browsing contexts this process holds. Those other processes hold are not searched.
-    auto& group = page().browsing_context_group();
+    // NB: The UI process holds the group. It represents the group's top-level browsing contexts here by the
+    //     navigables they are active in: those this process hosts, and stand-ins for the rest.
+    auto group_id = current_top_level_traversable->browsing_context_group_id();
 
     // 7. For each topLevelBrowsingContext of group's browsing context set, in an implementation-defined order (the user agent should pick a consistent ordering, such as the most recently opened, most recently focused, or more closely related):
-    for (auto const& top_level_browsing_context : group.browsing_context_set()) {
+    for (auto const& top_level_traversable : top_level_navigables_in_browsing_context_group(group_id)) {
         // 1. If currentTopLevelBrowsingContext is topLevelBrowsingContext, then continue.
-        if (current_top_level_browsing_context.ptr() == top_level_browsing_context.ptr())
+        if (top_level_traversable->id() == current_top_level_traversable->id())
             continue;
 
         // 2. Let documentToSearch be topLevelBrowsingContext's active document.
-        auto* document_to_search = top_level_browsing_context->active_document();
-
         // 3. For each navigable of the inclusive descendant navigables of documentToSearch:
-        for (auto const& navigable : document_to_search->inclusive_descendant_navigables()) {
+        for (auto const& navigable : top_level_traversable->active_document_inclusive_descendant_navigables()) {
             // 1. If currentNavigable's active browsing context is not familiar with navigable's active browsing context, then continue.
             if (!is_familiar_with(*navigable))
                 continue;
@@ -1940,8 +1950,7 @@ GC::Ptr<Navigable> LocalNavigable::find_a_navigable_by_target_name(Utf16View nam
                 continue;
 
             // 3. If navigable's target name is name, then return navigable.
-            auto const& target_name = navigable->target_name();
-            if (target_name.utf16_view() == name)
+            if (navigable->target_name().utf16_view() == name)
                 return *navigable;
         }
     }
@@ -2319,10 +2328,7 @@ static void perform_navigation_params_fetch(JS::Realm& realm, GC::Ref<Navigation
         //    creation URL is currentURL,
         //    top-level creation URL is topLevelCreationURL,
         //    and top-level origin is topLevelOrigin.
-        // FIXME: Make this a proper unique opaque string.
-        static int next_id = 1;
-        auto id_string = Utf16String::formatted("create-by-fetching-{}", next_id++);
-        state_holder->request->set_reserved_client(realm.create<Environment>(id_string, state_holder->current_url, top_level_creation_url, top_level_origin, state_holder->navigable->active_browsing_context()));
+        state_holder->request->set_reserved_client(realm.create<Environment>(EnvironmentId::generate(), state_holder->current_url, top_level_creation_url, top_level_origin, state_holder->navigable->active_browsing_context()));
     }
 
     // 3. If the result of should navigation request of type be blocked by Content Security Policy? given request and cspNavigationType is "Blocked", then set response to a network error and break. [CSP]
@@ -3001,6 +3007,20 @@ void LocalNavigable::populate_session_history_entry_document(
         received_navigation_params);
 }
 
+// NB: A document created in place of the response, or the PDF viewer, has an origin other than its navigation params'.
+//     The process reports which of the two it created, and the UI process takes up that origin for the document it
+//     holds.
+static void report_a_document_with_an_origin_of_its_own(LocalNavigable& navigable, PopulateSessionHistoryEntryDocumentOutput const& output)
+{
+    auto const* navigation_params = output.navigation_params.get_pointer<GC::Ref<NavigationParams>>();
+    if (!output.document || !navigation_params || output.document->origin().is_same_origin((*navigation_params)->origin))
+        return;
+    auto origin = output.inline_content_origin.has_value() && output.document->origin().is_same_origin(*output.inline_content_origin)
+        ? PopulatedDocumentOrigin::InlineContent
+        : PopulatedDocumentOrigin::PdfViewer;
+    navigable.page().client().page_did_create_populated_document_with_an_origin_of_its_own(navigable.id(), origin, output.document->relevant_settings_object().id);
+}
+
 void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_entry_population(
     URL::URL url,
     bool source_allows_downloading,
@@ -3068,7 +3088,7 @@ void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_ent
             //         any — rather than the URL it started at.
             auto error_url = output->redirected_url.value_or(url);
             auto error_html = load_error_page(error_url, error_message_utf8).release_value_but_fixme_should_propagate_errors();
-            output->document = create_document_for_inline_content(this, navigation_id, navigation_timing_type, user_involvement, [this, error_html](auto& document) {
+            output->document = create_document_for_inline_content(this, navigation_id, navigation_timing_type, user_involvement, output->inline_content_origin.value(), [this, error_html](auto& document) {
                 auto scripting_mode = document.is_scripting_enabled() ? HTML::ParserScriptingMode::Normal : HTML::ParserScriptingMode::Disabled;
                 auto parser = HTMLParser::create_from_byte_string(document, error_html, scripting_mode, "utf-8"sv);
                 document.set_url(URL::about_error());
@@ -3143,6 +3163,7 @@ void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_ent
                             stop_or_resume_response_body_delivery(navigation_params);
                         }
                         output->navigation_params = navigation_params;
+                        report_a_document_with_an_origin_of_its_own(*nav_params->navigable, output);
                         if (completion_steps)
                             completion_steps->function()(output);
                     }));
@@ -3162,6 +3183,7 @@ void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_ent
         }
 
         output->navigation_params = navigation_params;
+        report_a_document_with_an_origin_of_its_own(*this, output);
         if (completion_steps)
             completion_steps->function()(output);
     }));
@@ -4011,6 +4033,11 @@ GC::Ptr<DOM::Document> LocalNavigable::evaluate_javascript_url(URL::URL const& u
         active_document()->about_base_url(),
         user_involvement);
 
+    // NB: newDocumentOrigin is same origin-domain with the active document's origin, so the agent the UI process
+    //     obtains for it is the active document's: the origins are the same, or share the site that keys the agent
+    //     cluster, since an origin-keyed window cannot set document.domain.
+    navigation_params->agent_cluster_id = active_document()->relevant_settings_object().agent_cluster_id();
+
     // 17. Return the result of loading an HTML document given navigationParams.
     // NB: The response body is a known byte sequence, so we can pass it directly for sniffing.
     return load_document(navigation_params, result_utf8.bytes());
@@ -4480,6 +4507,7 @@ void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable> navigable, His
             .navigation_id = expected_ongoing_navigation_id,
             .history_handling = history_handling,
             .user_involvement = user_involvement,
+            .environment_id = pending_document ? Optional<Web::HTML::EnvironmentId> { pending_document->relevant_settings_object().id } : Optional<Web::HTML::EnvironmentId> {},
         },
         {
             .pending_document = pending_document,
@@ -4630,7 +4658,7 @@ GC::Ref<LocalNavigable> LocalNavigable::create_stand_in(Badge<Page> badge, Remot
     // 3. Let browsingContext and document be the result of creating a new browsing context and document given element's node document, element, and group.
     // NB: group is not resolved, as in NavigableContainer::create_new_child_navigable(). An element in another process
     //     is covered above.
-    auto [browsing_context, document] = BrowsingContext::create_a_new_browsing_context_and_document(page, container ? GC::Ptr<DOM::Document> { container->document() } : nullptr, container, remote_navigable.window_proxy());
+    auto [browsing_context, document] = BrowsingContext::create_a_new_browsing_context_and_document(page, container ? GC::Ptr<DOM::Document> { container->document() } : nullptr, container, remote_navigable.window_proxy(), current_history_entry.document_state.origin);
 
     if (!local_parent)
         page.ensure_compositor_host();
@@ -4657,6 +4685,10 @@ GC::Ref<LocalNavigable> LocalNavigable::create_stand_in(Badge<Page> badge, Remot
 
 void LocalNavigable::initialize_stand_in(RemoteNavigable& remote_navigable, SessionHistoryEntryDescriptor const& current_history_entry, GC::Ref<BrowsingContext> browsing_context, GC::Ref<DOM::Document> document, VisibilityState visibility_state)
 {
+    // NB: A provisional navigable's document stands in for the active document another page hosts, which is not its
+    //     browsing context's initial about:blank.
+    document->set_is_initial_about_blank(false);
+
     // 6. Let documentState be a new document state, with
     //  - document: document
     //  - initiator origin: document's origin
@@ -5291,7 +5323,7 @@ void LocalNavigable::re_snap_scroll_containers_after_layout_change()
     if (!document->layout_is_up_to_date() || document->is_running_update_layout())
         return;
 
-    auto const* viewport_layout_node = document->unsafe_layout_node();
+    auto const* viewport_layout_node = document->layout_node();
     if (!viewport_layout_node || !Painting::has_committed_box(*viewport_layout_node))
         return;
 
@@ -5635,7 +5667,7 @@ static bool adopt_async_viewport_scroll_delta(LocalNavigable& navigable, CSSPixe
 
 void LocalNavigable::adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness freshness)
 {
-    if (!page().async_scrolling_enabled() || !has_compositor_context())
+    if (!has_compositor_context())
         return;
 
     // The compositor process may have already presented newer scroll offsets. Adopt the latest ones before running
@@ -6957,9 +6989,8 @@ GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_a_scrolling_box(Com
         }
     }
 
-    // NB: A page can lack compositor scroll state before its first paint, or
-    //     asynchronous scrolling can be disabled. Keep the same algorithm on
-    //     the main thread in those cases.
+    // NB: A page can lack compositor scroll state before its first paint. Keep
+    //     the same algorithm on the main thread in that case.
     if (has_compositor_context()) {
         // NB: The compositor rejected the replacement, so consume its last
         //     offset before falling back to a main-thread animation.

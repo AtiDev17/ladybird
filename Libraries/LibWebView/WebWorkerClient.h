@@ -41,6 +41,8 @@ public:
     void remove_blob_url_entries();
 
     pid_t pid() const { return m_pid; }
+
+    Optional<CanonicalEnvironmentSettingsObject const&> hosted_environment(Web::HTML::EnvironmentId const& environment_id) const;
     void set_pid(pid_t pid) { m_pid = pid; }
 
     virtual void did_close_worker() override;
@@ -48,13 +50,13 @@ public:
     virtual void did_fail_loading_worker_script() override;
     virtual void did_report_worker_exception(Utf16String message, Utf16String filename, u32 lineno, u32 colno) override;
     virtual Messages::WebWorkerClient::DidRequestCookieResponse did_request_cookie(URL::URL, HTTP::Cookie::Source) override;
-    virtual Messages::WebWorkerClient::DidAddBlobUrlEntryResponse did_add_blob_url_entry(Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) override;
-    virtual void did_remove_blob_url_entries(Vector<Utf16String> urls, URL::Origin origin) override;
+    virtual Messages::WebWorkerClient::DidAddBlobUrlEntryResponse did_add_blob_url_entry(Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) override;
+    virtual void did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) override;
     virtual Messages::WebWorkerClient::DidRequestBlobUrlEntryResponse did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) override;
     virtual void did_request_file(ByteString path, i32 request_id) override;
     virtual Messages::WebWorkerClient::DidIsKnownHstsHostResponse did_is_known_hsts_host(String domain) override;
     virtual Messages::WebWorkerClient::RequestMediaServerConnectionResponse request_media_server_connection() override;
-    virtual void did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage) override;
+    virtual void did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage) override;
     virtual Messages::WebWorkerClient::StartWorkerAgentResponse start_worker_agent(Web::HTML::WorkerAgentStartRequest request) override;
     virtual void close_worker_agent(Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken) override;
     virtual Messages::WebWorkerClient::OpenSystemFontResponse open_system_font(u64 generation, u64 face_id) override;

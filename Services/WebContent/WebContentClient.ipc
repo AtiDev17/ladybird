@@ -16,6 +16,8 @@
 #include <LibRequests/RequestTimingInfo.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
+#include <LibWebCommon/HTML/PopulatedDocumentOrigin.h>
+#include <LibWeb/StorageAPI/StorageKey.h>
 #include <LibWebCommon/Bindings/Navigation.h>
 #include <LibWebCommon/CSS/PseudoElement.h>
 #include <LibWebCommon/CSS/StyleSheetIdentifier.h>
@@ -77,8 +79,8 @@ endpoint WebContentClient routed by Compositing::PageId page_id
     match_system_font_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) => (Gfx::BrokeredFont font)
     resolve_generic_font(String family, u16 weight, u8 slope) => (Optional<String> resolved_family)
 
-    did_add_blob_url_entry(Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) => (URL::BlobURLEntry::Token token)
-    did_remove_blob_url_entries(Vector<Utf16String> urls, URL::Origin origin) => ()
+    [NotRouted] did_add_blob_url_entry(Compositing::PageId page_id, Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) => (URL::BlobURLEntry::Token token)
+    did_remove_blob_url_entries(Compositing::PageId page_id, Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) => ()
     did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) => (Optional<Web::FileAPI::SerializedBlobURLEntry> entry)
     did_retain_blob_url_token(Web::HTML::CrossProcessId navigable_id, URL::BlobURLEntry::Token token) =|
 
@@ -97,7 +99,8 @@ endpoint WebContentClient routed by Compositing::PageId page_id
     did_finish_history_navigation_params_creation(Compositing::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation population) =|
     did_finish_navigation_params_creation(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, Optional<Web::HTML::NavigationPopulationResult> result) =|
     did_fail_navigation_population(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id) =|
-    did_create_child_frame(Compositing::PageId page_id, Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState hosted_state, Web::HTML::PendingSessionHistoryEntryDescriptor initial_history_entry) =|
+    did_create_populated_document_with_an_origin_of_its_own(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::PopulatedDocumentOrigin origin, Web::HTML::EnvironmentId environment_id) =|
+    did_create_child_frame(Compositing::PageId page_id, Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState hosted_state, Web::HTML::PendingSessionHistoryEntryDescriptor initial_history_entry, URL::Origin origin, Web::HTML::EnvironmentId environment_id) =|
     did_change_hosted_navigable_state(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::HostedNavigableState state) =|
     did_set_opener_browsing_context(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::CrossProcessId> opener_navigable_id) =|
     did_completely_finish_loading(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
@@ -175,12 +178,12 @@ endpoint WebContentClient routed by Compositing::PageId page_id
 
     did_change_favicon(Compositing::PageId page_id, Gfx::ShareableBitmap favicon) =|
 
-    did_request_document_cookie_version_index(Compositing::PageId page_id, i64 document_id, String domain) =|
+    did_request_document_cookie_version_index(Compositing::PageId page_id, Web::HTML::EnvironmentId environment_id, i64 document_id, String domain) =|
     did_request_all_cookies_webdriver(URL::URL url) => (Vector<HTTP::Cookie::Cookie> cookies)
-    did_request_all_cookies_cookiestore(URL::URL url) => (Vector<HTTP::Cookie::Cookie> cookies)
+    [NotRouted] did_request_all_cookies_cookiestore(Compositing::PageId page_id, URL::URL url) => (Vector<HTTP::Cookie::Cookie> cookies)
     did_request_named_cookie(URL::URL url, String name) => (Optional<HTTP::Cookie::Cookie> cookie)
     [NotRouted] did_request_cookie(Compositing::PageId page_id, URL::URL url, HTTP::Cookie::Source source) => (HTTP::Cookie::VersionedCookie cookie)
-    did_set_cookie(URL::URL url, HTTP::Cookie::ParsedCookie cookie, HTTP::Cookie::Source source) => ()
+    did_set_cookie(Compositing::PageId page_id, URL::URL url, HTTP::Cookie::ParsedCookie cookie, HTTP::Cookie::Source source) => ()
     did_update_cookie(HTTP::Cookie::Cookie cookie) =|
     did_request_delete_all_cookies(Compositing::PageId page_id, u64 request_id, URL::URL url) =|
 
@@ -189,18 +192,18 @@ endpoint WebContentClient routed by Compositing::PageId page_id
     did_lose_request_server_connection() => (Optional<IPC::TransportHandle> handle)
     request_media_server_connection() => (Optional<IPC::TransportHandle> handle)
 
-    [NotRouted] did_request_storage_item(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key) => (Optional<Utf16String> value)
-    [NotRouted] did_set_storage_item(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key, Utf16String value) => (WebView::StorageSetResult result)
-    did_remove_storage_item(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key) => ()
-    [NotRouted] did_request_storage_keys(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key) => (Vector<Utf16String> keys)
-    did_clear_storage(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key) => ()
-    [NotRouted] did_request_storage_usage(Compositing::PageId page_id, String storage_key) => (u64 usage)
+    [NotRouted] did_request_storage_item(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key) => (Optional<Utf16String> value)
+    [NotRouted] did_set_storage_item(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key, Utf16String value) => (WebView::StorageSetResult result)
+    did_remove_storage_item(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key) => ()
+    [NotRouted] did_request_storage_keys(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id) => (Vector<Utf16String> keys)
+    did_clear_storage(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id) => ()
+    [NotRouted] did_request_storage_usage(Compositing::PageId page_id, Web::HTML::EnvironmentId environment_id) => (u64 usage)
     did_change_storage_item(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String url, Optional<Utf16String> key, Optional<Utf16String> old_value, Optional<Utf16String> new_value) =|
     did_update_indexed_database(Compositing::PageId page_id, String update) =|
-    did_post_broadcast_channel_message(Compositing::PageId page_id, Web::HTML::BroadcastChannelMessage message) =|
+    did_post_broadcast_channel_message(Compositing::PageId page_id, Web::HTML::PostedBroadcastChannelMessage message) =|
 
     did_update_resource_count(Compositing::PageId page_id, i32 count_waiting) =|
-    [NotRouted] did_request_new_web_view(Compositing::PageId page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, Optional<Web::HTML::CrossProcessId> opener_navigable_id, Optional<URL::URL> opener_base_url, Utf16String target_name, Web::HTML::SandboxingFlagSet popup_sandboxing_flag_set) => (Optional<Compositing::PageId> new_page_id, Optional<Web::HTML::CrossProcessId> root_navigable_id, Optional<Web::HTML::SessionHistoryEntryDescriptor> initial_history_entry, Web::HTML::VisibilityState system_visibility_state, String handle)
+    [NotRouted] did_request_new_web_view(Compositing::PageId page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, Optional<Web::HTML::CrossProcessId> opener_navigable_id, Optional<URL::URL> opener_base_url, Utf16String target_name, Web::HTML::SandboxingFlagSet popup_sandboxing_flag_set) => (Optional<Compositing::PageId> new_page_id, Optional<Web::HTML::CrossProcessId> root_navigable_id, Optional<Web::HTML::SessionHistoryEntryDescriptor> initial_history_entry, Optional<Web::HTML::EnvironmentId> initial_environment_id, Optional<u64> browsing_context_group_id, Web::HTML::VisibilityState system_visibility_state, String handle)
     did_request_activate_tab(Compositing::PageId page_id) =|
     [NotRouted] did_close_browsing_context(Compositing::PageId page_id) =|
     did_change_needs_beforeunload_check(Compositing::PageId page_id, bool needs_beforeunload_check) =|

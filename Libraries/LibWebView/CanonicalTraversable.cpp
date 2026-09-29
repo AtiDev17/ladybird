@@ -14,6 +14,7 @@
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalBrowsingContextGroup.h>
 #include <LibWebView/CanonicalDocument.h>
+#include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/CanonicalWindow.h>
 #include <LibWebView/StorageJar.h>
@@ -236,7 +237,7 @@ void CanonicalTraversable::for_each_hosting_page(Function<void(WebContentPage&)>
         navigable.for_each_pending_host(visit);
         return IterationDecision::Continue;
     });
-    for (auto const& page : m_opener_pages)
+    for (auto const& page : m_representing_pages)
         visit(page);
 }
 
@@ -267,42 +268,55 @@ CanonicalNavigable* CanonicalTraversable::navigable_with_active_browsing_context
     return result;
 }
 
-// The other tabs holding the navigables the opener browsing contexts of this tab's browsing contexts are active in.
-void CanonicalTraversable::for_each_opener_traversable(Function<void(CanonicalTraversable&)> const& callback) const
+// A process holding part of a tab holds every tab of the tab's browsing context group, in pages hosting none of
+// them, so that a document here finds the group's navigables by target name and reaches an opener's WindowProxy.
+void CanonicalTraversable::represent_group_in(WebContentClient& client)
 {
-    for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
-        auto const& state = navigable.replicated_state();
-        if (!state.has_value() || !state->opener_navigable_id.has_value())
-            return IterationDecision::Continue;
-        if (auto* opener_traversable = traversable_containing(*state->opener_navigable_id); opener_traversable && opener_traversable != this)
-            callback(*opener_traversable);
-        return IterationDecision::Continue;
-    });
-}
-
-// A process holding part of this tab holds the tabs of its openers too, in pages hosting none of them, so that a
-// document here reaches an opener's WindowProxy.
-void CanonicalTraversable::represent_openers_in(WebContentClient& client)
-{
-    for_each_opener_traversable([&](CanonicalTraversable& opener_traversable) {
-        if (client.page_id_for_traversable(opener_traversable).has_value())
-            return;
+    auto group = active_browsing_context().group();
+    if (!group)
+        return;
+    for (auto* top_level_browsing_context : group->browsing_context_set()) {
+        auto* navigable = navigable_with_active_browsing_context(*top_level_browsing_context);
+        if (!navigable)
+            continue;
+        auto& traversable = navigable->top_level_traversable();
+        if (client.page_id_for_traversable(traversable).has_value())
+            continue;
         auto page_id = Application::the().allocate_page_id();
-        client.async_create_representing_page(page_id, opener_traversable.remote_navigable_graph());
-        client.register_embedded_page(page_id, opener_traversable);
-        opener_traversable.m_opener_pages.append(*client.page(page_id));
-        opener_traversable.represent_openers_in(client);
-    });
+        client.async_create_representing_page(page_id, traversable.remote_navigable_graph());
+        client.register_embedded_page(page_id, traversable);
+        traversable.m_representing_pages.append(*client.page(page_id));
+    }
 }
 
-void CanonicalTraversable::forget_opener_page(WebContentPage& page)
+// Every process holding part of a tab of the group holds the tab that joined it.
+void CanonicalTraversable::represent_group_everywhere()
 {
-    m_opener_pages.remove_all_matching([&](auto const& opener_page) { return opener_page.ptr() == &page; });
+    auto group = active_browsing_context().group();
+    if (!group)
+        return;
+    Vector<NonnullRefPtr<WebContentClient>> clients;
+    for (auto* top_level_browsing_context : group->browsing_context_set()) {
+        auto* navigable = navigable_with_active_browsing_context(*top_level_browsing_context);
+        if (!navigable)
+            continue;
+        navigable->top_level_traversable().for_each_hosting_page([&](WebContentPage& page) {
+            if (!any_of(clients, [&](auto const& client) { return client.ptr() == &page.client(); }))
+                clients.append(page.client());
+        });
+    }
+    for (auto& client : clients)
+        represent_group_in(*client);
 }
 
-void CanonicalTraversable::discard_opener_pages()
+void CanonicalTraversable::forget_representing_page(WebContentPage& page)
 {
-    for (auto& page : exchange(m_opener_pages, {})) {
+    m_representing_pages.remove_all_matching([&](auto const& representing_page) { return representing_page.ptr() == &page; });
+}
+
+void CanonicalTraversable::discard_representing_pages()
+{
+    for (auto& page : exchange(m_representing_pages, {})) {
         if (page->is_open())
             page->discard();
     }
@@ -378,10 +392,10 @@ void CanonicalTraversable::release_page_if_unused(NonnullRefPtr<WebContentPage> 
 {
     if (page_hosts_any(page))
         return;
-    if (is_opener_page(page)) {
-        if (page->client().holds_part_of_a_tab_opened_by(*this))
+    if (is_representing_page(page)) {
+        if (page->client().holds_part_of_a_tab_in_the_group_of(*this))
             return;
-        forget_opener_page(page);
+        forget_representing_page(page);
     }
     page->discard();
     did_lose_page(page, WebContentProcessLost::No);
@@ -446,13 +460,13 @@ ErrorOr<NonnullRefPtr<WebContentPage>> CanonicalTraversable::obtain_page_to_host
         page_id = Application::the().allocate_page_id();
         host->async_create_embedded_page(page_id, remote_navigable_graph(), id(), current_entry_descriptor, system_visibility_state());
         host->register_embedded_page(page_id, *this);
-        represent_openers_in(*host);
+        represent_group_in(*host);
     } else {
         auto process = TRY(Application::the().launch_child_frame_web_content_process(view->is_private(), remote_navigable_graph(), id(), current_entry_descriptor, system_visibility_state()));
         host = move(process.client);
         page_id = process.page_id;
         host->register_embedded_page(page_id, *this);
-        represent_openers_in(*host);
+        represent_group_in(*host);
     }
     auto& page = *host->page(page_id);
     view->prepare_page_for_tab(page);
@@ -523,7 +537,7 @@ void CanonicalTraversable::remove(CanonicalNavigable& navigable)
 
 void CanonicalTraversable::remove_page(WebContentPage& page)
 {
-    forget_opener_page(page);
+    forget_representing_page(page);
 
     Vector<Web::HTML::CrossProcessId> reported_by_page;
     Vector<Web::HTML::CrossProcessId> hosted_by_page;
@@ -663,6 +677,23 @@ void CanonicalTraversable::reload(OnHistoryOperationComplete on_complete)
     });
 }
 
+bool CanonicalTraversable::is_origin_held_by_a_document(URL::Origin const& origin)
+{
+    auto holds = [&](CanonicalDocument const& document) { return document.origin().is_same_origin(origin); };
+    for (auto const& traversable : user_agent_top_level_traversable_set()) {
+        auto decision = traversable->for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
+            auto held = holds(navigable.active_document());
+            navigable.for_each_populated_document([&](PopulatedDocument const& populated_document) {
+                held = held || holds(populated_document.document);
+            });
+            return held ? IterationDecision::Break : IterationDecision::Continue;
+        });
+        if (decision == IterationDecision::Break)
+            return true;
+    }
+    return false;
+}
+
 // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-top-level-traversable
 CanonicalTraversable& CanonicalTraversable::create_a_new_top_level_traversable(Web::HTML::CrossProcessId id, Optional<CanonicalNavigable&> opener, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry)
 {
@@ -671,7 +702,7 @@ CanonicalTraversable& CanonicalTraversable::create_a_new_top_level_traversable(W
 
     // 2. If opener is null, then set document to the second return value of creating a new top-level browsing context and document.
     if (!opener.has_value()) {
-        document = CanonicalBrowsingContext::create_a_new_top_level_browsing_context_and_document().document;
+        document = CanonicalBrowsingContext::create_a_new_top_level_browsing_context_and_document(initial_history_entry.document_state.origin).document;
     }
     // 3. Otherwise, set document to the second return value of creating a new auxiliary browsing context and document given opener.
     else {
@@ -993,6 +1024,7 @@ struct CanonicalTraversable::HistoryOperation {
         bool unload_preparation_pending { false };
         OwnPtr<NavigationLoader> population_loader;
         CanonicalNavigable::DidPopulateDocument did_populate_document { CanonicalNavigable::DidPopulateDocument::No };
+        RefPtr<CanonicalDocument> document;
     };
     HashMap<Web::HTML::CrossProcessId, NonnullOwnPtr<PendingChangingJob>> pending_changing_jobs;
     struct PendingNonchangingUpdate {
@@ -1483,7 +1515,9 @@ void CanonicalTraversable::continue_history_navigation_population(Web::HTML::Cro
     if (response_document.has_value()) {
         pending_job.value()->did_populate_document = CanonicalNavigable::DidPopulateDocument::Yes;
         auto document = navigable->create_and_initialize_a_document(*response_document);
-        navigable->populate_document(pending_job.value()->job.target_entry->document_state, *document);
+        pending_job.value()->document = document;
+        loader->set_window(document->relevant_global_object());
+        navigable->populate_document(pending_job.value()->job.target_entry->document_state, *document, loader->result().inline_content_origin);
 
         // A document created for inline content stands in for the resource the process that fetched it could not
         // load; that process hosts it.
@@ -1934,8 +1968,8 @@ void CanonicalTraversable::complete_history_jobs_of_lost_page(HistoryOperation& 
         auto pending_job = operation.pending_changing_jobs.take(navigable_id);
         if (!pending_job.has_value())
             continue;
-        if (auto navigable = find(navigable_id); navigable.has_value())
-            navigable->abandon_document_populated_for(*pending_job.value()->job.target_entry->document_state);
+        if (auto navigable = find(navigable_id); navigable.has_value() && pending_job.value()->document)
+            navigable->abandon_populated_document(*pending_job.value()->document);
 
         if (pending_job.value()->population_loader)
             pending_job.value()->population_loader->reclaim_response_body_after_failed_handoff();
@@ -2029,7 +2063,12 @@ ApplyHistoryStepJobs CanonicalTraversable::create_apply_history_step_jobs(Web::H
             if (!operation)
                 return;
             auto navigable_id = job.navigable_id;
-            operation->pending_changing_jobs.set(navigable_id, make<HistoryOperation::PendingChangingJob>(move(job), move(on_complete)));
+            auto pending_job = make<HistoryOperation::PendingChangingJob>(move(job), move(on_complete));
+            if (auto const* parameters = operation->parameters.get_pointer<Web::FinalizeCrossDocumentNavigationHistoryOperationParameters>(); parameters && parameters->navigable_id == navigable_id) {
+                if (auto navigable = find(navigable_id); navigable.has_value())
+                    pending_job->document = navigable->document_populated_for(*pending_job->job.target_entry->document_state);
+            }
+            operation->pending_changing_jobs.set(navigable_id, move(pending_job));
             dispatch_changing_navigable_history_step_job(*operation, navigable_id); },
         .apply_changing_navigable_history_step_continuation = [this, operation_id](ApplyHistoryStepJobs::ApplyChangingNavigableHistoryStepContinuation continuation, Function<void()> on_complete) {
             auto* operation = find_history_operation(operation_id);
@@ -2604,21 +2643,36 @@ void CanonicalTraversable::finalize_a_cross_document_navigation(HistoryOperation
     }
     auto history_entry = history_entry_or_error.release_value();
 
-    // NB: A javascript: URL navigation creates its document in the process running it, in navigable's active browsing
-    //     context, and reports it with these steps. It is populated for historyEntry's document state here.
+    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate-to-a-javascript:-url
+    // NB: The process running a javascript: URL navigation evaluates it, creates newDocument in navigable's active
+    //     browsing context, and reports historyEntry with these steps, without a navigation ID. The UI process runs the
+    //     steps that decide newDocument's origin, and populates the document it holds for historyEntry's document state.
     if (!parameters.navigation_id.has_value()) {
-        if (!history_entry->document_state->origin.has_value()) {
+        auto const& initiator_origin = history_entry->document_state->initiator_origin;
+
+        // 4. If initiatorOrigin is not same origin-domain with targetNavigable's active document's origin, then return.
+        if (!initiator_origin.has_value() || !initiator_origin->is_same_origin_domain(navigable->active_document().origin())) {
             finish_history_operation(operation.operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
             return;
         }
-        auto const& origin = *history_entry->document_state->origin;
+
+        // 8. Assert: initiatorOrigin is newDocument's origin.
+        // NB: The UI process creates its newDocument with initiatorOrigin.
         NavigationLoader::ResponseDocument response_document {
             .is_inline_content = false,
-            .coop_enforcement_result = { .url = history_entry->url, .origin = origin, .opener_policy = {} },
+            .coop_enforcement_result = { .url = history_entry->url, .origin = *initiator_origin, .opener_policy = {} },
             .response_url = history_entry->url,
             .request_current_url = {},
-            .origin = origin,
+            .origin = *initiator_origin,
+            .opener_policy = {},
+            .environment_id = parameters.environment_id,
         };
+
+        // 11. Let documentState be a new document state with
+        //     [...]
+        //     initiator origin: initiatorOrigin
+        //     origin: initiatorOrigin
+        history_entry->document_state->origin = initiator_origin;
         navigable->populate_document(history_entry->document_state, navigable->create_and_initialize_a_document(response_document));
     }
 
@@ -2812,8 +2866,8 @@ void CanonicalTraversable::finish_history_operation(Web::HTML::CrossProcessId op
 
     // A changing job still pending when its operation finishes never activates the document it populated.
     for (auto const& [navigable_id, pending_job] : taken_operation.pending_changing_jobs) {
-        if (auto navigable = find(navigable_id); navigable.has_value())
-            navigable->abandon_document_populated_for(*pending_job->job.target_entry->document_state);
+        if (auto navigable = find(navigable_id); navigable.has_value() && pending_job->document)
+            navigable->abandon_populated_document(*pending_job->document);
     }
     if (taken_operation.owns_navigation_transaction) {
         auto const& parameters = taken_operation.parameters.get<Web::FinalizeCrossDocumentNavigationHistoryOperationParameters>();
@@ -3051,14 +3105,14 @@ void CanonicalTraversable::did_receive_changing_navigable_history_job_ready(WebC
         auto on_complete = move(pending_job.value()->on_complete);
         if (disposition == Web::HTML::ChangingNavigableHistoryStepJobDisposition::Ready) {
             pending_job.value()->phase = HistoryOperation::PendingChangingJob::Phase::ReadyReported;
-            if (auto navigable = find(navigable_id); navigable.has_value())
-                navigable->claim_document_populated_for_ongoing_navigation(*pending_job.value()->job.target_entry->document_state);
+            if (auto navigable = find(navigable_id); navigable.has_value() && pending_job.value()->document)
+                navigable->claim_document_populated_for_ongoing_navigation(*pending_job.value()->document);
             on_complete(disposition);
             return;
         }
 
-        if (auto navigable = find(navigable_id); navigable.has_value())
-            navigable->abandon_document_populated_for(*pending_job.value()->job.target_entry->document_state);
+        if (auto navigable = find(navigable_id); navigable.has_value() && pending_job.value()->document)
+            navigable->abandon_populated_document(*pending_job.value()->document);
         operation->pending_changing_jobs.remove(navigable_id);
         on_complete(disposition);
     }
@@ -3075,8 +3129,8 @@ void CanonicalTraversable::did_receive_changing_navigable_continuation_applied(W
             return;
         if (activated_navigable_state.has_value())
             did_activate_history_entry(*operation, navigable_id, source_page, *pending_job.value()->job.target_entry, pending_job.value()->did_populate_document, activated_navigable_state.release_value());
-        else if (auto navigable = find(navigable_id); navigable.has_value())
-            navigable->abandon_document_populated_for(*pending_job.value()->job.target_entry->document_state);
+        else if (auto navigable = find(navigable_id); navigable.has_value() && pending_job.value()->document)
+            navigable->abandon_populated_document(*pending_job.value()->document);
         if (previous_entry_persisted_state.has_value()) {
             auto navigable = find(navigable_id);
             if (navigable.has_value())

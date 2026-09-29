@@ -28,22 +28,39 @@ public:
     RefPtr<WebContentClient> hosting_process() const;
     void set_hosting_process_if_unset(WebContentClient&);
 
+    u64 agent_cluster_id() const { return m_agent_cluster_id; }
+
 private:
-    CanonicalSimilarOriginWindowAgent() = default;
+    CanonicalSimilarOriginWindowAgent();
 
     WeakPtr<WebContentClient> m_hosting_process;
+    u64 m_agent_cluster_id { 0 };
+};
+
+// https://html.spec.whatwg.org/multipage/document-sequences.html#cross-origin-isolation-mode
+enum class CrossOriginIsolationMode : u8 {
+    None,
+    Logical,
+    Concrete,
 };
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#browsing-context-group
 class WEBVIEW_API CanonicalBrowsingContextGroup : public RefCounted<CanonicalBrowsingContextGroup> {
 public:
     static NonnullRefPtr<CanonicalBrowsingContextGroup> create();
+    static void append_to_user_agent_browsing_context_group_set(CanonicalBrowsingContextGroup&);
+
+    u64 id() const { return m_id; }
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#browsing-context-set
     OrderedHashTable<CanonicalBrowsingContext*> const& browsing_context_set() const { return m_browsing_context_set; }
 
     void append(CanonicalBrowsingContext&);
     void remove(CanonicalBrowsingContext&);
+
+    // https://html.spec.whatwg.org/multipage/document-sequences.html#bcg-cross-origin-isolation
+    CrossOriginIsolationMode cross_origin_isolation_mode() const { return m_cross_origin_isolation_mode; }
+    void set_cross_origin_isolation_mode(CrossOriginIsolationMode mode) { m_cross_origin_isolation_mode = mode; }
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#obtain-similar-origin-window-agent
     NonnullRefPtr<CanonicalSimilarOriginWindowAgent> obtain_similar_origin_window_agent(URL::Origin const&, bool requests_oac);
@@ -71,8 +88,12 @@ private:
         NonnullRefPtr<CanonicalSimilarOriginWindowAgent> similar_origin_window_agent;
     };
 
+    u64 m_id { 0 };
+
     // Browsing contexts own their group, so this inverse membership relation must remain non-owning.
     OrderedHashTable<CanonicalBrowsingContext*> m_browsing_context_set;
+
+    CrossOriginIsolationMode m_cross_origin_isolation_mode { CrossOriginIsolationMode::None };
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#agent-cluster-map
     // FIXME: Make this weak once canonical agent clusters have a lifetime independent of the browsing context group.

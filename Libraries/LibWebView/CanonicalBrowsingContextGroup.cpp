@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/NeverDestroyed.h>
+#include <AK/Random.h>
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalBrowsingContextGroup.h>
 #include <LibWebView/WebContentClient.h>
@@ -13,6 +15,12 @@ namespace WebView {
 NonnullRefPtr<CanonicalSimilarOriginWindowAgent> CanonicalSimilarOriginWindowAgent::create()
 {
     return adopt_ref(*new CanonicalSimilarOriginWindowAgent);
+}
+
+// Random, so that it cannot collide with the id a WebContent process gives a shared worker's agent cluster.
+CanonicalSimilarOriginWindowAgent::CanonicalSimilarOriginWindowAgent()
+    : m_agent_cluster_id(get_random<u64>())
+{
 }
 
 RefPtr<WebContentClient> CanonicalSimilarOriginWindowAgent::hosting_process() const
@@ -31,9 +39,28 @@ void CanonicalSimilarOriginWindowAgent::set_hosting_process_if_unset(WebContentC
     m_hosting_process = process.make_weak_ptr<WebContentClient>();
 }
 
+// https://html.spec.whatwg.org/multipage/document-sequences.html#browsing-context-group-set
+struct BrowsingContextGroupSet {
+    Vector<NonnullRefPtr<CanonicalBrowsingContextGroup>> groups;
+    u64 next_group_id { 1 };
+};
+
+static BrowsingContextGroupSet& user_agent_browsing_context_group_set()
+{
+    static NeverDestroyed<BrowsingContextGroupSet> set;
+    return *set;
+}
+
 NonnullRefPtr<CanonicalBrowsingContextGroup> CanonicalBrowsingContextGroup::create()
 {
     return adopt_ref(*new CanonicalBrowsingContextGroup);
+}
+
+void CanonicalBrowsingContextGroup::append_to_user_agent_browsing_context_group_set(CanonicalBrowsingContextGroup& group)
+{
+    auto& set = user_agent_browsing_context_group_set();
+    group.m_id = set.next_group_id++;
+    set.groups.append(group);
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#bcg-append
@@ -65,7 +92,8 @@ void CanonicalBrowsingContextGroup::remove(CanonicalBrowsingContext& browsing_co
     m_browsing_context_set.remove(&browsing_context);
 
     // 5. If group's browsing context set is empty, then remove group from the user agent's browsing context group set.
-    // NB: The group dies with its last reference.
+    if (m_browsing_context_set.is_empty())
+        user_agent_browsing_context_group_set().groups.remove_first_matching([&](auto const& group) { return group.ptr() == this; });
 }
 
 unsigned CanonicalBrowsingContextGroup::AgentClusterKeyTraits::hash(AgentClusterKey const& key)
@@ -87,11 +115,13 @@ NonnullRefPtr<CanonicalSimilarOriginWindowAgent> CanonicalBrowsingContextGroup::
     //     origin to preserve which arm of the agent cluster key union it occupies.
     auto key = origin.is_opaque() ? AgentClusterKey { origin } : AgentClusterKey { move(site) };
 
-    // FIXME: 3. If group's cross-origin isolation mode is not "none", then set key to origin.
-
+    // 3. If group's cross-origin isolation mode is not "none", then set key to origin.
+    if (m_cross_origin_isolation_mode != CrossOriginIsolationMode::None) {
+        key = AgentClusterKey { origin };
+    }
     // 4. Otherwise, if group's historical agent cluster key map[origin] exists, then set key to group's historical
     //    agent cluster key map[origin].
-    if (auto historical_key = m_historical_agent_cluster_key_map.get(origin); historical_key.has_value()) {
+    else if (auto historical_key = m_historical_agent_cluster_key_map.get(origin); historical_key.has_value()) {
         key = historical_key.release_value();
     }
     // 5. Otherwise:
@@ -122,7 +152,9 @@ NonnullRefPtr<CanonicalSimilarOriginWindowAgent> CanonicalBrowsingContextGroup::
 RefPtr<CanonicalSimilarOriginWindowAgent> CanonicalBrowsingContextGroup::similar_origin_window_agent_for(URL::Origin const& origin) const
 {
     auto key = origin.is_opaque() ? AgentClusterKey { origin } : AgentClusterKey { URL::Site::obtain(origin) };
-    if (auto historical_key = m_historical_agent_cluster_key_map.get(origin); historical_key.has_value())
+    if (m_cross_origin_isolation_mode != CrossOriginIsolationMode::None)
+        key = AgentClusterKey { origin };
+    else if (auto historical_key = m_historical_agent_cluster_key_map.get(origin); historical_key.has_value())
         key = *historical_key;
     auto agent_cluster = m_agent_cluster_map.get(key);
     if (!agent_cluster.has_value())

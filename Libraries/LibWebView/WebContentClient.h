@@ -82,8 +82,7 @@ public:
     virtual Messages::WebContentClient::MatchLocalFontResponse match_local_font(String name) override;
     virtual Messages::WebContentClient::MatchSystemFontForCodePointResponse match_system_font_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) override;
     virtual Messages::WebContentClient::ResolveGenericFontResponse resolve_generic_font(String family, u16 weight, u8 slope) override;
-    virtual Messages::WebContentClient::DidAddBlobUrlEntryResponse did_add_blob_url_entry(Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) override;
-    virtual void did_remove_blob_url_entries(Vector<Utf16String> urls, URL::Origin origin) override;
+    virtual Messages::WebContentClient::DidAddBlobUrlEntryResponse did_add_blob_url_entry(Compositing::PageId page_id, Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) override;
     virtual void did_retain_blob_url_token(Web::HTML::CrossProcessId navigable_id, URL::BlobURLEntry::Token token) override;
     virtual Messages::WebContentClient::DidRequestBlobUrlEntryResponse did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) override;
 
@@ -112,11 +111,14 @@ public:
     void set_web_ui(RefPtr<WebUI>);
     virtual void did_misbehave(StringView message_name, StringView reason) override;
     static bool renderers_may_access_cookies_like_http();
+    bool hosts_an_environment_that_may_use_cookies_of(URL::URL const&) const;
     void register_embedded_page(Compositing::PageId page_id, CanonicalTraversable&);
     void unregister_embedded_page(Compositing::PageId page_id);
     Optional<Compositing::PageId> page_id_for_traversable(CanonicalTraversable const&) const;
-    bool holds_part_of_a_tab_opened_by(CanonicalTraversable const&);
-    void release_unneeded_opener_pages();
+    bool holds_part_of_a_tab_in_the_group_of(CanonicalTraversable const&);
+    void release_unneeded_representing_pages();
+    bool hosts_an_environment_with_storage_key(Web::StorageAPI::StorageKey const&);
+    Optional<CanonicalEnvironmentSettingsObject const&> hosted_environment(Web::HTML::EnvironmentId const& environment_id);
 
     WebContentPage* page(Compositing::PageId page_id) const;
     template<CallableAs<IterationDecision, WebContentPage&> Callback>
@@ -158,19 +160,18 @@ private:
     virtual Messages::WebContentClient::AllocateCompositorContextIdResponse allocate_compositor_context_id(Compositing::PageId page_id, Compositing::PagePresentationRegistration) override;
     virtual void did_destroy_compositor_context(Compositing::CompositorContextId) override;
     virtual Messages::WebContentClient::DidRequestAllCookiesWebdriverResponse did_request_all_cookies_webdriver(URL::URL) override;
-    virtual Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse did_request_all_cookies_cookiestore(URL::URL) override;
+    virtual Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse did_request_all_cookies_cookiestore(Compositing::PageId page_id, URL::URL) override;
     virtual Messages::WebContentClient::DidRequestNamedCookieResponse did_request_named_cookie(URL::URL, String) override;
     virtual Messages::WebContentClient::DidRequestCookieResponse did_request_cookie(Compositing::PageId page_id, URL::URL, HTTP::Cookie::Source) override;
     virtual void did_close_browsing_context(Compositing::PageId page_id) override;
-    virtual Messages::WebContentClient::DidSetStorageItemResponse did_set_storage_item(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType, String storage_key, Utf16String bottle_key, Utf16String value) override;
-    virtual Messages::WebContentClient::DidRequestStorageItemResponse did_request_storage_item(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType, String storage_key, Utf16String bottle_key) override;
-    virtual Messages::WebContentClient::DidRequestStorageKeysResponse did_request_storage_keys(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType, String storage_key) override;
-    virtual Messages::WebContentClient::DidRequestStorageUsageResponse did_request_storage_usage(Compositing::PageId page_id, String storage_key) override;
+    virtual Messages::WebContentClient::DidSetStorageItemResponse did_set_storage_item(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key, Utf16String value) override;
+    virtual Messages::WebContentClient::DidRequestStorageItemResponse did_request_storage_item(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType, Web::HTML::EnvironmentId environment_id, Utf16String bottle_key) override;
+    virtual Messages::WebContentClient::DidRequestStorageKeysResponse did_request_storage_keys(Compositing::PageId page_id, Web::StorageAPI::StorageEndpointType, Web::HTML::EnvironmentId environment_id) override;
+    virtual Messages::WebContentClient::DidRequestStorageUsageResponse did_request_storage_usage(Compositing::PageId page_id, Web::HTML::EnvironmentId environment_id) override;
     virtual Messages::WebContentClient::DidStartDownloadWithoutRequestResponse did_start_download_without_request(Compositing::PageId page_id, URL::URL, ByteString suggested_filename, Optional<u64> total_size) override;
     virtual Messages::WebContentClient::DidStartDownloadResponse did_start_download(Compositing::PageId page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data) override;
     virtual Messages::WebContentClient::DidRequestNewWebViewResponse did_request_new_web_view(Compositing::PageId page_id, Web::HTML::ActivateTab, Web::HTML::WebViewHints, Optional<Web::HTML::CrossProcessId> opener_navigable_id, Optional<URL::URL> opener_base_url, Utf16String target_name, Web::HTML::SandboxingFlagSet popup_sandboxing_flag_set) override;
     virtual Messages::WebContentClient::StartWorkerAgentResponse start_worker_agent(Compositing::PageId page_id, Web::HTML::WorkerAgentStartRequest request) override;
-    virtual void did_set_cookie(URL::URL, HTTP::Cookie::ParsedCookie, HTTP::Cookie::Source) override;
     virtual void did_update_cookie(HTTP::Cookie::Cookie) override;
     virtual Messages::WebContentClient::DidIsKnownHstsHostResponse did_is_known_hsts_host(String) override;
     virtual Messages::WebContentClient::DidLoseRequestServerConnectionResponse did_lose_request_server_connection() override;

@@ -17,12 +17,19 @@
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibMain/Main.h>
 #include <LibURL/Parser.h>
+#include <LibWebCommon/FileAPI/SerializedBlobURLEntry.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/BlobURLStore.h>
 #include <LibWebView/BrowsingSession.h>
+#include <LibWebView/CanonicalDocument.h>
+#include <LibWebView/CanonicalEnvironmentSettingsObject.h>
+#include <LibWebView/CanonicalTraversable.h>
+#include <LibWebView/CanonicalWindow.h>
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/WebContentClient.h>
+#include <LibWebView/WebContentPage.h>
 
 namespace {
 
@@ -79,9 +86,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         return WebView::HeadlessWebView::create(theme, { 800, 600 });
     };
 
-    auto victim_cookie_value = [&](WebView::CookieJar& cookie_jar) -> Optional<String> {
+    auto victim_cookie_value = [&](WebView::CookieJar& cookie_jar, StringView name = "session"sv) -> Optional<String> {
         for (auto const& cookie : cookie_jar.get_all_cookies_webdriver(victim_url)) {
-            if (cookie.name == "session"sv)
+            if (cookie.name == name)
                 return cookie.value;
         }
         return {};
@@ -92,9 +99,31 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     cookie_jar.set_cookie(victim_url, HTTP::Cookie::ParsedCookie { .name = "session"_string, .value = "secret"_string, .http_only_attribute_present = true }, HTTP::Cookie::Source::Http);
     VERIFY(victim_cookie_value(cookie_jar) == "secret"sv);
 
-    // Script access is fine, and does not see the HttpOnly cookie.
+    // Script reaches cookies through a document the process hosts, and only those of such a document's origin. Any
+    // other access sees and changes nothing, but is not misbehavior: a document can outlive the UI process's record
+    // of it.
+    cookie_jar.set_cookie(victim_url, HTTP::Cookie::ParsedCookie { .name = "visible"_string, .value = "secret"_string }, HTTP::Cookie::Source::Http);
     auto& stub = static_cast<WebContentClientStub&>(view->client());
-    VERIFY(stub.did_request_cookie(view->page_id(), victim_url, HTTP::Cookie::Source::NonHttp).cookie().cookie.is_empty());
+    auto page_id = view->page_id();
+    VERIFY(stub.did_request_cookie(page_id, victim_url, HTTP::Cookie::Source::NonHttp).cookie().cookie.is_empty());
+    VERIFY(stub.did_request_all_cookies_cookiestore(page_id, victim_url).cookies().is_empty());
+    stub.did_set_cookie(page_id, victim_url, HTTP::Cookie::ParsedCookie { .name = "visible"_string, .value = "attacker"_string }, HTTP::Cookie::Source::NonHttp);
+    VERIFY(victim_cookie_value(cookie_jar, "visible"sv) == "secret"sv);
+    auto page_environment_id = view->client().page(page_id)->traversable().active_document().relevant_global_object().relevant_settings_object().id();
+
+    // A blob URL entry has the origin of the environment that added it, and only that origin revokes it.
+    auto& blob_url_store = *view->client().session().blob_url_store;
+    auto victim_blob_url = "blob:https://victim.example/entry"_utf16;
+    auto forged_blob_url = "blob:https://victim.example/forged"_utf16;
+    Web::FileAPI::SerializedBlobURLEntry victim_entry { .object = Web::FileAPI::SerializedBlobURLEntry::MediaSource {}, .origin = victim_url.origin() };
+    blob_url_store.add_entry(victim_blob_url, victim_entry, WeakPtr<WebView::WebContentClient> {});
+    for (auto const& environment_id : { Web::HTML::EnvironmentId::generate(), page_environment_id }) {
+        stub.did_add_blob_url_entry(page_id, environment_id, forged_blob_url, victim_entry);
+        auto forged_entry = blob_url_store.resolve(forged_blob_url, {});
+        VERIFY(!forged_entry.has_value() || !forged_entry->origin.is_same_origin(victim_url.origin()));
+        stub.did_remove_blob_url_entries(page_id, environment_id, { victim_blob_url });
+        VERIFY(blob_url_store.resolve(victim_blob_url, {}).has_value());
+    }
 
     auto expect_rejected = [&](StringView what, Function<void(WebContentClientStub&, Compositing::PageId)> send) {
         auto view = create_view();
@@ -117,8 +146,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     expect_rejected("reading all cookies for WebDriver"sv, [&](auto& stub, auto) {
         VERIFY(stub.did_request_all_cookies_webdriver(victim_url).cookies().is_empty());
     });
-    expect_rejected("storing a cookie with the HTTP source"sv, [&](auto& stub, auto) {
-        stub.did_set_cookie(victim_url, HTTP::Cookie::ParsedCookie { .name = "session"_string, .value = "attacker"_string, .http_only_attribute_present = true }, HTTP::Cookie::Source::Http);
+    expect_rejected("storing a cookie with the HTTP source"sv, [&](auto& stub, auto page_id) {
+        stub.did_set_cookie(page_id, victim_url, HTTP::Cookie::ParsedCookie { .name = "session"_string, .value = "attacker"_string, .http_only_attribute_present = true }, HTTP::Cookie::Source::Http);
     });
     expect_rejected("reading a named cookie for WebDriver"sv, [&](auto& stub, auto) {
         VERIFY(!stub.did_request_named_cookie(victim_url, "session"_string).cookie().has_value());
@@ -132,6 +161,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         stub.did_update_cookie(move(cookie));
     });
 
-    outln("PASS: renderers cannot read, store or update cookies the way HTTP responses and WebDriver do");
+    outln("PASS: renderers cannot read, store or update cookies the way HTTP responses and WebDriver do, nor reach another origin's cookies or blob URL entries");
     return 0;
 }

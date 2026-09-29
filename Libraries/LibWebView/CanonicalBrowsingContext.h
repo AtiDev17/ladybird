@@ -11,6 +11,7 @@
 #include <AK/Optional.h>
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
+#include <AK/Utf16String.h>
 #include <AK/WeakPtr.h>
 #include <LibURL/Origin.h>
 #include <LibWebCommon/Forward.h>
@@ -29,8 +30,8 @@ public:
         NonnullRefPtr<CanonicalDocument> document;
     };
 
-    static BrowsingContextAndDocument create_a_new_browsing_context_and_document(CanonicalDocument const* creator, Optional<Web::HTML::ReplicatedContainerState const&> embedder, CanonicalBrowsingContextGroup&);
-    static BrowsingContextAndDocument create_a_new_top_level_browsing_context_and_document();
+    static BrowsingContextAndDocument create_a_new_browsing_context_and_document(CanonicalDocument const* creator, Optional<Web::HTML::ReplicatedContainerState const&> embedder, CanonicalBrowsingContextGroup&, Optional<Web::HTML::EnvironmentId> environment_id, Optional<URL::Origin> given_origin = {});
+    static BrowsingContextAndDocument create_a_new_top_level_browsing_context_and_document(Optional<URL::Origin> given_origin = {});
     static BrowsingContextAndDocument create_a_new_auxiliary_browsing_context_and_document(CanonicalNavigable& opener);
 
     ~CanonicalBrowsingContext();
@@ -40,7 +41,7 @@ public:
     void set_active_document(Badge<CanonicalDocument>, CanonicalDocument&);
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#active-window
-    CanonicalWindow& active_window() const { return *m_window_proxy_window; }
+    CanonicalWindow& active_window() const;
     void set_active_window(Badge<CanonicalDocument>, CanonicalWindow&);
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#bc-tlbc
@@ -71,8 +72,8 @@ private:
 
     WeakPtr<CanonicalDocument> m_active_document;
 
-    // NB: The [[Window]] internal slot value of the browsing context's WindowProxy.
-    RefPtr<CanonicalWindow> m_window_proxy_window;
+    // NB: The [[Window]] internal slot value of the browsing context's WindowProxy. The documents using the window own it.
+    WeakPtr<CanonicalWindow> m_window_proxy_window;
 
     RefPtr<CanonicalBrowsingContext> m_top_level_browsing_context;
 

@@ -19,7 +19,7 @@ namespace Web::HTML {
 GC_DEFINE_ALLOCATOR(WorkerEnvironmentSettingsObject);
 
 // https://html.spec.whatwg.org/multipage/workers.html#set-up-a-worker-environment-settings-object
-GC::Ref<WorkerEnvironmentSettingsObject> WorkerEnvironmentSettingsObject::setup(GC::Ref<Page> page, NonnullOwnPtr<JS::ExecutionContext> execution_context, SerializedEnvironmentSettingsObject const& outside_settings, HighResolutionTime::DOMHighResTimeStamp unsafe_worker_creation_time)
+GC::Ref<WorkerEnvironmentSettingsObject> WorkerEnvironmentSettingsObject::setup(GC::Ref<Page> page, NonnullOwnPtr<JS::ExecutionContext> execution_context, SerializedEnvironmentSettingsObject const& outside_settings, HighResolutionTime::DOMHighResTimeStamp unsafe_worker_creation_time, URL::Origin origin, EnvironmentId id)
 {
     // 1. Let realm be the value of execution context's Realm component.
     auto realm = execution_context->realm;
@@ -36,7 +36,7 @@ GC::Ref<WorkerEnvironmentSettingsObject> WorkerEnvironmentSettingsObject::setup(
     worker->set_cross_origin_isolated_capability(outside_settings.cross_origin_isolated_capability == CanUseCrossOriginIsolatedAPIs::Yes);
 
     // 3. Let origin be a unique opaque origin if worker global scope's url's scheme is "data"; otherwise outside settings's origin.
-    auto origin = worker->url().scheme() == "data" ? URL::Origin::create_opaque() : outside_settings.origin;
+    // NB: The browser process determines it, as it holds the worker's environment too.
 
     // AD-HOC: A dedicated worker agent belongs to its owner's agent cluster, and a shared or service worker agent to a
     //         new one — which the spec settles while obtaining the agent, from outside settings' relevant agent. Here,
@@ -49,9 +49,12 @@ GC::Ref<WorkerEnvironmentSettingsObject> WorkerEnvironmentSettingsObject::setup(
     auto settings_object = realm->create<WorkerEnvironmentSettingsObject>(move(execution_context), *worker, move(origin), outside_settings.has_cross_site_ancestor, unsafe_worker_creation_time, agent_cluster_id);
     settings_object->target_browsing_context = nullptr;
 
-    // FIXME: 5. Set settings object's id to a new unique opaque string, creation URL to worker global scope's url, top-level creation URL to null, target browsing context to null, and active service worker to null.
-    // NB: WorkerHost sets (ad-hoc) the global scope's url to be the worker URL before redirects, as the spec does not
-    //     do so at that point. See https://github.com/whatwg/html/issues/11340.
+    // 5. Set settings object's id to a new unique opaque string, creation URL to worker global scope's url, top-level
+    //    creation URL to null, target browsing context to null, and active service worker to null.
+    // NB: The browser process generates the id, as it holds the worker's environment too. WorkerHost sets (ad-hoc) the
+    //     global scope's url to be the worker URL before redirects, as the spec does not do so at that point. See
+    //     https://github.com/whatwg/html/issues/11340.
+    settings_object->id = move(id);
     settings_object->creation_url = worker->url();
 
     // 6. If worker global scope is a DedicatedWorkerGlobalScope object, then set settings object's top-level origin to
