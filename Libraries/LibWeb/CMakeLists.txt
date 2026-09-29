@@ -31,8 +31,9 @@ set(SOURCES
     Clipboard/Clipboard.cpp
     Clipboard/ClipboardEvent.cpp
     Clipboard/ClipboardItem.cpp
-    Clipboard/SystemClipboard.cpp
+    Compositor/CompositorConnection.cpp
     Compositor/CompositorHost.cpp
+    Compositor/CompositorHostBase.cpp
     Compression/CompressionStream.cpp
     Compression/DecompressionStream.cpp
     ContentSecurityPolicy/BlockingAlgorithms.cpp
@@ -60,7 +61,6 @@ set(SOURCES
     ContentSecurityPolicy/Directives/ScriptSourceAttributeDirective.cpp
     ContentSecurityPolicy/Directives/ScriptSourceDirective.cpp
     ContentSecurityPolicy/Directives/ScriptSourceElementDirective.cpp
-    ContentSecurityPolicy/Directives/SerializedDirective.cpp
     ContentSecurityPolicy/Directives/SourceExpression.cpp
     ContentSecurityPolicy/Directives/StyleSourceAttributeDirective.cpp
     ContentSecurityPolicy/Directives/StyleSourceDirective.cpp
@@ -70,7 +70,6 @@ set(SOURCES
     ContentSecurityPolicy/Policy.cpp
     ContentSecurityPolicy/PolicyList.cpp
     ContentSecurityPolicy/SecurityPolicyViolationEvent.cpp
-    ContentSecurityPolicy/SerializedPolicy.cpp
     ContentSecurityPolicy/Violation.cpp
     CookieStore/CookieChangeEvent.cpp
     CookieStore/CookieStore.cpp
@@ -207,7 +206,6 @@ set(SOURCES
     CSS/Parser/RuleContext.cpp
     CSS/Parser/SelectorParsing.cpp
     CSS/Percentage.cpp
-    CSS/PreferredColorScheme.cpp
     CSS/Ratio.cpp
     CSS/Resolution.cpp
     CSS/ResolvedTransform.cpp
@@ -284,7 +282,6 @@ set(SOURCES
     CSS/StyleValues/UnresolvedStyleValue.cpp
     CSS/Supports.cpp
     CSS/SyntaxHighlighter/SyntaxHighlighter.cpp
-    CSS/SystemColor.cpp
     CSS/Time.cpp
     CSS/TransitionEvent.cpp
     CSS/URL.cpp
@@ -413,7 +410,6 @@ set(SOURCES
     Fetch/Infrastructure/HTTP/MIME.cpp
     Fetch/Infrastructure/HTTP/Requests.cpp
     Fetch/Infrastructure/HTTP/Responses.cpp
-    Fetch/Infrastructure/HTTP/Statuses.cpp
     Fetch/Infrastructure/IncrementalReadLoopReadRequest.cpp
     Fetch/Infrastructure/MimeTypeBlocking.cpp
     Fetch/Infrastructure/NetworkPartitionKey.cpp
@@ -430,7 +426,6 @@ set(SOURCES
     FileAPI/FileList.cpp
     FileAPI/FileReader.cpp
     FileAPI/FileReaderSync.cpp
-    FileAPI/SerializedBlobURLEntry.cpp
     Gamepad/EventNames.cpp
     Gamepad/Gamepad.cpp
     Gamepad/GamepadButton.cpp
@@ -466,11 +461,11 @@ set(SOURCES
     HTML/BarProp.cpp
     HTML/BeforeUnloadEvent.cpp
     HTML/BroadcastChannel.cpp
-    HTML/BroadcastChannelMessage.cpp
     HTML/BrowsingContext.cpp
     HTML/BrowsingContextGroup.cpp
     HTML/Canvas/AbstractCanvasMixin.cpp
     HTML/Canvas/Canvas2DContextBase.cpp
+    HTML/Canvas/CanvasHost.cpp
     HTML/Canvas/CanvasDrawImage.cpp
     HTML/Canvas/CanvasFillStrokeStyles.cpp
     HTML/Canvas/CanvasPath.cpp
@@ -508,7 +503,6 @@ set(SOURCES
     HTML/DragDataStore.cpp
     HTML/DragEvent.cpp
     HTML/ElementInternals.cpp
-    HTML/EmbedderPolicy.cpp
     HTML/ErrorEvent.cpp
     HTML/ErrorInformation.cpp
     HTML/EventHandler.cpp
@@ -518,7 +512,6 @@ set(SOURCES
     HTML/EventNames.cpp
     HTML/EventSource.cpp
     HTML/External.cpp
-    HTML/FileFilter.cpp
     HTML/Focus.cpp
     HTML/FormAssociatedElement.cpp
     HTML/FormControlInfrastructure.cpp
@@ -527,7 +520,6 @@ set(SOURCES
     HTML/HashChangeEvent.cpp
     HTML/History.cpp
     HTML/HistoryExecutor.cpp
-    HTML/HistoryOperation.cpp
     HTML/HTMLAllCollection.cpp
     HTML/HTMLAnchorElement.cpp
     HTML/HTMLAreaElement.cpp
@@ -624,7 +616,6 @@ set(SOURCES
     HTML/MimeType.cpp
     HTML/MimeTypeArray.cpp
     HTML/Navigable.cpp
-    HTML/CrossProcessId.cpp
     HTML/NavigableContainer.cpp
     HTML/NavigateParams.cpp
     HTML/NavigateEvent.cpp
@@ -633,7 +624,6 @@ set(SOURCES
     HTML/NavigationCurrentEntryChangeEvent.cpp
     HTML/NavigationDestination.cpp
     HTML/NavigationHistoryEntry.cpp
-    HTML/NavigationPopulationRequest.cpp
     HTML/NavigationSourceSnapshot.cpp
     HTML/NavigationObserver.cpp
     HTML/NavigationParams.cpp
@@ -660,9 +650,7 @@ set(SOURCES
     HTML/Plugin.cpp
     HTML/PluginArray.cpp
     HTML/PolicyContainers.cpp
-    HTML/PostedMessageDescriptor.cpp
     HTML/PreparedNavigationDescriptor.cpp
-    HTML/POSTResource.cpp
     HTML/PopoverTargetAttributes.cpp
     HTML/PopStateEvent.cpp
     HTML/PotentialCORSRequest.cpp
@@ -672,8 +660,6 @@ set(SOURCES
     HTML/RadioNodeList.cpp
     HTML/RemoteNavigable.cpp
     HTML/RemoteWindow.cpp
-    HTML/ReplicatedNavigableState.cpp
-    HTML/SandboxingFlagSet.cpp
     HTML/Scripting/Agent.cpp
     HTML/Scripting/ClassicScript.cpp
     HTML/Scripting/Environments.cpp
@@ -686,7 +672,6 @@ set(SOURCES
     HTML/Scripting/ModuleScript.cpp
     HTML/Scripting/Script.cpp
     HTML/Scripting/ScriptRegistry.cpp
-    HTML/Scripting/SerializedEnvironmentSettingsObject.cpp
     HTML/Scripting/SimilarOriginWindowAgent.cpp
     HTML/Scripting/TemporaryExecutionContext.cpp
     HTML/Scripting/WindowEnvironmentSettingsObject.cpp
@@ -694,9 +679,6 @@ set(SOURCES
     HTML/Scripting/WorkerAgent.cpp
     HTML/Scripting/WorkerEnvironmentSettingsObject.cpp
     HTML/Scripting/WorkletEnvironmentSettingsObject.cpp
-    HTML/SelectedFile.cpp
-    HTML/SelectItem.cpp
-    HTML/SerializedPolicyContainer.cpp
     HTML/SessionHistoryEntry.cpp
     HTML/SharedResourceRequest.cpp
     HTML/AnimatedBitmapDecodedImageData.cpp
@@ -740,7 +722,6 @@ set(SOURCES
     HTML/WorkerDebugConsoleClient.cpp
     HTML/WorkerGlobalScope.cpp
     HTML/WorkerLocation.cpp
-    HTML/WorkerAgentTypes.cpp
     HTML/WorkerNavigator.cpp
     HTML/Worklet.cpp
     HTML/WorkletGlobalScope.cpp
@@ -766,7 +747,6 @@ set(SOURCES
     IndexedDB/Internal/RequestList.cpp
     Infra/ByteSequences.cpp
     Infra/JSON.cpp
-    Infra/Strings.cpp
     Internals/FakeXRDevice.cpp
     Internals/InternalAnimationTimeline.cpp
     Internals/InternalGamepad.cpp
@@ -786,11 +766,10 @@ set(SOURCES
     Layout/UpdateLayout.cpp
     Layout/Viewport.cpp
     Loader/ContentBlocker.cpp
-    Loader/DownloadFilename.cpp
     Loader/FileRequest.cpp
     Loader/GeneratedPagesLoader.cpp
     Loader/ResourceLoader.cpp
-    Loader/SiteCompatibility.cpp
+    Loader/SourceHighlighter.cpp
     MathML/AttributeNames.cpp
     MathML/MathMLAnchorElement.cpp
     MathML/MathMLElement.cpp
@@ -811,7 +790,6 @@ set(SOURCES
     MediaSourceExtensions/MediaSourceHandle.cpp
     MediaSourceExtensions/SourceBuffer.cpp
     MediaSourceExtensions/SourceBufferList.cpp
-    MimeSniff/MimeType.cpp
     MimeSniff/Resource.cpp
     MixedContent/AbstractOperations.cpp
     Namespace.cpp
@@ -824,7 +802,6 @@ set(SOURCES
     Page/DragAndDropEventHandler.cpp
     Page/ElementResizeAction.cpp
     Page/EventHandler.cpp
-    Page/DragEvent.cpp
     Page/MiddleButtonScrollHandler.cpp
     Page/Page.cpp
     Page/ScreenWakeLockHandle.cpp
@@ -853,9 +830,9 @@ set(SOURCES
     Platform/EventLoopPlugin.cpp
     Platform/FontPlugin.cpp
     Platform/ImageCodecPlugin.cpp
+    Platform/RemoteImageCodecPlugin.cpp
     Platform/Timer.cpp
     ReferrerPolicy/AbstractOperations.cpp
-    ReferrerPolicy/ReferrerPolicy.cpp
     RequestIdleCallback/IdleDeadline.cpp
     ResizeObserver/ResizeObservation.cpp
     ResizeObserver/ResizeObserver.cpp
@@ -891,7 +868,6 @@ set(SOURCES
     SRI/SRI.cpp
     StorageAPI/NavigatorStorage.cpp
     StorageAPI/StorageBottle.cpp
-    StorageAPI/StorageEndpoint.cpp
     StorageAPI/StorageKey.cpp
     StorageAPI/StorageManager.cpp
     StorageAPI/StorageShelf.cpp
@@ -1086,20 +1062,14 @@ set(SOURCES
     WebAudio/ScriptProcessorNode.cpp
     WebAudio/StereoPannerNode.cpp
     WebDriver/Actions.cpp
-    WebDriver/Capabilities.cpp
-    WebDriver/Client.cpp
     WebDriver/Contexts.cpp
     WebDriver/ElementLocationStrategies.cpp
     WebDriver/ElementReference.cpp
-    WebDriver/Error.cpp
     WebDriver/ExecuteScript.cpp
     WebDriver/InputSource.cpp
     WebDriver/InputState.cpp
     WebDriver/JSON.cpp
-    WebDriver/Proxy.cpp
-    WebDriver/Response.cpp
     WebDriver/Screenshot.cpp
-    WebDriver/TimeoutsConfiguration.cpp
     WebDriver/UserPrompt.cpp
     WebGL/EventNames.cpp
     WebGL/Extensions/ANGLEInstancedArrays.cpp
@@ -1177,8 +1147,6 @@ set(SOURCES
     XPath/XPathResult.cpp
 )
 
-compile_ipc(Worker/WebWorkerClient.ipc Worker/WebWorkerClientEndpoint.h)
-compile_ipc(Worker/WebWorkerServer.ipc Worker/WebWorkerServerEndpoint.h)
 
 invoke_py_generator(
     "AriaRoles.cpp"
@@ -1214,17 +1182,15 @@ set(GENERATED_SOURCES
     CSS/Units.cpp
     MathML/MathMLStyleSheetSource.cpp
     SVG/SVGStyleSheetSource.cpp
-    Worker/WebWorkerClientEndpoint.h
-    Worker/WebWorkerServerEndpoint.h
     HTML/MediaControlsDOM.cpp
     HTML/Parser/NamedCharacterReferences.cpp
     WebGL/WebGLContextProxy.cpp
 )
 
 ladybird_lib(LibWeb web EXPLICIT_SYMBOL_EXPORT)
-target_link_libraries(LibWeb PUBLIC LibCompositing)
+target_link_libraries(LibWeb PUBLIC LibCompositing LibWebCommon)
 
-target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibJS LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibMedia LibMediaClient LibWasm LibXML LibURL LibTLS LibRequests LibGC LibThreading skia SDL3::SDL3 LibXml2::LibXml2)
+target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibJS LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibMedia LibMediaClient LibWasm LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading skia SDL3::SDL3 LibXml2::LibXml2)
 
 # LibWeb still includes ANGLE's GLES headers for WebGL constants and types, but
 # the actual GL entry points live in the Compositor. Copy only ANGLE's compile

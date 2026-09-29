@@ -11,6 +11,7 @@ set(SOURCES
     Audio/WSOLAAlgorithm.cpp
     Audio/WSOLAInternals.cpp
     Audio/WSOLATimeStretcher.cpp
+    AudioDiscardIntervals.cpp
     CodecParameters.cpp
     Color/CodingIndependentCodePoints.cpp
     Codecs/AAC.cpp
@@ -65,6 +66,7 @@ set(SOURCES
     PlaybackStates/PlayingStateHandler.cpp
     PlaybackStates/ResumingStateHandler.cpp
     PlaybackStates/StartingStateHandler.cpp
+    PlaybackStates/SuspendedStateHandler.cpp
     Processors/AudioMixer.cpp
     Processors/AudioTimeStretchProcessor.cpp
     Producers/DecodedAudioProducer.cpp

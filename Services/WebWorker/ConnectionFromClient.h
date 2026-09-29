@@ -12,14 +12,14 @@
 #include <LibIPC/ConnectionFromClient.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/HTML/BroadcastChannelMessage.h>
-#include <LibWeb/HTML/WorkerAgentTypes.h>
 #include <LibWeb/Loader/FileRequest.h>
-#include <LibWeb/Worker/WebWorkerClientEndpoint.h>
-#include <LibWeb/Worker/WebWorkerServerEndpoint.h>
-#include <LibWebView/Forward.h>
+#include <LibWebCommon/Forward.h>
+#include <LibWebCommon/HTML/BroadcastChannelMessage.h>
+#include <LibWebCommon/HTML/WorkerAgentTypes.h>
 #include <WebWorker/Forward.h>
 #include <WebWorker/PageHost.h>
+#include <WebWorker/WebWorkerClientEndpoint.h>
+#include <WebWorker/WebWorkerServerEndpoint.h>
 
 namespace Gfx {
 
@@ -47,7 +47,7 @@ public:
     PageHost& page_host() { return *m_page_host; }
     PageHost const& page_host() const { return *m_page_host; }
 
-    WebView::CompositorConnection* compositor_process_connection() const;
+    Web::Compositor::CompositorConnection* compositor_process_connection() const;
 
     Function<void(IPC::TransportHandle const&)> on_request_server_connection;
     Function<void(IPC::TransportHandle const&)> on_image_decoder_connection;
@@ -59,7 +59,7 @@ public:
 #endif
 
 private:
-    explicit ConnectionFromClient(NonnullOwnPtr<IPC::Transport>);
+    ConnectionFromClient(NonnullOwnPtr<IPC::Transport>, bool enable_test_mode);
 
     Web::Page& page();
     Web::Page const& page() const;
@@ -83,7 +83,7 @@ private:
 
     GC::Root<PageHost> m_page_host;
 
-    RefPtr<WebView::CompositorConnection> m_compositor_connection;
+    RefPtr<Web::Compositor::CompositorConnection> m_compositor_connection;
 
     // FIXME: Route console messages to the Browser UI using a ConsoleClient
 
@@ -93,6 +93,7 @@ private:
     RefPtr<WorkerHost> m_worker_host;
     Function<void()> m_request_server_died_callback_for_testing;
     Gfx::SharedFontProvider* m_font_provider { nullptr };
+    bool m_enable_test_mode { false };
 };
 
 }

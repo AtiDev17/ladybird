@@ -39,52 +39,56 @@
 #include <LibURL/URL.h>
 #include <LibWeb/Bindings/AgentType.h>
 #include <LibWeb/Bindings/Navigation.h>
-#include <LibWeb/CSS/PreferredColorScheme.h>
-#include <LibWeb/CSS/PreferredContrast.h>
-#include <LibWeb/CSS/PreferredMotion.h>
 #include <LibWeb/DOM/RequestFullscreenError.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/FileAPI/SerializedBlobURLEntry.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/Fullscreen/FullscreenRequestType.h>
 #include <LibWeb/Geolocation/Geolocation.h>
 #include <LibWeb/Geolocation/GeolocationCoordinates.h>
 #include <LibWeb/Geolocation/GeolocationPositionError.h>
-#include <LibWeb/HTML/ActivateTab.h>
-#include <LibWeb/HTML/AudioPlayState.h>
-#include <LibWeb/HTML/ColorPickerUpdateState.h>
-#include <LibWeb/HTML/CrossProcessId.h>
-#include <LibWeb/HTML/FileFilter.h>
 #include <LibWeb/HTML/Focus.h>
-#include <LibWeb/HTML/HistoryHandlingBehavior.h>
-#include <LibWeb/HTML/HistoryOperation.h>
 #include <LibWeb/HTML/NavigationSourceSnapshot.h>
-#include <LibWeb/HTML/POSTResource.h>
-#include <LibWeb/HTML/PostedMessageDescriptor.h>
 #include <LibWeb/HTML/PreparedNavigationDescriptor.h>
-#include <LibWeb/HTML/ReplicatedNavigableState.h>
 #include <LibWeb/HTML/SameDocumentNavigationEntry.h>
 #include <LibWeb/HTML/Scripting/ScriptRegistry.h>
-#include <LibWeb/HTML/SelectItem.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/TokenizedFeatures.h>
-#include <LibWeb/HTML/UserActivationConsumption.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
-#include <LibWeb/HTML/VisibilityState.h>
 #include <LibWeb/HTML/WebViewHints.h>
-#include <LibWeb/HTML/WorkerAgentForward.h>
-#include <LibWeb/IndexedDB/TransactionChanges.h>
 #include <LibWeb/Loader/FileRequest.h>
-#include <LibWeb/Page/EventResult.h>
-#include <LibWeb/Page/PageId.h>
-#include <LibWeb/Page/QueuedInputEvent.h>
 #include <LibWeb/Page/ScreenWakeLockHandle.h>
-#include <LibWeb/Page/ViewportIsFullscreen.h>
 #include <LibWeb/Painting/ChromeMetrics.h>
-#include <LibWeb/PixelUnits.h>
-#include <LibWeb/StorageAPI/StorageEndpoint.h>
-#include <LibWeb/UIEvents/KeyCode.h>
-#include <LibWebView/StorageSetResult.h>
+#include <LibWebCommon/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/CSS/PreferredContrast.h>
+#include <LibWebCommon/CSS/PreferredMotion.h>
+#include <LibWebCommon/FileAPI/SerializedBlobURLEntry.h>
+#include <LibWebCommon/Fullscreen/FullscreenRequestType.h>
+#include <LibWebCommon/HTML/ActivateTab.h>
+#include <LibWebCommon/HTML/AudioPlayState.h>
+#include <LibWebCommon/HTML/ColorPickerUpdateState.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/FileFilter.h>
+#include <LibWebCommon/HTML/HistoryHandlingBehavior.h>
+#include <LibWebCommon/HTML/HistoryOperation.h>
+#include <LibWebCommon/HTML/POSTResource.h>
+#include <LibWebCommon/HTML/PostedMessageDescriptor.h>
+#include <LibWebCommon/HTML/ReplicatedNavigableState.h>
+#include <LibWebCommon/HTML/SelectItem.h>
+#include <LibWebCommon/HTML/UserActivationConsumption.h>
+#include <LibWebCommon/HTML/VisibilityState.h>
+#include <LibWebCommon/HTML/WorkerAgentForward.h>
+#include <LibWebCommon/IndexedDB/TransactionChanges.h>
+#include <LibWebCommon/Page/ContextMenuForInputEventsTarget.h>
+#include <LibWebCommon/Page/EventResult.h>
+#include <LibWebCommon/Page/MediaContextMenu.h>
+#include <LibWebCommon/Page/NavigationTarget.h>
+#include <LibWebCommon/Page/PageId.h>
+#include <LibWebCommon/Page/PendingDialog.h>
+#include <LibWebCommon/Page/QueuedInputEvent.h>
+#include <LibWebCommon/Page/ViewportIsFullscreen.h>
+#include <LibWebCommon/PixelUnits.h>
+#include <LibWebCommon/StorageAPI/StorageEndpoint.h>
+#include <LibWebCommon/UIEvents/KeyCode.h>
+#include <LibWebCommon/WebView/StorageSetResult.h>
 
 namespace Web {
 
@@ -273,12 +277,7 @@ public:
     Optional<Utf16String> did_request_prompt(Utf16String const& message, Utf16String const& default_);
     void prompt_closed(Optional<Utf16String> response);
 
-    enum class PendingDialog {
-        None,
-        Alert,
-        Confirm,
-        Prompt,
-    };
+    using PendingDialog = Web::PendingDialog;
     void did_open_dialog_in_another_process(PendingDialog, Utf16String const& message);
     bool has_pending_dialog() const { return m_pending_dialog != PendingDialog::None; }
     PendingDialog pending_dialog() const { return m_pending_dialog; }
@@ -334,6 +333,7 @@ public:
 
     void register_canvas_element(Badge<HTML::HTMLCanvasElement>, UniqueNodeID canvas_id);
     void unregister_canvas_element(Badge<HTML::HTMLCanvasElement>, UniqueNodeID canvas_id);
+    void enqueue_offscreen_canvas_placeholder_commit(Badge<HTML::OffscreenCanvas>, HTML::OffscreenCanvas&);
 
     void prepare_canvas_contexts_for_compositing();
     void notify_all_canvas_elements_of_lost_backing_storage();
@@ -353,15 +353,7 @@ public:
     void clear_context_menu_request() { m_context_menu_request.clear(); }
     Optional<ContextMenuRequest> take_context_menu_request();
 
-    struct MediaContextMenu {
-        URL::URL media_url;
-        bool is_video { false };
-        bool is_playing { false };
-        bool is_muted { false };
-        bool has_user_agent_controls { false };
-        bool is_looping { false };
-        bool is_fullscreen { false };
-    };
+    using MediaContextMenu = Web::MediaContextMenu;
     void did_request_media_context_menu(UniqueNodeID media_id, HTML::CrossProcessId local_root_id, CSSPixelPoint, ByteString const& target, unsigned modifiers, MediaContextMenu const&);
     void toggle_media_play_state();
     void toggle_media_mute_state();
@@ -524,6 +516,7 @@ private:
 
     Vector<UniqueNodeID> m_media_elements;
     Vector<UniqueNodeID> m_canvas_elements;
+    Vector<GC::Ref<HTML::OffscreenCanvas>> m_offscreen_canvases_pending_placeholder_commit;
     Optional<UniqueNodeID> m_media_context_menu_element_id;
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
@@ -579,16 +572,6 @@ private:
     ViewportIsFullscreen m_viewport_is_fullscreen { ViewportIsFullscreen::No };
     bool m_fullscreen_ipc_sent_to_ui { false };
     bool m_processing_fullscreen_operations { false };
-};
-
-enum class ContextMenuForInputEventsTarget : u8 {
-    No,
-    Yes,
-};
-
-enum class NavigationTarget : u8 {
-    TopLevel,
-    IFrame,
 };
 
 class WEB_API PageClient : public JS::Cell {
@@ -837,15 +820,5 @@ public:
 protected:
     virtual ~PageClient() = default;
 };
-
-}
-
-namespace IPC {
-
-template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::Page::MediaContextMenu const&);
-
-template<>
-WEB_API ErrorOr<Web::Page::MediaContextMenu> decode(Decoder&);
 
 }

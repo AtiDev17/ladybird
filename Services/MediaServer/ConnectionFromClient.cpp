@@ -286,7 +286,7 @@ PlaybackSession* ConnectionFromClient::find_playback_session(u64 session_id)
     return it->value.ptr();
 }
 
-void ConnectionFromClient::create_playback_session(u64 session_id, bool audio_output_disabled)
+void ConnectionFromClient::create_playback_session(u64 session_id, Media::AudioOutput audio_output)
 {
     if (!verify_renderer_role())
         return;
@@ -294,7 +294,7 @@ void ConnectionFromClient::create_playback_session(u64 session_id, bool audio_ou
         did_misbehave("Duplicate playback session ID");
         return;
     }
-    m_playback_sessions.set(session_id, make<PlaybackSession>(*this, session_id, audio_output_disabled));
+    m_playback_sessions.set(session_id, make<PlaybackSession>(*this, session_id, audio_output));
 }
 
 void ConnectionFromClient::destroy_playback_session(u64 session_id)
@@ -457,6 +457,12 @@ void ConnectionFromClient::set_source_buffer_timestamp_offset(u64 session_id, u6
 {
     if (auto* session = find_playback_session(session_id))
         session->run_source_buffer_command(source_buffer_id, Commands::SetTimestampOffset { timestamp_offset });
+}
+
+void ConnectionFromClient::set_source_buffer_append_window(u64 session_id, u64 source_buffer_id, AK::Duration start, AK::Duration end)
+{
+    if (auto* session = find_playback_session(session_id))
+        session->run_source_buffer_command(source_buffer_id, Commands::SetAppendWindow { start, end });
 }
 
 void ConnectionFromClient::set_source_buffer_generate_timestamps_flag(u64 session_id, u64 source_buffer_id, bool flag)

@@ -43,6 +43,7 @@
 #include <LibJS/Runtime/VM.h>
 #include <LibJS/Runtime/Value.h>
 #include <LibJS/Runtime/ValueInlines.h>
+#include <LibJS/SourceTextModule.h>
 #include <math.h>
 
 // ===== Slow path functions callable from assembly =====
@@ -145,6 +146,12 @@ static void asm_update_environment_coordinate_cache(EnvironmentPointer environme
     auto candidate = reference.environment_coordinate().value();
     if (asm_get_cacheable_environment(environment, candidate))
         cache = candidate;
+}
+
+[[noreturn]] static void report_wrong_environment_coordinate(Utf16FlyString const& name, EnvironmentCoordinate const& coordinate, u32 hop, StringView reason)
+{
+    dbgln("Environment coordinate for '{}' ({} hops, index {}) is wrong at hop {}: {}", name, coordinate.hops, coordinate.index, hop, reason);
+    VERIFY_NOT_REACHED();
 }
 
 enum class AsmBindingIsKnownToBeInitialized {
@@ -648,6 +655,7 @@ DECLARE_SLOW_PATH(asm_slow_path_get_length_with_this, GetLengthWithThis);
 DECLARE_SLOW_PATH(asm_slow_path_get_method, GetMethod);
 DECLARE_SLOW_PATH(asm_slow_path_get_iterator, GetIterator);
 DECLARE_SLOW_PATH(asm_slow_path_get_import_meta, GetImportMeta);
+DECLARE_SLOW_PATH(asm_slow_path_get_import, GetImport);
 DECLARE_SLOW_PATH(asm_slow_path_get_new_target, GetNewTarget);
 DECLARE_SLOW_PATH(asm_slow_path_get_super_constructor, GetSuperConstructor);
 DECLARE_SLOW_PATH(asm_slow_path_get_global, GetGlobal);
@@ -719,6 +727,7 @@ DECLARE_SLOW_PATH(asm_slow_path_resolve_super_base, ResolveSuperBase);
 DECLARE_SLOW_PATH(asm_slow_path_set_resolved_binding, SetResolvedBinding);
 DECLARE_SLOW_PATH(asm_slow_path_typeof_binding, TypeofBinding);
 DECLARE_SLOW_PATH(asm_slow_path_dynamic_typeof_binding, DynamicTypeofBinding);
+DECLARE_SLOW_PATH(asm_slow_path_verify_environment_coordinate, VerifyEnvironmentCoordinate);
 DECLARE_SLOW_PATH(asm_slow_path_has_private_id, HasPrivateId);
 DECLARE_SLOW_PATH(asm_slow_path_set_function_name, SetFunctionName);
 DECLARE_SLOW_PATH(asm_slow_path_new_array_with_length, NewArrayWithLength);
@@ -757,8 +766,6 @@ DECLARE_SLOW_PATH(asm_slow_path_in, In);
 DECLARE_SLOW_PATH(asm_slow_path_get_private_by_id, GetPrivateById);
 DECLARE_SLOW_PATH(asm_slow_path_put_private_by_id, PutPrivateById);
 
-i64 asm_try_get_global_env_binding(VM*, u32 pc, Op::GetGlobal const*, Op::GetGlobal::Values& values);
-i64 asm_try_set_global_env_binding(VM*, u32 pc, Op::SetGlobal const*, Op::SetGlobal::Values& values);
 i64 asm_try_put_by_value_holey_array(VM*, u32 pc, Op::PutByValue const*, Op::PutByValue::Values& values);
 u64 asm_helper_to_boolean(u64 encoded_value);
 u64 asm_helper_math_exp(u64 encoded_value);
@@ -1143,6 +1150,13 @@ DEFINE_SLOW_PATH(asm_slow_path_get_import_meta, GetImportMeta)
     return continue_after_slow_path(pc + sizeof(Op::GetImportMeta));
 }
 
+DEFINE_SLOW_PATH(asm_slow_path_get_import, GetImport)
+{
+    auto& module = as<SourceTextModule>(*vm->running_execution_context().script_or_module.get<GC::Ref<Module>>());
+    values.dst = ASM_TRY(*vm, pc, module.get_imported_binding_value(*vm, instruction->import_index(), vm->get_identifier(instruction->identifier())));
+    return continue_after_slow_path(pc + sizeof(Op::GetImport));
+}
+
 DEFINE_SLOW_PATH(asm_slow_path_get_new_target, GetNewTarget)
 {
     values.dst = vm->get_new_target();
@@ -1154,29 +1168,6 @@ DEFINE_SLOW_PATH(asm_slow_path_get_super_constructor, GetSuperConstructor)
     auto* super_constructor = get_super_constructor(*vm);
     values.dst = super_constructor ? Value(super_constructor) : js_null();
     return continue_after_slow_path(pc + sizeof(Op::GetSuperConstructor));
-}
-
-i64 asm_try_get_global_env_binding(VM* vm, u32, Op::GetGlobal const* instruction, Op::GetGlobal::Values& values)
-{
-    auto& cache = vm->current_executable().global_variable_caches[instruction->cache()];
-
-    if (!cache.has_environment_binding_index) [[unlikely]]
-        return 1;
-
-    auto& current_vm = *vm;
-    ThrowCompletionOr<Value> result = js_undefined();
-    if (cache.in_module_environment) {
-        auto module = current_vm.running_execution_context().script_or_module.get_pointer<GC::Ref<Module>>();
-        if (!module) [[unlikely]]
-            return 1;
-        result = (*module)->environment()->get_binding_value_direct(current_vm, cache.environment_binding_index);
-    } else {
-        result = vm->global_declarative_environment().get_binding_value_direct(current_vm, cache.environment_binding_index);
-    }
-    if (result.is_error()) [[unlikely]]
-        return 1;
-    values.dst = result.value();
-    return 0;
 }
 
 DEFINE_SLOW_PATH(asm_slow_path_get_global, GetGlobal)
@@ -1195,14 +1186,7 @@ DEFINE_SLOW_PATH(asm_slow_path_get_global, GetGlobal)
         }
 
         if (cache.has_environment_binding_index) {
-            Value value;
-            if (cache.in_module_environment) {
-                auto module = vm->running_execution_context().script_or_module.get_pointer<GC::Ref<Module>>();
-                value = ASM_TRY(*vm, pc, (*module)->environment()->get_binding_value_direct(*vm, cache.environment_binding_index));
-            } else {
-                value = ASM_TRY(*vm, pc, declarative_record.get_binding_value_direct(*vm, cache.environment_binding_index));
-            }
-            values.dst = value;
+            values.dst = ASM_TRY(*vm, pc, declarative_record.get_binding_value_direct(*vm, cache.environment_binding_index));
             return continue_after_slow_path(pc + sizeof(Op::GetGlobal));
         }
     }
@@ -1212,27 +1196,10 @@ DEFINE_SLOW_PATH(asm_slow_path_get_global, GetGlobal)
 
     auto& identifier = vm->get_identifier(instruction->identifier());
 
-    if (auto* module = vm->running_execution_context().script_or_module.get_pointer<GC::Ref<Module>>()) {
-        auto& module_environment = *(*module)->environment();
-        Optional<size_t> index;
-        if (ASM_TRY(*vm, pc, module_environment.has_binding(identifier, &index))) {
-            if (index.has_value()) {
-                cache.environment_binding_index = static_cast<u32>(index.value());
-                cache.has_environment_binding_index = true;
-                cache.in_module_environment = true;
-                values.dst = ASM_TRY(*vm, pc, module_environment.get_binding_value_direct(*vm, index.value()));
-                return continue_after_slow_path(pc + sizeof(Op::GetGlobal));
-            }
-            values.dst = ASM_TRY(*vm, pc, module_environment.get_binding_value(*vm, identifier, true));
-            return continue_after_slow_path(pc + sizeof(Op::GetGlobal));
-        }
-    }
-
     Optional<size_t> offset;
     if (ASM_TRY(*vm, pc, declarative_record.has_binding(identifier, &offset))) {
         cache.environment_binding_index = static_cast<u32>(offset.value());
         cache.has_environment_binding_index = true;
-        cache.in_module_environment = false;
         values.dst = ASM_TRY(*vm, pc, declarative_record.get_binding_value(*vm, identifier, instruction->strict() == Strict::Yes));
         return continue_after_slow_path(pc + sizeof(Op::GetGlobal));
     }
@@ -1259,29 +1226,6 @@ DEFINE_SLOW_PATH(asm_slow_path_get_global, GetGlobal)
     return handle_asm_exception(*vm, pc, completion.value());
 }
 
-i64 asm_try_set_global_env_binding(VM* vm, u32, Op::SetGlobal const* instruction, Op::SetGlobal::Values& values)
-{
-    auto& cache = vm->current_executable().global_variable_caches[instruction->cache()];
-
-    if (!cache.has_environment_binding_index) [[unlikely]]
-        return 1;
-
-    auto& current_vm = *vm;
-    auto src = values.src;
-    ThrowCompletionOr<void> result;
-    if (cache.in_module_environment) {
-        auto module = current_vm.running_execution_context().script_or_module.get_pointer<GC::Ref<Module>>();
-        if (!module) [[unlikely]]
-            return 1;
-        result = (*module)->environment()->set_mutable_binding_direct(current_vm, cache.environment_binding_index, src, instruction->strict() == Strict::Yes);
-    } else {
-        result = vm->global_declarative_environment().set_mutable_binding_direct(current_vm, cache.environment_binding_index, src, instruction->strict() == Strict::Yes);
-    }
-    if (result.is_error()) [[unlikely]]
-        return 1;
-    return 0;
-}
-
 DEFINE_SLOW_PATH(asm_slow_path_set_global, SetGlobal)
 {
     auto& binding_object = vm->global_object();
@@ -1302,12 +1246,7 @@ DEFINE_SLOW_PATH(asm_slow_path_set_global, SetGlobal)
         }
 
         if (cache.has_environment_binding_index) {
-            if (cache.in_module_environment) {
-                auto module = vm->running_execution_context().script_or_module.get_pointer<GC::Ref<Module>>();
-                ASM_TRY(*vm, pc, (*module)->environment()->set_mutable_binding_direct(*vm, cache.environment_binding_index, src, instruction->strict() == Strict::Yes));
-            } else {
-                ASM_TRY(*vm, pc, declarative_record.set_mutable_binding_direct(*vm, cache.environment_binding_index, src, instruction->strict() == Strict::Yes));
-            }
+            ASM_TRY(*vm, pc, declarative_record.set_mutable_binding_direct(*vm, cache.environment_binding_index, src, instruction->strict() == Strict::Yes));
             return continue_after_slow_path(pc + sizeof(Op::SetGlobal));
         }
     }
@@ -1317,27 +1256,10 @@ DEFINE_SLOW_PATH(asm_slow_path_set_global, SetGlobal)
 
     auto& identifier = vm->get_identifier(instruction->identifier());
 
-    if (auto* module = vm->running_execution_context().script_or_module.get_pointer<GC::Ref<Module>>()) {
-        auto& module_environment = *(*module)->environment();
-        Optional<size_t> index;
-        if (ASM_TRY(*vm, pc, module_environment.has_binding(identifier, &index))) {
-            if (index.has_value()) {
-                cache.environment_binding_index = static_cast<u32>(index.value());
-                cache.has_environment_binding_index = true;
-                cache.in_module_environment = true;
-                ASM_TRY(*vm, pc, module_environment.set_mutable_binding_direct(*vm, index.value(), src, instruction->strict() == Strict::Yes));
-                return continue_after_slow_path(pc + sizeof(Op::SetGlobal));
-            }
-            ASM_TRY(*vm, pc, module_environment.set_mutable_binding(*vm, identifier, src, instruction->strict() == Strict::Yes));
-            return continue_after_slow_path(pc + sizeof(Op::SetGlobal));
-        }
-    }
-
     Optional<size_t> offset;
     if (ASM_TRY(*vm, pc, declarative_record.has_binding(identifier, &offset))) {
         cache.environment_binding_index = static_cast<u32>(offset.value());
         cache.has_environment_binding_index = true;
-        cache.in_module_environment = false;
         ASM_TRY(*vm, pc, declarative_record.set_mutable_binding(*vm, identifier, src, instruction->strict() == Strict::Yes));
         return continue_after_slow_path(pc + sizeof(Op::SetGlobal));
     }
@@ -2597,6 +2519,35 @@ DEFINE_SLOW_PATH(asm_slow_path_dynamic_typeof_binding, DynamicTypeofBinding)
     auto value = ASM_TRY(*vm, pc, reference.get_value(*vm));
     values.dst = value.typeof_(*vm);
     return continue_after_slow_path(pc + sizeof(Op::DynamicTypeofBinding));
+}
+
+DEFINE_SLOW_PATH(asm_slow_path_verify_environment_coordinate, VerifyEnvironmentCoordinate)
+{
+    auto const& coordinate = instruction->coordinate();
+    VERIFY(coordinate.is_valid());
+
+    auto const& name = vm->get_identifier(instruction->identifier());
+    auto const* environment = instruction->mode() == Op::EnvironmentMode::Lexical
+        ? vm->running_execution_context().lexical_environment.ptr()
+        : vm->running_execution_context().variable_environment.ptr();
+
+    for (u32 hop = 0;; ++hop) {
+        if (!environment)
+            report_wrong_environment_coordinate(name, coordinate, hop, "the environment chain ends"sv);
+        auto const* declarative_environment = as_if<DeclarativeEnvironment>(*environment);
+        if (!declarative_environment)
+            report_wrong_environment_coordinate(name, coordinate, hop, "the environment is not declarative"sv);
+        if (hop == coordinate.hops) {
+            if (declarative_environment->binding_index(name) != coordinate.index)
+                report_wrong_environment_coordinate(name, coordinate, hop, "the environment has no binding at the index"sv);
+            break;
+        }
+        if (MUST(declarative_environment->has_binding(name)))
+            report_wrong_environment_coordinate(name, coordinate, hop, "a closer environment binds the name"sv);
+        environment = environment->outer_environment();
+    }
+
+    return continue_after_slow_path(pc + sizeof(Op::VerifyEnvironmentCoordinate));
 }
 
 static Optional<StringView> asm_function_name_prefix_to_string(Op::FunctionNamePrefix prefix)

@@ -16,13 +16,13 @@
 #include <LibWeb/Bindings/Navigation.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/HTML/InitialInsertion.h>
-#include <LibWeb/HTML/POSTResource.h>
 #include <LibWeb/HTML/SourceSnapshotParams.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
-#include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
 #include <LibWeb/XHR/FormDataEntry.h>
+#include <LibWebCommon/HTML/InitialInsertion.h>
+#include <LibWebCommon/HTML/POSTResource.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::HTML {
 

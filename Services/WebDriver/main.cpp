@@ -17,9 +17,9 @@
 #include <LibCore/TCPServer.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibMain/Main.h>
-#include <LibWeb/WebDriver/Capabilities.h>
-#include <LibWebView/SiteIsolation.h>
-#include <LibWebView/Utilities.h>
+#include <LibWebCommon/WebDriver/Capabilities.h>
+#include <LibWebCommon/WebView/SiteIsolation.h>
+#include <LibWebCommon/WebView/Utilities.h>
 #include <WebDriver/Client.h>
 #include <WebDriver/Session.h>
 

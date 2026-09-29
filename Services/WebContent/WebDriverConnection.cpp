@@ -63,7 +63,6 @@
 #include <LibWeb/HTML/NavigationObserver.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/HTML/SelectedFile.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HTML/XMLSerializer.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
@@ -81,7 +80,7 @@
 #include <LibWeb/WebDriver/Properties.h>
 #include <LibWeb/WebDriver/Screenshot.h>
 #include <LibWeb/WebDriver/UserPrompt.h>
-#include <LibWebView/HistoryDebug.h>
+#include <LibWebCommon/HTML/SelectedFile.h>
 #include <WebContent/PageClient.h>
 #include <WebContent/WebDriverConnection.h>
 

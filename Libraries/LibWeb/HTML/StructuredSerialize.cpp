@@ -329,11 +329,6 @@ static ErrorOr<Gfx::AlphaType> storage_identifier_to_alpha_type(StringView ident
     return Error::from_string_literal("Unknown structured serialize alpha type");
 }
 
-static constexpr Array<u8, 4> storage_format_magic = { 'L', 'B', 'S', 'C' };
-
-// Flags are for optional envelope features (e.g. compression); changes to the value encoding bump the version instead.
-static constexpr u64 storage_format_flags = 0;
-
 class StructuredSerializeDataEncoder {
 public:
     AK_ALLOC_WITH_KMALLOC;
@@ -456,9 +451,7 @@ class StorageStructuredSerializeDataEncoder final : public StructuredSerializeDa
 public:
     StorageStructuredSerializeDataEncoder()
     {
-        m_data.append(storage_format_magic.data(), storage_format_magic.size());
-        encode(storage_format_version);
-        encode(storage_format_flags);
+        append_storage_format_prologue(m_data);
     }
 
     virtual SerializationType type() const override { return SerializationType::Storage; }
@@ -840,11 +833,26 @@ void StructuredSerializeWriter::encode(T const& value)
     encode_value(*m_encoder, value);
 }
 
+// The same-process SharedArrayBuffer aliases of an IPCSerializationRecord. Only this file creates side tables, so the
+// reader can rely on a record's side table being one of these.
+class SharedArrayBufferSideTable final : public SameProcessSerializationSideTable {
+public:
+    explicit SharedArrayBufferSideTable(Vector<GC::Root<JS::ArrayBuffer>> array_buffers)
+        : m_array_buffers(move(array_buffers))
+    {
+    }
+
+    Vector<GC::Root<JS::ArrayBuffer>> const& array_buffers() const { return m_array_buffers; }
+
+private:
+    Vector<GC::Root<JS::ArrayBuffer>> m_array_buffers;
+};
+
 void StructuredSerializeWriter::append(IPCSerializationRecord&& record)
 {
     // TransferDataEncoder only appends record.data. Silently accepting a side table here would
     // produce a record whose SharedArrayBuffer references cannot be decoded.
-    VERIFY(record.shared_array_buffers.is_empty());
+    VERIFY(!record.same_process_side_table);
     m_encoder->append(move(record));
 }
 
@@ -858,7 +866,8 @@ u32 StructuredSerializeWriter::add_shared_array_buffer(JS::ArrayBuffer& array_bu
 IPCSerializationRecord StructuredSerializeWriter::take_ipc_record()
 {
     auto record = m_encoder->take_ipc_record();
-    record.shared_array_buffers = move(m_shared_array_buffers);
+    if (!m_shared_array_buffers.is_empty())
+        record.same_process_side_table = adopt_ref(*new SharedArrayBufferSideTable(move(m_shared_array_buffers)));
     return record;
 }
 
@@ -867,9 +876,16 @@ StorageSerializationRecord StructuredSerializeWriter::take_storage_record()
     return m_encoder->take_storage_record();
 }
 
+ReadonlySpan<GC::Root<JS::ArrayBuffer>> same_process_shared_array_buffers(IPCSerializationRecord const& record)
+{
+    if (!record.same_process_side_table)
+        return {};
+    return static_cast<SharedArrayBufferSideTable const&>(*record.same_process_side_table).array_buffers();
+}
+
 StructuredSerializeReader::StructuredSerializeReader(IPCSerializationRecord const& record)
     : m_decoder(make<IPCStructuredSerializeDataDecoder>(record))
-    , m_shared_array_buffers(record.shared_array_buffers)
+    , m_shared_array_buffers(same_process_shared_array_buffers(record))
 {
 }
 
@@ -2338,6 +2354,8 @@ static bool is_transferable_interface_exposed_on_target_realm(TransferType name,
         return is_exposed(Bindings::InterfaceName::TransformStream, realm);
     case TransferType::ImageBitmap:
         return is_exposed(Bindings::InterfaceName::ImageBitmap, realm);
+    case TransferType::OffscreenCanvas:
+        return is_exposed(Bindings::InterfaceName::OffscreenCanvas, realm);
     case TransferType::Unknown:
         dbgln("Unknown interface type for transfer: {}", to_underlying(name));
         break;
@@ -2479,9 +2497,7 @@ WebIDL::ExceptionOr<StorageSerializationRecord> structured_serialize_for_storage
 StorageSerializationRecord structured_serialize_undefined_or_null_for_storage(JS::Value value)
 {
     VERIFY(value.is_undefined() || value.is_null());
-    auto serialized = StructuredSerializeWriter::create_storage();
-    serialized.encode(value.is_undefined() ? ValueTag::UndefinedPrimitive : ValueTag::NullPrimitive);
-    return serialized.take_storage_record();
+    return value.is_undefined() ? storage_serialization_record_for_undefined() : storage_serialization_record_for_null();
 }
 
 // https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal
@@ -2526,49 +2542,6 @@ WebIDL::ExceptionOr<JS::Value> structured_deserialize_internal(JS::VM& vm, Struc
         return data_clone_error_from_serialization_error(target_realm, AK::Error::from_string_literal("Trailing data after structured serialize storage record"));
 
     return value;
-}
-
-TransferDataEncoder::TransferDataEncoder()
-    : m_encoder(m_buffer)
-{
-}
-
-TransferDataEncoder::TransferDataEncoder(IPC::MessageBuffer&& buffer)
-    : m_buffer(move(buffer))
-    , m_encoder(m_buffer)
-{
-}
-
-IPC::MessageBuffer const& TransferDataEncoder::buffer() const
-{
-    return m_buffer;
-}
-
-IPC::MessageBuffer TransferDataEncoder::take_buffer() const
-{
-    VERIFY(!m_buffer_has_been_taken);
-    m_buffer_has_been_taken = true;
-    return move(m_buffer);
-}
-
-void TransferDataEncoder::append(IPCSerializationRecord&& record)
-{
-    VERIFY(!m_buffer_has_been_taken);
-    MUST(m_buffer.append_data(record.data.data(), record.data.size()));
-}
-
-void TransferDataEncoder::encode_unsigned_big_integer(::Crypto::UnsignedBigInteger const& value)
-{
-    auto buffer = MUST(ByteBuffer::create_zeroed(value.byte_length()));
-    auto written = value.export_data(buffer.bytes());
-    VERIFY(written.size() == buffer.size());
-    MUST(m_encoder.encode(buffer));
-}
-
-void TransferDataEncoder::extend(Vector<TransferDataEncoder> data_holders)
-{
-    for (auto& data_holder : data_holders)
-        MUST(m_buffer.extend(data_holder.take_buffer()));
 }
 
 TransferDataDecoder::TransferDataDecoder(IPCSerializationRecord const& record)
@@ -2631,91 +2604,6 @@ WebIDL::ExceptionOr<::Crypto::SignedBigInteger> decode_signed_big_integer(Struct
     if (buffer.is_empty())
         return data_clone_error_from_serialization_error(realm, AK::Error::from_string_literal("Invalid BigInt"));
     return ::Crypto::SignedBigInteger::import_data(buffer);
-}
-
-}
-
-namespace IPC {
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Web::HTML::TransferDataEncoder const& data_holder)
-{
-    auto buffer = data_holder.take_buffer();
-    auto data = buffer.take_data();
-    auto attachments = buffer.take_attachments();
-
-    TRY(encoder.encode(data));
-    TRY(encoder.encode(static_cast<u32>(attachments.size())));
-    for (auto& attachment : attachments)
-        TRY(encoder.append_attachment(move(attachment)));
-
-    return {};
-}
-
-template<>
-ErrorOr<Web::HTML::TransferDataEncoder> decode(Decoder& decoder)
-{
-    auto data = TRY(decoder.decode<MessageDataType>());
-    auto attachment_count = TRY(decoder.decode<u32>());
-
-    Vector<Attachment> attachments;
-    TRY(attachments.try_ensure_capacity(attachment_count));
-    for (u32 i = 0; i < attachment_count; ++i)
-        attachments.unchecked_append(TRY(decoder.attachments().try_dequeue()));
-
-    IPC::MessageBuffer buffer { move(data), move(attachments) };
-    return Web::HTML::TransferDataEncoder { move(buffer) };
-}
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Web::HTML::IPCSerializationRecord const& record)
-{
-    // record.shared_array_buffers is deliberately not encoded: it is a same-process aliasing side
-    // table, so a record that crosses a process boundary arrives with an empty side table by
-    // construction and deserializes SharedArrayBuffers from the self-contained byte copy in
-    // record.data instead.
-    TRY(encoder.encode(record.data));
-    return {};
-}
-
-template<>
-ErrorOr<Web::HTML::IPCSerializationRecord> decode(Decoder& decoder)
-{
-    auto data = TRY(decoder.decode<MessageDataType>());
-    return Web::HTML::IPCSerializationRecord { move(data) };
-}
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Web::HTML::StorageSerializationRecord const& record)
-{
-    TRY(encoder.encode(record.data));
-    return {};
-}
-
-template<>
-ErrorOr<Web::HTML::StorageSerializationRecord> decode(Decoder& decoder)
-{
-    auto data = TRY(decoder.decode<ByteBuffer>());
-    return Web::HTML::StorageSerializationRecord { move(data) };
-}
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Web::HTML::SerializedTransferRecord const& record)
-{
-    TRY(encoder.encode(record.serialized));
-    TRY(encoder.encode(record.transfer_data_holders));
-    TRY(encoder.encode(record.shared_buffers));
-    return {};
-}
-
-template<>
-ErrorOr<Web::HTML::SerializedTransferRecord> decode(Decoder& decoder)
-{
-    auto serialized = TRY(decoder.decode<Web::HTML::IPCSerializationRecord>());
-    auto transfer_data_holders = TRY(decoder.decode<Vector<Web::HTML::TransferDataEncoder>>());
-    auto shared_buffers = TRY(decoder.decode<Vector<Core::AnonymousBuffer>>());
-
-    return Web::HTML::SerializedTransferRecord { move(serialized), move(transfer_data_holders), move(shared_buffers) };
 }
 
 }

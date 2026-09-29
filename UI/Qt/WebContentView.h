@@ -18,11 +18,11 @@
 #include <LibGfx/Forward.h>
 #include <LibGfx/Rect.h>
 #include <LibURL/URL.h>
-#include <LibWeb/Forward.h>
+#include <LibWebCommon/Forward.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/ViewImplementation.h>
 
-#include <LibWeb/Page/QueuedInputEvent.h>
+#include <LibWebCommon/Page/QueuedInputEvent.h>
 #include <QPixmap>
 #include <QTimer>
 #include <QUrl>

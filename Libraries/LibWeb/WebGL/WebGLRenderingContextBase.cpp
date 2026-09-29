@@ -22,6 +22,7 @@ extern "C" {
 #include <LibWeb/HTML/HTMLVideoElement.h>
 #include <LibWeb/HTML/ImageBitmap.h>
 #include <LibWeb/HTML/ImageData.h>
+#include <LibWeb/HTML/OffscreenCanvas.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
@@ -52,9 +53,14 @@ WebGLRenderingContextBase::WebGLRenderingContextBase(JS::Realm& realm)
 {
 }
 
+HTML::CanvasHost& canvas_host_for(CanvasOwner const& canvas)
+{
+    return canvas.visit([](auto const& canvas) -> HTML::CanvasHost& { return *canvas; });
+}
+
 GC::Ptr<Bindings::Wrappable> WebGLRenderingContextBase::relevant_global_impl() const
 {
-    return canvas_for_binding()->document().window();
+    return canvas_host().canvas_relevant_global_impl();
 }
 
 struct Extension {
@@ -256,11 +262,11 @@ Optional<WebGLRenderingContextBase::TexImageSourceFrame> WebGLRenderingContextBa
         [](GC::Ref<HTML::HTMLImageElement> source) -> Optional<Gfx::DecodedImageFrame> {
             return source->current_image_frame();
         },
-        [](GC::Ref<HTML::HTMLCanvasElement> source) -> Optional<Gfx::DecodedImageFrame> {
-            return Gfx::DecodedImageFrame { *source->get_bitmap_from_surface() };
-        },
-        [](GC::Ref<HTML::OffscreenCanvas> source) -> Optional<Gfx::DecodedImageFrame> {
-            return Gfx::DecodedImageFrame { *source->bitmap() };
+        [](OneOf<GC::Ref<HTML::HTMLCanvasElement>, GC::Ref<HTML::OffscreenCanvas>> auto source) -> Optional<Gfx::DecodedImageFrame> {
+            auto bitmap = source->get_bitmap_from_surface();
+            if (!bitmap)
+                return {};
+            return Gfx::DecodedImageFrame { *bitmap };
         },
         [](GC::Ref<HTML::HTMLVideoElement> source) -> Optional<Gfx::DecodedImageFrame> {
             return source->current_decoded_image_frame();
@@ -354,10 +360,10 @@ void WebGLRenderingContextBase::lose_context_from_compositor_loss()
     // The next getError() must report CONTEXT_LOST_WEBGL (one-shot) per the spec.
     m_error = CONTEXT_LOST_WEBGL;
 
-    HTML::queue_a_task(HTML::Task::Source::WebGL, nullptr, nullptr, GC::create_function(heap(), [this, canvas = canvas_for_binding()] {
+    HTML::queue_a_task(HTML::Task::Source::WebGL, nullptr, nullptr, GC::create_function(heap(), [this] {
         // webglcontextlost is cancelable; preventDefault() means the page wants the context
         // restored once a compositor is available again.
-        m_context_restore_requested = !fire_webgl_context_event(canvas, EventNames::webglcontextlost);
+        m_context_restore_requested = !fire_webgl_context_event(canvas_host(), EventNames::webglcontextlost);
     }));
 }
 
@@ -376,8 +382,8 @@ void WebGLRenderingContextBase::restore_context_after_compositor_reconnect()
     m_context_restore_requested = false;
     m_error = GL_NO_ERROR;
 
-    HTML::queue_a_task(HTML::Task::Source::WebGL, nullptr, nullptr, GC::create_function(heap(), [canvas = canvas_for_binding()] {
-        fire_webgl_context_event(canvas, EventNames::webglcontextrestored);
+    HTML::queue_a_task(HTML::Task::Source::WebGL, nullptr, nullptr, GC::create_function(heap(), [this] {
+        fire_webgl_context_event(canvas_host(), EventNames::webglcontextrestored);
     }));
 }
 
@@ -400,7 +406,7 @@ GC::Ref<WebIDL::Promise> WebGLRenderingContextBase::make_xr_compatible()
 
     // 2. Let promise be a new Promise created in the Realm of this WebGLRenderingContextBase.
     auto& realm = this->realm();
-    auto promise = WebIDL::create_promise_for(*canvas_for_binding());
+    auto promise = WebIDL::create_promise_for(canvas_host().canvas_relevant_global_object());
 
     // 3. Let context be this.
     auto context = this;

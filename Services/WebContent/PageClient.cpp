@@ -43,7 +43,6 @@
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
-#include <LibWeb/HTML/NavigationPopulationRequest.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
@@ -57,11 +56,13 @@
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Streams/ReadableStreamDefaultReader.h>
+#include <LibWeb/WebDriver/UserPrompt.h>
 #include <LibWeb/WebIDL/Promise.h>
-#include <LibWebView/Debugger.h>
-#include <LibWebView/ViewImplementation.h>
+#include <LibWebCommon/HTML/NavigationPopulationRequest.h>
+#include <LibWebCommon/WebView/Debugger.h>
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/DevToolsConsoleClient.h>
+#include <WebContent/DevToolsIndexedDB.h>
 #include <WebContent/PageClient.h>
 #include <WebContent/PageHost.h>
 #include <WebContent/TestConnection.h>

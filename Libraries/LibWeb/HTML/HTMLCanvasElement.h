@@ -10,14 +10,17 @@
 #include <LibCompositing/DisplayList/DisplayListResourceIds.h>
 #include <LibGC/Function.h>
 #include <LibGfx/Forward.h>
+#include <LibWeb/HTML/Canvas/CanvasHost.h>
 #include <LibWeb/HTML/Canvas/CanvasSettings.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/WebGL/WebGLContextAttributes.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
 
-class HTMLCanvasElement final : public HTMLElement {
+class HTMLCanvasElement final
+    : public HTMLElement
+    , public CanvasHost {
     WEB_WRAPPABLE(HTMLCanvasElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLCanvasElement);
 
@@ -26,7 +29,22 @@ public:
 
     virtual ~HTMLCanvasElement() override;
 
-    Gfx::IntSize bitmap_size_for_canvas(size_t minimum_width = 0, size_t minimum_height = 0) const;
+    // ^CanvasHost
+    virtual Gfx::IntSize bitmap_size_for_canvas() const override;
+    virtual Canvas2DContextBase* canvas_2d_context() const override;
+    virtual WebGL::WebGLRenderingContextBase* canvas_webgl_context() const override;
+    virtual Page& canvas_page() override;
+    virtual DOM::EventTarget& canvas_event_target() override { return *this; }
+    virtual JS::Object& canvas_relevant_global_object() const override;
+    virtual GC::Ptr<Bindings::Wrappable> canvas_relevant_global_impl() const override;
+    virtual void did_change_canvas_content() override;
+    virtual void did_create_canvas_backing_storage() override;
+    virtual CSS::FontComputer& canvas_font_computer() override;
+    virtual CSS::ComputationContext canvas_font_computation_context() override;
+    virtual CSS::ColorResolutionContext canvas_color_resolution_context() override;
+    virtual CSSPixelRect canvas_viewport_rect() const override;
+    virtual RefPtr<Gfx::Bitmap> get_bitmap_from_surface() override;
+    virtual bool is_origin_clean() const override;
 
     JS::ThrowCompletionOr<RenderingContext> get_context(Utf16View type, JS::Value options);
     enum class HasOrCreatedContext {
@@ -41,14 +59,17 @@ public:
     WebIDL::UnsignedLong width() const;
     WebIDL::UnsignedLong height() const;
 
-    void set_width(WebIDL::UnsignedLong);
-    void set_height(WebIDL::UnsignedLong);
+    WebIDL::ExceptionOr<void> set_width(WebIDL::UnsignedLong);
+    WebIDL::ExceptionOr<void> set_height(WebIDL::UnsignedLong);
+
+    bool is_placeholder() const { return m_is_placeholder; }
+
+    WebIDL::ExceptionOr<GC::Ref<OffscreenCanvas>> transfer_control_to_offscreen();
+    WEB_API static void placeholder_frame_committed(Compositing::CanvasId, Gfx::IntSize, bool origin_clean);
     virtual void attribute_changed(Utf16FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     WebIDL::ExceptionOr<Utf16String> to_data_url(Utf16View type, Optional<JS::Value> quality);
     WebIDL::ExceptionOr<void> to_blob(GC::Ref<WebIDL::CallbackType> callback, Utf16View type, Optional<JS::Value> quality);
-    bool is_origin_clean() const;
-    RefPtr<Gfx::Bitmap> get_bitmap_from_surface();
 
     void prepare_for_compositing();
     void notify_compositor_backing_storage_lost();
@@ -70,8 +91,6 @@ public:
 
     void notify_compositor_connection_lost();
 
-    CSS::ComputationContext canvas_font_computation_context();
-
 private:
     HTMLCanvasElement(DOM::Document&, DOM::QualifiedName);
 
@@ -88,13 +107,17 @@ private:
 
     template<typename ContextType>
     JS::ThrowCompletionOr<HasOrCreatedContext> create_webgl_context(JS::Value options);
-    WebGL::WebGLRenderingContextBase* webgl_context() const;
     void reset_context_to_default_state();
     void notify_context_about_canvas_size_change();
+    void did_commit_placeholder_frame(Gfx::IntSize, bool origin_clean);
 
     Variant<GC::Ref<HTML::CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, Empty> m_context;
     bool m_canvas_content_dirty { false };
     u64 m_content_generation { 0 };
+
+    bool m_is_placeholder { false };
+    Optional<Compositing::CanvasId> m_placeholder_canvas_id;
+    bool m_placeholder_frame_is_origin_clean { true };
 };
 
 }

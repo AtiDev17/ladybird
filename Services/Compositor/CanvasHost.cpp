@@ -39,10 +39,11 @@ OwnPtr<Gfx::CanvasCommandPlayer> CanvasHost::create_2d_command_player(Gfx::IntSi
         // A 2D source resolves to its live draw surface: the shared command
         // stream replays in recording order, so at this point the surface holds
         // exactly the commands recorded before the referencing DrawCanvas.
-        if (auto* context = this->context(Compositing::CanvasId { canvas_id })) {
-            if (auto* canvas_context = context->get_pointer<Canvas2DContext>())
-                return canvas_context->command_player->surface().ptr();
-        }
+        auto* context = this->context(Compositing::CanvasId { canvas_id });
+        if (!context)
+            return nullptr;
+        if (auto* canvas_context = context->get_pointer<Canvas2DContext>())
+            return canvas_context->command_player->surface().ptr();
         // WebGL sources are presented separately and resolve via the registry.
         return m_canvas_surface_registry.canvas_surface(Compositing::CanvasId { canvas_id });
     };
@@ -119,8 +120,8 @@ CanvasHost::CreateWebGLContextResult CanvasHost::create_webgl_context(Compositin
 
 void CanvasHost::destroy_context(Compositing::CanvasId canvas_id)
 {
-    m_contexts.remove(canvas_id);
-    m_canvas_surface_registry.remove_canvas_surface(canvas_id);
+    if (m_contexts.remove(canvas_id))
+        m_canvas_surface_registry.remove_canvas_surface(canvas_id);
 }
 
 bool CanvasHost::has_context(Compositing::CanvasId canvas_id) const
@@ -239,7 +240,15 @@ void CanvasHost::present_webgl_canvas(Compositing::CanvasId canvas_id, bool pres
     m_canvas_surface_registry.set_canvas_surface(canvas_id, move(surface));
 }
 
-static Gfx::ShareableBitmap read_back_surface(Gfx::PaintingSurface& surface, Gfx::IntRect rect)
+void CanvasHost::clear_webgl_drawing_buffer(Compositing::CanvasId canvas_id)
+{
+    auto* context = this->context(canvas_id);
+    if (!context || !context->has<WebGLContext>())
+        return;
+    as_webgl(*context).clear_drawing_buffer();
+}
+
+Gfx::ShareableBitmap CanvasHost::read_back_surface(Gfx::PaintingSurface& surface, Gfx::IntRect rect)
 {
     auto clipped_rect = rect.intersected(surface.rect());
     if (clipped_rect.is_empty())
@@ -253,6 +262,21 @@ static Gfx::ShareableBitmap read_back_surface(Gfx::PaintingSurface& surface, Gfx
     surface.flush();
     surface.read_into_bitmap(*bitmap, clipped_rect.location());
     return Gfx::ShareableBitmap { move(bitmap), Gfx::ShareableBitmap::ConstructWithKnownGoodBitmap };
+}
+
+RefPtr<Gfx::PaintingSurface> CanvasHost::presented_surface(Compositing::CanvasId canvas_id)
+{
+    auto* context = this->context(canvas_id);
+    if (!context)
+        return nullptr;
+
+    return context->visit(
+        [](Canvas2DContext& canvas_context) -> RefPtr<Gfx::PaintingSurface> {
+            return canvas_context.presented_surface;
+        },
+        [](WebGLContext& webgl_context) -> RefPtr<Gfx::PaintingSurface> {
+            return webgl_context->surface();
+        });
 }
 
 Gfx::ShareableBitmap CanvasHost::read_back_pixels(Compositing::CanvasId canvas_id, Gfx::IntRect rect)

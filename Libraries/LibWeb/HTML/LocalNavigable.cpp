@@ -21,7 +21,6 @@
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/SerializationMode.h>
-#include <LibWeb/CSS/SystemColor.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
@@ -57,7 +56,6 @@
 #include <LibWeb/HTML/HTMLParagraphElement.h>
 #include <LibWeb/HTML/History.h>
 #include <LibWeb/HTML/HistoryExecutor.h>
-#include <LibWeb/HTML/HistoryHandlingBehavior.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
@@ -66,12 +64,9 @@
 #include <LibWeb/HTML/NavigationObserver.h>
 #include <LibWeb/HTML/NavigationParams.h>
 #include <LibWeb/HTML/NavigationParamsDescriptor.h>
-#include <LibWeb/HTML/NavigationPopulationRequest.h>
-#include <LibWeb/HTML/POSTResource.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
-#include <LibWeb/HTML/SandboxingFlagSet.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
@@ -80,10 +75,8 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HTML/XMLSerializer.h>
-#include <LibWeb/Infra/Strings.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/Viewport.h>
-#include <LibWeb/Loader/DownloadFilename.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
@@ -100,6 +93,13 @@
 #include <LibWeb/UIEvents/InputTypes.h>
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWeb/XHR/FormData.h>
+#include <LibWebCommon/CSS/SystemColor.h>
+#include <LibWebCommon/HTML/HistoryHandlingBehavior.h>
+#include <LibWebCommon/HTML/NavigationPopulationRequest.h>
+#include <LibWebCommon/HTML/POSTResource.h>
+#include <LibWebCommon/HTML/SandboxingFlagSet.h>
+#include <LibWebCommon/Infra/Strings.h>
+#include <LibWebCommon/Loader/DownloadFilename.h>
 
 #include <AK/Debug.h>
 #include <AK/LexicalPath.h>
@@ -1792,7 +1792,7 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(Utf16View nam
 
         auto request_new_web_view = [&] {
             TokenizedFeature::Map empty_window_features;
-            auto hints = WebViewHints::from_tokenised_features(window_features.has_value() ? *window_features : empty_window_features, page());
+            auto hints = web_view_hints_from_tokenised_features(window_features.has_value() ? *window_features : empty_window_features, page());
             Optional<CrossProcessId> opener_navigable_id;
             Optional<URL::URL> opener_base_url;
             if (new_no_opener == TokenizedFeature::NoOpener::No) {

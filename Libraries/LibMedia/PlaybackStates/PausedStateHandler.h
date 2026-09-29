@@ -25,6 +25,8 @@ public:
     virtual void play() override;
     virtual void pause() override { }
 
+    virtual void on_pipeline_status_changed(PipelineStatus) override;
+
     virtual bool is_playing() override
     {
         return false;

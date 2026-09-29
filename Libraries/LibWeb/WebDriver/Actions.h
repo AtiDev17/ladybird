@@ -15,11 +15,11 @@
 #include <LibGC/Ptr.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/PixelUnits.h>
-#include <LibWeb/UIEvents/MouseButton.h>
-#include <LibWeb/WebDriver/Error.h>
 #include <LibWeb/WebDriver/InputSource.h>
-#include <LibWeb/WebDriver/Response.h>
+#include <LibWebCommon/PixelUnits.h>
+#include <LibWebCommon/UIEvents/MouseButton.h>
+#include <LibWebCommon/WebDriver/Error.h>
+#include <LibWebCommon/WebDriver/Response.h>
 
 namespace Web::WebDriver {
 

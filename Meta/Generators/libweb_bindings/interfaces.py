@@ -55,10 +55,13 @@ def interface_needs_impl_from(interface: Interface) -> bool:
 
 
 def legacy_platform_object_flags_initialization(interface: Interface) -> str:
+    lines = []
+    if interface.name == "HTMLAllCollection":
+        lines.append("    set_is_htmldda();")
     if not needs_legacy_platform_object_flags_initialization(interface):
-        return ""
+        return "\n".join(lines)
 
-    lines = [
+    lines += [
         "    if (!m_legacy_platform_object_flags.has_value())",
         "        m_legacy_platform_object_flags = LegacyPlatformObjectFlags {};",
     ]
@@ -233,15 +236,6 @@ JS::ErrorData const* {wrapper_class}::error_data() const
 
 """
         )
-    if interface.name == "HTMLAllCollection":
-        out.write(
-            f"""bool {wrapper_class}::is_htmldda() const
-{{
-    return true;
-}}
-
-"""
-        )
     if interface.name in ("Location", "Window"):
         out.write(
             f"""void {wrapper_class}::visit_edges(JS::Cell::Visitor& visitor)
@@ -323,7 +317,7 @@ def write_implementation(
 
     includes.add("LibJS/Runtime/ValueInlines.h")
     includes.add("LibWeb/Bindings/Intrinsics.h")
-    includes.add("LibWeb/WebIDL/Types.h")
+    includes.add("LibWebCommon/WebIDL/Types.h")
     includes.add_binding(interface.implemented_name)
     if interface_needs_wrapper(interface):
         includes.add("AK/StdLibExtras.h")

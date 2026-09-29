@@ -22,14 +22,14 @@ class WebGLRenderingContext final : public WebGLRenderingContextOverloads {
     GC_DECLARE_ALLOCATOR(WebGLRenderingContext);
 
 public:
-    static JS::ThrowCompletionOr<GC::Ptr<WebGLRenderingContext>> create(JS::Realm&, HTML::HTMLCanvasElement& canvas_element, JS::Value options);
+    static JS::ThrowCompletionOr<GC::Ptr<WebGLRenderingContext>> create(JS::Realm&, CanvasOwner, JS::Value options);
 
     virtual ~WebGLRenderingContext() override;
 
     void prepare_for_compositing() override;
     void did_update_canvas_content() override;
 
-    virtual GC::Ref<HTML::HTMLCanvasElement> canvas_for_binding() const override;
+    virtual CanvasOwner canvas_for_binding() const override;
 
     Optional<WebGLContextAttributes> get_context_attributes();
 
@@ -40,12 +40,12 @@ public:
     WebIDL::Long drawing_buffer_height() const;
 
 private:
-    WebGLRenderingContext(JS::Realm&, HTML::HTMLCanvasElement&, NonnullOwnPtr<WebGLContextProxy> context, WebGLContextAttributes context_creation_parameters, WebGLContextAttributes actual_context_parameters);
+    WebGLRenderingContext(JS::Realm&, CanvasOwner, NonnullOwnPtr<WebGLContextProxy> context, WebGLContextAttributes context_creation_parameters, WebGLContextAttributes actual_context_parameters);
 
     virtual void visit_edges(Cell::Visitor&) override;
     virtual bool reestablish_remote_context() override;
 
-    GC::Ref<HTML::HTMLCanvasElement> m_canvas_element;
+    CanvasOwner m_canvas;
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#context-creation-parameters
     // Each WebGLRenderingContext has context creation parameters, set upon creation, in a WebGLContextAttributes object.
@@ -56,10 +56,10 @@ private:
     WebGLContextAttributes m_actual_context_parameters {};
 };
 
-bool fire_webgl_context_event(HTML::HTMLCanvasElement& canvas_element, Utf16FlyString const& type);
-void fire_webgl_context_creation_error(HTML::HTMLCanvasElement& canvas_element);
+bool fire_webgl_context_event(HTML::CanvasHost&, Utf16FlyString const& type);
+void fire_webgl_context_creation_error(HTML::CanvasHost&);
 
-OwnPtr<WebGLContextProxy> create_webgl_context_proxy(HTML::HTMLCanvasElement&, WebGLVersion, WebGLContextAttributes const&);
-bool restore_webgl_context_proxy(WebGLContextProxy&, HTML::HTMLCanvasElement&, WebGLVersion, WebGLContextAttributes const&);
+OwnPtr<WebGLContextProxy> create_webgl_context_proxy(HTML::CanvasHost&, WebGLVersion, WebGLContextAttributes const&);
+bool restore_webgl_context_proxy(WebGLContextProxy&, HTML::CanvasHost&, WebGLVersion, WebGLContextAttributes const&);
 
 }

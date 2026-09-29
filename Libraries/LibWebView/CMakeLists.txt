@@ -1,7 +1,6 @@
 set(SOURCES
     Application.cpp
     ApplyHistoryStep.cpp
-    Attribute.cpp
     Autocomplete.cpp
     AutocompleteMuxer.cpp
     AutocompleteRanker.cpp
@@ -19,14 +18,8 @@ set(SOURCES
     BrowserProcess.cpp
     CompositorClient.cpp
     CompositorFontServiceConnection.cpp
-    CompositorConnection.cpp
-    CompositorHostBase.cpp
-    ConsoleOutput.cpp
     CookieJar.cpp
     CrashReport.cpp
-    Debugger.cpp
-    DictionaryLookup.cpp
-    DOMNodeProperties.cpp
     DownloadPresentation.cpp
     DownloadSegmentation.cpp
     DownloadStore.cpp
@@ -34,20 +27,16 @@ set(SOURCES
     FaviconStore.cpp
     FileDownloader.cpp
     FontService.cpp
-    Geolocation.cpp
     HeadlessWebView.cpp
     HelperProcess.cpp
     HistoryDebug.cpp
     HistoryStore.cpp
     HSTSStore.cpp
     Menu.cpp
-    Mutation.cpp
     NavigationLoader.cpp
     Omnibox.cpp
     OmniboxEngagement.cpp
-    Plugins/ImageCodecPlugin.cpp
     Process.cpp
-    ProcessHandle.cpp
     ProcessManager.cpp
     TabPerformanceStats.cpp
     TabPerformanceMonitor.cpp
@@ -60,8 +49,6 @@ set(SOURCES
     SessionStore.cpp
     Settings.cpp
     SiteCompatibility.cpp
-    SiteIsolation.cpp
-    SourceHighlighter.cpp
     StorageJar.cpp
     URL.cpp
     UserAgent.cpp
@@ -96,35 +83,13 @@ set(GENERATED_SOURCES ${CURRENT_LIB_GENERATED})
 compile_ipc(UIProcessServer.ipc UIProcessServerEndpoint.h)
 compile_ipc(UIProcessClient.ipc UIProcessClientEndpoint.h)
 
-
-if (NOT APPLE AND NOT CMAKE_INSTALL_LIBEXECDIR STREQUAL "libexec")
-    set_source_files_properties(Utilities.cpp PROPERTIES COMPILE_DEFINITIONS LADYBIRD_LIBEXECDIR="${CMAKE_INSTALL_LIBEXECDIR}")
-endif()
-
 set(GENERATED_SOURCES
     ${GENERATED_SOURCES}
     ../../Services/RequestServer/RequestClientEndpoint.h
     ../../Services/RequestServer/RequestServerEndpoint.h
-    ../../Services/WebContent/WebContentClientEndpoint.h
-    ../../Services/WebContent/WebContentServerEndpoint.h
-    ../../Services/WebContent/WebContentTestClientEndpoint.h
-    ../../Services/WebContent/WebContentTestServerEndpoint.h
-    ../../Services/WebDriver/WebDriverBrowserClientEndpoint.h
-    ../../Services/WebDriver/WebDriverBrowserServerEndpoint.h
-    ../../Services/WebContent/WebUIClientEndpoint.h
-    ../../Services/WebContent/WebUIServerEndpoint.h
     UIProcessClientEndpoint.h
     UIProcessServerEndpoint.h
 )
-
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentClientEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentServerEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentTestClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentTestClientEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentTestServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentTestServerEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebDriver/WebDriverBrowserClient.ipc ${CMAKE_BINARY_DIR}/Services/WebDriver/WebDriverBrowserClientEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebDriver/WebDriverBrowserServer.ipc ${CMAKE_BINARY_DIR}/Services/WebDriver/WebDriverBrowserServerEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebUIClientEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebUIServerEndpoint.h)
 
 set(build_information_header "${CMAKE_CURRENT_BINARY_DIR}/BuildInformation.h")
 set(build_information_stamp "${CMAKE_CURRENT_BINARY_DIR}/BuildInformation.stamp")
@@ -155,8 +120,8 @@ add_custom_target(generate_build_information DEPENDS ${build_information_stamp})
 
 ladybird_lib(LibWebView webview EXPLICIT_SYMBOL_EXPORT)
 add_dependencies(LibWebView generate_build_information)
-target_link_libraries(LibWebView PUBLIC LibCompositing LibSandbox)
-target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGC LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibJS LibMedia LibMediaClient LibWeb LibUnicode LibURL LibSyntax LibTextCodec LibThreading)
+target_link_libraries(LibWebView PUBLIC LibCompositing LibSandbox LibWebCommon)
+target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibMedia LibMediaClient LibUnicode LibURL LibTextCodec LibThreading)
 
 if (ENABLE_CRANELIFT_JIT)
     target_link_libraries(LibWebView PRIVATE LibWasmCompilerClient)

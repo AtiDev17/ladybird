@@ -45,6 +45,7 @@ asm_dispatch_table:
     .quad asm_handler_End
     .quad asm_handler_GetLexicalEnvironment
     .quad asm_handler_GetImportMeta
+    .quad asm_handler_GetImport
     .quad asm_handler_GetNewTarget
     .quad asm_handler_GetSuperConstructor
     .quad asm_handler_SetLexicalEnvironment
@@ -65,6 +66,7 @@ asm_dispatch_table:
     .quad asm_handler_SetResolvedBinding
     .quad asm_handler_TypeofBinding
     .quad asm_handler_DynamicTypeofBinding
+    .quad asm_handler_VerifyEnvironmentCoordinate
     .quad asm_handler_HasPrivateId
     .quad asm_handler_SetFunctionName
     .quad asm_handler_NewArrayWithLength
@@ -229,8 +231,6 @@ asm_dispatch_table:
     .quad asm_handler_JumpStrictlyInequalsRhsInt32
     .quad asm_handler_JumpLooselyEqualsRhsInt32
     .quad asm_handler_JumpLooselyInequalsRhsInt32
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback
     .quad asm_handler_fallback
     .quad asm_handler_fallback
     .quad asm_handler_fallback
@@ -662,6 +662,10 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_GetImportMeta_hot_end
     .quad asm_handler_GetImportMeta_cold
     .quad asm_handler_GetImportMeta_cold_end
+    .quad asm_handler_GetImport
+    .quad asm_handler_GetImport_hot_end
+    .quad asm_handler_GetImport_cold
+    .quad asm_handler_GetImport_cold_end
     .quad asm_handler_GetNewTarget
     .quad asm_handler_GetNewTarget_hot_end
     .quad asm_handler_GetNewTarget_cold
@@ -742,6 +746,10 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_DynamicTypeofBinding_hot_end
     .quad asm_handler_DynamicTypeofBinding_cold
     .quad asm_handler_DynamicTypeofBinding_cold_end
+    .quad asm_handler_VerifyEnvironmentCoordinate
+    .quad asm_handler_VerifyEnvironmentCoordinate_hot_end
+    .quad asm_handler_VerifyEnvironmentCoordinate_cold
+    .quad asm_handler_VerifyEnvironmentCoordinate_cold_end
     .quad asm_handler_HasPrivateId
     .quad asm_handler_HasPrivateId_hot_end
     .quad asm_handler_HasPrivateId_cold
@@ -1546,14 +1554,6 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_fallback_hot_end
     .quad asm_handler_fallback_cold
     .quad asm_handler_fallback_cold_end
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback_hot_end
-    .quad asm_handler_fallback_cold
-    .quad asm_handler_fallback_cold_end
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback_hot_end
-    .quad asm_handler_fallback_cold
-    .quad asm_handler_fallback_cold_end
 
 .text
 
@@ -1776,13 +1776,26 @@ asm_handler_JumpIf:
     mov rax, rcx
     shr rax, 48
     cmp ax, 32761
-    jne .Lasm_JumpIf.ssa_block_6
+    jne .Lasm_JumpIf.ssa_block_7
     test ecx, 1
     jnz .Lasm_JumpIf.ssa_block_2
     jmp .Lasm_JumpIf.ssa_block_1
-.Lasm_JumpIf.ssa_block_6:
+.Lasm_JumpIf.ssa_block_7:
     cmp ax, 32762
-    je .Lasm_JumpIf.ssa_block_3
+    je .Lasm_JumpIf.ssa_block_4
+    cmp ax, 65529
+    jne .Lasm_JumpIf.ssa_block_3
+    movabs r11, 4398046511103
+    and rcx, r11
+    add rcx, r15
+    movzx eax, WORD PTR [rcx + 10]
+    test eax, 8192
+    jnz .Lasm_JumpIf.ssa_block_1
+.Lasm_JumpIf.ssa_block_2:
+    mov r13d, DWORD PTR [r14 + r13 + 8]
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_JumpIf.ssa_block_3:
     mov rdi, rcx
     call CSYM(asm_helper_to_boolean)
     cmp rax, 2
@@ -1793,13 +1806,10 @@ asm_handler_JumpIf:
     mov r13d, DWORD PTR [r14 + r13 + 12]
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
-.Lasm_JumpIf.ssa_block_3:
+.Lasm_JumpIf.ssa_block_4:
     test ecx, ecx
-    jz .Lasm_JumpIf.ssa_block_1
-.Lasm_JumpIf.ssa_block_2:
-    mov r13d, DWORD PTR [r14 + r13 + 8]
-    movzx eax, BYTE PTR [r14 + r13]
-    jmp [r12 + rax * 8]
+    jnz .Lasm_JumpIf.ssa_block_2
+    jmp .Lasm_JumpIf.ssa_block_1
 asm_handler_JumpIf_hot_end:
 
 .p2align 6
@@ -1809,15 +1819,27 @@ asm_handler_JumpTrue:
     mov rax, rcx
     shr rax, 48
     cmp ax, 32761
-    jne .Lasm_JumpTrue.ssa_block_5
+    jne .Lasm_JumpTrue.ssa_block_6
     test ecx, 1
     jnz .Lasm_JumpTrue.ssa_block_1
     add r13d, 16
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
-.Lasm_JumpTrue.ssa_block_5:
+.Lasm_JumpTrue.ssa_block_6:
     cmp ax, 32762
-    je .Lasm_JumpTrue.ssa_block_2
+    je .Lasm_JumpTrue.ssa_block_3
+    cmp ax, 65529
+    jne .Lasm_JumpTrue.ssa_block_2
+    movabs r11, 4398046511103
+    and rcx, r11
+    add rcx, r15
+    movzx eax, WORD PTR [rcx + 10]
+    test eax, 8192
+    jz .Lasm_JumpTrue.ssa_block_1
+    add r13d, 16
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_JumpTrue.ssa_block_2:
     mov rdi, rcx
     call CSYM(asm_helper_to_boolean)
     cmp rax, 2
@@ -1827,7 +1849,7 @@ asm_handler_JumpTrue:
     add r13d, 16
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
-.Lasm_JumpTrue.ssa_block_2:
+.Lasm_JumpTrue.ssa_block_3:
     test ecx, ecx
     jnz .Lasm_JumpTrue.ssa_block_1
     add r13d, 16
@@ -1846,15 +1868,27 @@ asm_handler_JumpFalse:
     mov rax, rcx
     shr rax, 48
     cmp ax, 32761
-    jne .Lasm_JumpFalse.ssa_block_5
+    jne .Lasm_JumpFalse.ssa_block_6
     test ecx, 1
     jz .Lasm_JumpFalse.ssa_block_1
     add r13d, 16
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
-.Lasm_JumpFalse.ssa_block_5:
+.Lasm_JumpFalse.ssa_block_6:
     cmp ax, 32762
-    je .Lasm_JumpFalse.ssa_block_2
+    je .Lasm_JumpFalse.ssa_block_3
+    cmp ax, 65529
+    jne .Lasm_JumpFalse.ssa_block_2
+    movabs r11, 4398046511103
+    and rcx, r11
+    add rcx, r15
+    movzx eax, WORD PTR [rcx + 10]
+    test eax, 8192
+    jnz .Lasm_JumpFalse.ssa_block_1
+    add r13d, 16
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_JumpFalse.ssa_block_2:
     mov rdi, rcx
     call CSYM(asm_helper_to_boolean)
     cmp rax, 2
@@ -1864,7 +1898,7 @@ asm_handler_JumpFalse:
     add r13d, 16
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
-.Lasm_JumpFalse.ssa_block_2:
+.Lasm_JumpFalse.ssa_block_3:
     test ecx, ecx
     jz .Lasm_JumpFalse.ssa_block_1
     add r13d, 16
@@ -2386,13 +2420,13 @@ asm_handler_Not:
     mov rax, rcx
     shr rax, 48
     cmp ax, 32761
-    jne .Lasm_Not.ssa_block_6
+    jne .Lasm_Not.ssa_block_7
     test ecx, 1
     jz .Lasm_Not.ssa_block_1
     jmp .Lasm_Not.ssa_block_2
-.Lasm_Not.ssa_block_6:
+.Lasm_Not.ssa_block_7:
     cmp ax, 32762
-    jne .Lasm_Not.ssa_block_5
+    jne .Lasm_Not.ssa_block_6
     test ecx, ecx
     jnz .Lasm_Not.ssa_block_2
 .Lasm_Not.ssa_block_1:
@@ -2402,16 +2436,27 @@ asm_handler_Not:
     add r13d, 16
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
-.Lasm_Not.ssa_block_5:
-    and ax, 65534
-    cmp ax, 32766
+.Lasm_Not.ssa_block_6:
+    mov rdx, rax
+    and dx, 65534
+    cmp dx, 32766
     je .Lasm_Not.ssa_block_1
+    cmp ax, 65529
+    je .Lasm_Not.ssa_block_10
     mov rdi, rcx
     call CSYM(asm_helper_to_boolean)
     cmp rax, 2
-    jae .Lasm_Not.assert_predicate_failure_12
+    jae .Lasm_Not.assert_predicate_failure_9
     test rax, rax
     jz .Lasm_Not.ssa_block_1
+    jmp .Lasm_Not.ssa_block_2
+.Lasm_Not.ssa_block_10:
+    movabs r11, 4398046511103
+    and rcx, r11
+    add rcx, r15
+    movzx eax, WORD PTR [rcx + 10]
+    test eax, 8192
+    jnz .Lasm_Not.ssa_block_1
 .Lasm_Not.ssa_block_2:
     movabs r11, 9221401712017801216
     mov eax, DWORD PTR [r14 + r13 + 4]
@@ -4815,16 +4860,16 @@ asm_handler_GetGlobal:
     jz .Lasm_GetGlobal.assert_predicate_failure_15
     mov rcx, QWORD PTR [rax + 48]
     cmp QWORD PTR [rdx + 64], rcx
-    jne .Lasm_GetGlobal.ssa_block_2
+    jne .Lasm_GetGlobal.ssa_block_1
     mov rcx, QWORD PTR [rsi + 24]
     test rcx, rcx
     jz .Lasm_GetGlobal.assert_failure_1
     cmp QWORD PTR [rax + 24], rcx
-    jne .Lasm_GetGlobal.ssa_block_3
+    jne .Lasm_GetGlobal.ssa_block_2
     mov edi, DWORD PTR [rax + 4]
     mov r8d, DWORD PTR [rax + 8]
     cmp DWORD PTR [rcx + 92], r8d
-    jne .Lasm_GetGlobal.ssa_block_3
+    jne .Lasm_GetGlobal.ssa_block_2
     mov rax, QWORD PTR [rsi + 32]
     test rax, rax
     jz .Lasm_GetGlobal.assert_failure_2
@@ -4832,17 +4877,15 @@ asm_handler_GetGlobal:
     mov r11, rax
     shr r11, 48
     cmp r11w, 65532
-    je .Lasm_GetGlobal.ssa_block_2
+    je .Lasm_GetGlobal.ssa_block_1
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
-.Lasm_GetGlobal.ssa_block_3:
+.Lasm_GetGlobal.ssa_block_2:
     cmp BYTE PTR [rax + 60], 0
-    jz .Lasm_GetGlobal.ssa_block_2
-    cmp BYTE PTR [rax + 61], 0
-    jnz .Lasm_GetGlobal.ssa_block_1
+    jz .Lasm_GetGlobal.ssa_block_1
     mov rcx, QWORD PTR [rdx + 48]
     test rcx, rcx
     jz .Lasm_GetGlobal.assert_failure_3
@@ -4851,7 +4894,7 @@ asm_handler_GetGlobal:
     mov r11, rax
     shr r11, 48
     cmp r11w, 32763
-    je .Lasm_GetGlobal.ssa_block_2
+    je .Lasm_GetGlobal.ssa_block_1
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -4877,16 +4920,16 @@ asm_handler_SetGlobal:
     jz .Lasm_SetGlobal.assert_predicate_failure_15
     mov rdx, QWORD PTR [rax + 48]
     cmp QWORD PTR [rcx + 64], rdx
-    jne .Lasm_SetGlobal.ssa_block_2
+    jne .Lasm_SetGlobal.ssa_block_1
     mov rdx, QWORD PTR [rsi + 24]
     test rdx, rdx
     jz .Lasm_SetGlobal.assert_failure_1
     cmp QWORD PTR [rax + 24], rdx
-    jne .Lasm_SetGlobal.ssa_block_3
+    jne .Lasm_SetGlobal.ssa_block_2
     mov edi, DWORD PTR [rax + 4]
     mov r8d, DWORD PTR [rax + 8]
     cmp DWORD PTR [rdx + 92], r8d
-    jne .Lasm_SetGlobal.ssa_block_3
+    jne .Lasm_SetGlobal.ssa_block_2
     mov rax, QWORD PTR [rsi + 32]
     test rax, rax
     jz .Lasm_SetGlobal.assert_failure_2
@@ -4894,18 +4937,16 @@ asm_handler_SetGlobal:
     mov r11, rcx
     shr r11, 48
     cmp r11w, 65532
-    je .Lasm_SetGlobal.ssa_block_2
+    je .Lasm_SetGlobal.ssa_block_1
     mov ecx, DWORD PTR [r14 + r13 + 8]
     mov rcx, QWORD PTR [rbx + rcx * 8]
     mov QWORD PTR [rax + rdi * 8], rcx
     add r13d, 16
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
-.Lasm_SetGlobal.ssa_block_3:
+.Lasm_SetGlobal.ssa_block_2:
     cmp BYTE PTR [rax + 60], 0
-    jz .Lasm_SetGlobal.ssa_block_2
-    cmp BYTE PTR [rax + 61], 0
-    jnz .Lasm_SetGlobal.ssa_block_1
+    jz .Lasm_SetGlobal.ssa_block_1
     mov eax, DWORD PTR [rax + 56]
     mov rdx, QWORD PTR [rcx + 48]
     test rdx, rdx
@@ -4914,20 +4955,20 @@ asm_handler_SetGlobal:
     mov r11, rsi
     shr r11, 48
     cmp r11w, 32763
-    je .Lasm_SetGlobal.ssa_block_2
+    je .Lasm_SetGlobal.ssa_block_1
     mov rsi, QWORD PTR [rcx + 24]
     test rsi, rsi
-    jnz .Lasm_SetGlobal.ssa_block_7
+    jnz .Lasm_SetGlobal.ssa_block_6
     mov rcx, QWORD PTR [rcx + 56]
     mov rcx, QWORD PTR [rcx + 40]
     test rcx, rcx
     jz .Lasm_SetGlobal.assert_failure_4
     movzx ecx, BYTE PTR [rcx + rax]
-    jmp .Lasm_SetGlobal.ssa_block_8
-.Lasm_SetGlobal.ssa_block_7:
+    jmp .Lasm_SetGlobal.ssa_block_7
+.Lasm_SetGlobal.ssa_block_6:
     mov rdi, QWORD PTR [rsi + 40]
     cmp rdi, rax
-    ja .Lasm_SetGlobal.ssa_block_10
+    ja .Lasm_SetGlobal.ssa_block_9
     mov rcx, QWORD PTR [rcx + 56]
     mov rcx, QWORD PTR [rcx + 40]
     test rcx, rcx
@@ -4935,15 +4976,15 @@ asm_handler_SetGlobal:
     mov rsi, rax
     sub rsi, rdi
     movzx ecx, BYTE PTR [rcx + rsi]
-    jmp .Lasm_SetGlobal.ssa_block_8
-.Lasm_SetGlobal.ssa_block_10:
+    jmp .Lasm_SetGlobal.ssa_block_7
+.Lasm_SetGlobal.ssa_block_9:
     mov rcx, QWORD PTR [rsi + 56]
     test rcx, rcx
     jz .Lasm_SetGlobal.assert_failure_6
     movzx ecx, BYTE PTR [rcx + rax]
-.Lasm_SetGlobal.ssa_block_8:
+.Lasm_SetGlobal.ssa_block_7:
     test ecx, 2
-    jz .Lasm_SetGlobal.ssa_block_2
+    jz .Lasm_SetGlobal.ssa_block_1
     mov ecx, DWORD PTR [r14 + r13 + 8]
     mov rcx, QWORD PTR [rbx + rcx * 8]
     mov QWORD PTR [rdx + rax * 8], rcx
@@ -8483,6 +8524,45 @@ asm_handler_GetImportMeta_cold:
 asm_handler_GetImportMeta_cold_end:
 
 .p2align 4
+asm_handler_GetImport:
+    mov DWORD PTR [rbx + -64], r13d
+    lea r11, [r14 + r13]
+    mov rdi, QWORD PTR [rbp - 48]
+    mov esi, r13d
+    lea rdx, [r14 + r13]
+    call CSYM(asm_slow_path_get_import)
+    test rax, rax
+    js .Lasm_GetImport.scalar_result_done_0
+    bt rax, 32
+    jnc .Lasm_GetImport.scalar_result_done_0
+    lea rcx, [r14 + r13]
+    mov r10d, DWORD PTR [rcx + 4]
+    mov QWORD PTR [rbx + r10 * 8], rdx
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_GetImport.scalar_result_done_0:
+    test rax, rax
+    js .Lexit
+    bt rax, 32
+    jnc .Lasm_GetImport.slow_path_transfer_1
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_GetImport.slow_path_transfer_1:
+    mov rcx, QWORD PTR [rbp - 48]
+    mov rbx, QWORD PTR [rcx + 15288]
+    add rbx, 128
+    mov rcx, QWORD PTR [rbx + -40]
+    mov r14, QWORD PTR [rcx + 80]
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+asm_handler_GetImport_hot_end:
+asm_handler_GetImport_cold:
+asm_handler_GetImport_cold_end:
+
+.p2align 4
 asm_handler_GetNewTarget:
     mov DWORD PTR [rbx + -64], r13d
     lea r11, [r14 + r13]
@@ -9106,6 +9186,42 @@ asm_handler_DynamicTypeofBinding:
 asm_handler_DynamicTypeofBinding_hot_end:
 asm_handler_DynamicTypeofBinding_cold:
 asm_handler_DynamicTypeofBinding_cold_end:
+
+.p2align 4
+asm_handler_VerifyEnvironmentCoordinate:
+    mov DWORD PTR [rbx + -64], r13d
+    lea r11, [r14 + r13]
+    mov rdi, QWORD PTR [rbp - 48]
+    mov esi, r13d
+    lea rdx, [r14 + r13]
+    call CSYM(asm_slow_path_verify_environment_coordinate)
+    test rax, rax
+    js .Lasm_VerifyEnvironmentCoordinate.scalar_result_done_0
+    bt rax, 32
+    jnc .Lasm_VerifyEnvironmentCoordinate.scalar_result_done_0
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_VerifyEnvironmentCoordinate.scalar_result_done_0:
+    test rax, rax
+    js .Lexit
+    bt rax, 32
+    jnc .Lasm_VerifyEnvironmentCoordinate.slow_path_transfer_1
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+.Lasm_VerifyEnvironmentCoordinate.slow_path_transfer_1:
+    mov rcx, QWORD PTR [rbp - 48]
+    mov rbx, QWORD PTR [rcx + 15288]
+    add rbx, 128
+    mov rcx, QWORD PTR [rbx + -40]
+    mov r14, QWORD PTR [rcx + 80]
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+asm_handler_VerifyEnvironmentCoordinate_hot_end:
+asm_handler_VerifyEnvironmentCoordinate_cold:
+asm_handler_VerifyEnvironmentCoordinate_cold_end:
 
 .p2align 4
 asm_handler_HasPrivateId:
@@ -12500,7 +12616,7 @@ asm_handler_GetIterator_cold_end:
 
 asm_handler_GetGlobal_cold:
 # Cold paths for GetGlobal
-.Lasm_GetGlobal.ssa_block_2:
+.Lasm_GetGlobal.ssa_block_1:
     mov DWORD PTR [rbx + -64], r13d
     lea r11, [r14 + r13]
     mov rdi, QWORD PTR [rbp - 48]
@@ -12534,86 +12650,36 @@ asm_handler_GetGlobal_cold:
     mov r13d, eax
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
-.Lasm_GetGlobal.ssa_block_1:
-    lea rcx, [r14 + r13]
-    sub rsp, 16
-    mov rdi, QWORD PTR [rbp - 48]
-    mov esi, r13d
-    lea rdx, [r14 + r13]
-    lea rcx, [rsp]
-    call CSYM(asm_try_get_global_env_binding)
-    mov r10, QWORD PTR [rbp - 48]
-    mov r10, QWORD PTR [r10 + 15288]
-    add r10, 128
-    cmp r10, rbx
-    jne .Lasm_GetGlobal.values_restore_stack_7
-    test rax, rax
-    jne .Lasm_GetGlobal.values_exceptional_outputs_8
-    lea rcx, [r14 + r13]
-    mov r10d, DWORD PTR [rcx + 4]
-    mov r11, QWORD PTR [rsp]
-    mov QWORD PTR [rbx + r10 * 8], r11
-.Lasm_GetGlobal.skip_output_value_9:
-    jmp .Lasm_GetGlobal.values_restore_stack_7
-.Lasm_GetGlobal.values_exceptional_outputs_8:
-.Lasm_GetGlobal.values_restore_stack_7:
-    add rsp, 16
-.Lasm_GetGlobal.values_call_done_6:
-    test eax, eax
-    jnz .Lasm_GetGlobal.ssa_block_2
-    add r13d, 16
-    movzx eax, BYTE PTR [r14 + r13]
-    jmp [r12 + rax * 8]
 asm_handler_GetGlobal_cold_end:
 asm_handler_SetGlobal_cold:
 # Cold paths for SetGlobal
 .Lasm_SetGlobal.ssa_block_1:
-    lea rcx, [r14 + r13]
-    sub rsp, 16
-    mov r10d, DWORD PTR [rcx + 8]
-    mov rax, QWORD PTR [rbx + r10 * 8]
-.Lasm_SetGlobal.value_ready_8:
-    mov QWORD PTR [rsp], rax
-    mov rdi, QWORD PTR [rbp - 48]
-    mov esi, r13d
-    lea rdx, [r14 + r13]
-    lea rcx, [rsp]
-    call CSYM(asm_try_set_global_env_binding)
-.Lasm_SetGlobal.values_restore_stack_9:
-    add rsp, 16
-.Lasm_SetGlobal.values_call_done_7:
-    test eax, eax
-    jnz .Lasm_SetGlobal.ssa_block_2
-    add r13d, 16
-    movzx eax, BYTE PTR [r14 + r13]
-    jmp [r12 + rax * 8]
-.Lasm_SetGlobal.ssa_block_2:
     mov DWORD PTR [rbx + -64], r13d
     lea r11, [r14 + r13]
     mov r10d, DWORD PTR [r11 + 8]
     mov rax, QWORD PTR [rbx + r10 * 8]
-.Lasm_SetGlobal.scalar_value_ready_10:
+.Lasm_SetGlobal.scalar_value_ready_7:
     mov rcx, rax
     mov rdi, QWORD PTR [rbp - 48]
     mov esi, r13d
     lea rdx, [r14 + r13]
     call CSYM(asm_slow_path_set_global)
     test rax, rax
-    js .Lasm_SetGlobal.scalar_result_done_11
+    js .Lasm_SetGlobal.scalar_result_done_8
     bt rax, 32
-    jnc .Lasm_SetGlobal.scalar_result_done_11
+    jnc .Lasm_SetGlobal.scalar_result_done_8
     mov r13d, eax
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
-.Lasm_SetGlobal.scalar_result_done_11:
+.Lasm_SetGlobal.scalar_result_done_8:
     test rax, rax
     js .Lexit
     bt rax, 32
-    jnc .Lasm_SetGlobal.slow_path_transfer_12
+    jnc .Lasm_SetGlobal.slow_path_transfer_9
     mov r13d, eax
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
-.Lasm_SetGlobal.slow_path_transfer_12:
+.Lasm_SetGlobal.slow_path_transfer_9:
     mov rcx, QWORD PTR [rbp - 48]
     mov rbx, QWORD PTR [rcx + 15288]
     add rbx, 128
@@ -18100,7 +18166,7 @@ asm_assertion_failure_traps:
     ud2
 .Lasm_JumpFalse.assert_predicate_failure_6:
     ud2
-.Lasm_Not.assert_predicate_failure_12:
+.Lasm_Not.assert_predicate_failure_9:
     ud2
 .Lasm_ToBoolean.assert_predicate_failure_3:
     ud2

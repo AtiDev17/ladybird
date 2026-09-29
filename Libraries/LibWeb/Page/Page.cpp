@@ -15,7 +15,6 @@
 #include <LibIPC/Encoder.h>
 #include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/CSS/StyleComputer.h>
-#include <LibWeb/Clipboard/SystemClipboard.h>
 #include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -33,11 +32,10 @@
 #include <LibWeb/HTML/HistoryExecutor.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
-#include <LibWeb/HTML/NavigationPopulationRequest.h>
+#include <LibWeb/HTML/OffscreenCanvas.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/HTML/SelectedFile.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/Layout/Viewport.h>
@@ -47,6 +45,9 @@
 #include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Selection/Selection.h>
+#include <LibWebCommon/Clipboard/SystemClipboard.h>
+#include <LibWebCommon/HTML/NavigationPopulationRequest.h>
+#include <LibWebCommon/HTML/SelectedFile.h>
 
 namespace Web {
 
@@ -135,6 +136,7 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_pending_clipboard_requests);
     visitor.visit(m_emulated_position_data);
     visitor.visit(m_emulated_position_data_observers);
+    visitor.visit(m_offscreen_canvases_pending_placeholder_commit);
     for (auto const& request : m_pending_geolocation_requests)
         visitor.visit(request.value.callback);
     m_pending_fullscreen_operations.for_each([&](auto const& operation) {
@@ -1423,6 +1425,11 @@ void Page::for_each_canvas_element(Callback&& callback)
     }
 }
 
+void Page::enqueue_offscreen_canvas_placeholder_commit(Badge<HTML::OffscreenCanvas>, HTML::OffscreenCanvas& offscreen_canvas)
+{
+    m_offscreen_canvases_pending_placeholder_commit.append(offscreen_canvas);
+}
+
 void Page::prepare_canvas_contexts_for_compositing()
 {
     for_each_canvas_element([](auto& canvas_element) {
@@ -1434,6 +1441,11 @@ void Page::prepare_canvas_contexts_for_compositing()
     // even when nothing else repaints this rendering update.
     if (has_compositor_host())
         compositor_host().flush_canvas_2d_stream();
+
+    GC::RootVector<GC::Ref<HTML::OffscreenCanvas>> offscreen_canvases { m_offscreen_canvases_pending_placeholder_commit.span() };
+    m_offscreen_canvases_pending_placeholder_commit.clear();
+    for (auto& offscreen_canvas : offscreen_canvases)
+        offscreen_canvas->commit_to_placeholder();
 }
 
 void Page::notify_all_canvas_elements_of_lost_backing_storage()
@@ -2027,31 +2039,4 @@ void PageClient::history_navigation_params_creation_finished(HTML::CrossProcessI
     VERIFY_NOT_REACHED();
 }
 
-}
-
-template<>
-ErrorOr<void> IPC::encode(Encoder& encoder, Web::Page::MediaContextMenu const& menu)
-{
-    TRY(encoder.encode(menu.media_url));
-    TRY(encoder.encode(menu.is_video));
-    TRY(encoder.encode(menu.is_playing));
-    TRY(encoder.encode(menu.is_muted));
-    TRY(encoder.encode(menu.has_user_agent_controls));
-    TRY(encoder.encode(menu.is_looping));
-    TRY(encoder.encode(menu.is_fullscreen));
-    return {};
-}
-
-template<>
-ErrorOr<Web::Page::MediaContextMenu> IPC::decode(Decoder& decoder)
-{
-    return Web::Page::MediaContextMenu {
-        .media_url = TRY(decoder.decode<URL::URL>()),
-        .is_video = TRY(decoder.decode<bool>()),
-        .is_playing = TRY(decoder.decode<bool>()),
-        .is_muted = TRY(decoder.decode<bool>()),
-        .has_user_agent_controls = TRY(decoder.decode<bool>()),
-        .is_looping = TRY(decoder.decode<bool>()),
-        .is_fullscreen = TRY(decoder.decode<bool>()),
-    };
 }

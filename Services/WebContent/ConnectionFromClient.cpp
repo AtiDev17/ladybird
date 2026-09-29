@@ -38,6 +38,7 @@
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleSheetState.h>
+#include <LibWeb/Compositor/CompositorConnection.h>
 #include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/CookieStore/CookieStore.h>
 #include <LibWeb/DOM/AbstractElement.h>
@@ -69,16 +70,14 @@
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/HTML/SelectedFile.h>
 #include <LibWeb/HTML/Storage.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WorkerAgentParent.h>
-#include <LibWeb/Infra/Strings.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Loader/ResourceLoader.h>
-#include <LibWeb/Loader/UserAgent.h>
+#include <LibWeb/Loader/SourceHighlighter.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
@@ -87,13 +86,15 @@
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/Selection/Selection.h>
-#include <LibWeb/WebDriver/Error.h>
-#include <LibWebView/Attribute.h>
-#include <LibWebView/CompositorConnection.h>
-#include <LibWebView/DictionaryLookup.h>
-#include <LibWebView/ViewImplementation.h>
+#include <LibWebCommon/HTML/SelectedFile.h>
+#include <LibWebCommon/Infra/Strings.h>
+#include <LibWebCommon/Loader/UserAgent.h>
+#include <LibWebCommon/WebDriver/Error.h>
+#include <LibWebCommon/WebView/Attribute.h>
+#include <LibWebCommon/WebView/DictionaryLookup.h>
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/DevToolsDebugger.h>
+#include <WebContent/DevToolsIndexedDB.h>
 #include <WebContent/PageClient.h>
 #include <WebContent/PageHost.h>
 #include <WebContent/TestConnection.h>
@@ -111,7 +112,7 @@ ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transpo
 
 ConnectionFromClient::~ConnectionFromClient() = default;
 
-WebView::CompositorConnection* ConnectionFromClient::compositor_process_connection() const
+Web::Compositor::CompositorConnection* ConnectionFromClient::compositor_process_connection() const
 {
     if (!m_compositor_connection || !m_compositor_connection->is_open())
         return nullptr;
@@ -479,7 +480,7 @@ void ConnectionFromClient::connect_to_wasm_compiler([[maybe_unused]] IPC::Transp
 void ConnectionFromClient::connect_to_compositor_process(IPC::TransportHandle handle)
 {
     auto transport = MUST(handle.create_transport());
-    m_compositor_connection = adopt_ref(*new WebView::CompositorConnection(move(transport)));
+    m_compositor_connection = adopt_ref(*new Web::Compositor::CompositorConnection(move(transport)));
     m_compositor_connection->on_mouse_event = [this](Compositing::PageId page_id, Compositing::MouseEvent event) {
         mouse_event(page_id, move(event));
     };
@@ -1230,8 +1231,10 @@ void ConnectionFromClient::debug_request(Compositing::PageId page_id, ByteString
 void ConnectionFromClient::get_source(Compositing::PageId page_id)
 {
     if (auto page = this->page(page_id); page.has_value()) {
-        if (auto doc = page->page().local_traversable()->active_document())
-            async_did_get_source(page_id, doc->url(), doc->base_url(), doc->source());
+        if (auto doc = page->page().local_traversable()->active_document()) {
+            auto html = Web::highlight_source(doc->url(), doc->base_url(), doc->source().to_utf8(), Syntax::Language::HTML);
+            async_did_get_highlighted_source(page_id, move(html));
+        }
     }
 }
 
@@ -1628,7 +1631,7 @@ void ConnectionFromClient::inspect_indexed_database_storage(Compositing::PageId 
         return;
     }
 
-    async_did_inspect_indexed_database(page_id, request_id, DevTools::IndexedDB::serialize_storage(*document).serialized());
+    async_did_inspect_indexed_database(page_id, request_id, DevToolsIndexedDB::serialize_storage(*document).serialized());
 }
 
 void ConnectionFromClient::inspect_indexed_database_objects(Compositing::PageId page_id, u64 request_id, String host, JsonValue names, JsonValue options)
@@ -1643,7 +1646,7 @@ void ConnectionFromClient::inspect_indexed_database_objects(Compositing::PageId 
         return;
     }
 
-    async_did_inspect_indexed_database(page_id, request_id, DevTools::IndexedDB::serialize_objects(*document, host, names, options).serialized());
+    async_did_inspect_indexed_database(page_id, request_id, DevToolsIndexedDB::serialize_objects(*document, host, names, options).serialized());
 }
 
 static void send_indexed_database_operation_result(ConnectionFromClient& connection, Compositing::PageId page_id, u64 request_id, ErrorOr<JsonObject> result)
@@ -1670,7 +1673,7 @@ void ConnectionFromClient::delete_indexed_database(Compositing::PageId page_id, 
         return;
     }
 
-    send_indexed_database_operation_result(*this, page_id, request_id, DevTools::IndexedDB::delete_database(*document, host, name));
+    send_indexed_database_operation_result(*this, page_id, request_id, DevToolsIndexedDB::delete_database(*document, host, name));
 }
 
 void ConnectionFromClient::clear_indexed_database_object_store(Compositing::PageId page_id, u64 request_id, String host, String name)
@@ -1685,7 +1688,7 @@ void ConnectionFromClient::clear_indexed_database_object_store(Compositing::Page
         return;
     }
 
-    send_indexed_database_operation_result(*this, page_id, request_id, DevTools::IndexedDB::clear_object_store(*document, host, name));
+    send_indexed_database_operation_result(*this, page_id, request_id, DevToolsIndexedDB::clear_object_store(*document, host, name));
 }
 
 void ConnectionFromClient::delete_indexed_database_record(Compositing::PageId page_id, u64 request_id, String host, String name)
@@ -1700,7 +1703,7 @@ void ConnectionFromClient::delete_indexed_database_record(Compositing::PageId pa
         return;
     }
 
-    send_indexed_database_operation_result(*this, page_id, request_id, DevTools::IndexedDB::delete_record(*document, host, name));
+    send_indexed_database_operation_result(*this, page_id, request_id, DevToolsIndexedDB::delete_record(*document, host, name));
 }
 
 void ConnectionFromClient::clear_inspected_dom_node(Compositing::PageId page_id)

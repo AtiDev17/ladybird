@@ -56,7 +56,7 @@ private:
     virtual void close_media_stream(u64 stream_id) override;
     virtual void set_media_stream_may_idle(u64 stream_id, bool may_idle) override;
 
-    virtual void create_playback_session(u64 session_id, bool audio_output_disabled) override;
+    virtual void create_playback_session(u64 session_id, Media::AudioOutput audio_output) override;
     virtual void destroy_playback_session(u64 session_id) override;
     virtual void add_media_stream_source(u64 session_id, u64 stream_id) override;
     virtual void start_playback(u64 session_id) override;
@@ -81,6 +81,7 @@ private:
     virtual void remove_source_buffer_coded_frames(u64 session_id, u64 source_buffer_id, AK::Duration start, AK::Duration end) override;
     virtual void set_source_buffer_mode(u64 session_id, u64 source_buffer_id, Media::MediaSourceExtensions::AppendMode mode) override;
     virtual void set_source_buffer_timestamp_offset(u64 session_id, u64 source_buffer_id, AK::Duration timestamp_offset) override;
+    virtual void set_source_buffer_append_window(u64 session_id, u64 source_buffer_id, AK::Duration start, AK::Duration end) override;
     virtual void set_source_buffer_generate_timestamps_flag(u64 session_id, u64 source_buffer_id, bool flag) override;
     virtual void set_source_buffer_pending_initialization_segment_for_change_type_flag(u64 session_id, u64 source_buffer_id, bool flag) override;
     virtual void set_source_buffer_reached_end_of_stream(u64 session_id, u64 source_buffer_id, bool reached) override;

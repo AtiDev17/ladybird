@@ -35,8 +35,8 @@
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
-#include <LibWebView/Plugins/ImageCodecPlugin.h>
-#include <LibWebView/Utilities.h>
+#include <LibWeb/Platform/RemoteImageCodecPlugin.h>
+#include <LibWebCommon/WebView/Utilities.h>
 #include <Services/RendererSandbox.h>
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/PageClient.h>
@@ -44,6 +44,7 @@
 #include <WebContent/WebDriverConnection.h>
 
 #if defined(HAVE_WASM_COMPILER_SERVICE)
+#    include <LibWasm/Types.h>
 #    include <LibWasmCompilerClient/State.h>
 #endif
 
@@ -269,7 +270,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     });
 
 #if defined(HAVE_WASM_COMPILER_SERVICE)
-    WasmCompilerClient::compiler_state().install_compiler_callback();
+    Wasm::set_cranelift_compile_callback([](Core::AnonymousBuffer const& buffer) {
+        return WasmCompilerClient::compiler_state().compile(buffer);
+    });
 
     webcontent_client->on_wasm_compiler_connection = [](auto handle) {
         WasmCompilerClient::compiler_state().replace_connection(move(handle));
@@ -303,8 +306,8 @@ ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle)
     new_client->transport().set_peer_pid(response->peer_pid());
 #endif
     if (Web::Platform::ImageCodecPlugin::is_initialized())
-        static_cast<WebView::ImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
+        static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
     else
-        Web::Platform::ImageCodecPlugin::install(*new WebView::ImageCodecPlugin(move(new_client)));
+        Web::Platform::ImageCodecPlugin::install(*new Web::Platform::RemoteImageCodecPlugin(move(new_client)));
     return {};
 }

@@ -12,8 +12,9 @@
 #include <LibCore/EventLoop.h>
 #include <LibDevTools/StorageHelpers.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
-#include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/WebDriver/Error.h>
+#include <LibWebCommon/HTML/BrowsingContext.h>
+#include <LibWebCommon/WebDriver/Error.h>
+#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalBrowsingContextGroup.h>
@@ -23,8 +24,6 @@
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/NavigationLoader.h>
-#include <LibWebView/SiteIsolation.h>
-#include <LibWebView/SourceHighlighter.h>
 #include <LibWebView/StorageJar.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
@@ -308,7 +307,7 @@ Optional<WebContentPage::ViewPosition> WebContentPage::view_position(Web::HTML::
 }
 
 // A dialog blocks the whole tab, so every other page of the tab is told of the one a document of this page opened.
-void WebContentPage::did_open_dialog(Web::Page::PendingDialog dialog, Utf16String const& message)
+void WebContentPage::did_open_dialog(Web::PendingDialog dialog, Utf16String const& message)
 {
     traversable().for_each_hosting_page([&](WebContentPage& page) {
         if (&page != this)
@@ -783,7 +782,7 @@ void WebContentPage::did_get_style_sheet_source(Web::CSS::StyleSheetIdentifier i
     }
 }
 
-void WebContentPage::did_list_devtools_sources(u64 request_id, Vector<Web::HTML::ScriptRegistry::Description> sources)
+void WebContentPage::did_list_devtools_sources(u64 request_id, Vector<Web::HTML::ScriptRegistryDescription> sources)
 {
     if (displays_tab()) {
         auto handler = view().on_received_devtools_sources.take(request_id);
@@ -792,7 +791,7 @@ void WebContentPage::did_list_devtools_sources(u64 request_id, Vector<Web::HTML:
     }
 }
 
-void WebContentPage::did_get_devtools_source(Web::HTML::ScriptRegistry::Identifier source_id, Optional<Web::HTML::ScriptRegistry::Content> source)
+void WebContentPage::did_get_devtools_source(Web::HTML::ScriptRegistryIdentifier source_id, Optional<Web::HTML::ScriptRegistryContent> source)
 {
     if (displays_tab()) {
         auto handler = view().on_received_devtools_source.take(source_id);
@@ -801,7 +800,7 @@ void WebContentPage::did_get_devtools_source(Web::HTML::ScriptRegistry::Identifi
     }
 }
 
-void WebContentPage::did_add_devtools_source(Web::HTML::ScriptRegistry::Description source)
+void WebContentPage::did_add_devtools_source(Web::HTML::ScriptRegistryDescription source)
 {
     if (displays_tab()) {
         if (view().on_devtools_source_available)
@@ -882,7 +881,7 @@ void WebContentPage::did_output_js_console_message(ConsoleOutput console_output)
     }
 }
 
-void WebContentPage::did_start_network_request(u64 request_id, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, ByteBuffer request_body, Optional<String> initiator_type, String referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::Request::Priority priority)
+void WebContentPage::did_start_network_request(u64 request_id, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, ByteBuffer request_body, Optional<String> initiator_type, String referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::RequestPriority priority)
 {
     if (displays_tab()) {
         if (view().on_network_request_started)
@@ -1964,18 +1963,16 @@ void WebContentPage::did_request_image_context_menu(Web::HTML::CrossProcessId lo
         target->view.did_request_image_context_menu({}, target->position, move(url), move(bitmap));
 }
 
-void WebContentPage::did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::Page::MediaContextMenu menu)
+void WebContentPage::did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu)
 {
     if (auto target = view_position(local_root_id, content_position); target.has_value())
         target->view.did_request_media_context_menu({}, *this, target->position, move(menu));
 }
 
-void WebContentPage::did_get_source(URL::URL url, URL::URL base_url, Utf16String source)
+void WebContentPage::did_get_highlighted_source(String html)
 {
-    if (auto new_tab = Application::the().open_blank_new_tab(Web::HTML::ActivateTab::Yes); new_tab.has_value()) {
-        auto html = highlight_source(url, base_url, source.to_utf8(), Syntax::Language::HTML);
+    if (auto new_tab = Application::the().open_blank_new_tab(Web::HTML::ActivateTab::Yes); new_tab.has_value())
         new_tab->load_html(html);
-    }
 }
 
 void WebContentPage::did_get_debugger_environments(u64 request_id, Optional<String> error, Vector<DebuggerEnvironment> environments)
@@ -2045,21 +2042,21 @@ void WebContentPage::did_get_debugger_source_positions(u64 request_id, Vector<De
 
 void WebContentPage::did_request_alert(Utf16String message)
 {
-    did_open_dialog(Web::Page::PendingDialog::Alert, message);
+    did_open_dialog(Web::PendingDialog::Alert, message);
     if (view().on_request_alert)
         view().on_request_alert(message);
 }
 
 void WebContentPage::did_request_confirm(Utf16String message)
 {
-    did_open_dialog(Web::Page::PendingDialog::Confirm, message);
+    did_open_dialog(Web::PendingDialog::Confirm, message);
     if (view().on_request_confirm)
         view().on_request_confirm(message);
 }
 
 void WebContentPage::did_request_prompt(Utf16String message, Utf16String default_)
 {
-    did_open_dialog(Web::Page::PendingDialog::Prompt, message);
+    did_open_dialog(Web::PendingDialog::Prompt, message);
     if (view().on_request_prompt)
         view().on_request_prompt(message, default_);
 }

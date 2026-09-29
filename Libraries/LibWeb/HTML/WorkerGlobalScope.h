@@ -13,16 +13,17 @@
 #include <LibCore/Socket.h>
 #include <LibJS/Forward.h>
 #include <LibURL/URL.h>
+#include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
 #include <LibWeb/DOM/EventTarget.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/Scripting/Fetching.h>
-#include <LibWeb/HTML/Scripting/SerializedEnvironmentSettingsObject.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/HTML/WorkerLocation.h>
 #include <LibWeb/HTML/WorkerNavigator.h>
-#include <LibWeb/HTML/WorkerTypes.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
+#include <LibWebCommon/HTML/Scripting/SerializedEnvironmentSettingsObject.h>
+#include <LibWebCommon/HTML/WorkerTypes.h>
 
 namespace Web::HTML {
 
@@ -106,6 +107,8 @@ public:
     GC::Ref<CSS::FontFaceSet> fonts();
 
     // Non-IDL public methods
+
+    CSS::FontComputer& font_computer();
 
     URL::URL const& url() const { return m_url.value(); }
     void set_url(URL::URL const& url) { m_url = url; }
@@ -196,6 +199,8 @@ private:
 
     // https://drafts.csswg.org/css-font-loading/#font-source
     GC::Ptr<CSS::FontFaceSet> m_fonts;
+
+    GC::Ptr<CSS::FontComputer> m_font_computer;
 
     // https://html.spec.whatwg.org/multipage/workers.html#concept-WorkerGlobalScope-owner-set
     // A WorkerGlobalScope object has an associated owner set (a set of Document and WorkerGlobalScope objects). It is initially empty and populated when the worker is created or obtained.

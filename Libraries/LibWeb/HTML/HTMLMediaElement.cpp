@@ -30,7 +30,6 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
-#include <LibWeb/HTML/AudioPlayState.h>
 #include <LibWeb/HTML/AudioTrack.h>
 #include <LibWeb/HTML/AudioTrackList.h>
 #include <LibWeb/HTML/AutoplaySettings.h>
@@ -57,13 +56,14 @@
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/MediaCapture/MediaStream.h>
 #include <LibWeb/MediaSourceExtensions/MediaSource.h>
-#include <LibWeb/MimeSniff/MimeType.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/WebIDL/Promise.h>
+#include <LibWebCommon/HTML/AudioPlayState.h>
+#include <LibWebCommon/MimeSniff/MimeType.h>
 
 namespace Web::HTML {
 
@@ -2126,10 +2126,19 @@ void HTMLMediaElement::on_metadata_parsed(SourceType source_type)
     update_ready_state();
 }
 
+static Media::AudioOutput audio_output_for_document(DOM::Document const& document)
+{
+    // AD-HOC: Headless instances use a null output stream, so that playback follows the same audio-driven path while
+    //         discarding the samples, without holding onto the system's audio output resources.
+    if (document.page().client().is_headless())
+        return Media::AudioOutput::Null;
+    return Media::AudioOutput::Platform;
+}
+
 // https://html.spec.whatwg.org/multipage/media.html#media-data-processing-steps-list
 void HTMLMediaElement::set_up_playback_manager_for_remote()
 {
-    m_playback_manager = MediaClient::RemotePlaybackManager::create(document().page().client().is_headless());
+    m_playback_manager = MediaClient::RemotePlaybackManager::create(audio_output_for_document(document()));
 
     m_playback_manager->set_playback_rate(static_cast<float>(m_playback_rate));
 
@@ -2212,7 +2221,7 @@ void HTMLMediaElement::set_up_playback_manager_error_handler(Function<void(Utf16
 // https://html.spec.whatwg.org/multipage/media.html#media-data-processing-steps-list
 void HTMLMediaElement::set_up_playback_manager_for_local(Function<void(Utf16String)> failure_callback)
 {
-    m_playback_manager = MediaClient::RemotePlaybackManager::create(document().page().client().is_headless());
+    m_playback_manager = MediaClient::RemotePlaybackManager::create(audio_output_for_document(document()));
 
     m_playback_manager->set_playback_rate(static_cast<float>(m_playback_rate));
 
@@ -2408,6 +2417,7 @@ void HTMLMediaElement::set_ready_state(ReadyState ready_state)
     if (m_ready_state == ready_state)
         return;
 
+    auto was_potentially_playing = potentially_playing();
     auto was_buffering = blocked();
     auto old_ready_state = m_ready_state;
     m_ready_state = ready_state;
@@ -2459,10 +2469,27 @@ void HTMLMediaElement::set_ready_state(ReadyState ready_state)
 
     // -> If the previous ready state was HAVE_FUTURE_DATA or more, and the new ready state is HAVE_CURRENT_DATA or less
     if (old_ready_state >= ReadyState::HaveFutureData && ready_state <= ReadyState::HaveCurrentData) {
-        // FIXME: If the media element was potentially playing before its readyState attribute changed to a value lower than HAVE_FUTURE_DATA, and the element
-        //        has not ended playback, and playback has not stopped due to errors, paused for user interaction, or paused for in-band content, the user agent
-        //        must queue a media element task given the media element to fire an event named timeupdate at the element, and queue a media element task given
-        //        the media element to fire an event named waiting at the element.
+        // If
+        if (
+            // the media element was potentially playing before its readyState attribute changed to a value lower than
+            // HAVE_FUTURE_DATA, and
+            was_potentially_playing &&
+            // the element has not ended playback, and
+            !ended() &&
+            // playback has not stopped due to errors,
+            !error()
+            // FIXME: paused for user interaction, or paused for in-band content,
+        ) {
+            // the user agent must queue a media element task given the media element to fire an event named timeupdate
+            // at the element, and
+            queue_a_media_element_task([](HTMLMediaElement& self) {
+                self.dispatch_time_update_event();
+            });
+            // queue a media element task given the media element to fire an event named waiting at the element.
+            queue_a_media_element_task([](HTMLMediaElement& self) {
+                self.dispatch_event(DOM::Event::create(HTML::relevant_global_object(self), HTML::EventNames::waiting));
+            });
+        }
         return;
     }
 
@@ -3085,8 +3112,7 @@ bool HTMLMediaElement::potentially_playing() const
 {
     // A media element is said to be potentially playing when its paused attribute is false, the element has not ended
     // playback, playback has not stopped due to errors, and the element is not a blocked media element.
-    // FIXME: Implement "stopped due to errors".
-    return !paused() && !ended() && !blocked();
+    return !paused() && !ended() && !error() && !blocked();
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#eligible-for-autoplay

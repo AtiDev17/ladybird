@@ -23,23 +23,25 @@
 #include <LibJS/Forward.h>
 #include <LibWeb/Bindings/Navigation.h>
 #include <LibWeb/Bindings/NavigationType.h>
-#include <LibWeb/CSS/PreferredColorScheme.h>
-#include <LibWeb/CSS/PreferredContrast.h>
-#include <LibWeb/CSS/PreferredMotion.h>
+#include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/HTML/AutoplayPolicy.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
-#include <LibWeb/HTML/WorkerAgentTypes.h>
 #include <LibWeb/Loader/FileRequest.h>
-#include <LibWeb/Page/EventResult.h>
-#include <LibWeb/Page/QueuedInputEvent.h>
-#include <LibWeb/Page/ViewportIsFullscreen.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/Timer.h>
-#include <LibWebView/DOMNodeProperties.h>
-#include <LibWebView/Debugger.h>
-#include <LibWebView/Forward.h>
-#include <LibWebView/Geolocation.h>
-#include <LibWebView/PageInfo.h>
+#include <LibWebCommon/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/CSS/PreferredContrast.h>
+#include <LibWebCommon/CSS/PreferredMotion.h>
+#include <LibWebCommon/Forward.h>
+#include <LibWebCommon/HTML/AutoplayPolicy.h>
+#include <LibWebCommon/HTML/WorkerAgentTypes.h>
+#include <LibWebCommon/Page/EventResult.h>
+#include <LibWebCommon/Page/QueuedInputEvent.h>
+#include <LibWebCommon/Page/ViewportIsFullscreen.h>
+#include <LibWebCommon/WebView/DOMNodeProperties.h>
+#include <LibWebCommon/WebView/Debugger.h>
+#include <LibWebCommon/WebView/Geolocation.h>
+#include <LibWebCommon/WebView/PageInfo.h>
 #include <WebContent/Forward.h>
 #include <WebContent/WebContentClientEndpoint.h>
 #include <WebContent/WebContentConsoleClient.h>
@@ -68,7 +70,7 @@ public:
 
     PageHost& page_host() { return *m_page_host; }
     PageHost const& page_host() const { return *m_page_host; }
-    WebView::CompositorConnection* compositor_process_connection() const;
+    Web::Compositor::CompositorConnection* compositor_process_connection() const;
     void did_destroy_compositor_context(Compositing::CompositorContextId);
 
     Function<void(IPC::TransportHandle const&)> on_request_server_connection;
@@ -317,7 +319,7 @@ private:
     virtual void exit_fullscreen(Compositing::PageId page_id) override;
 
     RefPtr<TestConnection> m_test_connection;
-    RefPtr<WebView::CompositorConnection> m_compositor_connection;
+    RefPtr<Web::Compositor::CompositorConnection> m_compositor_connection;
     NonnullOwnPtr<PageHost> m_page_host;
     OwnPtr<DevToolsDebugger> m_devtools_debugger;
 

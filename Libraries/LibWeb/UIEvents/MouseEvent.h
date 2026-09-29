@@ -9,9 +9,9 @@
 #include <AK/TypeCasts.h>
 #include <AK/Utf16String.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/HighResolutionTime/DOMHighResTimeStamp.h>
-#include <LibWeb/PixelUnits.h>
 #include <LibWeb/UIEvents/UIEvent.h>
+#include <LibWebCommon/HighResolutionTime/DOMHighResTimeStamp.h>
+#include <LibWebCommon/PixelUnits.h>
 
 namespace Web::HTML {
 

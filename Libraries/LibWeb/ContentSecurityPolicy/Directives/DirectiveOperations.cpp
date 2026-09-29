@@ -12,6 +12,7 @@
 #include <LibWeb/ContentSecurityPolicy/Directives/KeywordSources.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Names.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/SourceExpression.h>
+#include <LibWeb/ContentSecurityPolicy/Policy.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/NamedNodeMap.h>
@@ -21,11 +22,11 @@
 #include <LibWeb/Fetch/Infrastructure/URL.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/HTMLStyleElement.h>
-#include <LibWeb/Infra/Strings.h>
 #include <LibWeb/SRI/SRI.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
+#include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::ContentSecurityPolicy::Directives {
 

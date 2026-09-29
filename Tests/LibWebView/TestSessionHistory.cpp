@@ -8,7 +8,7 @@
 #include <LibCore/EventLoop.h>
 #include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
-#include <LibWeb/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/HistoryDebug.h>
@@ -77,8 +77,8 @@ static Web::HTML::SessionHistoryEntryDescriptor create_test_entry(i32 step, URL:
         .url = move(url),
         .document_state = {
             .id = test_document_state_id(s_next_test_document_state_local_id++),
-            .history_policy_container = Web::HTML::DocumentState::Client::Tag,
-            .request_referrer = Web::Fetch::Infrastructure::Request::Referrer::Client,
+            .history_policy_container = Web::HTML::DocumentStateClient::Tag,
+            .request_referrer = Web::Fetch::Infrastructure::RequestReferrer::Client,
             .request_referrer_policy = Web::ReferrerPolicy::DEFAULT_REFERRER_POLICY,
             .initiator_origin = {},
             .origin = {},

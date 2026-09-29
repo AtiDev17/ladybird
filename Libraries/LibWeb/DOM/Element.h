@@ -31,7 +31,6 @@
 #include <LibWeb/DOM/Slottable.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/Fullscreen/FullscreenRequestType.h>
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/EventLoop/Task.h>
 #include <LibWeb/HTML/Parser/ParserScriptingMode.h>
@@ -41,7 +40,8 @@
 #include <LibWeb/TrustedTypes/TrustedHTML.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/WebIDL/Promise.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/Fullscreen/FullscreenRequestType.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::Animations {
 

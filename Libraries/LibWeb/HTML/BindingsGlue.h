@@ -17,11 +17,11 @@
 #include <LibWeb/HTML/OffscreenCanvas.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/WebIDL/Promise.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::Bindings {
 
-WEB_API WebIDL::ExceptionOr<GC::Ref<HTML::OffscreenCanvas>> construct_offscreen_canvas(JS::Realm&, WebIDL::UnsignedLong width, WebIDL::UnsignedLong height);
+WEB_API WebIDL::ExceptionOr<GC::Ref<HTML::OffscreenCanvas>> construct_offscreen_canvas(JS::Realm&, WebIDL::UnsignedLongLong width, WebIDL::UnsignedLongLong height);
 WEB_API GC::Ref<WebIDL::Promise> convert_to_blob(JS::Realm&, HTML::OffscreenCanvas&, Optional<ImageEncodeOptions> const&);
 WEB_API JS::ThrowCompletionOr<HTML::OffscreenRenderingContext> get_context(JS::Realm&, HTML::OffscreenCanvas&, OffscreenRenderingContextId, JS::Value options);
 

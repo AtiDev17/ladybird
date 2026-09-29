@@ -93,6 +93,12 @@ struct SetTimestampOffset {
     AK::Duration timestamp_offset;
 };
 
+// https://w3c.github.io/media-source/#dfn-append-window
+struct SetAppendWindow {
+    AK::Duration start;
+    AK::Duration end;
+};
+
 // https://w3c.github.io/media-source/#dfn-generate-timestamps-flag
 struct SetGenerateTimestampsFlag {
     bool flag { false };
@@ -117,6 +123,7 @@ using Command = Variant<
     Commands::CodedFrameEviction,
     Commands::SetMode,
     Commands::SetTimestampOffset,
+    Commands::SetAppendWindow,
     Commands::SetGenerateTimestampsFlag,
     Commands::SetPendingInitializationSegmentForChangeTypeFlag,
     Commands::SetReachedEndOfStream>;
@@ -221,6 +228,10 @@ private:
     AK::Duration m_group_end_timestamp;
     // https://w3c.github.io/media-source/#dom-sourcebuffer-timestampoffset
     AK::Duration m_timestamp_offset;
+    // https://w3c.github.io/media-source/#dom-sourcebuffer-appendwindowstart
+    AK::Duration m_append_window_start;
+    // https://w3c.github.io/media-source/#dom-sourcebuffer-appendwindowend
+    AK::Duration m_append_window_end { AK::Duration::max() };
     // https://w3c.github.io/media-source/#dfn-generate-timestamps-flag
     bool m_generate_timestamps_flag { false };
     // https://w3c.github.io/media-source/#dfn-first-initialization-segment-received-flag

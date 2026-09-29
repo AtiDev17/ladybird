@@ -14,8 +14,7 @@
 #include <LibMediaClient/Client.h>
 #include <LibRequests/RequestClient.h>
 #include <LibRequests/RequestControlClient.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
-#include <LibWeb/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/WebContentClient.h>

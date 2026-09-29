@@ -7,10 +7,10 @@
 #pragma once
 
 #include <AK/Utf16String.h>
-#include <LibWeb/HighResolutionTime/DOMHighResTimeStamp.h>
 #include <LibWeb/UIEvents/MouseEvent.h>
 #include <LibWeb/UIEvents/UIEvent.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/HighResolutionTime/DOMHighResTimeStamp.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::Bindings {
 

@@ -14,9 +14,9 @@ target_include_directories(webworkerservice PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/
 target_include_directories(webworkerservice PRIVATE ${LADYBIRD_SOURCE_DIR})
 target_include_directories(webworkerservice PRIVATE ${LADYBIRD_SOURCE_DIR}/Services/)
 
-target_link_libraries(webworkerservice PUBLIC LibCore LibFileSystem LibGfx LibHTTP LibIPC LibJS LibRequests LibCompositing LibWeb LibWebView LibUnicode LibImageDecoderClient LibMain LibMediaClient LibURL LibGC)
+target_link_libraries(webworkerservice PUBLIC LibCore LibFileSystem LibGfx LibHTTP LibIPC LibJS LibRequests LibCompositing LibWeb LibUnicode LibImageDecoderClient LibMain LibMediaClient LibURL LibGC)
 if (ENABLE_CRANELIFT_JIT)
-    target_link_libraries(webworkerservice PUBLIC LibWasmCompilerClient)
+    target_link_libraries(webworkerservice PUBLIC LibWasm LibWasmCompilerClient)
 endif()
 target_link_libraries(webworkerservice PRIVATE OpenSSL::Crypto OpenSSL::SSL)
 

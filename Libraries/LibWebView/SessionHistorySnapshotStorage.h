@@ -13,12 +13,12 @@
 #include <AK/Variant.h>
 #include <LibDatabase/Database.h>
 #include <LibURL/Origin.h>
-#include <LibWeb/ContentSecurityPolicy/Policy.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
-#include <LibWeb/HTML/EmbedderPolicy.h>
-#include <LibWeb/HTML/POSTResource.h>
-#include <LibWeb/HTML/SessionHistoryEntry.h>
-#include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
+#include <LibWebCommon/ContentSecurityPolicy/PolicySource.h>
+#include <LibWebCommon/Fetch/Infrastructure/HTTP/RequestReferrer.h>
+#include <LibWebCommon/HTML/EmbedderPolicy.h>
+#include <LibWebCommon/HTML/POSTResource.h>
+#include <LibWebCommon/HTML/SessionHistoryEntryDescriptor.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/SessionHistory.h>
 
@@ -43,8 +43,8 @@ struct PersistedReferrer {
     Optional<String> url {};
 };
 
-WEBVIEW_API PersistedReferrer encode_referrer(Web::Fetch::Infrastructure::Request::ReferrerType const&);
-WEBVIEW_API ErrorOr<Web::Fetch::Infrastructure::Request::ReferrerType> decode_referrer(PersistedReferrer const&);
+WEBVIEW_API PersistedReferrer encode_referrer(Web::Fetch::Infrastructure::RequestReferrerType const&);
+WEBVIEW_API ErrorOr<Web::Fetch::Infrastructure::RequestReferrerType> decode_referrer(PersistedReferrer const&);
 
 WEBVIEW_API i64 encode_referrer_policy(Web::ReferrerPolicy::ReferrerPolicy);
 WEBVIEW_API ErrorOr<Web::ReferrerPolicy::ReferrerPolicy> decode_referrer_policy(i64 tag);
@@ -64,11 +64,11 @@ WEBVIEW_API ErrorOr<Web::HTML::ScrollRestorationMode> decode_scroll_restoration_
 WEBVIEW_API i64 encode_embedder_policy_value(Web::HTML::EmbedderPolicyValue);
 WEBVIEW_API ErrorOr<Web::HTML::EmbedderPolicyValue> decode_embedder_policy_value(i64 tag);
 
-WEBVIEW_API i64 encode_csp_disposition(Web::ContentSecurityPolicy::Policy::Disposition);
-WEBVIEW_API ErrorOr<Web::ContentSecurityPolicy::Policy::Disposition> decode_csp_disposition(i64 tag);
+WEBVIEW_API i64 encode_csp_disposition(Web::Bindings::SecurityPolicyViolationEventDisposition);
+WEBVIEW_API ErrorOr<Web::Bindings::SecurityPolicyViolationEventDisposition> decode_csp_disposition(i64 tag);
 
-WEBVIEW_API i64 encode_csp_source(Web::ContentSecurityPolicy::Policy::Source);
-WEBVIEW_API ErrorOr<Web::ContentSecurityPolicy::Policy::Source> decode_csp_source(i64 tag);
+WEBVIEW_API i64 encode_csp_source(Web::ContentSecurityPolicy::PolicySource);
+WEBVIEW_API ErrorOr<Web::ContentSecurityPolicy::PolicySource> decode_csp_source(i64 tag);
 
 struct SessionHistorySnapshotStatements {
     Database::StatementID insert_history;
