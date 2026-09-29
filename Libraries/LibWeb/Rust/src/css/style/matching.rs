@@ -3292,10 +3292,18 @@ impl RetainedState {
         // content share the entire transition: the answer content, the guards below, the compact
         // reduction, and the stop verdict are all node-independent for comparable document-scope
         // answers under one patch's fixed cascade orders. A stopping transition therefore runs
-        // once per cohort; every further member is one column store.
-        let memo_key =
-            (!patch.always_emit_for(node) && !orders_shifted && !self.node_has_element_declaration_input(node))
-                .then(|| Self::retained_answer_delta_memo_key(old_identity, old_cascade_input, deltas));
+        // once per cohort; every further member is one column store. A container-gated rule
+        // decides for each node over its own containers, so an answer holding one is not shared.
+        let answer_is_gated = retained
+            .iter()
+            .map(|entry| entry.rule)
+            .chain(deltas.iter().map(|delta| delta.rule))
+            .any(|rule| self.program.rule_is_gated_by_container_query(rule));
+        let memo_key = (!patch.always_emit_for(node)
+            && !orders_shifted
+            && !answer_is_gated
+            && !self.node_has_element_declaration_input(node))
+        .then(|| Self::retained_answer_delta_memo_key(old_identity, old_cascade_input, deltas));
         if let Some(key) = &memo_key
             && let Some(entry) = patch.delta_memo.get(key)
             && Self::retained_answer_delta_memo_entry_matches(entry, deltas)
@@ -4039,6 +4047,17 @@ impl RetainedState {
         })
     }
 
+    /// Whether nodes with this exact answer can share one node's completed cascade: not when the
+    /// answer holds a container-gated rule, whose conditions decide for each node over its own
+    /// containers.
+    pub(super) fn shared_cascade_completion_is_node_independent(&self, answer: MatchAnswerID) -> bool {
+        self.match_answers.answer(answer).is_some_and(|full| {
+            !full
+                .iter()
+                .any(|matched| self.program.rule_is_gated_by_container_query(matched.rule))
+        })
+    }
+
     /// Sharing avoids collecting and ordering the full declaration candidates. The
     /// copied winner rows refer to interned states, so retained declarations do not
     /// need to be discounted from the work saved by sharing.
@@ -4063,13 +4082,19 @@ impl RetainedState {
     ) -> Option<MatchAnswerID> {
         let cascade_input = effects.cascade_input(&self.retained_match_answers, node)?;
         let retained = self.match_answers.answer(cascade_input)?;
+        let winners = effects.winners.view(&self.winner_groups);
         if !matches!(
-            effects
-                .winners
-                .view(&self.winner_groups)
-                .token_for(WinnerGroupKey::current(node, self.program.version())),
+            winners.token_for(WinnerGroupKey::current(node, self.program.version())),
             Lookup::Known(_)
         ) {
+            return None;
+        }
+        // The node's pseudo-element rows stand for the retained answer as its element row does: a row
+        // from an older program, or one whose priorities went stale, is not what the answer derives now.
+        if winners
+            .pseudo_states(node)
+            .any(|(_, version, _, current)| version != self.program.version() || !current)
+        {
             return None;
         }
         for matched in retained.iter() {

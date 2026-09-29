@@ -627,7 +627,6 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
 
     auto* key_event = event.get_pointer<Compositing::KeyEvent>();
     auto* mouse_event = event.get_pointer<Compositing::MouseEvent>();
-    auto* pinch_event = event.get_pointer<Compositing::PinchEvent>();
     if (m_debugger_paused) {
         if (mouse_event) {
             if (mouse_event->type == Compositing::MouseEvent::Type::MouseMove) {
@@ -691,46 +690,6 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
         }
     }
 
-    if (Application::web_content_options().enable_async_scrolling == EnableAsyncScrolling::Yes
-        && m_client_state.has_usable_bitmap
-        && mouse_event) {
-        if (mouse_event->type == Compositing::MouseEvent::Type::MouseWheel) {
-            auto wheel_delta_x = mouse_event->wheel_delta_x;
-            auto wheel_delta_y = mouse_event->wheel_delta_y;
-            if (mouse_event->modifiers & Compositing::KeyModifier::Mod_Shift)
-                swap(wheel_delta_x, wheel_delta_y);
-
-            auto device_pixels_per_css_pixel = static_cast<float>(device_pixel_ratio() * zoom_level());
-            auto position = Gfx::FloatPoint {
-                static_cast<float>(mouse_event->position.x().value()),
-                static_cast<float>(mouse_event->position.y().value()),
-            };
-            auto delta_in_device_pixels = Gfx::FloatPoint { wheel_delta_x, wheel_delta_y }.scaled(device_pixels_per_css_pixel);
-            dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI attempting compositor wheel bypass for page {} at {},{} device delta {},{}",
-                page_id(), position.x(), position.y(), delta_in_device_pixels.x(), delta_in_device_pixels.y());
-            if (page().send_async_scroll_to_compositor(position, delta_in_device_pixels, mouse_event->wheel_delta_precision, mouse_event->scroll_gesture_phase, mouse_event->modifiers))
-                mouse_event->async_scroll_performed_default_action = true;
-            dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor wheel bypass result for page {}: {}",
-                page_id(), mouse_event->async_scroll_performed_default_action ? "accepted"sv : "rejected"sv);
-        } else if (auto result = page().handle_mouse_event_in_compositor(*mouse_event); result.handled) {
-            dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor handled mouse event for page {} at {},{}",
-                page_id(), mouse_event->position.x().value(), mouse_event->position.y().value());
-            // The page still sees the events of a drag the compositor scrolls for a scrollbar the display list paints.
-            if (!result.scrollbar_dragged_by_compositor.has_value())
-                return;
-            mouse_event->scrollbar_dragged_by_compositor = result.scrollbar_dragged_by_compositor;
-        }
-    }
-    if (Application::web_content_options().enable_async_scrolling == EnableAsyncScrolling::Yes
-        && m_client_state.has_usable_bitmap
-        && pinch_event) {
-        dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI attempting compositor pinch bypass for page {} at {},{} scale delta {}",
-            page_id(), pinch_event->position.x().value(), pinch_event->position.y().value(), pinch_event->scale_delta);
-        auto handled = page().handle_pinch_event_in_compositor(*pinch_event);
-        dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor pinch bypass result for page {}: {}",
-            page_id(), handled ? "accepted"sv : "rejected"sv);
-    }
-
     // Send the next event over to the WebContent to be handled by JS. We'll later get a message to say whether JS
     // prevented the default event behavior, at which point we either discard or handle that event, and then try to
     // process the next one.
@@ -748,8 +707,13 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
                 host.async_key_event(event.clone_without_browser_data());
             }
         },
-        [this](Compositing::MouseEvent const& event) {
-            page().dispatch_mouse_event_to_web_content(event);
+        [&](Compositing::MouseEvent const& event) {
+            // The compositor scrolls or drags a scrollbar for the event when it can, then forwards the event to
+            // WebContent behind the scroll updates that produced, consumes it, or hands it back for direct dispatch.
+            if (page().handle_and_dispatch_mouse_event_in_compositor(event))
+                pending.routed_through_compositor = true;
+            else
+                page().async_mouse_event(event.clone_without_browser_data());
         },
         [this](Web::DragEvent& event) {
             auto cloned_event = event.clone_without_browser_data();
@@ -758,6 +722,7 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
             client().async_drag_event(page_id(), cloned_event);
         },
         [this](Compositing::PinchEvent const& event) {
+            page().handle_pinch_event_in_compositor(event);
             client().async_pinch_event(page_id(), event);
         });
 }
@@ -968,6 +933,36 @@ void ViewImplementation::did_lose_input_event_endpoint(Badge<WebContentClient>, 
 {
     // Nothing will finish the events the lost page held, and a pending event holds back compositor input.
     m_pending_input_events.remove_all_matching([&](auto const& pending) { return pending.endpoint == page; });
+}
+
+void ViewImplementation::did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id)
+{
+    // The compositor performed the default action itself, so there is no result to hand to the view.
+    m_pending_input_events.remove_first_matching([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
+}
+
+void ViewImplementation::did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id)
+{
+    auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
+    if (!index.has_value())
+        return;
+
+    auto& pending = m_pending_input_events[*index];
+    pending.routed_through_compositor = false;
+    pending.event.visit(
+        [&](Compositing::MouseEvent const& event) {
+            pending.endpoint->async_mouse_event(event.clone_without_browser_data());
+        },
+        [](auto const&) {
+            VERIFY_NOT_REACHED();
+        });
+}
+
+void ViewImplementation::discard_input_events_routed_through_lost_compositor(Badge<Application>)
+{
+    // The compositor may have forwarded some of these before it died, and WebContent does not de-duplicate event ids,
+    // so sending them again could run an event twice. Acknowledgements that still arrive for them are ignored.
+    m_pending_input_events.remove_all_matching([](auto const& pending) { return pending.routed_through_compositor; });
 }
 
 void ViewImplementation::set_preferred_color_scheme(Web::CSS::PreferredColorScheme color_scheme)

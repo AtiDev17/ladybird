@@ -43,6 +43,16 @@ void ConnectionFromClient::did_present_frame(Compositing::CompositorContextId co
     async_did_present_frame(context_id, content_rect, damage_rect, bitmap_id);
 }
 
+void ConnectionFromClient::did_consume_input_event(Compositing::CompositorContextId context_id, u64 event_id)
+{
+    async_did_consume_input_event(context_id, event_id);
+}
+
+void ConnectionFromClient::did_not_dispatch_input_event(Compositing::CompositorContextId context_id, u64 event_id)
+{
+    async_did_not_dispatch_input_event(context_id, event_id);
+}
+
 Messages::CompositorControlServer::InitTransportResponse ConnectionFromClient::init_transport([[maybe_unused]] int peer_pid)
 {
 #ifdef AK_OS_WINDOWS
@@ -184,14 +194,9 @@ void ConnectionFromClient::set_context_visibility(Compositing::CompositorContext
     m_compositor_state->set_context_visibility(context_id, visibility);
 }
 
-Messages::CompositorControlServer::HandleMouseEventResponse ConnectionFromClient::handle_mouse_event(Compositing::CompositorContextId context_id, Compositing::MouseEvent event)
+void ConnectionFromClient::handle_and_dispatch_mouse_event(Compositing::CompositorContextId context_id, Compositing::MouseEvent event)
 {
-    return m_compositor_state->handle_mouse_event(context_id, event);
-}
-
-Messages::CompositorControlServer::DispatchMouseEventToWebContentResponse ConnectionFromClient::dispatch_mouse_event_to_web_content(Compositing::CompositorContextId context_id, Compositing::MouseEvent event)
-{
-    return m_compositor_state->dispatch_mouse_event_to_web_content(context_id, event);
+    m_compositor_state->handle_and_dispatch_mouse_event(context_id, move(event));
 }
 
 Messages::CompositorControlServer::HandleKeyEventResponse ConnectionFromClient::handle_key_event(Compositing::CompositorContextId context_id, Compositing::KeyEvent event)
@@ -204,14 +209,9 @@ Messages::CompositorControlServer::DispatchKeyEventToWebContentResponse Connecti
     return m_compositor_state->dispatch_key_event_to_web_content(context_id, event);
 }
 
-Messages::CompositorControlServer::HandlePinchEventResponse ConnectionFromClient::handle_pinch_event(Compositing::CompositorContextId context_id, Compositing::PinchEvent event)
+void ConnectionFromClient::handle_pinch_event(Compositing::CompositorContextId context_id, Compositing::PinchEvent event)
 {
-    return m_compositor_state->handle_pinch_event(context_id, event);
-}
-
-Messages::CompositorControlServer::AsyncScrollByResponse ConnectionFromClient::async_scroll_by(Compositing::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Compositing::WheelDeltaPrecision wheel_delta_precision, Compositing::ScrollGesturePhase scroll_gesture_phase, u32 modifiers)
-{
-    return m_compositor_state->async_scroll_by(context_id, position, delta_in_device_pixels, wheel_delta_precision, scroll_gesture_phase, modifiers);
+    m_compositor_state->handle_pinch_event(context_id, event);
 }
 
 void ConnectionFromClient::presented_bitmap_ready_to_paint(Compositing::CompositorContextId context_id, i32 bitmap_id)
