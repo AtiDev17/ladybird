@@ -409,6 +409,10 @@ public:
 
     Layout::Node const* unsafe_layout_node() const { return m_layout_node.ptr(); }
     Layout::Node* unsafe_layout_node() { return m_layout_node.ptr(); }
+    // Whether the last layout tree build gave this node a box, and whether layout committed geometry for it. Code
+    // that only needs to know whether there is a box should ask these instead of reaching for the box.
+    [[nodiscard]] bool has_layout_box() const { return m_layout_node; }
+    [[nodiscard]] bool is_rendered() const;
     Element const* first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor) const;
     Element* first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor)
     {
@@ -441,6 +445,13 @@ public:
 
     [[nodiscard]] bool child_needs_layout_tree_update() const { return m_child_needs_layout_tree_update; }
     void set_child_needs_layout_tree_update(bool b) { m_child_needs_layout_tree_update = b; }
+
+    // The number of animations associated with this node's shadow-including inclusive subtree. A
+    // synchronous read of layout geometry has to catch up the style of a throttled animation that
+    // could change what it sees, and this count answers "there is none in here" for a whole subtree
+    // at once, so a read far away from the page's animations never looks at an animation.
+    [[nodiscard]] u32 associated_animation_count_in_subtree() const { return m_associated_animation_count_in_subtree; }
+    void change_associated_animation_count_in_subtree(i32 delta);
 
     [[nodiscard]] u32 children_explicitly_inherited_non_inherited_style_groups() const { return m_children_explicitly_inherited_non_inherited_style_groups; }
     void add_children_explicitly_inherited_non_inherited_style_groups(u32 style_groups) { m_children_explicitly_inherited_non_inherited_style_groups |= style_groups; }
@@ -627,6 +638,7 @@ protected:
     u8 m_layout_tree_update_reuse_reasons { 0 };
 
     u32 m_children_explicitly_inherited_non_inherited_style_groups { 0 };
+    u32 m_associated_animation_count_in_subtree { 0 };
     bool m_in_editable_subtree { false };
     bool m_is_connected { false };
     bool m_has_assigned_slot { false };

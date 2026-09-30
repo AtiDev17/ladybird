@@ -407,6 +407,11 @@ impl RetainedState {
             counters.bump(Counter::EngineComputedRecordBailWinnerElement);
             return None;
         }
+        // Both first records and updates need the inherited values composed by the parent's animations.
+        if self.parent_composes_animations(node) {
+            counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
+            return None;
+        }
         let Some(old_style_record) = self.computed_group_sets.assigned_style_record(node) else {
             // Presentational hints are mapped from the attributes by the C++ computation, which
             // publishes them as the element's declarations: a first record waits for that
@@ -593,7 +598,9 @@ impl RetainedState {
             state,
             facts,
             cohort_parent,
-            environment.unwrap_or(0),
+            // An unchanged environment is not necessarily empty. Distinguish it from a
+            // record moving to the empty environment when both started with the same style.
+            current_environment,
             RootFontInputs::from_document(&inputs),
         );
         if let Some(&new_style_record) = scratch.cohorts.get(&cohort) {
@@ -1834,14 +1841,22 @@ impl RetainedState {
             counters.bump(Counter::EngineComputedRecordBailRecordParent);
             return None;
         }
-        // A child inherits the parent's animated values, which C++ composes over the record.
-        if let Some(parent) = parent
-            && self.computed_group_sets.node_has_animation_overlay(parent)
-        {
+        if self.parent_composes_animations(node) {
             counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
             return None;
         }
         Some(DriveSubject { parent, facts })
+    }
+
+    /// Whether a node inherits values its parent's animations sample, which C++ composes over the
+    /// parent's record. An animation that settles a custom property installs an environment of its
+    /// own on the parent, and sampling moves it without a publication the engine sees.
+    fn parent_composes_animations(&self, node: StyleNodeID) -> bool {
+        self.tree.flat_tree_parent(node).is_some_and(|parent| {
+            self.computed_group_sets.node_has_animation_overlay(parent)
+                || self.computed_group_sets.adjustment_facts(parent) & bridge::element_adjustment_fact::HAS_ANIMATIONS
+                    != 0
+        })
     }
 
     /// A later element alike in what a first record is computed from takes this record, the way a
@@ -2218,8 +2233,9 @@ impl RetainedState {
         })
     }
 
-    /// The shorthand declared in a winner's block with the written value a pending longhand
-    /// names: which shorthand it is, and that written value.
+    /// The outermost shorthand declared in a winner's block for the written value a pending
+    /// longhand names, and that shorthand's written value. A shorthand nested in another, such as
+    /// `border-width` in `border`, is itself declared pending the outer one.
     fn shorthand_declaration_written_as(
         &self,
         node: StyleNodeID,
@@ -2241,22 +2257,19 @@ impl RetainedState {
         if written.len() != declared.len() {
             return None;
         }
-        declared
-            .iter()
-            .zip(written)
-            .find(|(declared, written)| {
+        let mut written_value = written_value;
+        loop {
+            let (shorthand, value) = declared.iter().zip(written).find(|(declared, written)| {
                 declared.property < crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID
                     && std::ptr::eq(written.pointer(), written_value)
-            })
-            .map(|(declared, written)| {
-                let value = match written.data() {
-                    crate::css::style_value::StyleValueData::PendingSubstitution {
-                        original_shorthand_value,
-                    } => original_shorthand_value.clone_retained(),
-                    _ => written.clone_retained(),
-                };
-                (declared.property, value)
-            })
+            })?;
+            match value.data() {
+                crate::css::style_value::StyleValueData::PendingSubstitution {
+                    original_shorthand_value,
+                } => written_value = original_shorthand_value.pointer(),
+                _ => return Some((shorthand.property, value.clone_retained())),
+            }
+        }
     }
 
     /// Whether any winner of a state was written with a substitution, so the record computed
@@ -4331,27 +4344,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pending_shorthand_lookup_returns_the_original_value() {
+    fn pending_shorthand_lookup_returns_the_outermost_shorthand() {
         use crate::css::property_metadata::property_id;
         use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
 
         let mut engine = StyleEngineState::new(DeviceClass::ForegroundDesktop);
         let sheet = engine.program.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
-        for property in [property_id::BACKGROUND_POSITION, property_id::FONT_VARIANT] {
+        for (shorthand, nested_shorthand) in [
+            (property_id::BACKGROUND, property_id::BACKGROUND_POSITION),
+            (property_id::BORDER, property_id::BORDER_WIDTH),
+            (property_id::FONT, property_id::FONT_VARIANT),
+        ] {
             let rule = engine.program.append_rule(sheet, None, RuleKind::Style);
             let original = RetainedStyleValueData::from_owned(StyleValueData::Number { value: 1.0 });
             let pending = RetainedStyleValueData::from_owned(StyleValueData::PendingSubstitution {
                 original_shorthand_value: original.clone_retained(),
             });
+            let declared = |property| DeclaredProperty {
+                property,
+                important: false,
+                operator: CascadeOperator::Declared,
+                value: SpecifiedValueID(1),
+            };
             engine.program.set_rule_declared_properties(
                 rule,
-                vec![DeclaredProperty {
-                    property,
-                    important: false,
-                    operator: CascadeOperator::Declared,
-                    value: SpecifiedValueID(1),
-                }],
-                vec![pending.clone_retained()],
+                vec![declared(shorthand), declared(nested_shorthand)],
+                vec![original.clone_retained(), pending.clone_retained()],
                 vec![],
                 vec![],
                 true,
@@ -4359,7 +4377,7 @@ mod tests {
             let (found_property, found_value) = engine
                 .shorthand_declaration_written_as(StyleNodeID::element(1), WinnerSource::Rule(rule), pending.pointer())
                 .unwrap();
-            assert_eq!(found_property, property);
+            assert_eq!(found_property, shorthand);
             assert!(std::ptr::eq(found_value.pointer(), original.pointer()));
         }
     }

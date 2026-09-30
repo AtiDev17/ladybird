@@ -48,7 +48,10 @@ public:
         auto node = m_identities.get(GC::Ptr { element });
         VERIFY(node.has_value());
         CSS::StyleNodeID scope_root;
-        if (GC::Ptr<Element const> scope_element = as_if<Element>(scope))
+        GC::Ptr<Element const> scope_element = as_if<Element>(scope);
+        if (!scope_element)
+            scope_element = scope.document().document_element();
+        if (scope_element)
             scope_root = m_identities.get(scope_element).value_or(0);
         auto const* compiled_query = compiled_query_for(query);
         auto result = m_has_document_root
@@ -94,7 +97,7 @@ private:
             return { identity, identity, false };
         }
         // A document's element participates in its query; a fragment's synthetic root does not.
-        return { m_root_identity, {}, m_has_document_root };
+        return { m_root_identity, m_has_document_root ? m_root_identity : CSS::StyleNodeID {}, m_has_document_root };
     }
 
     void* compiled_query_for(SelectorQuery const& query)
@@ -244,6 +247,11 @@ static EngineSubtreeQuery engine_subtree_query_for(Document& document, ParentNod
         query.include_root = true;
         query.has_query_root = true;
     }
+    // A non-element scoping root uses the document element for :scope.
+    if (!is<Element>(root)) {
+        if (auto const* document_element = document.document_element())
+            query.scope_root = document_element->style_node_id();
+    }
     if (GC::Ptr<ShadowRoot const> tree_root = as_if<ShadowRoot>(root.root()))
         query.shadow_root = tree_root->style_node_id();
     return query;
@@ -372,7 +380,6 @@ bool SelectorQuery::matches_simple_selector_in_dom(Element const& element) const
         auto result = CSS::SelectorFFI::rust_selector_matches_simple_dom(
             &selector->rust_selector(),
             interned_name_identity(element.local_name()),
-            interned_name_identity(element.lowercased_local_name()),
             interned_name_identity(id),
             interned_name_identity(lowercase_id),
             class_identities.data(),
@@ -427,7 +434,10 @@ bool SelectorQuery::matches_in_style_engine(Element const& element, ParentNode c
     VERIFY(element.style_node_id() != 0);
 
     CSS::StyleNodeID scope_root;
-    if (GC::Ptr<Element const> scope_element = as_if<Element>(scope))
+    GC::Ptr<Element const> scope_element = as_if<Element>(scope);
+    if (!scope_element)
+        scope_element = scope.document().document_element();
+    if (scope_element)
         scope_root = scope_element->style_node_id();
 
     CSS::StyleNodeID shadow_root;

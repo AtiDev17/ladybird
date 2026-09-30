@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ConditionVariable.h>
 #include <AK/MemoryStream.h>
 #include <AK/Queue.h>
 #include <LibCore/MappedFile.h>
@@ -17,6 +18,8 @@
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibTest/TestCase.h>
+#include <LibThreading/Thread.h>
+#include <core/SkFont.h>
 #include <core/SkStream.h>
 #include <core/SkTypeface.h>
 #include <harfbuzz/hb.h>
@@ -33,6 +36,24 @@ struct Global {
 } global;
 
 }
+
+class ConcurrentStart {
+public:
+    void wait()
+    {
+        MutexLocker locker(m_mutex);
+        ++m_waiting;
+        if (m_waiting == 8)
+            m_condition.broadcast();
+        else
+            m_condition.wait_while([&] { return m_waiting < 8; });
+    }
+
+private:
+    Mutex m_mutex;
+    ConditionVariable m_condition { m_mutex };
+    size_t m_waiting { 0 };
+};
 
 static bool font_is_emoji(StringView path)
 {
@@ -274,6 +295,20 @@ TEST_CASE(pending_font_can_resolve_synchronously_without_loading_fallbacks)
     EXPECT_EQ(fallback_loads, 0u);
 }
 
+TEST_CASE(pending_font_becoming_resident_replaces_ascii_fallback)
+{
+    auto local_font = load_text_font(24);
+    auto fallback_font = load_text_font(16);
+    auto cascade = Gfx::FontCascadeList::create();
+    bool resident = false;
+    cascade->add_pending_face({ { 'a', 'a' } }, [] { return Gfx::PendingFontState::Visible; }, [&]() -> RefPtr<Gfx::Font const> { return resident ? local_font.ptr() : nullptr; });
+    cascade->add(fallback_font);
+    cascade->set_last_resort_font(fallback_font);
+    EXPECT_EQ(&cascade->font_for_code_point('a'), fallback_font.ptr());
+    resident = true;
+    EXPECT_EQ(&cascade->font_for_code_point('a'), local_font.ptr());
+}
+
 TEST_CASE(first_available_font_resolves_resident_faces_in_cascade_order)
 {
     auto local_font = load_text_font(24);
@@ -391,4 +426,156 @@ TEST_CASE(shaping_cache_preserves_positions_spacing_and_trailing_whitespace)
 
     auto without_spacing = Gfx::shape_text({}, 0, 0, u"abc "sv, font, Gfx::GlyphRun::TextType::Common);
     EXPECT_APPROXIMATE(origin->width() - without_spacing->width(), 11.f);
+}
+
+// Only ThreadSanitizer can catch a memo race here, since every thread reaches the same verdict.
+TEST_CASE(emoji_classification_can_run_on_several_threads)
+{
+    auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/colrv1-noname.ttf"sv)));
+    auto typeface = MUST(Gfx::Typeface::try_load_from_externally_owned_memory(file->bytes()));
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto font = adopt_ref(*new Gfx::Font(typeface, 12, 12, {}, {}));
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Array<bool, 8> verdicts {};
+    IGNORE_USE_IN_ESCAPING_LAMBDA ConcurrentStart start;
+    Vector<NonnullRefPtr<Threading::Thread>> threads;
+    for (size_t thread_index = 0; thread_index < verdicts.size(); ++thread_index) {
+        auto thread = Threading::Thread::construct("EmojiVerdict"sv, [&font, &verdicts, &start, thread_index]() {
+            start.wait();
+            verdicts[thread_index] = font->is_emoji_font();
+            return 0;
+        });
+        thread->start();
+        threads.append(move(thread));
+    }
+    for (auto& thread : threads)
+        (void)thread->join();
+
+    for (auto verdict : verdicts)
+        EXPECT(verdict);
+}
+
+// Only ThreadSanitizer can catch a memo race here, since every thread reads the same head table.
+TEST_CASE(typeface_bounding_box_can_be_read_on_several_threads)
+{
+    auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/text.ttf"sv)));
+    IGNORE_USE_IN_ESCAPING_LAMBDA NonnullRefPtr<Gfx::Typeface const> typeface = MUST(Gfx::Typeface::try_load_from_temporary_memory(file->bytes()));
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Array<Gfx::Typeface::BoundingBoxInFontUnits, 8> bounding_boxes {};
+    IGNORE_USE_IN_ESCAPING_LAMBDA ConcurrentStart start;
+    Vector<NonnullRefPtr<Threading::Thread>> threads;
+    for (size_t thread_index = 0; thread_index < bounding_boxes.size(); ++thread_index) {
+        auto thread = Threading::Thread::construct("TypefaceBoundingBox"sv, [typeface, &bounding_boxes, &start, thread_index]() {
+            start.wait();
+            bounding_boxes[thread_index] = typeface->bounding_box_in_font_units();
+            return 0;
+        });
+        thread->start();
+        threads.append(move(thread));
+    }
+    for (auto& thread : threads)
+        (void)thread->join();
+
+    auto expected = typeface->bounding_box_in_font_units();
+    EXPECT(!expected.is_empty());
+
+    for (auto const& bounding_box : bounding_boxes) {
+        EXPECT_EQ(bounding_box.x_min, expected.x_min);
+        EXPECT_EQ(bounding_box.y_min, expected.y_min);
+        EXPECT_EQ(bounding_box.x_max, expected.x_max);
+        EXPECT_EQ(bounding_box.y_max, expected.y_max);
+        EXPECT_EQ(bounding_box.units_per_em, expected.units_per_em);
+    }
+}
+
+// Only ThreadSanitizer can catch a memo race here, since fontconfig answers each scale the same way.
+TEST_CASE(hinting_options_can_be_memoized_on_several_threads)
+{
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto font = load_text_font(16);
+    IGNORE_USE_IN_ESCAPING_LAMBDA Array<float, 4> scales { 1, 1.5f, 2, 3 };
+
+    // The memo answers the way a fresh query does: ask, displace it with another scale, ask again.
+    auto fresh = font->skia_font(1);
+    (void)font->skia_font(2);
+    auto memoized = font->skia_font(1);
+    EXPECT_EQ(memoized.getHinting(), fresh.getHinting());
+    EXPECT_EQ(memoized.isForceAutoHinting(), fresh.isForceAutoHinting());
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Array<Array<SkFont, 4>, 8> fonts;
+    Vector<NonnullRefPtr<Threading::Thread>> threads;
+    for (size_t thread_index = 0; thread_index < fonts.size(); ++thread_index) {
+        auto thread = Threading::Thread::construct("HintingMemo"sv, [&font, &scales, &fonts, thread_index]() {
+            for (size_t scale_index = 0; scale_index < scales.size(); ++scale_index)
+                fonts[thread_index][scale_index] = font->skia_font(scales[scale_index]);
+            return 0;
+        });
+        thread->start();
+        threads.append(move(thread));
+    }
+    for (auto& thread : threads)
+        (void)thread->join();
+
+    for (auto const& thread_fonts : fonts) {
+        for (size_t scale_index = 0; scale_index < scales.size(); ++scale_index) {
+            EXPECT_EQ(thread_fonts[scale_index].getHinting(), fonts[0][scale_index].getHinting());
+            EXPECT_EQ(thread_fonts[scale_index].isForceAutoHinting(), fonts[0][scale_index].isForceAutoHinting());
+            EXPECT_EQ(thread_fonts[scale_index].getSize(), font->pixel_size() * scales[scale_index]);
+        }
+    }
+}
+
+// Only ThreadSanitizer can catch a cache race here, since every thread computes the same glyph IDs.
+TEST_CASE(glyph_pages_can_be_populated_on_several_threads)
+{
+    auto font = load_text_font(16);
+    NonnullRefPtr<Gfx::Typeface const> typeface { font->typeface() };
+    IGNORE_USE_IN_ESCAPING_LAMBDA Array<u32, 4> code_points { 'A', 0x3a9, 0x4e00, 0x1f600 };
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Array<Array<u32, 4>, 8> glyph_ids;
+    IGNORE_USE_IN_ESCAPING_LAMBDA ConcurrentStart start;
+    Vector<NonnullRefPtr<Threading::Thread>> threads;
+    for (size_t thread_index = 0; thread_index < glyph_ids.size(); ++thread_index) {
+        auto thread = Threading::Thread::construct("GlyphPageCache"sv, [typeface, &code_points, &glyph_ids, &start, thread_index]() {
+            start.wait();
+            for (size_t code_point_index = 0; code_point_index < code_points.size(); ++code_point_index)
+                glyph_ids[thread_index][code_point_index] = typeface->glyph_id_for_code_point(code_points[code_point_index]);
+            return 0;
+        });
+        thread->start();
+        threads.append(move(thread));
+    }
+    for (auto& thread : threads)
+        (void)thread->join();
+
+    Array<u32, 4> expected_glyph_ids;
+    for (size_t i = 0; i < code_points.size(); ++i)
+        expected_glyph_ids[i] = typeface->glyph_id_for_code_point(code_points[i]);
+
+    for (auto const& thread_glyph_ids : glyph_ids)
+        EXPECT_EQ(thread_glyph_ids, expected_glyph_ids);
+}
+
+TEST_CASE(glyph_page_caches_keep_the_typefaces_in_use_once_full)
+{
+    auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/text.ttf"sv)));
+    IGNORE_USE_IN_ESCAPING_LAMBDA Vector<NonnullRefPtr<Gfx::Typeface>> typefaces;
+    for (size_t i = 0; i < 200; ++i)
+        typefaces.append(MUST(Gfx::Typeface::try_load_from_temporary_memory(file->bytes())));
+
+    // A fresh thread starts with no caches. More typefaces than it keeps caches for fill them up, and a few typefaces
+    // used in turn afterwards fill their glyph pages in once each.
+    IGNORE_USE_IN_ESCAPING_LAMBDA u64 pages_populated_in_turns = 0;
+    auto thread = Threading::Thread::construct("GlyphPageCache"sv, [&typefaces, &pages_populated_in_turns]() {
+        for (auto const& typeface : typefaces)
+            (void)typeface->glyph_id_for_code_point('A');
+        auto populated_before_turns = Gfx::TypefaceSkia::glyph_pages_populated_on_this_thread();
+        for (size_t turn = 0; turn < 50; ++turn) {
+            for (size_t i = 0; i < 8; ++i)
+                (void)typefaces[i * 20]->glyph_id_for_code_point('A');
+        }
+        pages_populated_in_turns = Gfx::TypefaceSkia::glyph_pages_populated_on_this_thread() - populated_before_turns;
+        return 0;
+    });
+    thread->start();
+    (void)thread->join();
+    EXPECT(pages_populated_in_turns <= 8);
 }

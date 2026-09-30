@@ -16,11 +16,11 @@ use super::reconcile::BoxNodeWriter;
 use super::refresh::compute_sticky_data;
 use super::scroll_state::ScrollState;
 use super::*;
+use crate::fast_hash::{FastMap as HashMap, FastSet as HashSet};
 use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::painting::host::{FfiVisualContextHostCallbacks, FfiVisualContextTreeInputs};
 use crate::painting::paint_order;
 use crate::painting::paintable_rows::PaintableRowsRead;
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -75,7 +75,7 @@ fn expand_dirty_entries(
     layout_arena: &impl PaintableRowsRead,
     dirty: &VisualContextDirtySet,
 ) -> Result<WorkPlan, VisualContextGlobalRebuildReason> {
-    let mut work: HashMap<NodeSlotId, BoxDirtyBits> = HashMap::new();
+    let mut work: HashMap<NodeSlotId, BoxDirtyBits> = HashMap::default();
     for (slot, bits) in &dirty.boxes {
         if !layout_arena.paintable_row_is_populated(*slot) {
             continue;
@@ -89,7 +89,7 @@ fn expand_dirty_entries(
         }
         work.entry(*slot).or_default().merge(bits);
     }
-    let mut revalidate_children_of = HashSet::new();
+    let mut revalidate_children_of = HashSet::default();
     for removed in &dirty.removed {
         if layout_arena.paintable_row_is_populated(removed.former_paint_parent) {
             revalidate_children_of.insert(removed.former_paint_parent);
@@ -98,7 +98,7 @@ fn expand_dirty_entries(
     let mut plan = WorkPlan {
         work,
         revalidate_children_of,
-        ancestors_of_work: HashSet::new(),
+        ancestors_of_work: HashSet::default(),
     };
     let dirty_slots: Vec<NodeSlotId> = plan
         .work
@@ -424,7 +424,8 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
         0
     };
     let mut assignments: Vec<PaintableVisualContextAssignment> = Vec::with_capacity(every_box_capacity);
-    let mut assignment_index_by_slot: HashMap<NodeSlotId, usize> = HashMap::with_capacity(every_box_capacity);
+    let mut assignment_index_by_slot: HashMap<NodeSlotId, usize> =
+        HashMap::with_capacity_and_hasher(every_box_capacity, Default::default());
     let mut mask_node_owners_changed = state
         .dirty_boxes
         .removed
@@ -461,7 +462,7 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
     // the box is built once the stack is drained, after every anchor this pass rebuilds.
     let defers_anchor_positioned = layout_arena.may_have_default_scroll_shift_anchor();
     let mut deferred_anchor_positioned: Vec<DeferredAnchorPositionedBox> = Vec::new();
-    let mut deferred_awaiting_build: HashSet<NodeSlotId> = HashSet::new();
+    let mut deferred_awaiting_build: HashSet<NodeSlotId> = HashSet::default();
     loop {
         let (pending, may_defer_this_box) = match stack.pop() {
             Some(pending) => (pending, defers_anchor_positioned),
@@ -480,14 +481,17 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
             .expect("every pending box below the viewport has a paint parent");
         let input = pending.input;
         let work_bits = plan.work.get(&slot).copied();
+        // A box that only moved changes no more than the boxes a moved ancestor carries along: only the nodes that
+        // depend on its geometry.
+        let moved = pending.cascade.geometry_walk || work_bits.is_some_and(|bits| bits.is_move_only());
         let (rebuild, subtree_may_own_geometry_dependent_nodes) = if scope.rebuilds_every_box() {
             (true, false)
         } else {
             let record = layout_arena.paintable_visual_context_record(slot);
             let record = record.as_deref();
-            let rebuild = work_bits.is_some()
+            let rebuild = work_bits.is_some_and(|bits| !bits.is_move_only())
                 || record.is_none_or(|record| record.inherited_input != input)
-                || (pending.cascade.geometry_walk && record.is_some_and(|record| record.owns_geometry_dependent_nodes));
+                || (moved && record.is_some_and(|record| record.owns_geometry_dependent_nodes));
             (
                 rebuild,
                 record.is_some_and(|record| record.subtree_may_own_geometry_dependent_nodes),
@@ -591,7 +595,7 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsRead>(
         } else {
             let cascade = ChildCascade {
                 input_changed: false,
-                geometry_walk: pending.cascade.geometry_walk && subtree_may_own_geometry_dependent_nodes,
+                geometry_walk: moved && subtree_may_own_geometry_dependent_nodes,
             };
             (cascade, None)
         };

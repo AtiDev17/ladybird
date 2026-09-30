@@ -9,8 +9,10 @@
 
 #pragma once
 
+#include <AK/Atomic.h>
 #include <AK/AtomicRefCounted.h>
 #include <AK/FlyString.h>
+#include <AK/Once.h>
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
 #include <AK/Utf16String.h>
@@ -102,16 +104,20 @@ private:
 #if defined(USE_FONTCONFIG)
     FontHintingOptions hinting_options(float scale) const;
 
-    struct ScaledFontHintingOptions {
-        float scale;
-        FontHintingOptions options;
-    };
-    mutable Optional<ScaledFontHintingOptions> m_hinting_options;
+    // The one-entry memo is a single atomic word because a stage that turns text into a path and
+    // the rasterizer that draws it ask the same font for hinting at different scales. Font.cpp
+    // owns the encoding. Either winner is correct: fontconfig's answer is a pure function of the
+    // family, the scaled pixel size, the weight and the slope.
+    mutable Atomic<u64> m_hinting_memo { 0 };
 #endif
 
+    mutable OnceFlag m_harfbuzz_font_once;
     mutable hb_font_t* m_harfbuzz_font { nullptr };
 
-    mutable TriState m_is_emoji_font { TriState::Unknown };
+    // A layout pass classifies fonts while the document thread may be doing the same to the same
+    // font, so the verdict is a single atomic byte. Either winner is correct: the classification
+    // reads only the face's immutable tables.
+    mutable Atomic<TriState> m_is_emoji_font { TriState::Unknown };
 
     NonnullRefPtr<Typeface const> m_typeface;
     float m_point_width { 0.0f };

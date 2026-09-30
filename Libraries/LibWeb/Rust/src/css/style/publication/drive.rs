@@ -331,7 +331,10 @@ impl RetainedState {
                     counters.bump(Counter::EngineComputedRecordBailRecordTable);
                     return None;
                 };
-                if view.dependency_flags & (1 << 2) != 0
+                // A record kept under display:none is still what the element's own style is driven
+                // from, but the animations it names start only when C++ computes the element out of
+                // that subtree.
+                if (view.dependency_flags & (1 << 2) != 0 && table_names_animations(old_table))
                     || crate::css::style_compute::has_active_transition_properties(old_table)
                 {
                     counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
@@ -779,8 +782,16 @@ impl RetainedState {
         let remaining_length = length_context(
             own_metrics(line_height_before_adjustments),
             results.font_metrics_depend_on_viewport_metrics,
-            document_root_font_metrics,
-            inputs.root_font_metrics_depend_on_viewport_metrics,
+            if is_document_element {
+                own_metrics(line_height_before_adjustments)
+            } else {
+                document_root_font_metrics
+            },
+            if is_document_element {
+                results.font_metrics_depend_on_viewport_metrics
+            } else {
+                inputs.root_font_metrics_depend_on_viewport_metrics
+            },
         );
         let input_line_height_metrics = if has(fact::CHECK_INPUT_LINE_HEIGHT) {
             FfiInputLineHeightMetrics {
@@ -845,6 +856,19 @@ impl RetainedState {
         };
         Some((table, length, results.longhand_evaluations, Some(font)))
     }
+}
+
+/// Whether a computed table's `animation-name` names any animation.
+fn table_names_animations(table: &ComputedLonghandTable) -> bool {
+    use crate::css::style_compute::keyword;
+    let is_none =
+        |value: &StyleValueData| matches!(value, StyleValueData::Keyword { keyword: name } if *name == keyword::NONE);
+    table
+        .get(crate::css::property_metadata::property_id::ANIMATION_NAME)
+        .is_some_and(|value| match value.data() {
+            StyleValueData::ValueList { values, .. } => values.as_slice().iter().any(|value| !is_none(value.data())),
+            value => !is_none(value),
+        })
 }
 
 /// A font's pixel metric as the drive resolves font-relative units against it: the C++ length

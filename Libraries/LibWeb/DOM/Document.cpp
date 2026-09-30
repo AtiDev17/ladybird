@@ -1964,6 +1964,19 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed)
     m_document->set_needs_repaint();
 }
 
+bool Document::is_clean_for_layout_geometry_read() const
+{
+    return m_has_completed_style_update
+        && layout_is_up_to_date()
+        && m_elements_with_dirty_style_attributes.is_empty()
+        && !style_computer().style_engine().has_pending_transaction()
+        && !m_needs_media_rule_evaluation
+        && !m_needs_animated_style_update
+        && m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
+        && m_elements_with_pending_top_layer_membership_change.is_empty()
+        && !m_top_layer_needs_layout_zone_rebuild;
+}
+
 void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutReason reason)
 {
     if (!node.is_connected())
@@ -1972,13 +1985,29 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
     if (reason != UpdateLayoutReason::HTMLEventLoopRenderingUpdate)
         flush_throttled_animation_style_update_for_node(node);
 
+    auto const reads_layout_geometry = reason_reads_layout_geometry(reason);
+    auto embedding_document_chain_is_clean = [&] {
+        auto const* embedded_document = this;
+        while (auto navigable = embedded_document->navigable()) {
+            auto embedding_document = navigable->container_document();
+            if (!embedding_document || embedding_document.ptr() == embedded_document)
+                return true;
+            if (!embedding_document->is_clean_for_layout_geometry_read())
+                return false;
+            embedded_document = embedding_document.ptr();
+        }
+        return true;
+    };
+
+    // Nothing is waiting anywhere, so committed layout already answers the read and the pipeline
+    // would find no work to do. A geometry read also seals the before-change style that a later CSS
+    // transition starts from, but with no style input pending there is nothing left to seal, so a
+    // document that declares transitions does not have to give up its clean reads over it either.
+    if (reads_layout_geometry && is_clean_for_layout_geometry_read() && embedding_document_chain_is_clean())
+        return;
+
     auto* document_element = this->document_element();
     auto const may_have_style_query_dependencies = document_element && document_element->is_style_query_container();
-    auto const reads_layout_geometry = reason == UpdateLayoutReason::ElementGetClientRects
-        || reason == UpdateLayoutReason::ElementClientWidth
-        || reason == UpdateLayoutReason::ElementClientHeight
-        || reason == UpdateLayoutReason::HTMLElementOffsetWidth
-        || reason == UpdateLayoutReason::HTMLElementOffsetHeight;
     if (reads_layout_geometry
         && m_has_completed_style_update
         && layout_is_up_to_date()
@@ -1989,29 +2018,6 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
         && !m_top_layer_needs_layout_zone_rebuild
         && !style_computer().style_engine().css_transitions_may_observe_style_changes()
         && !may_have_style_query_dependencies) {
-        auto document_is_clean_for_layout_geometry_read = [](Document const& document) {
-            return document.m_has_completed_style_update
-                && document.layout_is_up_to_date()
-                && document.m_elements_with_dirty_style_attributes.is_empty()
-                && !document.style_computer().style_engine().has_pending_transaction()
-                && !document.m_needs_media_rule_evaluation
-                && !document.m_needs_animated_style_update
-                && document.m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
-                && document.m_elements_with_pending_top_layer_membership_change.is_empty()
-                && !document.m_top_layer_needs_layout_zone_rebuild;
-        };
-        auto embedding_document_chain_is_clean = [&] {
-            auto const* embedded_document = this;
-            while (auto navigable = embedded_document->navigable()) {
-                auto embedding_document = navigable->container_document();
-                if (!embedding_document || embedding_document.ptr() == embedded_document)
-                    return true;
-                if (!document_is_clean_for_layout_geometry_read(*embedding_document))
-                    return false;
-                embedded_document = embedding_document.ptr();
-            }
-            return true;
-        };
         if (embedding_document_chain_is_clean()) {
             synchronize_dirty_style_attributes();
             if (!style_computer().style_engine().pending_transaction_may_affect_layout_geometry()) {
@@ -2263,14 +2269,19 @@ void Document::sample_animation_effects_needing_style_update()
     GC::RootVector<GC::Ref<Animations::Animation>> animations;
     if (m_force_throttled_animation_style_update) {
         for (auto& animation : m_associated_animations) {
-            if (animation.is_idle() || !animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
+            if (!animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
+                continue;
+            auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
+            // NB: Dirty idle effects still need to remove their last sampled values after cancellation.
+            if (animation.is_idle() && !m_effects_needing_animated_style_update.contains(effect))
                 continue;
             animations.append(animation);
         }
     } else {
         for (auto& effect : m_effects_needing_animated_style_update) {
             auto animation = effect.associated_animation();
-            if (!animation || animation->is_idle())
+            // NB: A canceled animation still needs to remove its last sampled values.
+            if (!animation)
                 continue;
             animations.append(*animation);
         }
@@ -2350,20 +2361,40 @@ void Document::flush_throttled_animation_style_update_for_node(Node const& node)
         return;
 
     auto task_generation = relevant_settings_object().responsible_event_loop().task_generation();
-    for (auto& animation : m_associated_animations) {
-        if (!animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
-            continue;
-        auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
-        auto target = effect.target();
-        if (!target
-            || (!target->is_shadow_including_inclusive_ancestor_of(node) && !node.is_shadow_including_inclusive_ancestor_of(*target))
-            || !effect.can_skip_per_frame_style_update())
-            continue;
-        if (m_is_updating_animated_style) {
-            m_effects_needing_animated_style_update_after_current_update.set(effect);
-        } else {
-            effect.request_element_scoped_observation_sample(task_generation);
+    auto flush_animations_targeting = [&](Node const& target) {
+        auto const* element = as_if<Element>(target);
+        if (!element)
+            return;
+        for (auto const& animation : element->associated_animations_unordered()) {
+            if (!animation->effect() || !is<Animations::KeyframeEffect>(*animation->effect()))
+                continue;
+            auto& effect = static_cast<Animations::KeyframeEffect&>(*animation->effect());
+            if (!effect.can_skip_per_frame_style_update())
+                continue;
+            if (m_is_updating_animated_style) {
+                m_effects_needing_animated_style_update_after_current_update.set(effect);
+            } else {
+                effect.request_element_scoped_observation_sample(task_generation);
+            }
         }
+    };
+
+    // An animation changes what this read sees only if its target is the node itself, one of its
+    // shadow-including ancestors, or one of its shadow-including descendants. An element's own
+    // animation list answers the first two directions along the ancestor chain, and the count of
+    // animations in a subtree prunes the third to the branches that hold one. A page with hundreds
+    // of throttled animations therefore costs a read that is far away from all of them one walk to
+    // the root, instead of two ancestor tests against every animation in the document.
+    for (auto const* ancestor = &node; ancestor; ancestor = ancestor->parent_or_shadow_host())
+        flush_animations_targeting(*ancestor);
+
+    if (node.associated_animation_count_in_subtree() != 0) {
+        const_cast<Node&>(node).for_each_shadow_including_descendant([&](Node& descendant) {
+            if (descendant.associated_animation_count_in_subtree() == 0)
+                return TraversalDecision::SkipChildrenAndContinue;
+            flush_animations_targeting(descendant);
+            return TraversalDecision::Continue;
+        });
     }
 }
 
@@ -6305,6 +6336,11 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
     //    For the top-level browsing context, this includes implicit root observers.
     // 2. For each observer in observer list:
 
+    // AD-HOC: With no observer there is nothing to observe, and nothing to prepare the paint state for: the rendering
+    //         update prepares it when it paints.
+    if (m_intersection_observers.is_empty())
+        return;
+
     // NOTE: We make a copy of the intersection observers list to avoid modifying it while iterating.
     GC::RootVector<GC::Ref<IntersectionObserver::IntersectionObserver>> intersection_observers;
     for (auto& observer : m_intersection_observers)
@@ -9102,10 +9138,8 @@ void Document::process_top_layer_removals()
     // NB: Called during top layer processing.
     for (auto& element : m_top_layer_pending_removals) {
         // FIXME: Implement overlay property
-        auto const* layout_node = element->unsafe_layout_node();
-        if (!layout_node || !Painting::has_committed_box(*layout_node)) {
+        if (!element->is_rendered())
             elements_to_remove.append(element);
-        }
     }
 
     for (auto& element : elements_to_remove) {
@@ -10000,7 +10034,7 @@ Optional<Painting::HitTestResult> Document::hit_test(CSSPixelPoint position)
     //    the transforms that apply to the descendants of the viewport, return the associated element and terminate
     //    these steps.
     auto result = hit_test_display_list->hit_test(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics());
-    if (result.has_value() && (result->chrome_widget || result->node))
+    if (result.has_value() && (result->chrome_widget || result->dom_node()))
         return result;
 
     // 3. If the document has a root element, return the root element and terminate these steps.
@@ -10714,8 +10748,8 @@ Utf16View to_string(InvalidateLayoutTreeReason reason)
 Utf16View to_string(UpdateLayoutReason reason)
 {
     switch (reason) {
-#define ENUMERATE_UPDATE_LAYOUT_REASON(e) \
-    case UpdateLayoutReason::e:           \
+#define ENUMERATE_UPDATE_LAYOUT_REASON(e, reads_layout_geometry) \
+    case UpdateLayoutReason::e:                                  \
         return #e##sv;
         ENUMERATE_UPDATE_LAYOUT_REASONS(ENUMERATE_UPDATE_LAYOUT_REASON)
 #undef ENUMERATE_UPDATE_LAYOUT_REASON

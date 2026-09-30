@@ -112,7 +112,7 @@ static int scale_for_harfbuzz(float pixel_size)
 
 hb_font_t* Font::harfbuzz_font() const
 {
-    if (!m_harfbuzz_font) {
+    call_once(m_harfbuzz_font_once, [&] {
         m_harfbuzz_font = hb_font_create(typeface().harfbuzz_typeface());
         auto harfbuzz_scale = scale_for_harfbuzz(pixel_size());
         hb_font_set_scale(m_harfbuzz_font, harfbuzz_scale, harfbuzz_scale);
@@ -130,7 +130,8 @@ hb_font_t* Font::harfbuzz_font() const
 
             hb_font_set_variations(m_harfbuzz_font, hb_list.data(), hb_list.size());
         }
-    }
+        hb_font_make_immutable(m_harfbuzz_font);
+    });
     return m_harfbuzz_font;
 }
 
@@ -161,11 +162,31 @@ void force_hinting_for_testing([[maybe_unused]] Optional<FontHintingStyle> style
 }
 
 #if defined(USE_FONTCONFIG)
+// The scale's bits sit above, bit 0 says the word holds an answer, bits 1 and 2 carry the style
+// and bit 3 the autohinting flag.
+static constexpr u64 hinting_memo_holds_answer = 1;
+
+static u64 encode_hinting_memo(float scale, FontHintingOptions options)
+{
+    return (static_cast<u64>(bit_cast<u32>(scale)) << 32)
+        | hinting_memo_holds_answer
+        | (static_cast<u64>(to_underlying(options.style)) << 1)
+        | (static_cast<u64>(options.force_autohinting) << 3);
+}
+
 FontHintingOptions Font::hinting_options(float scale) const
 {
-    if (!m_hinting_options.has_value() || m_hinting_options->scale != scale)
-        m_hinting_options = ScaledFontHintingOptions { scale, GlobalFontConfig::the().hinting_for_font(family(), pixel_size() * scale, weight(), slope()) };
-    return m_hinting_options->options;
+    auto memo = m_hinting_memo.load(AK::MemoryOrder::memory_order_relaxed);
+    if ((memo & hinting_memo_holds_answer) != 0 && bit_cast<float>(static_cast<u32>(memo >> 32)) == scale) {
+        return FontHintingOptions {
+            .style = static_cast<FontHintingStyle>((memo >> 1) & 3),
+            .force_autohinting = ((memo >> 3) & 1) != 0,
+        };
+    }
+
+    auto options = GlobalFontConfig::the().hinting_for_font(family(), pixel_size() * scale, weight(), slope());
+    m_hinting_memo.store(encode_hinting_memo(scale, options), AK::MemoryOrder::memory_order_relaxed);
+    return options;
 }
 #endif
 
@@ -198,7 +219,7 @@ static bool hb_face_has_table(hb_face_t* face, hb_tag_t tag)
 
 bool Font::is_emoji_font() const
 {
-    if (m_is_emoji_font == TriState::Unknown) {
+    if (m_is_emoji_font.load(AK::MemoryOrder::memory_order_relaxed) == TriState::Unknown) {
         // NOTE: This is a heuristic approach to determine if a font is an emoji font.
         //       AFAIK there is no definitive way to know this from the font data itself.
 
@@ -227,10 +248,12 @@ bool Font::is_emoji_font() const
             return has_uppercase_a && has_lowercase_a;
         }();
 
-        m_is_emoji_font = (name_contains_emoji && !looks_like_text) || (has_any_color && !looks_like_text) ? TriState::True : TriState::False;
+        auto verdict = (name_contains_emoji && !looks_like_text) || (has_any_color && !looks_like_text) ? TriState::True : TriState::False;
+        m_is_emoji_font.store(verdict, AK::MemoryOrder::memory_order_relaxed);
+        return verdict == TriState::True;
     }
 
-    return m_is_emoji_font == TriState::True;
+    return m_is_emoji_font.load(AK::MemoryOrder::memory_order_relaxed) == TriState::True;
 }
 
 }

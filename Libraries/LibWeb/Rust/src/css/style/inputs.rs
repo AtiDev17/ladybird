@@ -1333,28 +1333,12 @@ impl StyleEngineState {
             keys.into_iter().any(|key| {
                 // Geometry independence depends on the routing key's rules, not the node.
                 // Reuse that proof when several journal inputs reach the same key.
-                if !checked_keys.insert(key) {
-                    return false;
-                }
-                self.retained.routing.routes_for(key).iter().copied().any(|route| {
-                    if !self
-                        .retained
-                        .routing
-                        .route_is_live(route, &self.retained.program, &self.retained.programs)
-                    {
-                        return false;
-                    }
-                    let rule = self.retained.routing.rule_of(route);
-                    !self.retained.program.declarations_are_complete_for(rule)
-                        || self
-                            .retained
-                            .program
-                            .declared_properties_of(rule)
-                            .iter()
-                            .any(|declared| {
-                                crate::css::property_metadata::property_may_affect_layout_geometry(declared.property)
-                            })
-                })
+                checked_keys.insert(key)
+                    && self.retained.routing.key_may_affect_layout_geometry(
+                        key,
+                        &self.retained.program,
+                        &self.retained.programs,
+                    )
             })
         })
     }

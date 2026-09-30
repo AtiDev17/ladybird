@@ -1778,6 +1778,16 @@ fn execute_formatting_context_run(
             } else {
                 CssPixels::default()
             };
+        } else if containment_facts.node_has_inline_size_containment() {
+            // https://drafts.csswg.org/css-contain-2/#containment-inline-size
+            // "This means the inline-axis intrinsic sizes of the principal box are determined as if the element had
+            //  no content."
+            let style = containment_facts.style();
+            result.automatic_content_inline_size = if style.contain_intrinsic_width_has_length() {
+                CssPixels::nearest_value_for(style.contain_intrinsic_width_px())
+            } else {
+                CssPixels::default()
+            };
         }
 
         if containment_facts.has_preferred_aspect_ratio() {
@@ -2054,15 +2064,21 @@ pub(crate) fn layout_inside_child(
     let root_containing_block = run
         .callbacks
         .containing_block_for_child_run(child, &input.participation);
-    input.sizing.treat_block_axis_percentage_insets_as_auto_beyond_root =
-        treat_block_axis_percentage_insets_as_auto_beyond_anonymous_child_root(
+    // https://drafts.csswg.org/css-sizing-3/#definite
+    // "Additionally, the size of the containing block of an absolutely positioned element is always definite with
+    //  respect to that element."
+    // NB: That containing block may also have been laid out by a run other than this one, which holds no record of it.
+    input.sizing.treat_block_axis_percentage_insets_as_auto_beyond_root = match input.participation {
+        ParticipationInParentFormattingContext::AbsolutelyPositioned(_) => false,
+        _ => treat_block_axis_percentage_insets_as_auto_beyond_anonymous_child_root(
             run.records,
             &run.callbacks,
             child,
             root_containing_block,
             run.box_,
             run.treat_block_axis_percentage_insets_as_auto_beyond_root,
-        );
+        ),
+    };
     input.sizing.flex_self_block_size_resolution_space = dimension_root_in_parent_scope(
         parent_block,
         child,

@@ -212,8 +212,9 @@ Layout::RustFFI::FfiVisualContextHostCallbacks visual_context_host_callbacks(DOM
             inputs.visual_viewport_offset_x = offset.x();
             inputs.visual_viewport_offset_y = offset.y();
             inputs.visual_viewport_scale = visual_viewport.scale();
-            inputs.viewport_wheel_overflow_x = static_cast<u8>(to_underlying(overflow_value_applied_to_viewport_for_wheel_scrolling(document, ScrollDirection::Horizontal)));
-            inputs.viewport_wheel_overflow_y = static_cast<u8>(to_underlying(overflow_value_applied_to_viewport_for_wheel_scrolling(document, ScrollDirection::Vertical)));
+            auto viewport_overflow = overflow_values_applied_to_viewport_for_wheel_scrolling(document);
+            inputs.viewport_wheel_overflow_x = static_cast<u8>(to_underlying(viewport_overflow.x));
+            inputs.viewport_wheel_overflow_y = static_cast<u8>(to_underlying(viewport_overflow.y));
             return inputs;
         },
         .scroll_offset = [](void*, void* layout_node_shell) -> CSSPixelPoint {
@@ -404,6 +405,11 @@ Utf16String serialize_painting_dump(DOM::Document const& document, Compositing::
             auto bytes = static_cast<Compositing::DisplayList const*>(display_list_pointer)->command_bytes();
             *byte_count = bytes.size();
             return bytes.data();
+        },
+        .command_runs = [](void*, void const* display_list_pointer, size_t* run_count) -> Compositing::DisplayListCommandRun const* {
+            auto runs = static_cast<Compositing::DisplayList const*>(display_list_pointer)->command_runs();
+            *run_count = runs.size();
+            return runs.data();
         },
         .nested_display_list = [](void* context_pointer, u64 display_list_id) -> void const* {
             auto& context = *static_cast<DumpContext*>(context_pointer);

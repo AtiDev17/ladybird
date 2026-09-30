@@ -8,6 +8,8 @@
 
 #include <AK/AtomicRefCounted.h>
 #include <AK/HashMap.h>
+#include <AK/Mutex.h>
+#include <AK/Once.h>
 #include <AK/Optional.h>
 #include <AK/QuickSort.h>
 #include <AK/RefCounted.h>
@@ -58,7 +60,7 @@ struct FontCacheKey {
     }
 };
 
-class Typeface : public RefCounted<Typeface> {
+class Typeface : public AtomicRefCounted<Typeface> {
 public:
     struct FontDataBacking final : AtomicRefCounted<FontDataBacking> {
         using Storage = Variant<Core::AnonymousBuffer, NonnullRefPtr<Core::Resource const>, NonnullRefPtr<Core::SharedMappedFile>>;
@@ -150,10 +152,13 @@ private:
 
     void clear_font_cache() const;
 
+    mutable Mutex m_fonts_mutex;
     mutable HashMap<FontCacheKey, NonnullRefPtr<Font>> m_fonts;
+    mutable OnceFlag m_harfbuzz_face_once;
     mutable hb_blob_t* m_harfbuzz_blob { nullptr };
     mutable hb_face_t* m_harfbuzz_face { nullptr };
-    mutable Optional<BoundingBoxInFontUnits> m_bounding_box_in_font_units;
+    mutable OnceFlag m_bounding_box_once;
+    mutable BoundingBoxInFontUnits m_bounding_box_in_font_units;
 };
 
 }

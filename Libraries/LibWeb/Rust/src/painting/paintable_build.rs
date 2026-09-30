@@ -75,7 +75,7 @@ pub(crate) struct PaintableCommit<'a> {
     is_full_layout: bool,
     committed_navigable_container_viewports: Vec<NodeSlotId>,
     row_reset_notifications: Vec<crate::painting::paintable_rows::PaintableRowReset>,
-    overflow_invalidated_boxes: std::collections::HashSet<NodeSlotId>,
+    overflow_invalidated_boxes: crate::fast_hash::FastSet<NodeSlotId>,
 }
 
 impl<'a> PaintableCommit<'a> {
@@ -325,7 +325,8 @@ impl<'a> PaintableCommit<'a> {
         if !offset_unchanged {
             self.arena()
                 .note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::MovedWithDescendants);
-        } else if !fragment_content_unchanged {
+        }
+        if !fragment_content_unchanged {
             self.arena()
                 .note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::RecommittedInPlace);
         }

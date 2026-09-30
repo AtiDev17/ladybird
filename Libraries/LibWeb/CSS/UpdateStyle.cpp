@@ -43,7 +43,11 @@ static void finish_complete_style_update()
         ladybird_utf16_fly_string_unref(releases.fly_strings[i]);
 }
 
-static void update_style(DOM::Document&);
+enum class DocumentWithoutBrowsingContext {
+    Skip,
+    Update,
+};
+static void update_style(DOM::Document&, DocumentWithoutBrowsingContext = DocumentWithoutBrowsingContext::Skip);
 static bool update_style_for_element(DOM::Document&, DOM::AbstractElement const&, StyleUpdateMode);
 static bool embedding_document_chain_has_no_pending_style_or_layout_work(DOM::Document const&);
 
@@ -151,7 +155,7 @@ static StyleEngineTransaction take_style_engine_transaction(DOM::Document& docum
     // packing the scope once is cheaper than repeatedly reconstructing cold facts while matching
     // the planned elements.
     transaction.prefers_broad_matching_batch = !published_transaction.is_scoped
-        || transaction.reactions.size() * 16 > style_computer.style_engine().connected_element_count();
+        || transaction.reactions.size() * 16 > published_transaction.connected_element_count;
     transaction.only_derived_child_reactions = published_transaction.only_derived_child_reactions;
 
     return transaction;
@@ -815,15 +819,10 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
             // updates style-engine bookkeeping, such as a synthetic pseudo-element reaction. Keep the DOM style
             // unmaterialized until a CSSOM read or the ancestor becomes visible.
             if (!!current_style_record) {
-                facts |= StyleEngine::HasStyle;
                 auto const* current_box_values = element->style_group<ComputedValues::BoxValues>();
                 VERIFY(current_box_values);
-                if (display_from_ffi_display(current_box_values->display).is_none())
-                    facts |= StyleEngine::IsDisplayNone;
                 if (previous_display.has_value() && *previous_display != display_from_ffi_display(current_box_values->display))
                     facts |= StyleEngine::DisplayChanged;
-                if (has_flag(style_engine.style_record_dependency_flags(current_style_record), StyleRecordDependencyFlag::InDisplayNoneSubtree))
-                    facts |= StyleEngine::InDisplayNoneSubtree;
             } else {
                 VERIFY(was_unstyled);
             }
@@ -834,7 +833,7 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
     return transaction_invalidation;
 }
 
-static void update_style(DOM::Document& document)
+static void update_style(DOM::Document& document, DocumentWithoutBrowsingContext document_without_browsing_context)
 {
     auto style_update_started_at = MonotonicTime::now();
     auto& timing_counters = document.style_invalidation_counters();
@@ -862,7 +861,7 @@ static void update_style(DOM::Document& document)
         && !embedding_document_chain_has_no_pending_style_or_layout_work(document))
         navigable->container()->document().update_layout(DOM::UpdateLayoutReason::ChildDocumentStyleUpdate);
 
-    if (!document.browsing_context())
+    if (!document.browsing_context() && document_without_browsing_context == DocumentWithoutBrowsingContext::Skip)
         return;
 
     // NOTE: If this is a document hosting <template> contents, style update is unnecessary.
@@ -1110,16 +1109,6 @@ static void note_targeted_style_reaction_applied(DOM::Element& element, Required
         facts |= StyleEngine::WasDisplayNone;
     if (display_changed)
         facts |= StyleEngine::DisplayChanged;
-    auto style_record = element.style_record_identity();
-    if (!!style_record) {
-        facts |= StyleEngine::HasStyle;
-        auto const* box_values = element.style_group<ComputedValues::BoxValues>();
-        VERIFY(box_values);
-        if (display_from_ffi_display(box_values->display).is_none())
-            facts |= StyleEngine::IsDisplayNone;
-        if (has_flag(style_engine.style_record_dependency_flags(style_record), StyleRecordDependencyFlag::InDisplayNoneSubtree))
-            facts |= StyleEngine::InDisplayNoneSubtree;
-    }
     style_engine.note_style_reaction_applied(element.style_node_id(), reaction, invalidation.inherited_style_groups_changed(), facts);
 }
 
@@ -1254,7 +1243,10 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
     };
 
     bool ran_regular_style_update = false;
-    if (document.browsing_context()) {
+    // NB: A document without a browsing context (for example, one from createHTMLDocument()) has no rendering
+    //     opportunities to publish its elements to the style engine. A targeted read runs its transaction here, so
+    //     the engine has the facts it matches the read element and its ancestors against.
+    if (document.browsing_context() || !document.created_for_appropriate_template_contents()) {
         document.begin_style_stabilization_epoch();
         entered_stabilization_epoch = true;
         document.update_style_computer_viewport_rect();
@@ -1271,13 +1263,13 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
             && (!document.has_completed_style_update()
                 || document.style_computer().style_engine().has_pending_transaction());
         if (can_run_regular_style_update) {
-            update_style(document);
+            update_style(document, DocumentWithoutBrowsingContext::Update);
             ran_regular_style_update = true;
         } else {
             document.sample_animation_effects_needing_style_update();
             if (!document.is_running_update_layout()
                 && document.style_computer().style_engine().has_pending_transaction()) {
-                update_style(document);
+                update_style(document, DocumentWithoutBrowsingContext::Update);
                 ran_regular_style_update = true;
             }
         }
@@ -1354,11 +1346,6 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
         bool const was_display_none = previous_box_values && display_from_ffi_display(previous_box_values->display).is_none();
         auto const previous_display = previous_box_values ? Optional<Display> { display_from_ffi_display(previous_box_values->display) } : Optional<Display> {};
         auto invalidation = materialize_style_for_targeted_update(element, did_change_custom_properties);
-        if (document.style_computer().style_engine().has_recorded_element_style_input_change(element->style_node_id())) {
-            bool changed_custom_properties_again = false;
-            invalidation |= materialize_style_for_targeted_update(element, changed_custom_properties_again);
-            did_change_custom_properties |= changed_custom_properties_again;
-        }
         auto const* current_box_values = element->style_group<ComputedValues::BoxValues>();
         bool const display_changed = previous_display.has_value() && current_box_values && *previous_display != display_from_ffi_display(current_box_values->display);
         apply_targeted_style_invalidation(element, invalidation, did_change_custom_properties, descendant_style_recompute_needed, was_unstyled, was_display_none, display_changed);

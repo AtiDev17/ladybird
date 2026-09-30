@@ -193,6 +193,8 @@ pub struct FfiStyleTransactionView {
     /// The transaction planned nothing but the child reactions the engine derived from the
     /// reactions C++ applied last: one more generation of the same style change, not a new one.
     pub only_derived_child_reactions: bool,
+    /// The elements connected to the document as the transaction was taken.
+    pub connected_element_count: u32,
 }
 
 /// A host-owned object the engine names but never follows.
@@ -365,6 +367,7 @@ impl Default for FfiStyleTransactionView {
             scoped: false,
             only_derived_child_reactions: false,
             style_atoms_swept: false,
+            connected_element_count: 0,
         }
     }
 }
@@ -577,9 +580,6 @@ pub mod style_reaction_applied_fact {
     pub const SHADOW_CHILDREN_EXPLICITLY_INHERIT: u32 = 1 << 5;
     pub const WAS_UNSTYLED: u32 = 1 << 6;
     pub const WAS_DISPLAY_NONE: u32 = 1 << 7;
-    pub const IS_DISPLAY_NONE: u32 = 1 << 8;
-    pub const IN_DISPLAY_NONE_SUBTREE: u32 = 1 << 9;
-    pub const HAS_STYLE: u32 = 1 << 10;
     /// The applied reaction moved the element's computed display, which its children's box-type
     /// transformation reads.
     pub const DISPLAY_CHANGED: u32 = 1 << 11;
@@ -1071,10 +1071,15 @@ impl StyleEngineState {
             };
             // Zero means the node has no declaration block of that kind on that side.
             let block = |raw: u32| (raw != 0).then_some(DeclarationBlockID(raw));
+            // The block's contents moved even where the host's object for it did not, so what makes
+            // this a change is a fresh version of the block, which is minted here rather than by the
+            // host: the host says only that the node has one.
+            let new_block =
+                (delta.new_block != 0).then(|| DeclarationBlockID(self.retained.next_declaration_block_version()));
             self.record_input(
                 InputKey::ElementDeclaration(node, decode_element_declaration_kind(delta.kind)),
                 InputValue::ElementDeclaration(block(delta.old_block)),
-                InputValue::ElementDeclaration(block(delta.new_block)),
+                InputValue::ElementDeclaration(new_block),
                 counters,
             );
         }
@@ -3557,6 +3562,7 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
         scoped: output.scoped,
         only_derived_child_reactions: output.only_derived_child_reactions,
         style_atoms_swept: output.style_atoms_swept,
+        connected_element_count: engine.connected_element_count(),
     }
 }
 

@@ -98,11 +98,13 @@ Typeface::~Typeface()
 
 void Typeface::clear_font_cache() const
 {
+    MutexLocker locker { m_fonts_mutex };
     m_fonts.clear();
 }
 
 NonnullRefPtr<Font> Typeface::font(float point_size, FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features) const
 {
+    MutexLocker locker { m_fonts_mutex };
     FontCacheKey key { point_size, variations.to_sorted_list(), shape_features };
 
     if (auto it = m_fonts.find(key); it != m_fonts.end())
@@ -128,39 +130,40 @@ NonnullRefPtr<Font> Typeface::font(float point_size, FontVariationSettings const
 
 hb_face_t* Typeface::harfbuzz_typeface() const
 {
-    if (!m_harfbuzz_face)
+    call_once(m_harfbuzz_face_once, [&] {
         m_harfbuzz_face = create_harfbuzz_face();
+        hb_face_make_immutable(m_harfbuzz_face);
+    });
     return m_harfbuzz_face;
 }
 
+// Recording asks for this while the document thread may ask the same typeface for it, so the
+// read of a half-written memo has to be impossible. The same `call_once` the HarfBuzz face uses
+// above publishes it.
 Typeface::BoundingBoxInFontUnits Typeface::bounding_box_in_font_units() const
 {
-    if (m_bounding_box_in_font_units.has_value())
-        return *m_bounding_box_in_font_units;
+    call_once(m_bounding_box_once, [&] {
+        auto* face = harfbuzz_typeface();
+        auto* head_table = hb_face_reference_table(face, HB_TAG('h', 'e', 'a', 'd'));
+        unsigned head_table_length = 0;
+        auto const* head_table_data = reinterpret_cast<u8 const*>(hb_blob_get_data(head_table, &head_table_length));
 
-    BoundingBoxInFontUnits bounding_box;
-    auto* face = harfbuzz_typeface();
-    auto* head_table = hb_face_reference_table(face, HB_TAG('h', 'e', 'a', 'd'));
-    unsigned head_table_length = 0;
-    auto const* head_table_data = reinterpret_cast<u8 const*>(hb_blob_get_data(head_table, &head_table_length));
-
-    // https://learn.microsoft.com/en-us/typography/opentype/spec/head
-    // xMin, yMin, xMax and yMax are big-endian int16 values at byte offsets 36, 38, 40 and 42 of a 54-byte table.
-    constexpr unsigned head_table_size = 54;
-    if (head_table_data && head_table_length >= head_table_size) {
-        auto read_i16 = [&](unsigned offset) {
-            return static_cast<i16>((head_table_data[offset] << 8) | head_table_data[offset + 1]);
-        };
-        bounding_box.x_min = read_i16(36);
-        bounding_box.y_min = read_i16(38);
-        bounding_box.x_max = read_i16(40);
-        bounding_box.y_max = read_i16(42);
-        bounding_box.units_per_em = hb_face_get_upem(face);
-    }
-    hb_blob_destroy(head_table);
-
-    m_bounding_box_in_font_units = bounding_box;
-    return bounding_box;
+        // https://learn.microsoft.com/en-us/typography/opentype/spec/head
+        // xMin, yMin, xMax and yMax are big-endian int16 values at byte offsets 36, 38, 40 and 42 of a 54-byte table.
+        constexpr unsigned head_table_size = 54;
+        if (head_table_data && head_table_length >= head_table_size) {
+            auto read_i16 = [&](unsigned offset) {
+                return static_cast<i16>((head_table_data[offset] << 8) | head_table_data[offset + 1]);
+            };
+            m_bounding_box_in_font_units.x_min = read_i16(36);
+            m_bounding_box_in_font_units.y_min = read_i16(38);
+            m_bounding_box_in_font_units.x_max = read_i16(40);
+            m_bounding_box_in_font_units.y_max = read_i16(42);
+            m_bounding_box_in_font_units.units_per_em = hb_face_get_upem(face);
+        }
+        hb_blob_destroy(head_table);
+    });
+    return m_bounding_box_in_font_units;
 }
 
 hb_face_t* Typeface::create_harfbuzz_face() const

@@ -413,7 +413,7 @@ WebIDL::ExceptionOr<void> Node::set_text_content(Optional<Utf16String> const& ma
 
     // Otherwise, do nothing.
 
-    auto is_boxless_style_element = (is_html_style_element() || is_svg_style_element()) && !unsafe_layout_node();
+    auto is_boxless_style_element = (is_html_style_element() || is_svg_style_element()) && !has_layout_box();
     if (is_connected() && !is_boxless_style_element)
         set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeSetTextContent);
 
@@ -635,9 +635,12 @@ void Node::record_style_environment_change()
     // A shadow root has no style of its own, so a caller naming one means the scope it heads. An
     // element names its own environment input; StyleEngine routes any consequences of its changed
     // facts separately.
+    // The environment version this bumped is a published document input, so what these rows need
+    // is a drive against the new one, which the engine can do for itself. What the host knows that
+    // the engine does not is only WHICH nodes to drive, and that is what the reaction carries.
     if (is_element()) {
         auto& element = static_cast<Element&>(*this);
-        document().style_computer().style_engine().record_element_style_input_change(element.style_node_id());
+        document().style_computer().style_engine().record_derived_element_style_input_change(element.style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
         return;
     }
 
@@ -645,7 +648,7 @@ void Node::record_style_environment_change()
         auto* element = as_if<Element>(descendant);
         if (!element)
             return TraversalDecision::Continue;
-        element->document().style_computer().style_engine().record_element_style_input_change(element->style_node_id());
+        element->document().style_computer().style_engine().record_derived_element_style_input_change(element->style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
         return TraversalDecision::Continue;
     });
 }
@@ -1054,7 +1057,7 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
     if (any_of(nodes, [](auto const& node) { return node->is_connected(); }))
         run_post_connection_steps(nodes);
 
-    auto is_boxless_style_element = (is_html_style_element() || is_svg_style_element()) && !unsafe_layout_node();
+    auto is_boxless_style_element = (is_html_style_element() || is_svg_style_element()) && !has_layout_box();
     if (is_connected() && !is_boxless_style_element) {
         // NB: Called during DOM insertion, layout is not up to date.
         if (auto* element = as_if<Element>(*this); element && element->has_style() && CSS::display_from_ffi_display(element->style_group<CSS::ComputedValues::BoxValues>()->display).is_contents() && parent_element()) {
@@ -1235,7 +1238,7 @@ void Node::run_node_iterator_pre_removing_steps()
 
 static bool node_contributes_to_layout_tree(Node const& node)
 {
-    if (node.unsafe_layout_node())
+    if (node.has_layout_box())
         return true;
 
     auto const* element = as_if<Element>(node);
@@ -3752,6 +3755,11 @@ size_t Node::length() const
     return child_count();
 }
 
+bool Node::is_rendered() const
+{
+    return m_layout_node && Painting::has_committed_box(*m_layout_node);
+}
+
 Layout::Node const* Node::layout_node() const
 {
     if (m_layout_node)
@@ -3892,6 +3900,8 @@ void Node::append_child_impl(GC::Ref<Node> node)
 
     TreeNode::append_child(node);
     node->set_root_for_subtree(root());
+    if (auto count = node->m_associated_animation_count_in_subtree)
+        change_associated_animation_count_in_subtree(count);
 }
 
 void Node::insert_before_impl(GC::Ref<Node> node, GC::Ptr<Node> child)
@@ -3900,12 +3910,22 @@ void Node::insert_before_impl(GC::Ref<Node> node, GC::Ptr<Node> child)
         return append_child_impl(move(node));
     TreeNode::insert_before(node, child);
     node->set_root_for_subtree(root());
+    if (auto count = node->m_associated_animation_count_in_subtree)
+        change_associated_animation_count_in_subtree(count);
 }
 
 void Node::remove_child_impl(GC::Ref<Node> node)
 {
+    if (auto count = node->m_associated_animation_count_in_subtree)
+        change_associated_animation_count_in_subtree(-static_cast<i32>(count));
     TreeNode::remove_child(node);
     node->set_root_for_subtree(node);
+}
+
+void Node::change_associated_animation_count_in_subtree(i32 delta)
+{
+    for (auto* node = this; node; node = node->parent_or_shadow_host())
+        node->m_associated_animation_count_in_subtree += delta;
 }
 
 void Node::set_root_for_subtree(Node& new_root)
