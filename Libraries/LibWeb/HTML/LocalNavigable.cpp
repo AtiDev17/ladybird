@@ -3270,7 +3270,9 @@ WebIDL::ExceptionOr<void> LocalNavigable::continue_navigation_in_active_document
     //         the creation operation, so navigations that arrive before that acknowledgment queue until it lands.
     //         Top-level traversables are marked ready at creation and never queue here. Keep the values snapshotted
     //         by steps 1-7 so the eventual continuation starts at step 8.
-    if (!m_has_session_history_entry_and_ready_for_navigation) {
+    //         A javascript: URL runs against the active document, and the UI process orders any document it creates
+    //         after the creation operation, so it queues its task now unless an earlier navigation is still queued.
+    if (!m_has_session_history_entry_and_ready_for_navigation && (navigation.url.scheme() != "javascript"sv || has_pending_navigations())) {
         queue_pending_navigation(move(navigation), PendingNavigationBehavior::Append);
         return {};
     }
@@ -3481,6 +3483,7 @@ void LocalNavigable::navigate_to_a_javascript_url_from_ui_process(URL::URL const
     //        navigate to a javascript: URL given navigable, request, historyHandling, initiatorOriginSnapshot,
     //        userInvolvement, cspNavigationType, initialInsertion, and navigationId.
     // NB: initialInsertion is false for a navigation the UI process runs: it never inserts a container.
+    m_queued_javascript_url_navigations.append(navigation_id);
     queue_global_task(Task::Source::NavigationAndTraversal, relevant_global_object(*window), GC::create_function(heap(), [this, request, history_handling, initiator_origin, user_involvement, csp_navigation_type, navigation_id = move(navigation_id)] {
         navigate_to_a_javascript_url(request, history_handling, initiator_origin, user_involvement, csp_navigation_type, InitialInsertion::No, navigation_id);
     }));
@@ -3644,17 +3647,20 @@ void LocalNavigable::begin_navigation(PreparedNavigation navigation)
         if (is_top_level_traversable())
             active_browsing_context()->page().client().request_navigation_start(*this, NavigationTarget::TopLevel, url, navigation_id, {});
 
-        // 1. Let request be a new request whose URL is url and whose policy container is sourceSnapshotParams's source policy container.
-        // NB: This is a synthetic request solely for plumbing into navigate to a javascript: URL. It will never hit the network.
+        // 1. Let request be a new request, with
+        //    URL: url
+        //    client: sourceSnapshotParams's fetch client
+        //    policy container: sourceSnapshotParams's source policy container
+        // NB: This is a synthetic request, needed because the Content Security Policy check in navigate to a javascript:
+        //     URL operates on a request. It will never hit the network.
         auto request = Fetch::Infrastructure::Request::create(vm);
         request->set_url(url);
-        request->set_policy_container(source_snapshot_params->source_policy_container);
-
-        // AD-HOC: See https://github.com/whatwg/html/issues/4651, requires some investigation to figure out what we should be setting here.
         request->set_client(source_snapshot_params->fetch_client);
+        request->set_policy_container(source_snapshot_params->source_policy_container);
 
         // 2. Queue a global task on the navigation and traversal task source given navigable's active window to navigate to a javascript: URL given navigable, request, historyHandling, initiatorOriginSnapshot, userInvolvement, cspNavigationType, initialInsertion, and navigationId.
         VERIFY(active_window());
+        m_queued_javascript_url_navigations.append(navigation_id);
         queue_global_task(Task::Source::NavigationAndTraversal, HTML::relevant_global_object(*active_window()), GC::create_function(heap(), [this, request, history_handling, initiator_origin_snapshot, user_involvement, csp_navigation_type, initial_insertion, navigation_id] {
             navigate_to_a_javascript_url(request, to_history_handling_behavior(history_handling), initiator_origin_snapshot, user_involvement, csp_navigation_type, initial_insertion, navigation_id);
         }));
@@ -4058,9 +4064,12 @@ void LocalNavigable::navigate_to_a_javascript_url(GC::Ref<Fetch::Infrastructure:
     VERIFY(history_handling == HistoryHandlingBehavior::Replace);
 
     // 2. If targetNavigable's ongoing navigation is no longer navigationId, then return.
-    // AD-HOC: See https://github.com/whatwg/html/issues/12120, other browsers only cancel pending navigations for form submissions.
-    // if (ongoing_navigation() != navigation_id)
-    //     return;
+    // AD-HOC: Browsers return here only for a navigation that was stopped, not for one a later navigation superseded;
+    //         see https://github.com/whatwg/html/issues/12120. Stopping loading forgets the navigation's queued task.
+    if (!m_queued_javascript_url_navigations.remove_first_matching([&](auto const& id) { return id == navigation_id; })) {
+        finish_loading_without_navigation();
+        return;
+    }
 
     // 3. Set the ongoing navigation for targetNavigable to null.
     set_ongoing_navigation({});
@@ -4072,25 +4081,39 @@ void LocalNavigable::navigate_to_a_javascript_url(GC::Ref<Fetch::Infrastructure:
     }
 
     // 5. If the result of should navigation request of type be blocked by Content Security Policy? given request and cspNavigationType is "Blocked", then return.
+    // NB: This can change request's URL, as the require-trusted-types-for pre-navigation check passes the script source
+    //     through the default policy.
     if (ContentSecurityPolicy::should_navigation_request_of_type_be_blocked_by_content_security_policy(request, csp_navigation_type) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
         finish_loading_without_navigation();
         return;
     }
 
-    // 6. Let newDocument be the result of evaluating a javascript: URL given targetNavigable, request's URL, initiatorOrigin, and userInvolvement.
+    // 6. Let newDocument be the result of evaluating a javascript: URL given targetNavigable, request's URL, initiatorOrigin, userInvolvement, and navigationId.
     auto new_document = evaluate_javascript_url(request->url(), initiator_origin, user_involvement, navigation_id);
 
     // 7. If newDocument is null:
     if (!new_document) {
-        // 1. If initialInsertion is true and targetNavigable's active document's is initial about:blank is true,
-        //    then run the iframe load event steps given targetNavigable's container.
-        if (initial_insertion == InitialInsertion::Yes && active_document()->is_initial_about_blank()) {
-            run_iframe_load_event_steps(as<HTMLIFrameElement>(*container()));
+        // 1. Let container be targetNavigable's container.
+        auto container = this->container();
+
+        // 2. If initialInsertion is true, container is non-null, and targetNavigable's active document's is initial
+        //    about:blank is true:
+        // NOTE: container can be null if author code, such as the Trusted Types default policy or
+        //       javascript:frameElement.remove(), removed it.
+        if (initial_insertion == InitialInsertion::Yes && container && active_document()->is_initial_about_blank()) {
+            // 1. If container is an iframe element, then run the iframe load event steps given container.
+            if (auto* iframe = as_if<HTMLIFrameElement>(*container)) {
+                run_iframe_load_event_steps(*iframe);
+            }
+            // 2. Otherwise, fire an event named load at container.
+            else {
+                container->dispatch_event(DOM::Event::create(EventNames::load, HighResolutionTime::current_high_resolution_time(relevant_global_object(*container))));
+            }
         }
 
         finish_loading_without_navigation();
 
-        // 2. Return.
+        // 3. Return.
         // NOTE: In this case, some JavaScript code was executed, but no new Document was created, so we will not perform a navigation.
         return;
     }
@@ -6505,6 +6528,9 @@ void LocalNavigable::stop_loading()
     //         handling window.stop(). Prevent navigations deferred behind an ongoing traversal from starting once it
     //         completes. See https://github.com/whatwg/html/issues/12609.
     clear_pending_navigations();
+
+    // NB: This is what makes step 2 of navigate to a javascript: URL return for a navigation this stops.
+    m_queued_javascript_url_navigations.clear();
 
     // 2. If document's unload counter is 0, and navigable's ongoing navigation is a navigation ID, then set the ongoing navigation for navigable to null.
     if (document->unload_counter() == 0 && ongoing_navigation().has<Utf16String>())
