@@ -2582,6 +2582,23 @@ void CanonicalTraversable::run_direct_history_operation(HistoryOperation& operat
         });
 }
 
+// A traversal re-displays a document that a previous navigation populated, so it applies as a traverse. An entry whose
+// document state was never populated has no document to traverse back to: a view's initial about:blank, whose first
+// WebContent process died before committing it, is such an entry. Applying the step to it loads its URL into the entry
+// the traversal displays, which is what "replace" does, and what the specification's own preconditions for a replace —
+// targetEntry's step is the displayed step and targetEntry was never populated — describe.
+//
+// Traversing to such an entry instead trips the specification's "ever populated" assertion in the new process. Its
+// crash recovery applies the same traversal to the same entry, so the assertion fires again in its replacement, and the
+// view restarts forever. One crash during initial page setup would be unrecoverable.
+static Web::Bindings::NavigationType browser_traversal_navigation_type(TraversableSessionHistory const& session_history, i32 step)
+{
+    auto target = session_history.traversal_target_for_step(step);
+    if (target.has_value() && !target->target_top_level_entry->document_state->ever_populated)
+        return Web::Bindings::NavigationType::Replace;
+    return Web::Bindings::NavigationType::Traverse;
+}
+
 void CanonicalTraversable::start_history_operation(HistoryOperation& operation, NonnullRefPtr<Core::Promise<Empty>>)
 {
     if (!operation.initiating_page)
@@ -2594,7 +2611,7 @@ void CanonicalTraversable::start_history_operation(HistoryOperation& operation, 
         }
         VERIFY(operation.parameters.has<Web::TraverseToStepHistoryOperationParameters>());
         auto const& parameters = operation.parameters.get<Web::TraverseToStepHistoryOperationParameters>();
-        apply_history_step(operation, parameters.target_step, operation.check_for_cancelation, {}, parameters.user_involvement, Web::Bindings::NavigationType::Traverse);
+        apply_history_step(operation, parameters.target_step, operation.check_for_cancelation, {}, parameters.user_involvement, browser_traversal_navigation_type(m_session_history, parameters.target_step));
         return;
     }
 
