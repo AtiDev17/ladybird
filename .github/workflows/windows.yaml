@@ -1,0 +1,346 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 */14 * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    permissions:
+      contents: write
+
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_SLOPPINESS: file_macro,locale,time_macros
+      CCACHE_DEPEND: "1"
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg_cache,readwrite"
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+
+      - name: MSVC Version Hash
+        id: msvc
+        shell: pwsh
+        run: echo "version=$env:VCToolsVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Setup Windows Specific Tools
+        shell: pwsh
+        run: |
+          choco install ccache pkgconfiglite -y --limit-output
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup
+        with:
+          os: 'Windows'
+          arch: 'x86_64'
+          toolchain: 'ClangCL'
+          type: 'build'
+
+      - name: Restore ccache
+        id: ccache-restore
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache | Windows | x86_64 | ClangCL | NORMAL | ${{ github.run_id }}
+          restore-keys: |
+            ccache | Windows | x86_64 | ClangCL | NORMAL
+
+      - name: Patch CPU baseline
+        shell: pwsh
+        run: |
+          (Get-Content Meta/CMake/compile_options.cmake) -replace 'x86-64-v3', 'x86-64-v2' | Set-Content Meta/CMake/compile_options.cmake
+
+      - name: Configure ccache
+        shell: pwsh
+        run: |
+          ccache -M 0
+          Get-ChildItem -Path "${{ github.workspace }}/.ccache" -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            ForEach-Object {
+              $_.LastWriteTime = [DateTime]::Parse("2018-10-10T09:53:07Z")
+              $_.LastAccessTime = [DateTime]::Parse("2018-10-10T09:53:07Z")
+            }
+          ccache -s
+          ccache -z
+
+      - name: Compute vcpkg cache key
+        id: vcpkg-key
+        shell: bash
+        run: |
+          echo "key=vcpkg-Windows-x86_64-ClangCL-NORMAL-${{ hashFiles('vcpkg.json') }}-${{ steps.msvc.outputs.version }}" >> $GITHUB_OUTPUT
+
+      - name: Restore vcpkg cache
+        id: vcpkg-restore
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg_cache
+          key: ${{ steps.vcpkg-key.outputs.key }}
+          restore-keys: |
+            vcpkg-Windows-x86_64-ClangCL-NORMAL-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-Windows-x86_64-ClangCL-NORMAL-
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --preset Release -B Build/release -DENABLE_CI_BASELINE_CPU=ON
+          ninja -C Build/release -j $env:NUMBER_OF_PROCESSORS ladybird
+
+      - name: Package Build
+        if: success()
+        shell: pwsh
+        run: |
+          $pkgDir = "ladybird-package/Ladybird"
+          $null = New-Item -ItemType Directory -Force -Path $pkgDir
+
+          cmake --install Build/release --prefix $pkgDir 2>$null
+          $LASTEXITCODE = 0
+
+          $null = Copy-Item "Build/release/bin/*.exe" -Destination "$pkgDir/bin/" -Force -ErrorAction SilentlyContinue
+          $null = Copy-Item "Build/release/bin/*.dll" -Destination "$pkgDir/bin/" -Force -ErrorAction SilentlyContinue
+
+          $vcpkgBin = "Build/release/vcpkg_installed/x64-windows/bin"
+          if (Test-Path $vcpkgBin) {
+              $null = Copy-Item "$vcpkgBin/*.dll" -Destination "$pkgDir/bin/" -Force
+          }
+
+          $shareSource = "Build/release/share"
+          if (Test-Path $shareSource) {
+              $null = Copy-Item -Path $shareSource -Destination "$pkgDir/" -Recurse -Force
+          }
+
+          $deployTool = "Build/release/vcpkg_installed/x64-windows/tools/qt6/bin/windeployqt.exe"
+          if (!(Test-Path $deployTool)) {
+              $deployTool = Get-ChildItem -Path "Build/release/vcpkg_installed" -Filter "windeployqt.exe" -Recurse |
+                  Select-Object -First 1 -ExpandProperty FullName
+              if (!$deployTool) {
+                  Write-Host "Error: windeployqt.exe not found!" -ForegroundColor Red
+                  exit 1
+              }
+          }
+
+          $ladybirdExe = "$pkgDir/bin/Ladybird.exe"
+          if (!(Test-Path $ladybirdExe)) {
+              Write-Host "Error: Ladybird.exe not found!" -ForegroundColor Red
+              exit 1
+          }
+
+          $env:PATH = "$(Resolve-Path 'Build/release/vcpkg_installed/x64-windows/bin');" + $env:PATH
+
+          $process = Start-Process -FilePath $deployTool -ArgumentList "`"$ladybirdExe`" --dir `"$pkgDir/bin`" --no-translations --compiler-runtime" -Wait -NoNewWindow -PassThru
+
+          if ($process.ExitCode -ne 0) {
+              Write-Host "Error: windeployqt failed for Ladybird.exe!" -ForegroundColor Red
+              exit 1
+          }
+
+          Remove-Item -Path "$pkgDir/bin/vc_redist.x64.exe" -Force -ErrorAction SilentlyContinue
+
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" -Destination "$pkgDir/LICENSE.txt" }
+
+          "Commit: ${{ github.sha }}`nBuild Date: $(Get-Date)" | Out-File -FilePath "$pkgDir/version.txt"
+
+          "@echo off`r`nstart `"`" `"%~dp0bin\Ladybird.exe`"" | Out-File -FilePath "$pkgDir/Launch Ladybird.bat" -Encoding ASCII
+
+      - name: Generate Update Script
+        if: success()
+        shell: pwsh
+        run: |
+          $batScript = @'
+          <# :
+          @echo off
+          setlocal
+          echo ============================================
+          echo   Unofficial Ladybird Build Updater
+          echo ============================================
+          echo.
+          echo Please ensure Ladybird is closed before updating.
+          echo Checking for updates...
+
+          powershell -noprofile -executionpolicy bypass -command "iex ((Get-Content '%~f0') -join \"`n\")"
+
+          echo.
+          echo Press any key to exit...
+          pause >nul
+          goto :EOF
+          #>
+
+          $ProgressPreference = 'Continue'
+          $ErrorActionPreference = 'Stop'
+
+          if (Get-Process Ladybird -ErrorAction SilentlyContinue) {
+              Write-Host "Error: Ladybird is currently running. Please close it before updating." -ForegroundColor Red
+              exit 1
+          }
+
+          $localCommit = 'unknown'
+
+          if (Test-Path 'version.txt') {
+              $lines = Get-Content 'version.txt'
+              if ($lines[0] -match 'Commit: ([a-f0-9]+)') {
+                  $localCommit = $matches[1]
+              }
+          }
+
+          Write-Host "Local Version:  $localCommit"
+
+          $headers = @{ "User-Agent" = "Ladybird-Windows-Updater" }
+
+          $latestRelease = try {
+              (Invoke-RestMethod -Uri 'https://api.github.com/repos/${{ github.repository }}/releases/latest' -Headers $headers)
+          } catch {
+              $null
+          }
+
+          if (!$latestRelease) {
+              Write-Host 'Error: Could not fetch the latest release from GitHub.' -ForegroundColor Red
+              exit 1
+          }
+
+          $remoteCommit = 'unknown'
+          if ($latestRelease.body -match 'Commit: ([a-f0-9]+)') {
+              $remoteCommit = $matches[1]
+          }
+
+          Write-Host "Remote Version: $remoteCommit"
+
+          if ($localCommit -ne 'unknown' -and $localCommit -eq $remoteCommit) {
+              Write-Host 'Ladybird is already up to date!' -ForegroundColor Green
+              exit 0
+          }
+
+          $asset = $latestRelease.assets | Where-Object { $_.name -eq 'ladybird-windows-x64.zip' }
+          $hashAsset = $latestRelease.assets | Where-Object { $_.name -eq 'ladybird-windows-x64.zip.sha256' }
+
+          if ($asset) {
+              if (!$hashAsset) {
+                  Write-Host 'Error: Security hash file not found in the remote release. Aborting to prevent corruption.' -ForegroundColor Red
+                  exit 1
+              }
+
+              $tmp = Join-Path $env:TEMP 'LadybirdUpdate'
+              if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+              $null = New-Item -Type Directory $tmp
+
+              function Download-File {
+                  param($Url, $OutFile)
+                  try {
+                      Start-BitsTransfer -Source $Url -Destination $OutFile
+                  } catch {
+                      $null = Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+                  }
+              }
+
+              Download-File -Url $asset.browser_download_url -OutFile "$tmp\update.zip"
+
+              Download-File -Url $hashAsset.browser_download_url -OutFile "$tmp\update.sha256"
+
+              $expectedHash = (Get-Content "$tmp\update.sha256").Trim().ToUpper()
+              $actualHash = (Get-FileHash -Path "$tmp\update.zip" -Algorithm SHA256).Hash.ToUpper()
+
+              if ($expectedHash -ne $actualHash) {
+                  Write-Host 'Error: Hash mismatch! The download is corrupted or tampered with. Aborting.' -ForegroundColor Red
+                  Write-Host "Expected: $expectedHash" -ForegroundColor Gray
+                  Write-Host "Actual:   $actualHash" -ForegroundColor Gray
+                  Remove-Item $tmp -Recurse -Force
+                  exit 1
+              }
+
+              try {
+                  Expand-Archive -Path "$tmp\update.zip" -DestinationPath $tmp -Force
+
+                  if (Test-Path "$tmp\Ladybird") {
+                      Get-ChildItem -Path "$tmp\Ladybird" | Copy-Item -Destination '.' -Recurse -Force
+                      Write-Host 'Update successful!' -ForegroundColor Green
+                  } else {
+                      Write-Host 'Error: Update package format is invalid.' -ForegroundColor Red
+                  }
+              } catch {
+                  Write-Host "Error during extraction or installation: $_" -ForegroundColor Red
+              } finally {
+                  Remove-Item $tmp -Recurse -Force
+              }
+
+          } else {
+              Write-Host 'Error: No Windows release asset found on GitHub.' -ForegroundColor Red
+          }
+          '@
+
+          $batScript | Out-File -FilePath "ladybird-package/Ladybird/Update Ladybird.bat" -Encoding ASCII
+
+      - name: Create Archive and Hash
+        if: success()
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "ladybird-package/Ladybird" -DestinationPath "ladybird-windows-x64.zip" -CompressionLevel Optimal -Force
+          $hash = (Get-FileHash -Path "ladybird-windows-x64.zip" -Algorithm SHA256).Hash
+          $hash | Out-File -FilePath "ladybird-windows-x64.zip.sha256" -Encoding ASCII
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        if: success()
+        with:
+          name: ladybird-windows-x64
+          path: |
+            ladybird-windows-x64.zip
+          retention-days: 1
+
+      - name: Generate Unique Tag
+        id: tag
+        shell: bash
+        run: |
+          TAG="$(date +'%Y-%m-%d')"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Upload to GitHub Release (unique tag)
+        uses: softprops/action-gh-release@v3
+        if: success() && github.ref == 'refs/heads/master'
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Windows Build ${{ steps.tag.outputs.tag }}"
+          body: |
+            **UNOFFICIAL BUILD**
+            This is an automated, experimental build created from a personal fork.
+            It is **NOT** affiliated with, endorsed by, or supported by the official Ladybird Browser Initiative.
+
+            Please **do not** report bugs or issues found in this build to the official Ladybird repository.
+
+            Commit: ${{ github.sha }}
+          files: |
+            ladybird-windows-x64.zip
+            ladybird-windows-x64.zip.sha256
+          make_latest: true
+
+      - name: Prune ccache
+        if: always()
+        shell: pwsh
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: ccache --evict-older-than=1d
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
+
+      - name: Save vcpkg cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg_cache
+          key: ${{ steps.vcpkg-key.outputs.key }}
