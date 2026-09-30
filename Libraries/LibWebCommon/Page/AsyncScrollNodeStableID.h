@@ -9,9 +9,11 @@
 #include <AK/HashFunctions.h>
 #include <AK/Traits.h>
 #include <AK/Types.h>
-#include <LibCompositing/Forward.h>
+#include <LibIPC/Forward.h>
+#include <LibWebCommon/Export.h>
+#include <LibWebCommon/Forward.h>
 
-namespace Compositing {
+namespace Web {
 
 enum class AsyncScrollNodeKind : u8 {
     Viewport,
@@ -40,10 +42,24 @@ struct ScrollbarDraggedByCompositor {
 }
 
 template<>
-struct AK::Traits<Compositing::AsyncScrollNodeStableID> : DefaultTraits<Compositing::AsyncScrollNodeStableID> {
-    static unsigned hash(Compositing::AsyncScrollNodeStableID const& stable_node_id)
+struct AK::Traits<Web::AsyncScrollNodeStableID> : DefaultTraits<Web::AsyncScrollNodeStableID> {
+    static unsigned hash(Web::AsyncScrollNodeStableID const& stable_node_id)
     {
         return pair_int_hash(u64_hash(static_cast<u64>(stable_node_id.node_id.value())),
             pair_int_hash(to_underlying(stable_node_id.kind), stable_node_id.pseudo_element_type));
     }
 };
+
+namespace IPC {
+
+template<>
+WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::AsyncScrollNodeStableID const&);
+template<>
+WEBCOMMON_API ErrorOr<Web::AsyncScrollNodeStableID> decode(Decoder&);
+
+template<>
+WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::ScrollbarDraggedByCompositor const&);
+template<>
+WEBCOMMON_API ErrorOr<Web::ScrollbarDraggedByCompositor> decode(Decoder&);
+
+}

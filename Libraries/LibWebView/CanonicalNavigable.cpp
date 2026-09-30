@@ -660,7 +660,7 @@ ErrorOr<NonnullRefPtr<WebContentPage>> CanonicalNavigable::obtain_page_to_host(C
 
     // A process holds one page per tab, with the tab's whole graph: the process displaying the tab hosts a document
     // in the view's page, another process in the page it has for the tab, or in a page created for it.
-    Compositing::PageId page_id;
+    Web::PageId page_id;
     if (host && host->page_id_for_traversable(traversable).has_value()) {
         page_id = *host->page_id_for_traversable(traversable);
         host->async_begin_hosting_navigable(page_id, id(), current_entry_descriptor(), traversable.system_visibility_state());
@@ -781,11 +781,13 @@ void CanonicalNavigable::abandon_populated_document(Optional<PopulatedDocument>&
 {
     if (!populated_document.has_value())
         return;
-    RefPtr<WebContentPage> host = populated_document->document->host();
+    NonnullRefPtr document = populated_document->document;
+    RefPtr<WebContentPage> host = document->host();
     populated_document.clear();
     if (!host || top_level_traversable().hosts(*this, *host) || pending_host_matches(*host))
         return;
     host->async_discard_provisional_navigable(id());
+    top_level_traversable().end_history_jobs(*this, document.ptr());
     top_level_traversable().release_page_if_unused(host.release_nonnull());
 }
 
@@ -825,7 +827,7 @@ void CanonicalNavigable::discard_pending_host(WebContentPage const& page)
         abandon_populated_document(m_document_populated_by_history_job);
 }
 
-void CanonicalNavigable::set_viewport(Compositing::DevicePixelRect viewport_rect, Compositing::DevicePixelRect viewport_intersection, double device_pixel_ratio)
+void CanonicalNavigable::set_viewport(Web::DevicePixelRect viewport_rect, Web::DevicePixelRect viewport_intersection, double device_pixel_ratio)
 {
     m_viewport_rect = viewport_rect;
     m_viewport_intersection = viewport_intersection;

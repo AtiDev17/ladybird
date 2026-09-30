@@ -6,16 +6,23 @@
 
 #pragma once
 
+#include <AK/DistinctNumeric.h>
 #include <AK/Types.h>
-#include <LibCompositing/Forward.h>
 
 namespace Web {
 
-using Compositing::CSSPixels;
-using Compositing::UniqueNodeID;
+class CSSPixels;
 
 enum class NavigationTarget : u8;
+enum class ScrollGesturePhase : u8;
+enum class WheelDeltaPrecision : u8;
+
 struct InitiatorSourceSnapshot;
+struct KeyEvent;
+struct MouseEvent;
+struct PinchEvent;
+
+AK_TYPEDEF_DISTINCT_NUMERIC_GENERAL(i64, UniqueNodeID, Comparison, Increment, CastToUnderlying);
 
 }
 

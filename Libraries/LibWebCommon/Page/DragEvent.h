@@ -8,10 +8,10 @@
 
 #include <AK/OwnPtr.h>
 #include <AK/Vector.h>
-#include <LibCompositing/InputEvent.h>
 #include <LibIPC/Forward.h>
 #include <LibWebCommon/Export.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
+#include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/UIEvents/KeyCode.h>
 #include <LibWebCommon/UIEvents/MouseButton.h>
 
@@ -28,14 +28,14 @@ struct WEBCOMMON_API DragEvent {
     DragEvent clone_without_browser_data() const;
 
     Type type;
-    Compositing::DevicePixelPoint position;
-    Compositing::DevicePixelPoint screen_position;
+    Web::DevicePixelPoint position;
+    Web::DevicePixelPoint screen_position;
     UIEvents::MouseButton button { UIEvents::MouseButton::None };
     UIEvents::MouseButton buttons { UIEvents::MouseButton::None };
     UIEvents::KeyModifier modifiers { UIEvents::KeyModifier::Mod_None };
     Vector<HTML::SelectedFile> files;
 
-    OwnPtr<Compositing::BrowserInputData> browser_data;
+    OwnPtr<Web::BrowserInputData> browser_data;
     u64 id { 0 };
 };
 

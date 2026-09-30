@@ -11,25 +11,6 @@
 namespace IPC {
 
 template<>
-ErrorOr<void> encode(Encoder& encoder, Compositing::AsyncScrollNodeStableID const& stable_node_id)
-{
-    TRY(encoder.encode(stable_node_id.node_id));
-    TRY(encoder.encode(stable_node_id.kind));
-    TRY(encoder.encode(stable_node_id.pseudo_element_type));
-    return {};
-}
-
-template<>
-ErrorOr<Compositing::AsyncScrollNodeStableID> decode(Decoder& decoder)
-{
-    return Compositing::AsyncScrollNodeStableID {
-        .node_id = TRY(decoder.decode<Compositing::UniqueNodeID>()),
-        .kind = TRY(decoder.decode<Compositing::AsyncScrollNodeKind>()),
-        .pseudo_element_type = TRY(decoder.decode<u8>()),
-    };
-}
-
-template<>
 ErrorOr<void> encode(Encoder& encoder, Compositing::KeyboardScrollState const& state)
 {
     TRY(encoder.encode(state.generation));
@@ -46,7 +27,7 @@ ErrorOr<Compositing::KeyboardScrollState> decode(Decoder& decoder)
     return Compositing::KeyboardScrollState {
         .generation = TRY(decoder.decode<u64>()),
         .visual_context_tree_structural_epoch = TRY(decoder.decode<u64>()),
-        .target = TRY(decoder.decode<Optional<Compositing::AsyncScrollNodeStableID>>()),
+        .target = TRY(decoder.decode<Optional<Web::AsyncScrollNodeStableID>>()),
         .page_scroll_distance = TRY(decoder.decode<float>()),
         .arrow_scroll_distance = TRY(decoder.decode<float>()),
     };
@@ -66,7 +47,7 @@ template<>
 ErrorOr<Compositing::AsyncScrollOffset> decode(Decoder& decoder)
 {
     return Compositing::AsyncScrollOffset {
-        .stable_node_id = TRY(decoder.decode<Compositing::AsyncScrollNodeStableID>()),
+        .stable_node_id = TRY(decoder.decode<Web::AsyncScrollNodeStableID>()),
         .compositor_scroll_offset = TRY(decoder.decode<Gfx::FloatPoint>()),
         .unadopted_scroll_delta = TRY(decoder.decode<Gfx::FloatPoint>()),
         .last_relative_scroll_delta = TRY(decoder.decode<Gfx::FloatPoint>()),
@@ -85,7 +66,7 @@ template<>
 ErrorOr<Compositing::SnapAreaIdentity> decode(Decoder& decoder)
 {
     return Compositing::SnapAreaIdentity {
-        .node_id = TRY(decoder.decode<Compositing::UniqueNodeID>()),
+        .node_id = TRY(decoder.decode<Web::UniqueNodeID>()),
         .pseudo_element_type = TRY(decoder.decode<u8>()),
     };
 }
@@ -108,7 +89,7 @@ template<>
 ErrorOr<Compositing::SnapDestination> decode(Decoder& decoder)
 {
     return Compositing::SnapDestination {
-        .position = TRY(decoder.decode<Compositing::CSSPixelPoint>()),
+        .position = TRY(decoder.decode<Web::CSSPixelPoint>()),
         .snapped_x = TRY(decoder.decode<bool>()),
         .snapped_y = TRY(decoder.decode<bool>()),
         .evaluated_x = TRY(decoder.decode<bool>()),
@@ -136,10 +117,10 @@ template<>
 ErrorOr<Compositing::StartedUserScroll> decode(Decoder& decoder)
 {
     return Compositing::StartedUserScroll {
-        .stable_node_id = TRY(decoder.decode<Compositing::AsyncScrollNodeStableID>()),
+        .stable_node_id = TRY(decoder.decode<Web::AsyncScrollNodeStableID>()),
         .operation_id = TRY(decoder.decode<Compositing::AsyncScrollOperationID>()),
-        .initial_scroll_offset = TRY(decoder.decode<Compositing::CSSPixelPoint>()),
-        .unsnapped_scroll_destination = TRY(decoder.decode<Compositing::CSSPixelPoint>()),
+        .initial_scroll_offset = TRY(decoder.decode<Web::CSSPixelPoint>()),
+        .unsnapped_scroll_destination = TRY(decoder.decode<Web::CSSPixelPoint>()),
         .selection = TRY(decoder.decode<Compositing::SnapDestination>()),
         .settles_gesture = TRY(decoder.decode<bool>()),
     };
@@ -163,7 +144,7 @@ template<>
 ErrorOr<Compositing::PendingAsyncScrollUpdates> decode(Decoder& decoder)
 {
     return Compositing::PendingAsyncScrollUpdates {
-        .document_id = TRY(decoder.decode<Optional<Compositing::UniqueNodeID>>()),
+        .document_id = TRY(decoder.decode<Optional<Web::UniqueNodeID>>()),
         .sequence = TRY(decoder.decode<u64>()),
         .scroll_offsets = TRY(decoder.decode<Vector<Compositing::AsyncScrollOffset>>()),
         .completed_operation_ids = TRY(decoder.decode<Vector<Compositing::AsyncScrollOperationID>>()),
@@ -171,23 +152,6 @@ ErrorOr<Compositing::PendingAsyncScrollUpdates> decode(Decoder& decoder)
         .started_user_scrolls = TRY(decoder.decode<Vector<Compositing::StartedUserScroll>>()),
         .user_scroll_gesture_in_progress = TRY(decoder.decode<bool>()),
         .user_scroll_gesture_ended = TRY(decoder.decode<bool>()),
-    };
-}
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Compositing::ScrollbarDraggedByCompositor const& scrollbar)
-{
-    TRY(encoder.encode(scrollbar.scroller_stable_node_id));
-    TRY(encoder.encode(scrollbar.vertical));
-    return {};
-}
-
-template<>
-ErrorOr<Compositing::ScrollbarDraggedByCompositor> decode(Decoder& decoder)
-{
-    return Compositing::ScrollbarDraggedByCompositor {
-        .scroller_stable_node_id = TRY(decoder.decode<Compositing::AsyncScrollNodeStableID>()),
-        .vertical = TRY(decoder.decode<bool>()),
     };
 }
 

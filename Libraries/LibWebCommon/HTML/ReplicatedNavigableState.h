@@ -9,7 +9,6 @@
 #include <AK/Optional.h>
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
-#include <LibCompositing/Types.h>
 #include <LibIPC/Forward.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
@@ -17,6 +16,7 @@
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicy.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
+#include <LibWebCommon/Page/CompositorContextId.h>
 #include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::HTML {
@@ -49,7 +49,7 @@ struct HostedNavigableState {
     bool is_closing { false };
     ReplicatedContainerState container;
     bool delays_the_load_event_of_its_container { false };
-    Optional<Compositing::CompositorContextId> compositor_context_id;
+    Optional<Web::CompositorContextId> compositor_context_id;
 };
 
 struct ReplicatedNavigableState {
@@ -75,7 +75,7 @@ struct ReplicatedNavigableState {
     bool delays_the_load_event_of_its_container { false };
     bool has_session_history_entry_and_ready_for_navigation { false };
 
-    Optional<Compositing::CompositorContextId> compositor_context_id;
+    Optional<Web::CompositorContextId> compositor_context_id;
 };
 
 struct RemoteNavigableDescriptor {
