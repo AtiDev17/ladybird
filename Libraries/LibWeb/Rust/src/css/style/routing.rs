@@ -407,6 +407,10 @@ impl RetainedState {
             regions.add(ImpactRegion::Node(node));
             for slot in [old.assigned_slot, new.assigned_slot].into_iter().flatten() {
                 for assigned in self.tree.assigned_nodes_of(slot) {
+                    // A text slottable holds a place in the list but answers no selector.
+                    if assigned.text_index().is_some() {
+                        continue;
+                    }
                     regions.add(ImpactRegion::Node(*assigned));
                 }
             }
@@ -2980,6 +2984,9 @@ impl RetainedState {
                 if !has_active_change {
                     continue;
                 }
+                // A record rolled back below a substituted revert keyword holds a declaration its
+                // winners do not name, which a losing rule may be.
+                may_change_cascade |= self.record_rolls_back_substitution(*node);
                 record_match_set_difference(
                     &mut self.selector_truth_changes,
                     self.selector_truth_changes_active,

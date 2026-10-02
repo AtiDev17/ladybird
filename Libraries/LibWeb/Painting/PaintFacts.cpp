@@ -7,9 +7,13 @@
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageSetStyleValue.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/InvalidationJournal.h>
 #include <LibWeb/HTML/DecodedImageData.h>
+#include <LibWeb/HTML/HTMLAreaElement.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
+#include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
+#include <LibWeb/HTML/HTMLMapElement.h>
 #include <LibWeb/HTML/HTMLVideoElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
@@ -42,12 +46,22 @@ static void push_form_control_paint_facts_onto(HTML::HTMLInputElement const& inp
     Layout::RustFFI::layout_arena_set_form_control_paint_facts(layout_node.arena_handle(), Layout::Node::slot_id(&layout_node), facts);
 }
 
+// The journal finds the box as it drains, so the box is not looked up here.
+static void note_paint_facts(DOM::Node const& node, PaintFactsFamily families)
+{
+    if (!node.has_layout_box())
+        return;
+    if (auto identity = DOM::NodeIdentity::of(node))
+        const_cast<DOM::Document&>(node.document()).invalidation_journal().note_paint_facts(identity, families);
+    else
+        apply_paint_facts(*node.unsafe_layout_node(), families);
+}
+
 void push_form_control_paint_facts(HTML::HTMLInputElement& input)
 {
-    auto const* layout_node = input.unsafe_layout_node();
-    if (!layout_node || !paints_form_control_from_facts(*layout_node))
-        return;
-    push_form_control_paint_facts_onto(input, *layout_node);
+    using enum HTML::HTMLInputElement::TypeAttributeState;
+    if (first_is_one_of(input.type_state(), Checkbox, RadioButton))
+        note_paint_facts(input, PaintFactsFamily::FormControl);
 }
 
 static void push_canvas_paint_facts_onto(HTML::HTMLCanvasElement const& canvas, Layout::Node const& layout_node)
@@ -62,15 +76,12 @@ static void push_canvas_paint_facts_onto(HTML::HTMLCanvasElement const& canvas, 
     }
     bool changed = Layout::RustFFI::layout_arena_set_canvas_paint_facts(layout_node.arena_handle(), Layout::Node::slot_id(&layout_node), facts);
     if (changed && has_committed_box(layout_node))
-        invalidate_paint_cache(layout_node);
+        apply_paint_cache_invalidation(layout_node, PaintCacheInvalidation::PaintAndHitTest);
 }
 
 void push_canvas_paint_facts(HTML::HTMLCanvasElement const& canvas)
 {
-    auto const* layout_node = canvas.unsafe_layout_node();
-    if (!layout_node || layout_node->kind() != Layout::RustFFI::NodeKind::CanvasBox)
-        return;
-    push_canvas_paint_facts_onto(canvas, *layout_node);
+    note_paint_facts(canvas, PaintFactsFamily::Canvas);
 }
 
 static Optional<u64> composited_context_id_for_navigable_container(HTML::NavigableContainer const& navigable_container)
@@ -110,7 +121,7 @@ void reconcile_navigable_container_paint_facts(DOM::Document const& document)
         }
         bool changed = Layout::RustFFI::layout_arena_set_navigable_container_paint_facts(layout_node->arena_handle(), Layout::Node::slot_id(layout_node), facts);
         if (changed)
-            invalidate_paint_cache(*layout_node);
+            apply_paint_cache_invalidation(*layout_node, PaintCacheInvalidation::PaintAndHitTest);
     }
 }
 
@@ -171,7 +182,7 @@ static GC::Ptr<HTML::DecodedImageData> decoded_image_data_of(Layout::NodeWithSty
     return observer->decoded_image_data();
 }
 
-void push_layer_image_paint_facts(Layout::NodeWithStyle const& layout_node)
+static void push_layer_image_paint_facts_onto(Layout::NodeWithStyle const& layout_node)
 {
     auto const& background_layers = layout_node.background_layers();
     auto const& mask_layers = layout_node.mask_layers();
@@ -196,10 +207,8 @@ void push_layer_image_paint_facts(Layout::NodeWithStyle const& layout_node)
     Layout::RustFFI::layout_arena_set_layer_image_paint_facts(layout_node.arena_handle(), Layout::Node::slot_id(&layout_node), entries.data(), entries.size());
 }
 
-bool push_replaced_image_paint_facts(Layout::ImageProvider const& image_provider, Layout::Node const& layout_node)
+static bool push_replaced_image_paint_facts_onto(Layout::ImageProvider const& image_provider, Layout::Node const& layout_node)
 {
-    if (layout_node.kind() != Layout::RustFFI::NodeKind::ImageBox && layout_node.kind() != Layout::RustFFI::NodeKind::SVGImageBox)
-        return false;
     Optional<Gfx::DecodedImageFrame> current_frame;
     Layout::RustFFI::FfiReplacedImagePaintFacts facts {
         .natural = natural_size_facts(image_provider.intrinsic_width(), image_provider.intrinsic_height(), image_provider.intrinsic_aspect_ratio()),
@@ -238,31 +247,128 @@ static bool push_video_paint_facts_onto(HTML::HTMLVideoElement const& video_elem
     return Layout::RustFFI::layout_arena_set_video_paint_facts(layout_node.arena_handle(), Layout::Node::slot_id(&layout_node), facts);
 }
 
+static bool paints_replaced_image_from_facts(Layout::Node const& layout_node)
+{
+    return layout_node.kind() == Layout::RustFFI::NodeKind::ImageBox || layout_node.kind() == Layout::RustFFI::NodeKind::SVGImageBox;
+}
+
+static void note_box_paint_facts(Layout::Node const& layout_node, PaintFactsFamily families)
+{
+    if (auto identity = journal_identity_of(layout_node))
+        const_cast<DOM::Document&>(layout_node.document()).invalidation_journal().note_paint_facts(identity, families);
+    else
+        apply_paint_facts(layout_node, families);
+}
+
+void push_layer_image_paint_facts(Layout::NodeWithStyle const& layout_node)
+{
+    note_box_paint_facts(layout_node, PaintFactsFamily::LayerImages);
+}
+
+void push_replaced_image_paint_facts(Layout::Node const& layout_node)
+{
+    if (paints_replaced_image_from_facts(layout_node))
+        note_box_paint_facts(layout_node, PaintFactsFamily::ReplacedImage);
+}
+
 void push_video_paint_facts(HTML::HTMLVideoElement const& video_element)
 {
-    auto const* layout_node = video_element.unsafe_layout_node();
-    if (!layout_node || layout_node->kind() != Layout::RustFFI::NodeKind::VideoBox)
+    note_paint_facts(video_element, PaintFactsFamily::Video);
+}
+
+// The `<area>` elements of the image map an image is associated with, in tree order, each named by its style-tree
+// identity, because that is what a hit hands back. An area is never rendered, so it has no row of its own to carry its
+// shape; the image whose map lists it does.
+static void push_image_map_area_facts_onto(GC::Ptr<HTML::HTMLMapElement> map_element, Layout::Node const& layout_node)
+{
+    // The values AreaShape::from_raw() reads.
+    static_assert(to_underlying(HTML::HTMLAreaElement::ShapeState::Circle) == 0);
+    static_assert(to_underlying(HTML::HTMLAreaElement::ShapeState::Default) == 1);
+    static_assert(to_underlying(HTML::HTMLAreaElement::ShapeState::Polygon) == 2);
+    static_assert(to_underlying(HTML::HTMLAreaElement::ShapeState::Rectangle) == 3);
+
+    Vector<Layout::RustFFI::FfiImageMapArea> areas;
+    Vector<double> coords;
+    if (map_element) {
+        // https://html.spec.whatwg.org/multipage/image-maps.html#image-map-processing-model
+        // 3. Otherwise, the user agent must collect all the area elements that are descendants of the map. Let areas
+        //    be that list.
+        map_element->for_each_in_subtree_of_type<HTML::HTMLAreaElement>([&](HTML::HTMLAreaElement& area_element) {
+            auto area_coords = area_element.shape_coords();
+            areas.append({
+                .style_node = DOM::NodeIdentity::of(area_element).style_node().value(),
+                .shape = to_underlying(area_element.shape_state()),
+                .coords_offset = static_cast<u32>(coords.size()),
+                .coords_count = static_cast<u32>(area_coords.size()),
+            });
+            coords.extend(move(area_coords));
+            return TraversalDecision::Continue;
+        });
+    }
+    Layout::RustFFI::layout_arena_publish_image_map_areas(layout_node.arena_handle(), Layout::Node::slot_id(&layout_node), areas.data(), areas.size(), coords.data(), coords.size());
+}
+
+// Which map an image is associated with is a hash-name reference resolved against the image's root, so any map or area
+// of the document can decide any image's areas and there is no smaller funnel than the document. The funnels only mark
+// the document, and this runs before the next hit test, after layout, so the association it reads is current and a
+// map that gains many areas is walked once. Nearly every page has no image map at all, and never marks it.
+void publish_image_map_area_facts_if_needed(DOM::Document& document)
+{
+    if (!document.take_image_map_areas_need_publication())
         return;
-    if (push_video_paint_facts_onto(video_element, *layout_node))
-        set_needs_repaint(*layout_node, InvalidateDisplayList::PaintCommands);
+    document.for_each_shadow_including_descendant([](DOM::Node& node) {
+        auto* image_element = as_if<HTML::HTMLImageElement>(node);
+        if (!image_element)
+            return TraversalDecision::Continue;
+        // NB: Any box an image has answers for its map, including the one it takes when it renders as its alt text.
+        if (auto const* layout_node = image_element->unsafe_layout_node())
+            push_image_map_area_facts_onto(image_element->associated_map_element(), *layout_node);
+        return TraversalDecision::Continue;
+    });
 }
 
 void push_paint_facts_after_style_attach(Layout::NodeWithStyle& layout_node, StyleHoldsImageValues style_holds_image_values)
 {
-    if (style_holds_image_values == StyleHoldsImageValues::Yes)
-        push_layer_image_paint_facts(layout_node);
-    else
-        Layout::RustFFI::layout_arena_set_layer_image_paint_facts(layout_node.arena_handle(), Layout::Node::slot_id(&layout_node), nullptr, 0);
+    // NB: Nothing paints from the image map areas, so they are written at once rather than noted in the journal. An
+    //     image with no map has nothing to write: a row starts out with no areas, and when an image loses its map, the
+    //     document's publication pass clears what its row had.
+    if (auto* image_element = as_if<HTML::HTMLImageElement>(layout_node.dom_node())) {
+        if (auto map_element = image_element->associated_map_element())
+            push_image_map_area_facts_onto(map_element, layout_node);
+    }
+    auto families = style_holds_image_values == StyleHoldsImageValues::Yes ? PaintFactsFamily::LayerImages : PaintFactsFamily::NoLayerImages;
     if (paints_form_control_from_facts(layout_node))
-        push_form_control_paint_facts_onto(as<HTML::HTMLInputElement>(*layout_node.dom_node()), layout_node);
+        families |= PaintFactsFamily::FormControl;
     else if (layout_node.kind() == Layout::RustFFI::NodeKind::CanvasBox)
-        push_canvas_paint_facts_onto(as<HTML::HTMLCanvasElement>(*layout_node.dom_node()), layout_node);
-    else if (layout_node.kind() == Layout::RustFFI::NodeKind::ImageBox)
-        push_replaced_image_paint_facts(static_cast<Layout::Box const&>(layout_node).image_provider(), layout_node);
-    else if (layout_node.kind() == Layout::RustFFI::NodeKind::SVGImageBox)
-        push_replaced_image_paint_facts(as<SVG::SVGImageElement>(*layout_node.dom_node()), layout_node);
+        families |= PaintFactsFamily::Canvas;
+    else if (paints_replaced_image_from_facts(layout_node))
+        families |= PaintFactsFamily::ReplacedImage;
     else if (layout_node.kind() == Layout::RustFFI::NodeKind::VideoBox)
-        push_video_paint_facts_onto(as<HTML::HTMLVideoElement>(*layout_node.dom_node()), layout_node);
+        families |= PaintFactsFamily::Video;
+    note_box_paint_facts(layout_node, families);
+}
+
+void apply_paint_facts(Layout::Node const& layout_node, PaintFactsFamily families)
+{
+    if (has_flag(families, PaintFactsFamily::NoLayerImages))
+        Layout::RustFFI::layout_arena_set_layer_image_paint_facts(layout_node.arena_handle(), Layout::Node::slot_id(&layout_node), nullptr, 0);
+    if (auto const* node_with_style = as_if<Layout::NodeWithStyle>(layout_node); node_with_style && has_flag(families, PaintFactsFamily::LayerImages))
+        push_layer_image_paint_facts_onto(*node_with_style);
+    if (has_flag(families, PaintFactsFamily::FormControl) && paints_form_control_from_facts(layout_node))
+        push_form_control_paint_facts_onto(as<HTML::HTMLInputElement>(*layout_node.dom_node()), layout_node);
+    if (has_flag(families, PaintFactsFamily::Canvas) && layout_node.kind() == Layout::RustFFI::NodeKind::CanvasBox)
+        push_canvas_paint_facts_onto(as<HTML::HTMLCanvasElement>(*layout_node.dom_node()), layout_node);
+    if (has_flag(families, PaintFactsFamily::ReplacedImage) && paints_replaced_image_from_facts(layout_node)) {
+        auto const& image_provider = layout_node.kind() == Layout::RustFFI::NodeKind::ImageBox
+            ? static_cast<Layout::Box const&>(layout_node).image_provider()
+            : static_cast<Layout::ImageProvider const&>(as<SVG::SVGImageElement>(*layout_node.dom_node()));
+        if (push_replaced_image_paint_facts_onto(image_provider, layout_node))
+            apply_repaint_damage(layout_node, InvalidateDisplayList::PaintCommands);
+    }
+    if (has_flag(families, PaintFactsFamily::Video) && layout_node.kind() == Layout::RustFFI::NodeKind::VideoBox) {
+        if (push_video_paint_facts_onto(as<HTML::HTMLVideoElement>(*layout_node.dom_node()), layout_node))
+            apply_repaint_damage(layout_node, InvalidateDisplayList::PaintCommands);
+    }
 }
 
 }

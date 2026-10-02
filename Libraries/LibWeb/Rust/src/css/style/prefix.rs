@@ -294,11 +294,19 @@ struct PrefixDispatchBucket {
     end_step: u32,
 }
 
-thread_local! {
-    static SHARED_PREFIX_COMPOUNDS: std::cell::RefCell<SharedVectorPool<PrefixCompound>> =
-        std::cell::RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
-    static SHARED_PREFIX_FEATURES: std::cell::RefCell<SharedVectorPool<PrefixFeature>> =
-        std::cell::RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
+/// The pools for finished prefix automata.
+pub(super) struct PrefixPools {
+    compounds: SharedVectorPool<PrefixCompound>,
+    features: SharedVectorPool<PrefixFeature>,
+}
+
+impl Default for PrefixPools {
+    fn default() -> Self {
+        Self {
+            compounds: SharedVectorPool::new(MemoryCategory::RuleProgram),
+            features: SharedVectorPool::new(MemoryCategory::RuleProgram),
+        }
+    }
 }
 
 /// Immutable prefix program attached to one selector dispatch.
@@ -604,7 +612,7 @@ impl PrefixAutomaton {
         true
     }
 
-    pub(super) fn finish(&mut self) {
+    pub(super) fn finish(&mut self, pools: &mut PrefixPools) {
         assert!(!self.entry_paths_finished, "cannot finish a prefix automaton twice");
         if !self.entry_paths.is_sorted_by_key(|path| path.terminal) {
             self.entry_paths.sort_unstable_by_key(|path| path.terminal);
@@ -738,8 +746,8 @@ impl PrefixAutomaton {
         // have exact capacity. Spare builder capacity in the retained template is unused.
         self.compounds.shrink_to_fit();
         self.features.shrink_to_fit();
-        self.compounds.share(&SHARED_PREFIX_COMPOUNDS);
-        self.features.share(&SHARED_PREFIX_FEATURES);
+        self.compounds.share(&mut pools.compounds);
+        self.features.share(&mut pools.features);
         self.tag_tests.shrink_to_fit();
         self.attribute_tests.shrink_to_fit();
         self.outputs.shrink_to_fit();
@@ -1780,7 +1788,7 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
                 Ok(self
                     .automaton
                     .features_for(*feature_start, *feature_len)
-                    .all(|feature| matches_feature(row.facts, row.row, feature)))
+                    .all(|feature| matches_feature(row, feature)))
             }
             PrefixPredicate::Program { program, local, .. } => {
                 self.evaluator
@@ -1808,7 +1816,7 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
                     && self
                         .automaton
                         .features_for(*feature_start, *feature_len)
-                        .all(|feature| matches_feature(row.facts, row.row, feature)),
+                        .all(|feature| matches_feature(row, feature)),
             ),
             PrefixPredicate::Program { program, local, .. } => {
                 self.evaluator
@@ -3455,7 +3463,7 @@ impl PrefixStates {
                             (positional_bits & required_positional_bits) == *required_positional_bits
                                 && automaton
                                     .features_for(*feature_start, *feature_len)
-                                    .all(|feature| matches_feature(row.facts, row.row, feature))
+                                    .all(|feature| matches_feature(row, feature))
                         }
                         PrefixPredicate::Program { program, local, .. } => match evaluation
                             .evaluator
@@ -4881,35 +4889,13 @@ fn rows_have_equal_local_facts_between(
     }
 }
 
-fn matches_feature(facts: &StyleNodeFacts, row: u32, feature: FeatureTest) -> bool {
-    match feature {
-        FeatureTest::AnyElement => true,
-        FeatureTest::Namespace(NamespaceTest::None) => facts.namespace_of(row).is_none(),
-        FeatureTest::Namespace(NamespaceTest::Named(namespace)) => facts.namespace_of(row) == namespace,
-        FeatureTest::TagName(tag) => tag.matches(facts.tag_of(row), facts.namespace_of(row)),
-        FeatureTest::Id(id) => facts.id_of(row) == id,
-        FeatureTest::Class(class) => facts.classes_of(row).contains(&class),
-        FeatureTest::Attribute(test) => {
-            let folds = !test.fold_in_namespace.is_none() && facts.namespace_of(row) == test.fold_in_namespace;
-            facts.attributes_of(row).iter().any(|attribute| {
-                let value_matches = match test.operator {
-                    AttributeOperator::Presence => true,
-                    AttributeOperator::Exact => attribute.value == test.value_atom,
-                    _ => unreachable!("only atom-answerable features are canonicalized"),
-                };
-                if !value_matches {
-                    return false;
-                }
-                let name = if folds { test.folded } else { test.name };
-                let written = if test.any_namespace {
-                    facts.attribute_name_forms(attribute.name).local
-                } else {
-                    attribute.name
-                };
-                written == name
-            })
-        }
-    }
+/// Whether a canonical feature holds. Canonical attribute features are answerable by their value atom alone.
+fn matches_feature(row: MatchFactRow<'_>, feature: FeatureTest) -> bool {
+    super::selector_evaluation::matches_feature(&row, feature, |test, (_, attribute), _| match test.operator {
+        AttributeOperator::Presence => true,
+        AttributeOperator::Exact => attribute.value == test.value_atom,
+        _ => unreachable!("only atom-answerable features are canonicalized"),
+    })
 }
 
 #[cfg(test)]
@@ -5503,7 +5489,7 @@ mod tests {
             .extend([unique, unique, shared]);
         automaton.step_output_builders[1].terminals.push(shared);
 
-        automaton.finish();
+        automaton.finish(&mut PrefixPools::default());
 
         let first_outputs = automaton.outputs_for(&automaton.steps[0]);
         assert!(matches!(first_outputs[0].kind, PrefixOutputKind::UniqueTerminal));
@@ -5567,7 +5553,7 @@ mod tests {
             steps: 0..2,
         });
 
-        automaton.finish();
+        automaton.finish(&mut PrefixPools::default());
 
         assert_eq!(
             automaton.compounds[automaton.steps[0].compound.0 as usize].dispatch_key,

@@ -26,6 +26,7 @@
 #include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BookmarkStore.h>
+#include <LibWebView/CrashReportReview.h>
 #include <LibWebView/ErrorHTML.h>
 #include <LibWebView/FaviconStore.h>
 #include <LibWebView/HelperProcess.h>
@@ -282,14 +283,21 @@ void ViewImplementation::set_has_system_focus(bool has_system_focus)
 
 void ViewImplementation::load(URL::URL const& url, Web::Bindings::NavigationHistoryBehavior history_handling)
 {
+    load(traversable().prepare_navigation(url, {}, history_handling));
+}
+
+// A navigation a page asked the browser's UI to start for it — a link opened with a middle-click, e.g. — whose
+// source is still that page.
+void ViewImplementation::load(Web::HTML::PreparedNavigationDescriptor navigation)
+{
     if (on_before_browser_initiated_navigation)
         on_before_browser_initiated_navigation();
 
-    prepare_for_navigation_after_crash(url);
-    m_last_stopped_load_url.clear();
-    if (url.scheme() != "javascript"sv)
-        set_url(url);
-    traversable().navigate(url, {}, history_handling);
+    prepare_for_navigation_after_crash(NavigationToRetry { navigation.url, prepare_navigation_to_retry(navigation) });
+    m_last_stopped_navigation.clear();
+    if (navigation.url.scheme() != "javascript"sv)
+        set_url(navigation.url);
+    traversable().begin_navigation(move(navigation));
     if (traversable().has_uncommitted_navigation())
         set_loading_state(true);
     dump_session_history("load"sv);
@@ -307,7 +315,7 @@ void ViewImplementation::load_from_user_input(URL::URL const& url)
 
 void ViewImplementation::load_from_user_input(StringView input)
 {
-    load_from_user_input(input, sanitize_url(input, Application::settings().search_engine()));
+    load_from_user_input(input, sanitize_url(input, Application::settings().search_engine_settings().engine));
 }
 
 void ViewImplementation::load_from_user_input(StringView input, Optional<URL::URL> fallback_url)
@@ -351,13 +359,53 @@ void ViewImplementation::open_url_in_new_tab(URL::URL const& url, Web::HTML::Act
         return;
     }
 
+    if (auto* view = create_view_for_new_tab_or_window(is_private())) {
+        view->load(url);
+        return;
+    }
+
     Application::the().open_url_in_new_tab(url, activate_tab);
+}
+
+void ViewImplementation::open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor navigation, Web::HTML::ActivateTab activate_tab)
+{
+    if (!is_url_handled_internally(navigation.url)) {
+        handle_external_url_from_user_input(navigation.url);
+        return;
+    }
+
+    if (auto* view = create_view_for_new_tab_or_window(is_private())) {
+        view->load(move(navigation));
+        return;
+    }
+
+    Application::the().open_navigation_in_new_tab(move(navigation), activate_tab);
+}
+
+void ViewImplementation::open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor navigation, IsPrivate is_private)
+{
+    if (!is_url_handled_internally(navigation.url)) {
+        handle_external_url_from_user_input(navigation.url);
+        return;
+    }
+
+    if (auto* view = create_view_for_new_tab_or_window(is_private)) {
+        view->load(move(navigation));
+        return;
+    }
+
+    Application::the().open_navigation_in_new_window(move(navigation), is_private);
 }
 
 void ViewImplementation::open_url_in_new_window(URL::URL const& url, IsPrivate is_private)
 {
     if (!is_url_handled_internally(url)) {
         handle_external_url_from_user_input(url);
+        return;
+    }
+
+    if (auto* view = create_view_for_new_tab_or_window(is_private)) {
+        view->load(url);
         return;
     }
 
@@ -370,7 +418,7 @@ void ViewImplementation::load_html(StringView html)
         on_before_browser_initiated_navigation();
 
     prepare_for_navigation_after_crash();
-    m_last_stopped_load_url.clear();
+    m_last_stopped_navigation.clear();
     traversable().navigate(URL::about_srcdoc(), Utf16String::from_utf8(html));
     if (traversable().has_uncommitted_navigation())
         set_loading_state(true);
@@ -392,14 +440,13 @@ void ViewImplementation::reload()
     m_history_visit_transition_for_next_load = HistoryVisitTransition::Reload;
 
     // A load stopped before its document was activated is loaded again, rather than the document it was to replace.
-    if (m_last_stopped_load_url.has_value()) {
-        auto url = m_last_stopped_load_url.release_value();
-        load(url, Web::Bindings::NavigationHistoryBehavior::Replace);
+    if (m_last_stopped_navigation.has_value()) {
+        retry_navigation(m_last_stopped_navigation.release_value(), Web::Bindings::NavigationHistoryBehavior::Replace);
         return;
     }
 
     if (m_crash_state.has_value() && m_crash_state->navigation_to_retry.has_value()) {
-        load(m_crash_state->navigation_to_retry.release_value());
+        retry_navigation(m_crash_state->navigation_to_retry.release_value(), Web::Bindings::NavigationHistoryBehavior::Auto);
         return;
     }
 
@@ -440,10 +487,7 @@ void ViewImplementation::stop_loading()
         return;
     // Only a stopped navigation that never activated its document needs reissuing on reload; a stopped
     // active-document load reloads through the session history.
-    if (traversable().ongoing_navigation().has_value())
-        m_last_stopped_load_url = traversable().ongoing_navigation()->url;
-    else
-        m_last_stopped_load_url = {};
+    m_last_stopped_navigation = navigation_to_retry_for_ongoing_navigation();
     if (cancel_uncommitted_top_level_navigation("stop-loading"sv, true))
         return;
     set_loading_state(false);
@@ -2099,6 +2143,25 @@ void ViewImplementation::did_allocate_backing_stores(Badge<WebContentPage>, Vect
     install_backing_stores(move(bitmap_ids), move(backing_stores));
 }
 
+void ViewImplementation::did_add_backing_stores(Badge<WebContentPage>, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores)
+{
+    VERIFY(bitmap_ids.size() == backing_stores.size());
+    for (size_t i = 0; i < backing_stores.size(); ++i) {
+        m_client_state.other_bitmaps.append({
+            .id = bitmap_ids[i],
+            .last_painted_size = {},
+            .shared_image_buffer = make<Gfx::SharedImageBuffer>(Gfx::SharedImageBuffer::import_from_shared_image(move(backing_stores[i]))),
+        });
+    }
+}
+
+void ViewImplementation::did_retire_backing_stores(Badge<WebContentPage>, ReadonlySpan<i32> bitmap_ids)
+{
+    m_client_state.other_bitmaps.remove_all_matching([&](auto const& bitmap) {
+        return bitmap_ids.contains_slow(bitmap.id);
+    });
+}
+
 void ViewImplementation::install_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores)
 {
     VERIFY(bitmap_ids.size() == backing_stores.size());
@@ -2790,8 +2853,9 @@ Optional<ViewImplementation&> ViewImplementation::find_view_by_handle(StringView
 
 void ViewImplementation::load_for_webdriver_navigation(URL::URL const& url)
 {
-    prepare_for_navigation_after_crash(url);
-    traversable().navigate(url);
+    auto navigation = traversable().prepare_navigation(url);
+    prepare_for_navigation_after_crash(NavigationToRetry { url, prepare_navigation_to_retry(navigation) });
+    traversable().begin_navigation(move(navigation));
 }
 
 void ViewImplementation::did_start_webdriver_navigation()
@@ -3160,10 +3224,13 @@ void ViewImplementation::dump_session_history(StringView reason, SessionHistoryD
 void ViewImplementation::handle_web_content_process_crash()
 {
     auto failed_url = m_url;
-    Optional<URL::URL> navigation_to_retry;
+    Optional<NavigationToRetry> navigation_to_retry;
     auto const* current_entry = traversable().session_history().current_entry();
-    if (!current_entry || current_entry->url != failed_url)
-        navigation_to_retry = failed_url;
+    if (!current_entry || current_entry->url != failed_url) {
+        navigation_to_retry = NavigationToRetry { failed_url, {} };
+        if (auto ongoing = navigation_to_retry_for_ongoing_navigation(); ongoing.has_value() && ongoing->url == failed_url)
+            navigation_to_retry = ongoing.release_value();
+    }
 
     reject_pending_selection_requests();
     // Nothing will finish the input events the crashed process still held, and the events another process holds
@@ -3203,10 +3270,8 @@ void ViewImplementation::handle_web_content_process_crash()
     if (auto const& headless_mode = Application::browser_options().headless_mode; headless_mode.has_value())
         recovery_mode = *headless_mode == HeadlessMode::Test ? RecoveryMode::PrepareForNextNavigation : RecoveryMode::Restore;
 
-    if (recovery_mode == RecoveryMode::ShowOverlay) {
+    if (recovery_mode == RecoveryMode::ShowOverlay)
         dbgln("\033[31;1mWebContent process crashed!\033[0m Last page loaded: {}", failed_url);
-        dbgln("Consider raising an issue at https://github.com/LadybirdBrowser/ladybird/issues/new/choose");
-    }
 
     reset_page_media_state();
 
@@ -3262,7 +3327,26 @@ void ViewImplementation::respawn_web_content_process_after_crash()
     display_page_changed({});
 }
 
-void ViewImplementation::prepare_for_navigation_after_crash(Optional<URL::URL> navigation_to_retry)
+Optional<ViewImplementation::NavigationToRetry> ViewImplementation::navigation_to_retry_for_ongoing_navigation() const
+{
+    auto const& ongoing_navigation = traversable().ongoing_navigation();
+    if (!ongoing_navigation.has_value() || !ongoing_navigation->url.has_value())
+        return {};
+    return NavigationToRetry { *ongoing_navigation->url, ongoing_navigation->retry };
+}
+
+void ViewImplementation::retry_navigation(NavigationToRetry retry, Web::Bindings::NavigationHistoryBehavior history_handling)
+{
+    if (!retry.navigation.has_value()) {
+        load(retry.url, history_handling);
+        return;
+    }
+    auto navigation = retry.navigation.release_value();
+    navigation.history_handling = history_handling;
+    load(move(navigation));
+}
+
+void ViewImplementation::prepare_for_navigation_after_crash(Optional<NavigationToRetry> navigation_to_retry)
 {
     if (!m_crash_state.has_value())
         return;
@@ -3279,9 +3363,40 @@ void ViewImplementation::set_crash_state(Optional<CrashState> state)
         on_crash_overlay_state_change(active);
 }
 
+// The report is written once the process has exited, which can be after this view was told the process was lost.
+void ViewImplementation::did_save_crash_report(ByteString report_name)
+{
+    if (!m_crash_state.has_value())
+        return;
+    m_crash_state->report_name = move(report_name);
+    if (on_crash_report_saved)
+        on_crash_report_saved();
+}
+
 String ViewImplementation::crash_overlay_failed_url() const
 {
     return m_crash_state.has_value() ? m_crash_state->failed_url.serialize() : m_url.serialize();
+}
+
+Optional<ByteString> ViewImplementation::crash_report_name() const
+{
+    if (!m_crash_state.has_value() || m_crash_state->report_name.is_empty())
+        return {};
+    return m_crash_state->report_name;
+}
+
+// The crash screen offers the failed URL for the user to include in the report; nothing is sent unless they do.
+Optional<String> ViewImplementation::crash_report_website() const
+{
+    if (!m_crash_state.has_value())
+        return {};
+    auto const& failed_url = m_crash_state->failed_url;
+    if (failed_url.scheme() != "http"sv && failed_url.scheme() != "https"sv)
+        return {};
+    auto serialized_url = failed_url.serialize();
+    if (serialized_url.bytes().size() > CrashReportReview::maximum_url_bytes)
+        return {};
+    return serialized_url;
 }
 
 String ViewImplementation::current_host_for_settings() const
@@ -3553,7 +3668,7 @@ void ViewImplementation::initialize_context_menus()
     m_reset_zoom_action->set_visible(false);
 
     m_search_selected_text_action = Action::create("Search Selected Text"sv, ActionID::SearchSelectedText, [this]() {
-        auto const& search_engine = Application::settings().search_engine();
+        auto const& search_engine = Application::settings().search_engine_settings().engine;
         if (!search_engine.has_value())
             return;
 
@@ -3594,17 +3709,33 @@ void ViewImplementation::initialize_context_menus()
         take_and_save_screenshot(ScreenshotType::Full);
     });
 
+    // A URL from the context menu is the page's — a link's or an image's — so it's navigated to from the page, unless
+    // the user selected it as text. Blink also starts a selected URL with no initiator (IDC_CONTENT_CONTEXT_GOTOURL).
     m_open_in_new_tab_action = Action::create("Open in New Tab"sv, ActionID::OpenInNewTab, [this]() {
-        open_url_in_new_tab(m_context_menu_url, Web::HTML::ActivateTab::No);
+        if (m_context_menu_navigation.has_value())
+            open_navigation_in_new_tab(*m_context_menu_navigation, Web::HTML::ActivateTab::No);
+        else
+            open_url_in_new_tab(m_context_menu_url, Web::HTML::ActivateTab::No);
     });
     if (m_is_private == IsPrivate::No) {
         m_open_in_new_window_action = Action::create("Open in New Window"sv, ActionID::OpenInNewWindow, [this]() {
-            open_url_in_new_window(m_context_menu_url, IsPrivate::No);
+            if (m_context_menu_navigation.has_value())
+                open_navigation_in_new_window(*m_context_menu_navigation, IsPrivate::No);
+            else
+                open_url_in_new_window(m_context_menu_url, IsPrivate::No);
         });
     }
     if (application.supports_private_browsing_windows()) {
         m_open_in_new_private_window_action = Action::create("Open in New Private Window"sv, ActionID::OpenInNewPrivateWindow, [this]() {
-            open_url_in_new_window(m_context_menu_url, IsPrivate::Yes);
+            if (!m_context_menu_navigation.has_value()) {
+                open_url_in_new_window(m_context_menu_url, IsPrivate::Yes);
+                return;
+            }
+            // A private window still gets the page as the navigation's initiator, but never the page's URL as its
+            // referrer — as in Gecko/Blink (Gecko URILoadingHelper, Blink IDC_CONTENT_CONTEXT_OPENLINKOFFTHERECORD).
+            auto navigation = *m_context_menu_navigation;
+            navigation.referrer_policy = Web::ReferrerPolicy::ReferrerPolicy::NoReferrer;
+            open_navigation_in_new_window(move(navigation), IsPrivate::Yes);
         });
     }
     m_download_linked_file_action = Action::create("Download Linked File"sv, ActionID::DownloadLinkedFile, [this]() {
@@ -3618,7 +3749,7 @@ void ViewImplementation::initialize_context_menus()
     });
 
     m_open_image_action = Action::create("Open Image"sv, ActionID::OpenImage, [this]() {
-        load(m_context_menu_url);
+        load(*m_context_menu_navigation);
     });
     m_save_image_action = Action::create("Save Image As..."sv, ActionID::SaveImage, [this]() {
         download_context_menu_url(PromptForPath::Yes);
@@ -3639,10 +3770,10 @@ void ViewImplementation::initialize_context_menus()
     });
 
     m_open_audio_action = Action::create("Open Audio"sv, ActionID::OpenAudio, [this]() {
-        load(m_context_menu_url);
+        load(*m_context_menu_navigation);
     });
     m_open_video_action = Action::create("Open Video"sv, ActionID::OpenVideo, [this]() {
-        load(m_context_menu_url);
+        load(*m_context_menu_navigation);
     });
     m_media_play_action = Action::create("Play"sv, ActionID::PlayMedia, [this]() {
         send_to_media_context_menu_page([](auto& page) { page.async_toggle_media_play_state(); });
@@ -3924,7 +4055,7 @@ void ViewImplementation::did_request_page_context_menu(Badge<WebContentPage>, Gf
             auto& cut_selection_action = Application::the().cut_selection_action();
             cut_selection_action.set_visible(for_input_events_target == Web::ContextMenuForInputEventsTarget::Yes);
 
-            auto const& search_engine = Application::settings().search_engine();
+            auto const& search_engine = Application::settings().search_engine_settings().engine;
             weak_this->m_search_text = search_engine.has_value() ? selected_text : OptionalNone {};
             auto selected_text_url = selected_text.has_value() ? url_from_text(*selected_text) : OptionalNone {};
             weak_this->update_look_up_selected_text_action(lookup, content_position);
@@ -3943,6 +4074,7 @@ void ViewImplementation::did_request_page_context_menu(Badge<WebContentPage>, Gf
 
             if (selected_text_url.has_value() && weak_this->m_selected_text_link_context_menu->on_activation) {
                 weak_this->m_context_menu_url = selected_text_url.release_value();
+                weak_this->m_context_menu_navigation.clear();
                 weak_this->m_open_in_new_tab_action->set_text("Open in New Tab"sv);
                 weak_this->m_selected_text_link_context_menu->on_activation(weak_this->to_widget_position(content_position));
                 return;
@@ -3963,15 +4095,16 @@ void ViewImplementation::did_request_page_context_menu(Badge<WebContentPage>, Gf
     });
 }
 
-void ViewImplementation::did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, URL::URL url)
+void ViewImplementation::did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation)
 {
     auto request_id = ++m_context_menu_request_id;
     auto weak_this = make_weak_ptr();
-    request_context_menu_dictionary_lookup([weak_this, request_id, content_position, url = move(url)](auto const& lookup) mutable {
+    request_context_menu_dictionary_lookup([weak_this, request_id, content_position, navigation = move(navigation)](auto const& lookup) mutable {
         if (!weak_this || request_id != weak_this->m_context_menu_request_id)
             return;
 
-        weak_this->m_context_menu_url = move(url);
+        weak_this->m_context_menu_url = navigation.url;
+        weak_this->m_context_menu_navigation = move(navigation);
         weak_this->update_look_up_selected_text_action(lookup, content_position);
 
         weak_this->m_open_in_new_tab_action->set_text("Open in New Tab"sv);
@@ -4007,15 +4140,16 @@ void ViewImplementation::download_context_menu_url(PromptForPath prompt_for_path
     Application::the().file_downloader().download_file(is_private(), m_context_menu_url, download_path.release_value());
 }
 
-void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, URL::URL url, Optional<Gfx::ShareableBitmap> bitmap)
+void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<Gfx::ShareableBitmap> bitmap)
 {
     auto request_id = ++m_context_menu_request_id;
     auto weak_this = make_weak_ptr();
-    request_context_menu_dictionary_lookup([weak_this, request_id, content_position, url = move(url), bitmap = move(bitmap)](auto const& lookup) mutable {
+    request_context_menu_dictionary_lookup([weak_this, request_id, content_position, navigation = move(navigation), bitmap = move(bitmap)](auto const& lookup) mutable {
         if (!weak_this || request_id != weak_this->m_context_menu_request_id)
             return;
 
-        weak_this->m_context_menu_url = move(url);
+        weak_this->m_context_menu_url = navigation.url;
+        weak_this->m_context_menu_navigation = move(navigation);
         weak_this->m_image_context_menu_bitmap = move(bitmap);
         weak_this->update_look_up_selected_text_action(lookup, content_position);
 
@@ -4036,16 +4170,17 @@ void ViewImplementation::send_to_media_context_menu_page(Function<void(WebConten
         send(target);
 }
 
-void ViewImplementation::did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu)
+void ViewImplementation::did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu, Web::HTML::PreparedNavigationDescriptor navigation)
 {
     m_media_context_menu_page = requesting_page;
     auto request_id = ++m_context_menu_request_id;
     auto weak_this = make_weak_ptr();
-    request_context_menu_dictionary_lookup([weak_this, request_id, content_position, menu = move(menu)](auto const& lookup) mutable {
+    request_context_menu_dictionary_lookup([weak_this, request_id, content_position, menu = move(menu), navigation = move(navigation)](auto const& lookup) mutable {
         if (!weak_this || request_id != weak_this->m_context_menu_request_id)
             return;
 
         weak_this->m_context_menu_url = move(menu.media_url);
+        weak_this->m_context_menu_navigation = move(navigation);
         weak_this->update_look_up_selected_text_action(lookup, content_position);
 
         weak_this->m_open_in_new_tab_action->set_text(menu.is_video ? "Open Video in New Tab"sv : "Open Audio in new Tab"sv);

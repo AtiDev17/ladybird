@@ -257,6 +257,9 @@ static ErrorOr<void> append_allowed_executables(StringBuilder& builder, Readonly
     }
     builder.append(")\n"sv);
 
+    // NB: Child processes inherit the sandbox, and dyld needs F_GETPATH to find the shared library cache during startup.
+    builder.append("(allow system-fcntl (fcntl-command F_GETPATH))\n"sv);
+
     return {};
 }
 
@@ -326,6 +329,18 @@ static ErrorOr<void> append_allowed_mach_services(StringBuilder& builder, Seatbe
 )~~~"sv);
     }
 
+    // Two frameworks ask for the path behind a descriptor they hold: ANGLE for its own descriptors while it sets up an
+    // EGL display, and AudioToolbox's code-signing workaround checks while it creates its first AudioConverter — which
+    // crash with SIGBUS rather than fail when the command is denied. F_GETPATH also reveals the path of a descriptor
+    // that was handed over without one, so the Audio service alone doesn't grant it: The renderer plays WebAudio, but
+    // it also receives files from the Browser. MediaServer decodes, and receives nothing but sockets.
+    if (has_flag(options.system_services, SystemService::GPU) || has_flag(options.system_services, SystemService::AudioDecoding)) {
+        builder.append(R"~~~(
+(allow system-fcntl
+    (fcntl-command F_GETPATH))
+)~~~"sv);
+    }
+
     if (has_flag(options.system_services, SystemService::JIT))
         builder.append("(allow dynamic-code-generation)\n"sv);
 
@@ -346,9 +361,6 @@ static ErrorOr<void> append_allowed_mach_services(StringBuilder& builder, Seatbe
 (allow file-read* file-test-existence
     (subpath "/Library/GPUBundles"))
 
-; ANGLE asks for the paths of its own descriptors while it sets up an EGL display.
-(allow system-fcntl
-    (fcntl-command F_GETPATH))
 )~~~"sv);
     }
 
@@ -643,6 +655,10 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
     (remote ip)
     (control-name "com.apple.netsrc")
     (literal "/private/var/run/mDNSResponder"))
+
+; SecTrust evaluates TLS certificates through the per-user trust daemon.
+(allow mach-lookup
+    (global-name "com.apple.trustd.agent"))
 
 ; Sharing a port with another socket would let a helper receive traffic that is meant for another process.
 (deny socket-option-set

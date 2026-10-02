@@ -11,6 +11,7 @@
 #include <LibGC/WeakInlines.h>
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/FontComputer.h>
+#include <LibWeb/CSS/FontResolution.h>
 #include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/CSS/StyleValues/ColorSchemeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
@@ -139,6 +140,8 @@ NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_for_anima
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::Position))
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::Float))
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::LineHeight))
+            || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::OverflowX))
+            || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::OverflowY))
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::TextAlign));
         auto animated_properties = adopt_ref(*new AnimatedProperties(overlay, AnimatedProperties::InheritedOnly {}));
         working_set->m_animated_properties = move(animated_properties);
@@ -438,6 +441,8 @@ bool ComputedStyleWorkingSet::requires_animated_post_compute_adjustments() const
         || has_animated_property(PropertyID::Position)
         || has_animated_property(PropertyID::Float)
         || has_animated_property(PropertyID::LineHeight)
+        || has_animated_property(PropertyID::OverflowX)
+        || has_animated_property(PropertyID::OverflowY)
         || has_animated_property(PropertyID::TextAlign);
 }
 
@@ -464,6 +469,12 @@ void ComputedStyleWorkingSet::did_apply_style_finalization_from_rust(u16 invalid
 void ComputedStyleWorkingSet::set_animated_custom_property(Badge<StyleComputer>, Utf16FlyString name, NonnullRefPtr<StyleValue const> value)
 {
     m_animated_custom_properties.set(move(name), move(value));
+}
+
+void ComputedStyleWorkingSet::install_animated_overlay(Badge<StyleComputer>, ComputedValuesFFI::AnimatedOverlay const* overlay)
+{
+    m_animated_properties = adopt_ref(*new AnimatedProperties(overlay));
+    clear_computed_font_list_cache();
 }
 
 void ComputedStyleWorkingSet::clear_animated_properties(Badge<StyleComputer>)
@@ -780,8 +791,11 @@ FontFeatureData ComputedStyleWorkingSet::font_feature_data() const
 
 Optional<FontVariantAlternates> ComputedStyleWorkingSet::font_variant_alternates() const
 {
-    auto const& value = property(PropertyID::FontVariantAlternates);
+    return font_variant_alternates_from_style_value(property(PropertyID::FontVariantAlternates));
+}
 
+Optional<FontVariantAlternates> font_variant_alternates_from_style_value(StyleValue const& value)
+{
     // normal
     if (value.is_keyword()) {
         VERIFY(value.to_keyword() == Keyword::Normal);
@@ -821,8 +835,11 @@ FontVariantCaps ComputedStyleWorkingSet::font_variant_caps() const
 
 Optional<FontVariantEastAsian> ComputedStyleWorkingSet::font_variant_east_asian() const
 {
-    auto const& value = property(PropertyID::FontVariantEastAsian);
+    return font_variant_east_asian_from_style_value(property(PropertyID::FontVariantEastAsian));
+}
 
+Optional<FontVariantEastAsian> font_variant_east_asian_from_style_value(StyleValue const& value)
+{
     if (value.to_keyword() == Keyword::Normal)
         return {};
 
@@ -850,8 +867,11 @@ FontVariantEmoji ComputedStyleWorkingSet::font_variant_emoji() const
 
 Optional<FontVariantLigatures> ComputedStyleWorkingSet::font_variant_ligatures() const
 {
-    auto const& value = property(PropertyID::FontVariantLigatures);
+    return font_variant_ligatures_from_style_value(property(PropertyID::FontVariantLigatures));
+}
 
+Optional<FontVariantLigatures> font_variant_ligatures_from_style_value(StyleValue const& value)
+{
     if (value.to_keyword() == Keyword::Normal)
         return {};
 
@@ -879,8 +899,11 @@ Optional<FontVariantLigatures> ComputedStyleWorkingSet::font_variant_ligatures()
 
 Optional<FontVariantNumeric> ComputedStyleWorkingSet::font_variant_numeric() const
 {
-    auto const& value = property(PropertyID::FontVariantNumeric);
+    return font_variant_numeric_from_style_value(property(PropertyID::FontVariantNumeric));
+}
 
+Optional<FontVariantNumeric> font_variant_numeric_from_style_value(StyleValue const& value)
+{
     if (value.to_keyword() == Keyword::Normal)
         return {};
 
@@ -914,8 +937,11 @@ FontVariantPosition ComputedStyleWorkingSet::font_variant_position() const
 
 HashMap<Utf16FlyString, u8> ComputedStyleWorkingSet::font_feature_settings() const
 {
-    auto const& value = property(PropertyID::FontFeatureSettings);
+    return font_feature_settings_from_style_value(property(PropertyID::FontFeatureSettings));
+}
 
+HashMap<Utf16FlyString, u8> font_feature_settings_from_style_value(StyleValue const& value)
+{
     if (value.is_keyword())
         return {}; // normal
 
@@ -936,8 +962,11 @@ HashMap<Utf16FlyString, u8> ComputedStyleWorkingSet::font_feature_settings() con
 
 HashMap<Utf16FlyString, double> ComputedStyleWorkingSet::font_variation_settings() const
 {
-    auto const& value = property(PropertyID::FontVariationSettings);
+    return font_variation_settings_from_style_value(property(PropertyID::FontVariationSettings));
+}
 
+HashMap<Utf16FlyString, double> font_variation_settings_from_style_value(StyleValue const& value)
+{
     if (value.is_keyword())
         return {}; // normal
 
@@ -1000,10 +1029,49 @@ ScrollbarColorData ComputedStyleWorkingSet::scrollbar_color(ColorResolutionConte
     return {};
 }
 
-ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet::computed_font_list(FontComputer const& font_computer) const
+ComputedValuesFFI::FfiFontGroupBuildInputs ComputedStyleWorkingSet::font_group_build_inputs(DOM::Document const& document, TreeScopeID tree_scope) const
 {
-    if (!m_cached_computed_font_list) {
-        m_cached_computed_font_list = font_computer.compute_font_for_style_values(computed_font_families(), font_size(), font_slope(), font_weight(), font_width(), font_optical_sizing(), font_variation_settings(), font_feature_data());
+    // FIXME: A tree-scoped name is resolved in the tree of the declaration that named it, and inherits with that
+    //        tree (css-scoping). This resolves feature value names in the element's own tree scope instead.
+    auto font_list = computed_font_list(document.font_computer(), tree_scope);
+    auto const& first_available_font = font_list->first_available_font();
+    auto const metrics = first_available_font.pixel_metrics();
+    auto math_shift = keyword_to_math_shift(property(PropertyID::MathShift).to_keyword()).release_value();
+    auto math_style = keyword_to_math_style(property(PropertyID::MathStyle).to_keyword()).release_value();
+    return {
+        .font_size_raw = font_size().raw_value(),
+        .line_height_used_raw = line_height(document.font_computer()).raw_value(),
+        .font_variant_emoji = to_underlying(font_variant_emoji()),
+        .font_ascent = metrics.ascent,
+        .font_descent = metrics.descent,
+        .font_x_height = metrics.x_height,
+        .font_zero_advance = metrics.advance_of_ascii_zero,
+        .first_available_font = &first_available_font,
+        .font_cascade_list = font_list.ptr(),
+        .font_weight = font_weight(),
+        .font_width = font_width().value(),
+        .math_shift = to_underlying(math_shift),
+        .math_style = to_underlying(math_style),
+        .math_depth = math_depth(),
+    };
+}
+
+ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet::computed_font_list(FontComputer const& font_computer, TreeScopeID tree_scope) const
+{
+    if (!m_cached_computed_font_list || m_cached_computed_font_list_scope != tree_scope) {
+        m_cached_computed_font_list = resolve_font_for_style_values(font_computer,
+            {
+                .font_families = computed_font_families(),
+                .font_optical_sizing = font_optical_sizing(),
+                .font_size = font_size(),
+                .font_slope = font_slope(),
+                .font_weight = font_weight(),
+                .font_width = font_width(),
+                .font_variation_settings = font_variation_settings(),
+                .font_feature_data = font_feature_data(),
+                .font_feature_values_scope = tree_scope,
+            });
+        m_cached_computed_font_list_scope = tree_scope;
         VERIFY(!m_cached_computed_font_list->is_empty());
     }
 
@@ -1012,8 +1080,10 @@ ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet:
 
 ValueComparingNonnullRefPtr<Gfx::Font const> ComputedStyleWorkingSet::first_available_computed_font(FontComputer const& font_computer) const
 {
+    // NB: Feature values only change how a font shapes text, not which font is first available, so the list
+    //     resolved for any tree scope answers.
     if (!m_cached_first_available_computed_font)
-        m_cached_first_available_computed_font = computed_font_list(font_computer)->first_available_font();
+        m_cached_first_available_computed_font = computed_font_list(font_computer, m_cached_computed_font_list_scope)->first_available_font();
     return *m_cached_first_available_computed_font;
 }
 

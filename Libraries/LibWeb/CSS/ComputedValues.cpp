@@ -1126,27 +1126,6 @@ RefPtr<AbstractImageStyleValue const> ComputedValues::InheritedListValues::list_
     return value->as_abstract_image();
 }
 
-QuotesData ComputedValues::InheritedListValues::quotes_value() const
-{
-    auto value = animation_style_value(quotes);
-    QuotesData result { .type = QuotesData::Type::Auto };
-    if (value->is_keyword()) {
-        if (value->to_keyword() == Keyword::None)
-            result.type = QuotesData::Type::None;
-        return result;
-    }
-
-    result.type = QuotesData::Type::Specified;
-    auto const& items = value->as_value_list().values();
-    VERIFY(items.size() % 2 == 0);
-    for (size_t index = 0; index < items.size(); index += 2) {
-        result.strings.empend(
-            items[index]->as_string().string_value(),
-            items[index + 1]->as_string().string_value());
-    }
-    return result;
-}
-
 NonnullRefPtr<StyleValue const> ComputedValues::ContentValues::computed_content_value() const
 {
     return animation_style_value(content);
@@ -1475,35 +1454,6 @@ Vector<BackgroundLayerData> ComputedValues::MaskValues::mask_layers_value() cons
     return layers;
 }
 
-template<typename T, typename Mapper>
-static Vector<T> animation_keyword_items(ComputedValuesFFI::ComputedStyleValueHandle const& handle, Mapper mapper)
-{
-    Vector<T> result;
-    for (auto const& item : animation_items(handle))
-        result.append(mapper(item->to_keyword()).release_value());
-    return result;
-}
-
-static Vector<Time> animation_time_items(ComputedValuesFFI::ComputedStyleValueHandle const& handle)
-{
-    Vector<Time> result;
-    for (auto const& item : animation_items(handle))
-        result.append(Time::from_style_value(item, {}));
-    return result;
-}
-
-static Vector<Optional<Utf16FlyString>> animation_optional_name_items(ComputedValuesFFI::ComputedStyleValueHandle const& handle)
-{
-    Vector<Optional<Utf16FlyString>> result;
-    for (auto const& item : animation_items(handle)) {
-        if (item->is_custom_ident())
-            result.append(item->as_custom_ident().custom_ident());
-        else
-            result.empend();
-    }
-    return result;
-}
-
 Vector<ComputedAnimationName> ComputedValues::AnimationValues::animation_names_value() const
 {
     auto const* value = static_cast<StyleValueFFI::StyleValueData const*>(animation_name.pointer);
@@ -1537,34 +1487,6 @@ Vector<ComputedAnimationName> ComputedValues::AnimationValues::animation_names_v
     return result;
 }
 
-Vector<Optional<Utf16FlyString>> ComputedValues::AnimationValues::transition_properties_value() const
-{
-    return animation_optional_name_items(transition_property);
-}
-
-Vector<Time> ComputedValues::AnimationValues::transition_durations_value() const
-{
-    return animation_time_items(transition_duration);
-}
-
-Vector<EasingFunction> ComputedValues::AnimationValues::transition_timing_functions_value() const
-{
-    Vector<EasingFunction> result;
-    for (auto const& item : animation_items(transition_timing_function))
-        result.append(EasingFunction::from_style_value(item));
-    return result;
-}
-
-Vector<Time> ComputedValues::AnimationValues::transition_delays_value() const
-{
-    return animation_time_items(transition_delay);
-}
-
-Vector<TransitionBehavior> ComputedValues::AnimationValues::transition_behaviors_value() const
-{
-    return animation_keyword_items<TransitionBehavior>(transition_behavior, keyword_to_transition_behavior);
-}
-
 NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedStyleWorkingSet const& computed_style, DOM::Document const& document, StyleScope const& style_scope, ColorResolutionContext color_resolution_context, ComputedValues const* inherit_parent)
 {
     return create_internal(computed_style, document, style_scope, move(color_resolution_context), inherit_parent, nullptr, all_style_groups);
@@ -1575,7 +1497,7 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create_over_base(ComputedSty
     return create_internal(computed_style, document, style_scope, move(color_resolution_context), nullptr, &base, groups_to_apply);
 }
 
-NonnullRefPtr<ComputedValues const> ComputedValues::create_internal(ComputedStyleWorkingSet const& computed_style, DOM::Document const& document, StyleScope const&, ColorResolutionContext color_resolution_context, ComputedValues const* inherit_parent, ComputedValues const* base, u32 groups_to_apply)
+NonnullRefPtr<ComputedValues const> ComputedValues::create_internal(ComputedStyleWorkingSet const& computed_style, DOM::Document const& document, StyleScope const& style_scope, ColorResolutionContext color_resolution_context, ComputedValues const* inherit_parent, ComputedValues const* base, u32 groups_to_apply)
 {
     // A group outside `groups_to_apply` keeps the base's payload: its build is skipped and it counts
     // as adopted, so the guarded setters below leave it alone. The caller warrants that every
@@ -1606,29 +1528,8 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create_internal(ComputedStyl
     Optional<ComputedValuesFFI::FfiLengthResolutionContext> length_context_storage;
     auto ffi_color_input = make_rust_color_resolution_input(color_resolution_context, length_context_storage);
     Optional<ComputedValuesFFI::FfiFontGroupBuildInputs> font_group_inputs;
-    if (applies(StyleGroupIndex::FontValues)) {
-        auto font_list = computed_style.computed_font_list(document.font_computer());
-        auto const& first_available_font = font_list->first_available_font();
-        auto const metrics = first_available_font.pixel_metrics();
-        auto math_shift = keyword_to_math_shift(computed_style.property(PropertyID::MathShift).to_keyword()).release_value();
-        auto math_style = keyword_to_math_style(computed_style.property(PropertyID::MathStyle).to_keyword()).release_value();
-        font_group_inputs = ComputedValuesFFI::FfiFontGroupBuildInputs {
-            .font_size_raw = computed_style.font_size().raw_value(),
-            .line_height_used_raw = computed_style.line_height(document.font_computer()).raw_value(),
-            .font_variant_emoji = to_underlying(computed_style.font_variant_emoji()),
-            .font_ascent = metrics.ascent,
-            .font_descent = metrics.descent,
-            .font_x_height = metrics.x_height,
-            .font_zero_advance = metrics.advance_of_ascii_zero,
-            .first_available_font = &first_available_font,
-            .font_cascade_list = font_list.ptr(),
-            .font_weight = computed_style.font_weight(),
-            .font_width = computed_style.font_width().value(),
-            .math_shift = to_underlying(math_shift),
-            .math_style = to_underlying(math_style),
-            .math_depth = computed_style.math_depth(),
-        };
-    }
+    if (applies(StyleGroupIndex::FontValues))
+        font_group_inputs = computed_style.font_group_build_inputs(document, style_scope.style_engine_tree_scope());
     ComputedValuesFFI::FfiTableGroupBuildInputs table_build_inputs {
         .color_input = &ffi_color_input,
         .used_color_scheme = static_cast<u8>(to_underlying(color_scheme)),
@@ -1888,140 +1789,6 @@ RefPtr<StyleValue const> ComputedValues::computed_style_value(PropertyID propert
         m_style_value_cache = make<HashMap<PropertyID, NonnullRefPtr<StyleValue const>>>();
     m_style_value_cache->set(property_id, value);
     return value;
-}
-
-static ContentDataAndQuoteNestingLevel resolve_content(StyleValue const& value, QuotesData const& quotes_data, DOM::AbstractElement& element_reference, u32 initial_quote_nesting_level, NotifyListItemCounterRendered notify_list_item_counter_rendered)
-{
-    auto quote_nesting_level = initial_quote_nesting_level;
-
-    auto get_quote_string = [&](bool open, auto depth) {
-        switch (quotes_data.type) {
-        case QuotesData::Type::None:
-            return Utf16FlyString {};
-        case QuotesData::Type::Auto:
-            // FIXME: "A typographically appropriate used value for quotes is automatically chosen by the UA
-            //        based on the content language of the element and/or its parent."
-            if (open)
-                return depth == 0 ? u"“"_utf16_fly_string : u"‘"_utf16_fly_string;
-            return depth == 0 ? u"”"_utf16_fly_string : u"’"_utf16_fly_string;
-        case QuotesData::Type::Specified:
-            // If the depth is greater than the number of pairs, the last pair is repeated.
-            auto& level = quotes_data.strings[min(depth, quotes_data.strings.size() - 1)];
-            return open ? level[0] : level[1];
-        }
-        VERIFY_NOT_REACHED();
-    };
-
-    if (value.is_content()) {
-        auto& content_style_value = value.as_content();
-
-        ContentData content_data;
-
-        Utf16StringBuilder pending_text;
-        bool has_pending_text = false;
-        auto append_text = [&](Utf16View const& text) {
-            pending_text.append(text);
-            has_pending_text = true;
-        };
-        auto flush_pending_text = [&] {
-            if (!has_pending_text)
-                return;
-            content_data.data.append(pending_text.to_string());
-            pending_text.clear();
-            has_pending_text = false;
-        };
-
-        for (auto const& item : content_style_value.content().values()) {
-            if (item->is_string()) {
-                append_text(item->as_string().string_value().view());
-            } else if (item->is_keyword()) {
-                switch (item->to_keyword()) {
-                case Keyword::OpenQuote:
-                    append_text(get_quote_string(true, quote_nesting_level++).view());
-                    break;
-                case Keyword::CloseQuote:
-                    // A 'close-quote' or 'no-close-quote' that would make the depth negative is in error and is ignored
-                    // (at rendering time): the depth stays at 0 and no quote mark is rendered (although the rest of the
-                    // 'content' property's value is still inserted).
-                    // - https://www.w3.org/TR/CSS21/generate.html#quotes-insert
-                    // (This is missing from the CONTENT-3 spec.)
-                    if (quote_nesting_level > 0)
-                        append_text(get_quote_string(false, --quote_nesting_level).view());
-                    break;
-                case Keyword::NoOpenQuote:
-                    quote_nesting_level++;
-                    break;
-                case Keyword::NoCloseQuote:
-                    // NOTE: See CloseQuote
-                    if (quote_nesting_level > 0)
-                        quote_nesting_level--;
-                    break;
-                default:
-                    dbgln("`{}` is not supported in `content` (yet?)", item->to_string(SerializationMode::Normal));
-                    break;
-                }
-            } else if (item->is_counter()) {
-                flush_pending_text();
-                if (notify_list_item_counter_rendered == NotifyListItemCounterRendered::Yes && item->as_counter().counter_name() == list_item_counter_name())
-                    element_reference.element().document().did_render_list_item_counter_value(element_reference.element());
-                content_data.counter_style_dependencies.append(item->as_counter().counter_style()->as_counter_style().resolve_counter_style(element_reference.style_scope()));
-                content_data.data.append(item->as_counter().resolve(element_reference));
-            } else if (item->is_image() || item->is_image_set()) {
-                // https://drafts.csswg.org/css-content-3/#typedef-content-list
-                // https://drafts.csswg.org/css-images-4/#typedef-image
-                // <content-list> accepts <image>, and image-set() is an <image>.
-                flush_pending_text();
-                content_data.data.append(NonnullRefPtr { const_cast<AbstractImageStyleValue&>(item->as_abstract_image()) });
-            } else {
-                // TODO: Implement images, and other things.
-                dbgln("`{}` is not supported in `content` (yet?)", item->to_string(SerializationMode::Normal));
-            }
-        }
-        flush_pending_text();
-        content_data.type = ContentData::Type::List;
-
-        if (auto alt_text = content_style_value.alt_text()) {
-            Utf16StringBuilder alt_text_builder;
-            for (auto const& item : alt_text->values()) {
-                if (item->is_string()) {
-                    alt_text_builder.append(item->as_string().string_value().view());
-                } else if (item->is_counter()) {
-                    if (notify_list_item_counter_rendered == NotifyListItemCounterRendered::Yes && item->as_counter().counter_name() == list_item_counter_name())
-                        element_reference.element().document().did_render_list_item_counter_value(element_reference.element());
-                    content_data.counter_style_dependencies.append(item->as_counter().counter_style()->as_counter_style().resolve_counter_style(element_reference.style_scope()));
-                    alt_text_builder.append(item->as_counter().resolve(element_reference));
-                } else {
-                    dbgln("`{}` is not supported in `content` alt-text (yet?)", item->to_string(SerializationMode::Normal));
-                }
-            }
-            content_data.alt_text = alt_text_builder.to_string();
-        }
-
-        return { move(content_data), quote_nesting_level };
-    }
-
-    switch (value.to_keyword()) {
-    case Keyword::None:
-        return { { ContentData::Type::None, {}, {} }, quote_nesting_level };
-    case Keyword::Normal:
-        return { { ContentData::Type::Normal, {}, {} }, quote_nesting_level };
-    default:
-        break;
-    }
-
-    return { {}, quote_nesting_level };
-}
-
-ContentDataAndQuoteNestingLevel ComputedValues::resolved_content(DOM::AbstractElement& element_reference, u32 initial_quote_nesting_level, NotifyListItemCounterRendered notify_list_item_counter_rendered) const
-{
-    return resolved_content(*m_noninherited.content_data, *m_inherited.list, element_reference, initial_quote_nesting_level, notify_list_item_counter_rendered);
-}
-
-ContentDataAndQuoteNestingLevel ComputedValues::resolved_content(ContentValues const& content_values, InheritedListValues const& list_values, DOM::AbstractElement& element_reference, u32 initial_quote_nesting_level, NotifyListItemCounterRendered notify_list_item_counter_rendered)
-{
-    // Read the content group's value directly, including the resource context attached to its images.
-    auto value = content_values.computed_content_value();
-    return resolve_content(value, list_values.quotes_value(), element_reference, initial_quote_nesting_level, notify_list_item_counter_rendered);
 }
 
 }

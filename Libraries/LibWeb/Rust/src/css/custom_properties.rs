@@ -16,17 +16,21 @@ use std::sync::Arc;
 
 use ak::ScopeGuard;
 
+use crate::css::calc::CanonicalNumericType;
 use crate::css::css_tokenizer::OwnedToken;
 use crate::css::css_tokenizer::OwnedTokenKind;
 use crate::css::css_tokenizer::tokenize_owned;
 use crate::css::ffi_support::FfiUtf16View;
 use crate::css::function_signature::FunctionSignature;
+use crate::css::parser::component_value::ComponentSerializationMode;
 use crate::css::parser::query_parser::{
-    FfiMediaEnvironment, MatchResult, parse_and_evaluate_media_if_condition, parse_and_evaluate_supports_if_condition,
+    FeatureComparison, FfiMediaEnvironment, MatchResult, StyleFeature, StyleRangeValue as ParsedStyleRangeValue,
+    parse_and_evaluate_media_if_condition, parse_and_evaluate_supports_if_condition, parse_style_range_from_source,
 };
-use crate::css::parser::syntax::{SyntaxNode, clone_syntax_handle, parse_syntax, parse_with_syntax};
+use crate::css::parser::syntax::{SyntaxNode, SyntaxType, clone_syntax_handle, parse_syntax, parse_with_syntax};
 use crate::css::parser::value_parser::{FfiValueParsingContext, FfiValueParsingContextKind, ParseContext};
 use crate::css::retained_fly_string::RetainedUtf16FlyString;
+use crate::css::serialize::serialize_component_values_to_utf16;
 use crate::css::style_value::RetainedStyleValueData;
 use crate::css::style_value::StyleValueData;
 
@@ -114,12 +118,26 @@ pub struct CustomPropertyRegistry {
     registrations: HashMap<Vec<u16>, RegisteredCustomProperty>,
     document_url: Vec<u8>,
     document_base_url: Vec<u8>,
+    /// What a value parses to with a registration's syntax, by registration and value identity,
+    /// keeping the value alive so its identity is not reused: one declared value is parsed for
+    /// what its computation reads, then again to finalize it, for every element declaring it.
+    parses: std::sync::Mutex<HashMap<(usize, usize), RegisteredValueParse>>,
 }
+
+/// A value the registry has parsed, kept alive, and what it parsed to.
+type RegisteredValueParse = (RetainedStyleValueData, Option<RetainedStyleValueData>);
+
+/// How many parses the registry keeps before it starts over.
+const MAX_REGISTERED_VALUE_PARSES: usize = 4096;
 
 struct RegisteredCustomProperty {
     syntax: SyntaxNode,
     inherits: bool,
     initial_source: Option<Vec<u16>>,
+    /// The initial value as it computes, against the document rather than any element: the host
+    /// computes it, memoizes it on the registration for every reader, and publishes it with the
+    /// registration. The guaranteed-invalid value for a registration without one.
+    computed_initial: RetainedStyleValueData,
 }
 
 type CustomFunctionIdentity = u64;
@@ -136,6 +154,9 @@ struct CustomFunctionDefinition {
 struct CustomFunctionRegistry {
     caller_scope_identity: usize,
     definitions: Vec<CustomFunctionDefinition>,
+    /// Which definition a call names from each scope that sees one: the caller scope and the
+    /// index of the definition its name resolves to there.
+    visible: Vec<(usize, usize)>,
 }
 
 #[derive(Clone)]
@@ -165,6 +186,8 @@ pub struct FfiCustomPropertyRegistration {
     pub inherits: bool,
     pub has_initial_value: bool,
     pub initial_value: FfiUtf16View,
+    /// The initial value as the host computed it against the document, borrowed for the call.
+    pub computed_initial_value: *const c_void,
 }
 
 #[repr(C)]
@@ -196,10 +219,71 @@ pub struct FfiSubstitutionFunctionDefinition {
     pub declaration_count: usize,
 }
 
+/// That a call from a scope names a function: the definition its name dereferences to there, as
+/// a tree-scoped reference.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FfiSubstitutionFunctionVisibility {
+    pub caller_scope_identity: usize,
+    pub function_identity: u64,
+}
+
 impl CustomPropertyRegistry {
+    /// The registry of a document that registers no custom property.
+    fn empty() -> Self {
+        Self {
+            registrations: HashMap::new(),
+            document_url: Vec::new(),
+            document_base_url: Vec::new(),
+            parses: Default::default(),
+        }
+    }
+
+    /// One empty registry for every document input that names none.
+    pub(crate) fn shared_empty() -> &'static Self {
+        static EMPTY: std::sync::LazyLock<CustomPropertyRegistry> =
+            std::sync::LazyLock::new(CustomPropertyRegistry::empty);
+        &EMPTY
+    }
+
     /// Whether any custom property is registered; an unregistered name resolves without a syntax.
     pub(crate) fn has_registrations(&self) -> bool {
         !self.registrations.is_empty()
+    }
+
+    /// Whether any registration says its name does not inherit. Such a name is in an element's own
+    /// environment and in none of its descendants', which a store built over the parent's cannot
+    /// say.
+    pub(crate) fn has_non_inheriting_registrations(&self) -> bool {
+        self.registrations.values().any(|registration| !registration.inherits)
+    }
+
+    pub(crate) fn name_is_registered(&self, name: &[u16]) -> bool {
+        self.registrations.contains_key(name)
+    }
+
+    /// Whether a custom property of this name inherits: only a registration can say it does not.
+    pub(crate) fn name_inherits(&self, name: &[u16]) -> bool {
+        self.registrations
+            .get(name)
+            .is_none_or(|registration| registration.inherits)
+    }
+
+    /// Whether a custom property of this name is registered with a syntax other than the universal
+    /// one, which its values compute against.
+    pub(crate) fn name_has_syntax(&self, name: &[u16]) -> bool {
+        self.registrations
+            .get(name)
+            .is_some_and(|registration| !matches!(registration.syntax, SyntaxNode::Universal))
+    }
+
+    /// A custom property's initial value: what its registration's initial value computes to, and
+    /// the guaranteed-invalid value for an unregistered name or a registration without one.
+    pub(crate) fn initial_value(&self, name: &[u16]) -> RetainedStyleValueData {
+        self.registrations.get(name).map_or_else(
+            || RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid),
+            |registration| registration.computed_initial.clone(),
+        )
     }
 
     pub(crate) fn parse_context(&self, random_function_index: &mut usize) -> ParseContext {
@@ -222,7 +306,267 @@ impl CustomPropertyRegistry {
     }
 }
 
+/// What a custom property's substituted value is finalized against, beside the registry and the
+/// environment inherited: the element's lengths as its style computes them after line-height, the
+/// facts its longhands are computed against, and the color scheme its colors resolve with. Only a
+/// registered name reads them.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CustomPropertyFinalization<'a> {
+    pub(crate) length: Option<&'a crate::css::style_compute::FfiLengthResolutionContext>,
+    pub(crate) environment: Option<&'a crate::css::style_compute::FfiStyleComputationEnvironment>,
+    /// A PreferredColorScheme code.
+    pub(crate) color_scheme: u8,
+    /// How to draw the random base value of a key the host published none for, with its context.
+    pub(crate) draw_random_base_value: Option<(DrawRandomBaseValue, *mut c_void)>,
+}
+
+/// Loads what a style query resolves against from a resolution's callback context.
+pub(crate) type LoadStyleQueryInputs =
+    unsafe extern "C" fn(*mut c_void) -> *const crate::css::cascaded_properties::FfiStyleQueryInputs;
+
+/// Draws the random base value of a random caching key for the element computed: its name, and
+/// whether the key's element is null.
+pub(crate) type DrawRandomBaseValue = unsafe extern "C" fn(*mut c_void, *const u16, usize, bool) -> f64;
+
+impl CustomPropertyRegistry {
+    /// Parse a value with a registration's syntax, as the computation of its name parses it.
+    fn parse_registered_value(
+        &self,
+        registration: &RegisteredCustomProperty,
+        source: &[u16],
+    ) -> Option<StyleValueData> {
+        let mut random_function_index = 0;
+        let value_context = FfiValueParsingContext {
+            kind: FfiValueParsingContextKind::Property,
+            value: crate::css::property_metadata::property_id::CUSTOM,
+            secondary_value: 0,
+            name: Default::default(),
+        };
+        let mut context = self.parse_context(&mut random_function_index);
+        context.value_contexts = &raw const value_context;
+        context.value_context_count = 1;
+        parse_with_syntax(&context, source, &registration.syntax)
+    }
+
+    /// A value parsed with a registration's syntax, once per value the registry keeps alive.
+    fn parse_registered_value_memoized(
+        &self,
+        registration: &RegisteredCustomProperty,
+        value: &RetainedStyleValueData,
+    ) -> Option<RetainedStyleValueData> {
+        let key = (std::ptr::from_ref(registration) as usize, value.pointer() as usize);
+        let mut parses = self.parses.lock().expect("the parse memo is not poisoned");
+        if let Some((_, parsed)) = parses.get(&key) {
+            return parsed.clone();
+        }
+        let parsed = crate::css::serialize::serialize_resolved_style_value_to_utf16(value.data())
+            .and_then(|source| self.parse_registered_value(registration, &source))
+            .map(RetainedStyleValueData::from_owned);
+        if parses.len() >= MAX_REGISTERED_VALUE_PARSES {
+            parses.clear();
+        }
+        parses.insert(key, (value.clone(), parsed.clone()));
+        parsed
+    }
+
+    /// A registered custom property's declared value as its computation will parse it, where it
+    /// parses before substitution: what the computation reads beside lengths, the random sharings
+    /// and tree-counting functions, is in it. `None` for a name without a syntax to parse with, or
+    /// a value that parses only once substituted.
+    pub(crate) fn parse_declared_registered_value(
+        &self,
+        name: &[u16],
+        value: &RetainedStyleValueData,
+    ) -> Option<RetainedStyleValueData> {
+        let registration = self
+            .registrations
+            .get(name)
+            .filter(|registration| !matches!(registration.syntax, SyntaxNode::Universal))?;
+        self.parse_registered_value_memoized(registration, value)
+    }
+
+    /// Finalize a custom property's substituted value as its element's style computes it, as
+    /// `StyleComputer::finalize_custom_property_value` does: a CSS-wide keyword resolves against
+    /// the registration and the environment inherited, the guaranteed-invalid value against the
+    /// registration, and a registered name's value parses with its syntax and computes against
+    /// the element. Also says whether the computation resolved a viewport-relative length. A
+    /// registered value that does not compute against the element's inputs is an error carrying
+    /// the invalid fallback it takes.
+    pub(crate) fn finalize_custom_property_value(
+        &self,
+        inherited: Option<&CustomPropertyStore>,
+        name_raw: usize,
+        name: &[u16],
+        value: RetainedStyleValueData,
+        finalization: &CustomPropertyFinalization<'_>,
+    ) -> Result<(RetainedStyleValueData, bool), RetainedStyleValueData> {
+        use crate::css::style_compute::keyword;
+        let registration = self.registrations.get(name);
+        let initial = || {
+            registration.map_or_else(
+                || RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid),
+                |registration| registration.computed_initial.clone(),
+            )
+        };
+        let inherited_value = || {
+            inherited
+                .and_then(|inherited| inherited.get(name_raw))
+                .map_or_else(initial, |entry| entry.value.clone())
+        };
+
+        let value = match value.data() {
+            // https://drafts.csswg.org/css-mixins/#resolve-function-styles
+            // On result, all CSS-wide keywords are left unresolved.
+            StyleValueData::Keyword { keyword } if !name.iter().copied().eq("result".encode_utf16()) => {
+                match *keyword {
+                    keyword::INITIAL => initial(),
+                    keyword::INHERIT => inherited_value(),
+                    // Unset is the same as inherit for an inherited property, and every unregistered
+                    // custom property inherits.
+                    // FIXME: Roll revert and revert-layer back to a declaration of the custom property from
+                    //        a lower cascade layer or origin when there is one, instead of treating them as
+                    //        unset.
+                    keyword::UNSET | keyword::REVERT | keyword::REVERT_LAYER => {
+                        if registration.is_some_and(|registration| !registration.inherits) {
+                            initial()
+                        } else {
+                            inherited_value()
+                        }
+                    }
+                    _ => value,
+                }
+            }
+            _ => value,
+        };
+
+        // https://drafts.csswg.org/css-values-5/#invalid-substitution
+        // An unregistered name, or one registered with the universal syntax, computes to the
+        // guaranteed-invalid value; any other to its inherited value or its initial value, as if
+        // its value had been specified as unset.
+        let syntax_registration =
+            registration.filter(|registration| !matches!(registration.syntax, SyntaxNode::Universal));
+        let invalid_fallback = || match syntax_registration {
+            Some(registration) if registration.inherits => inherited_value(),
+            Some(_) => initial(),
+            None => RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid),
+        };
+        if matches!(value.data(), StyleValueData::GuaranteedInvalid) {
+            return Ok((invalid_fallback(), false));
+        }
+        let Some(registration) = syntax_registration else {
+            return Ok((value, false));
+        };
+
+        let contains_attr_tainted_values = matches!(
+            value.data(),
+            StyleValueData::Unresolved {
+                contains_attr_tainted_values: true,
+                ..
+            }
+        );
+        let Some(parsed) = self.parse_registered_value_memoized(registration, &value) else {
+            return Ok((invalid_fallback(), false));
+        };
+        // Without the element's lengths the value stays as parsed, as the host leaves one it has
+        // no computed style to compute against.
+        let Some(length) = finalization.length else {
+            return Ok((parsed, false));
+        };
+        let random_base_values = random_base_values_for_registered_value(parsed.data(), finalization);
+        let context = crate::css::absolutize::AbsolutizationContext {
+            length,
+            scheme: Some(finalization.color_scheme),
+            resolved_viewport_relative_length: Cell::new(false),
+            tree_counting: finalization
+                .environment
+                .filter(|environment| environment.has_tree_counting_context)
+                .map(|environment| (environment.sibling_count, environment.sibling_index)),
+            random_base_values: &random_base_values,
+            document_base_url: &self.document_base_url,
+            style_sheet_resource_context: None,
+        };
+        let computed = match crate::css::absolutize::absolutize(parsed.data(), &context) {
+            Some(crate::css::absolutize::Absolutized::Changed(computed)) => computed,
+            Some(crate::css::absolutize::Absolutized::Unchanged) => parsed,
+            None => return Err(invalid_fallback()),
+        };
+        let depends_on_viewport_metrics = context.resolved_viewport_relative_length.get();
+        if !contains_attr_tainted_values {
+            return Ok((computed, depends_on_viewport_metrics));
+        }
+
+        // A value an attr() substituted into stays tainted, as an unresolved value carrying what
+        // it computed to.
+        let source =
+            crate::css::serialize::serialize_resolved_style_value_to_utf16(computed.data()).unwrap_or_default();
+        let mut wrapped = crate::css::parser::value_parser::unresolved_value(
+            &source,
+            &[],
+            crate::css::parser::arbitrary_substitution::SubstitutionFunctionsPresence::default(),
+        );
+        let StyleValueData::Unresolved {
+            contains_attr_tainted_values,
+            parsed_value,
+            ..
+        } = &mut wrapped
+        else {
+            unreachable!("an unresolved value is built");
+        };
+        *contains_attr_tainted_values = true;
+        *parsed_value = computed;
+        Ok((RetainedStyleValueData::from_owned(wrapped), depends_on_viewport_metrics))
+    }
+}
+
+/// The random base values a registered value draws from once parsed after substitution. Its random
+/// sharings are new, but the host published a base for each sharing the same declaration held when
+/// parsed before substitution, which agrees with it in name and kind; one that only substitution
+/// brought in is drawn now.
+fn random_base_values_for_registered_value(
+    value: &StyleValueData,
+    finalization: &CustomPropertyFinalization<'_>,
+) -> Vec<crate::css::style_compute::FfiRandomBaseValue> {
+    let published = finalization.environment.map_or(&[][..], |environment| unsafe {
+        ffi_slice(environment.random_base_values, environment.random_base_value_count)
+    });
+    let kind = |sharing: *const StyleValueData| match unsafe { &*sharing } {
+        StyleValueData::RandomValueSharing {
+            is_auto,
+            name,
+            element_shared,
+            ..
+        } => Some((*is_auto, name, *element_shared)),
+        _ => None,
+    };
+    let mut sharings = Vec::new();
+    crate::css::style_compute::collect_unfixed_random_sharings_in_value(value, &mut sharings);
+    sharings
+        .into_iter()
+        .filter_map(|sharing| {
+            let wanted = kind(sharing)?;
+            let value = match published.iter().find(|base| kind(base.source.cast()) == Some(wanted)) {
+                Some(base) => base.value,
+                None => {
+                    let (draw, context) = finalization.draw_random_base_value?;
+                    let (name, element_shared) = crate::css::style_compute::random_caching_key(unsafe { &*sharing });
+                    unsafe { draw(context, name.as_ptr(), name.len(), element_shared) }
+                }
+            };
+            Some(crate::css::style_compute::FfiRandomBaseValue {
+                source: sharing.cast(),
+                value,
+            })
+        })
+        .collect()
+}
+
 impl CustomPropertyStore {
+    /// The store this one's chain goes on in, which may skip the environment it inherits from
+    /// once that one's few values were absorbed into this one.
+    pub(crate) fn parent(&self) -> Option<&Arc<CustomPropertyStore>> {
+        self.parent.as_ref()
+    }
+
     pub(crate) fn get(&self, name_raw: usize) -> Option<&CustomPropertyEntry> {
         self.own_values
             .get(&name_raw)
@@ -457,13 +801,6 @@ impl GuardedSubstitutionContexts {
         true
     }
 
-    fn contains_property(&self, name: &[u16], custom_function: Option<CustomFunctionIdentity>) -> bool {
-        self.contexts
-            .borrow()
-            .iter()
-            .any(|context| context.dependency.is_property(name, custom_function))
-    }
-
     fn innermost_function(&self) -> Option<CustomFunctionIdentity> {
         self.contexts
             .borrow()
@@ -485,12 +822,18 @@ struct ASFResolutionContext<'a> {
     attribute_names_are_ascii_case_insensitive: bool,
     contains_attr_tainted_values: bool,
     custom_functions: Option<&'a CustomFunctionRegistry>,
-    resolve_custom_function: Option<unsafe extern "C" fn(usize, FfiUtf16View) -> CustomFunctionIdentity>,
     parse_context: Option<&'a ParseContext>,
     media_environment: Option<&'a FfiMediaEnvironment>,
     load_media_environment: Option<unsafe extern "C" fn(*mut c_void) -> *const c_void>,
     callback_context: *mut c_void,
-    evaluate_style_query: Option<unsafe extern "C" fn(*mut c_void, FfiUtf16View) -> u8>,
+    /// What lengths in a style query resolve against: the element's last computed style.
+    style_query_length_resolution_context: Option<&'a crate::css::style_compute::FfiLengthResolutionContext>,
+    /// What colors in a style query resolve against, where the queried element's are known.
+    style_query_color_resolution_input: Option<crate::css::color_resolution::ColorResolutionInput<'a>>,
+    /// Loads both from the callback context the first time a style query is evaluated.
+    load_style_query_inputs: Option<LoadStyleQueryInputs>,
+    /// Where the custom properties a style query reads are noted, for the host to record.
+    style_query_dependencies: Option<&'a mut Option<Box<StyleQueryDependencies>>>,
     final_custom_properties: Option<&'a HashMap<Vec<u16>, *const c_void>>,
     function_local_scopes: Vec<FunctionLocalScope>,
     token_cache: Option<&'a mut CustomPropertyTokenCache>,
@@ -498,6 +841,25 @@ struct ASFResolutionContext<'a> {
 }
 
 impl ASFResolutionContext<'_> {
+    fn note_style_query_dependency(&mut self, name: &[u16]) {
+        if let Some(dependencies) = self.style_query_dependencies.as_deref_mut() {
+            dependencies.get_or_insert_default().note(name);
+        }
+    }
+
+    /// Load what a style query resolves against, if the host left it to be loaded.
+    fn load_style_query_inputs(&mut self) {
+        let Some(load) = self.load_style_query_inputs.take() else {
+            return;
+        };
+        // SAFETY: The host keeps what it loads live for the resolution.
+        let Some(inputs) = (unsafe { load(self.callback_context).as_ref() }) else {
+            return;
+        };
+        self.style_query_length_resolution_context = Some(&inputs.length);
+        self.style_query_color_resolution_input = Some(inputs.color_input());
+    }
+
     fn media_environment(&mut self) -> Option<&FfiMediaEnvironment> {
         if self.media_environment.is_none()
             && let Some(load_media_environment) = self.load_media_environment
@@ -510,6 +872,57 @@ impl ASFResolutionContext<'_> {
             };
         }
         self.media_environment
+    }
+}
+
+/// The custom properties style queries read in one resolution, which the host records as the
+/// element's style query references.
+#[derive(Clone, Default)]
+pub(crate) struct StyleQueryDependencies(Vec<Vec<u16>>);
+
+impl StyleQueryDependencies {
+    fn note(&mut self, name: &[u16]) {
+        if !self.0.iter().any(|noted| noted == name) {
+            self.0.push(name.to_vec());
+        }
+    }
+
+    pub(crate) fn extend(&mut self, other: &Self) {
+        for name in other.names() {
+            self.note(name);
+        }
+    }
+
+    pub(crate) fn names(&self) -> impl Iterator<Item = &[u16]> {
+        self.0.iter().map(Vec::as_slice)
+    }
+}
+
+/// Visits each custom property the style queries of a resolution read, and frees them.
+///
+/// # Safety
+/// `dependencies` must be null or what a resolution left in its `style_query_dependencies`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_style_query_dependencies_take(
+    dependencies: *mut c_void,
+    context: *mut c_void,
+    visit: unsafe extern "C" fn(*mut c_void, FfiUtf16View),
+) {
+    if dependencies.is_null() {
+        return;
+    }
+    let dependencies = unsafe { Box::from_raw(dependencies.cast::<StyleQueryDependencies>()) };
+    for name in dependencies.names() {
+        unsafe {
+            visit(
+                context,
+                FfiUtf16View {
+                    ascii: std::ptr::null(),
+                    utf16: name.as_ptr(),
+                    length: name.len(),
+                },
+            );
+        }
     }
 }
 
@@ -725,16 +1138,23 @@ fn tokens_for_function_value(data: &StyleValueData) -> Option<(Vec<OwnedToken>, 
     Some((tokenize_owned(&source), false))
 }
 
-unsafe fn custom_function_registry_from_ffi(
-    definitions: *const FfiSubstitutionFunctionDefinition,
-    definition_count: usize,
-    caller_scope_identity: usize,
-) -> Option<CustomFunctionRegistry> {
-    let definitions = if definition_count == 0 {
+/// An array the host lends, empty when it has no entries.
+///
+/// # Safety
+/// A non-empty array must be live for `'a`.
+pub(crate) unsafe fn ffi_slice<'a, T>(items: *const T, count: usize) -> &'a [T] {
+    if count == 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(definitions, definition_count) }
-    };
+        unsafe { std::slice::from_raw_parts(items, count) }
+    }
+}
+
+unsafe fn custom_function_registry_from_ffi(
+    definitions: &[FfiSubstitutionFunctionDefinition],
+    caller_scope_identity: usize,
+    visibilities: &[FfiSubstitutionFunctionVisibility],
+) -> Option<CustomFunctionRegistry> {
     let mut parsed_definitions = Vec::with_capacity(definitions.len());
     for definition in definitions {
         let signature = definition.signature.cast::<FunctionSignature>();
@@ -772,9 +1192,20 @@ unsafe fn custom_function_registry_from_ffi(
             declarations: parsed_declarations,
         });
     }
+    let visible = visibilities
+        .iter()
+        .filter_map(|visibility| {
+            let index = definitions
+                .iter()
+                .position(|definition| definition.identity == visibility.function_identity);
+            debug_assert!(index.is_some(), "a visible function is published with its definition");
+            Some((visibility.caller_scope_identity, index?))
+        })
+        .collect();
     Some(CustomFunctionRegistry {
         caller_scope_identity,
         definitions: parsed_definitions,
+        visible,
     })
 }
 
@@ -788,13 +1219,10 @@ pub(crate) unsafe fn prepare_var_resolution_environment(
     custom_functions: *const FfiSubstitutionFunctionDefinition,
     custom_function_count: usize,
     custom_function_scope_identity: usize,
+    custom_function_visibilities: *const FfiSubstitutionFunctionVisibility,
+    custom_function_visibility_count: usize,
 ) -> Option<VarResolutionEnvironment> {
-    let attributes = if attribute_count == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(attributes, attribute_count) }
-    };
-    let attributes = attributes
+    let attributes = unsafe { ffi_slice(attributes, attribute_count) }
         .iter()
         .filter_map(|attribute| {
             Some((unsafe { attribute.name.to_utf16() }?, unsafe {
@@ -803,7 +1231,11 @@ pub(crate) unsafe fn prepare_var_resolution_environment(
         })
         .collect();
     let custom_functions = unsafe {
-        custom_function_registry_from_ffi(custom_functions, custom_function_count, custom_function_scope_identity)
+        custom_function_registry_from_ffi(
+            ffi_slice(custom_functions, custom_function_count),
+            custom_function_scope_identity,
+            ffi_slice(custom_function_visibilities, custom_function_visibility_count),
+        )
     }?;
     Some(VarResolutionEnvironment {
         attributes,
@@ -818,21 +1250,10 @@ fn registration_accepts_tokens(
     registration: &RegisteredCustomProperty,
     tokens: &[OwnedToken],
 ) -> bool {
-    if matches!(registration.syntax, SyntaxNode::Universal) {
-        return true;
-    }
-    let source = serialize_tokens(tokens);
-    let mut random_function_index = 0;
-    let value_context = FfiValueParsingContext {
-        kind: FfiValueParsingContextKind::Property,
-        value: crate::css::property_metadata::property_id::CUSTOM,
-        secondary_value: 0,
-        name: Default::default(),
-    };
-    let mut context = registry.parse_context(&mut random_function_index);
-    context.value_contexts = &raw const value_context;
-    context.value_context_count = 1;
-    parse_with_syntax(&context, &source, &registration.syntax).is_some()
+    matches!(registration.syntax, SyntaxNode::Universal)
+        || registry
+            .parse_registered_value(registration, &serialize_tokens(tokens))
+            .is_some()
 }
 
 fn registered_property_fallback(
@@ -872,9 +1293,7 @@ fn resolve_css_wide_keyword(
     lookup: CustomPropertyLookup,
 ) -> TokenResolution {
     let registration = registry.and_then(|registry| registry.registrations.get(name));
-    // Mirror StyleComputer::resolve_css_wide_keyword_for_custom_property(). Revert keywords
-    // remain unresolved there pending custom-property revert support; typed `revert` then reaches
-    // the invalid-value fallback below.
+    // Mirror StyleComputer::resolve_css_wide_keyword_for_custom_property().
     if keyword.eq_ignore_ascii_case("initial") {
         return registration
             .and_then(|registration| registration.initial_source.as_ref())
@@ -882,8 +1301,13 @@ fn resolve_css_wide_keyword(
                 TokenResolution::Resolved(tokenize_owned(source))
             });
     }
+    // FIXME: Roll `revert` and `revert-layer` back to a declaration of the custom property from a lower cascade layer
+    //        or origin when there is one, instead of treating them as `unset`.
+    let is_unset = keyword.eq_ignore_ascii_case("unset")
+        || keyword.eq_ignore_ascii_case("revert")
+        || keyword.eq_ignore_ascii_case("revert-layer");
     if keyword.eq_ignore_ascii_case("inherit")
-        || keyword.eq_ignore_ascii_case("unset") && registration.is_none_or(|registration| registration.inherits)
+        || is_unset && registration.is_none_or(|registration| registration.inherits)
     {
         let inheritance_store = match lookup {
             CustomPropertyLookup::Normal => context.inheritance_store,
@@ -898,28 +1322,11 @@ fn resolve_css_wide_keyword(
             CustomPropertyLookup::ExplicitInheritance,
         );
     }
-    if keyword.eq_ignore_ascii_case("unset") {
-        return registration
-            .and_then(|registration| registration.initial_source.as_ref())
-            .map_or(TokenResolution::Invalid, |source| {
-                TokenResolution::Resolved(tokenize_owned(source))
-            });
-    }
-    // NB: Typed registered `revert` uses the invalid-value fallback, while `revert-layer` remains
-    //     unresolved pending custom-property revert support.
-    if keyword.eq_ignore_ascii_case("revert")
-        && let (Some(registry), Some(registration)) = (registry, registration)
-        && !matches!(registration.syntax, SyntaxNode::Universal)
-    {
-        let inheritance_store = match lookup {
-            CustomPropertyLookup::Normal => context.inheritance_store,
-            CustomPropertyLookup::ExplicitInheritance => owner.inheritance_parent.as_deref(),
-        };
-        return registered_property_fallback(inheritance_store, registry, registration, name, recursion_depth);
-    }
-    TokenResolution::Resolved(tokenize_owned(crate::css::css_tokenizer::TokenizerInput::Utf16(
-        keyword,
-    )))
+    registration
+        .and_then(|registration| registration.initial_source.as_ref())
+        .map_or(TokenResolution::Invalid, |source| {
+            TokenResolution::Resolved(tokenize_owned(source))
+        })
 }
 
 fn normalize_function_tokens(
@@ -1519,6 +1926,8 @@ fn registered_style_query_values_are_equal(
     syntax: &SyntaxNode,
     computed_tokens: &[OwnedToken],
     query_tokens: &[OwnedToken],
+    length_resolution_context: Option<&crate::css::style_compute::FfiLengthResolutionContext>,
+    color_resolution_input: Option<&crate::css::color_resolution::ColorResolutionInput>,
 ) -> bool {
     let mut random_function_index = 0;
     let context = registry.parse_context(&mut random_function_index);
@@ -1528,19 +1937,214 @@ fn registered_style_query_values_are_equal(
     let Some(query) = parse_with_syntax(&context, &serialize_tokens(query_tokens), syntax) else {
         return false;
     };
-    let computed_color = crate::css::color_resolution::to_color(&computed, &crate::css::color_resolution::EMPTY_INPUT);
-    let query_color = crate::css::color_resolution::to_color(&query, &crate::css::color_resolution::EMPTY_INPUT);
+    let color_resolution_input = color_resolution_input.unwrap_or(&crate::css::color_resolution::EMPTY_INPUT);
+    let computed_color = crate::css::color_resolution::to_color(&computed, color_resolution_input);
+    let query_color = crate::css::color_resolution::to_color(&query, color_resolution_input);
     if computed_color.is_some() || query_color.is_some() {
         return computed_color.is_some() && computed_color == query_color;
+    }
+    // Numeric values compare computed: in their canonical unit, relative lengths resolved.
+    if let (Some(computed), Some(query)) = (
+        StyleRangeValue::of(&computed, length_resolution_context),
+        StyleRangeValue::of(&query, length_resolution_context),
+    ) {
+        return computed.kind == query.kind && computed.value == query.value;
     }
     computed == query
 }
 
+/// A `<style-range-value>` as a range compares it: its type, and its value in that type's
+/// canonical unit.
+#[derive(Clone, Copy)]
+struct StyleRangeValue {
+    kind: CanonicalNumericType,
+    value: f64,
+}
+
+impl StyleRangeValue {
+    /// The types a `<style-range-value>` parses as, in the order it tries them.
+    const SYNTAX_TYPES: [SyntaxType; 7] = [
+        SyntaxType::Number,
+        SyntaxType::Length,
+        SyntaxType::Percentage,
+        SyntaxType::Angle,
+        SyntaxType::Time,
+        SyntaxType::Frequency,
+        SyntaxType::Resolution,
+    ];
+
+    fn of(
+        value: &StyleValueData,
+        length_resolution_context: Option<&crate::css::style_compute::FfiLengthResolutionContext>,
+    ) -> Option<Self> {
+        use crate::css::calc::CalcNumericValue;
+        let length_resolution = crate::css::calc::LengthResolution {
+            context: length_resolution_context,
+            fallback: None,
+        };
+        let (kind, value) = match *value {
+            StyleValueData::Number { value } => (CanonicalNumericType::Number, value),
+            StyleValueData::Integer { value } => (CanonicalNumericType::Number, f64::from(value)),
+            StyleValueData::Percentage { value } => (CanonicalNumericType::Percentage, value),
+            StyleValueData::Length { value, unit } => (
+                CanonicalNumericType::Length,
+                CalcNumericValue::Length { value, unit }.to_canonical_number(length_resolution),
+            ),
+            StyleValueData::Angle { value, unit } => (
+                CanonicalNumericType::Angle,
+                CalcNumericValue::Angle { value, unit }.to_canonical_number(length_resolution),
+            ),
+            StyleValueData::Time { value, unit } => (
+                CanonicalNumericType::Time,
+                CalcNumericValue::Time { value, unit }.to_canonical_number(length_resolution),
+            ),
+            StyleValueData::Frequency { value, unit } => (
+                CanonicalNumericType::Frequency,
+                CalcNumericValue::Frequency { value, unit }.to_canonical_number(length_resolution),
+            ),
+            StyleValueData::Resolution { value, unit } => (
+                CanonicalNumericType::Resolution,
+                CalcNumericValue::Resolution { value, unit }.to_canonical_number(length_resolution),
+            ),
+            StyleValueData::Calculated { .. } => {
+                crate::css::calc::resolve_calculated_canonically(value, length_resolution_context)?
+            }
+            _ => return None,
+        };
+        value.is_finite().then_some(Self { kind, value })
+    }
+
+    // https://drafts.csswg.org/css-conditional-5/#style-container
+    fn compare(self, comparison: FeatureComparison, other: Self) -> bool {
+        // A unitless zero compares with any dimension.
+        let is_dimension = |kind| !matches!(kind, CanonicalNumericType::Number | CanonicalNumericType::Percentage);
+        let is_unitless_zero = |value: Self| value.kind == CanonicalNumericType::Number && value.value == 0.0;
+        if self.kind != other.kind
+            && !(is_unitless_zero(self) && is_dimension(other.kind))
+            && !(is_unitless_zero(other) && is_dimension(self.kind))
+        {
+            return false;
+        }
+        match comparison {
+            FeatureComparison::Equal => self.value == other.value,
+            FeatureComparison::LessThan => self.value < other.value,
+            FeatureComparison::LessThanOrEqual => self.value <= other.value,
+            FeatureComparison::GreaterThan => self.value > other.value,
+            FeatureComparison::GreaterThanOrEqual => self.value >= other.value,
+        }
+    }
+}
+
+/// One `<style-range-value>`: a custom property name substitutes as if wrapped in `var()`, other
+/// values have their arbitrary substitution functions substituted, and either then parses as one
+/// of the numeric types. `None` when it does not.
+fn evaluate_style_range_value(
+    store: Option<&CustomPropertyStore>,
+    registry: Option<&CustomPropertyRegistry>,
+    operand: &ParsedStyleRangeValue,
+    context: &mut ASFResolutionContext,
+    recursion_depth: u32,
+) -> Result<Option<StyleRangeValue>, ConditionEvaluation> {
+    let resolution = match operand {
+        ParsedStyleRangeValue::Property(name) => {
+            context.note_style_query_dependency(name);
+            resolve_custom_property(store, registry, name, context, recursion_depth + 1)
+        }
+        ParsedStyleRangeValue::Components(values) => substitute_arbitrary_substitution_functions(
+            store,
+            registry,
+            &tokenize_owned(&serialize_component_values_to_utf16(
+                values,
+                ComponentSerializationMode::Normalized,
+            )),
+            context,
+            recursion_depth + 1,
+            None,
+        ),
+    };
+    let resolved = match resolution {
+        TokenResolution::Resolved(tokens) => tokens,
+        TokenResolution::Invalid => return Ok(None),
+        TokenResolution::Cyclic => return Err(ConditionEvaluation::Cyclic),
+        TokenResolution::NotHandled => return Err(ConditionEvaluation::NotHandled),
+    };
+    let source = serialize_tokens(&resolved);
+    let mut random_function_index = 0;
+    let registry_parse_context;
+    let parse_context = match (context.parse_context, registry) {
+        (Some(parse_context), _) => parse_context,
+        (None, Some(registry)) => {
+            registry_parse_context = registry.parse_context(&mut random_function_index);
+            &registry_parse_context
+        }
+        (None, None) => return Ok(None),
+    };
+    Ok(StyleRangeValue::SYNTAX_TYPES
+        .iter()
+        .find_map(|&syntax_type| parse_with_syntax(parse_context, &source, &SyntaxNode::Type(syntax_type)))
+        .and_then(|value| StyleRangeValue::of(&value, context.style_query_length_resolution_context)))
+}
+
+// https://drafts.csswg.org/css-conditional-5/#style-container
+fn evaluate_style_range(
+    store: Option<&CustomPropertyStore>,
+    registry: Option<&CustomPropertyRegistry>,
+    range: &StyleFeature,
+    context: &mut ASFResolutionContext,
+    recursion_depth: u32,
+) -> ConditionEvaluation {
+    let StyleFeature::Range {
+        left,
+        left_comparison,
+        middle,
+        right,
+    } = range
+    else {
+        return ConditionEvaluation::Invalid;
+    };
+    let mut value = |operand: &ParsedStyleRangeValue| match evaluate_style_range_value(
+        store,
+        registry,
+        operand,
+        context,
+        recursion_depth + 1,
+    ) {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => Err(ConditionEvaluation::Match(false)),
+        Err(result) => Err(result),
+    };
+    let comparisons = std::iter::once((*left_comparison, middle))
+        .chain(right.as_ref().map(|(comparison, right)| (*comparison, right)));
+    let mut previous = match value(left) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    for (comparison, operand) in comparisons {
+        let next = match value(operand) {
+            Ok(value) => value,
+            Err(result) => return result,
+        };
+        if !previous.compare(comparison, next) {
+            return ConditionEvaluation::Match(false);
+        }
+        previous = next;
+    }
+    ConditionEvaluation::Match(true)
+}
+
+fn has_comparison(tokens: &[OwnedToken]) -> bool {
+    tokens.iter().any(|token| {
+        token.source.equals_ascii(b"<") || token.source.equals_ascii(b">") || token.source.equals_ascii(b"=")
+    })
+}
+
 fn validate_style_feature(tokens: &[OwnedToken]) -> ConditionValidation {
     let tokens = trim_whitespace(tokens);
-    if tokens.iter().any(|token| {
-        token.source.equals_ascii(b"<") || token.source.equals_ascii(b">") || token.source.equals_ascii(b"=")
-    }) {
+    // A `<style-feature-value>` is a `<declaration-value>`, which holds no top-level `!`.
+    if find_top_level_source(tokens, b"!").is_some() {
+        return ConditionValidation::Invalid;
+    }
+    if has_comparison(tokens) {
         return ConditionValidation::Valid;
     }
     let colon = find_top_level_source(tokens, b":");
@@ -1556,9 +2160,7 @@ fn validate_style_feature(tokens: &[OwnedToken]) -> ConditionValidation {
     }
     if let Some(colon) = colon {
         let query = trim_whitespace(&tokens[colon + 1..]);
-        if query.iter().any(|token| {
-            token.source.equals_ascii(b"<") || token.source.equals_ascii(b">") || token.source.equals_ascii(b"=")
-        }) {
+        if has_comparison(query) {
             return ConditionValidation::Invalid;
         }
     }
@@ -1573,34 +2175,12 @@ fn evaluate_style_feature(
     recursion_depth: u32,
 ) -> ConditionEvaluation {
     let tokens = trim_whitespace(tokens);
-    if tokens.iter().any(|token| {
-        token.source.equals_ascii(b"<") || token.source.equals_ascii(b">") || token.source.equals_ascii(b"=")
-    }) {
-        // FIXME: Range style queries are evaluated in C++ without access to the Rust guarded-context stack. The cyclic
-        //        result does not identify the context that began the cycle, so marking the innermost context could mark
-        //        a caller outside the cycle and cannot mark the complete cycle suffix. Share the guarded contexts across
-        //        the callback instead.
-        let Some(evaluate) = context.evaluate_style_query else {
-            return ConditionEvaluation::NotHandled;
+    if has_comparison(tokens) {
+        // A range parses as the query parser has it, as it did when C++ evaluated it.
+        let Some(range) = parse_style_range_from_source(&serialize_tokens(tokens)) else {
+            return ConditionEvaluation::Invalid;
         };
-        let source = serialize_tokens(tokens);
-        crate::css::ffi_stats::bump_cpp_callback(crate::css::ffi_stats::FfiOp::EvaluateConditionCallback);
-        return match unsafe {
-            evaluate(
-                context.callback_context,
-                FfiUtf16View {
-                    ascii: std::ptr::null(),
-                    utf16: source.as_ptr(),
-                    length: source.len(),
-                },
-            )
-        } {
-            0 => ConditionEvaluation::Match(false),
-            1 => ConditionEvaluation::Match(true),
-            2 => ConditionEvaluation::Invalid,
-            3 => ConditionEvaluation::Cyclic,
-            _ => ConditionEvaluation::NotHandled,
-        };
+        return evaluate_style_range(store, registry, &range, context, recursion_depth + 1);
     }
     let colon = find_top_level_source(tokens, b":");
     let name_tokens = trim_whitespace(&tokens[..colon.unwrap_or(tokens.len())]);
@@ -1613,6 +2193,19 @@ fn evaluate_style_feature(
     else {
         return ConditionEvaluation::Invalid;
     };
+    let query = colon.map(|colon| &tokens[colon + 1..]);
+    evaluate_named_style_feature(store, registry, name, query, context, recursion_depth)
+}
+
+/// A `style()` feature naming a property, `name` or `name: query`.
+fn evaluate_named_style_feature(
+    store: Option<&CustomPropertyStore>,
+    registry: Option<&CustomPropertyRegistry>,
+    name: &[u16],
+    query: Option<&[OwnedToken]>,
+    context: &mut ASFResolutionContext,
+    recursion_depth: u32,
+) -> ConditionEvaluation {
     if !name.starts_with_ascii("--") {
         return ConditionEvaluation::Match(false);
     }
@@ -1627,41 +2220,32 @@ fn evaluate_style_feature(
         .is_empty()
         .then(|| registry.and_then(|registry| registry.registrations.get(name)))
         .flatten();
+    context.note_style_query_dependency(name);
     let computed = resolve_custom_property(store, registry, name, context, recursion_depth + 1);
     let computed = match computed {
         TokenResolution::Resolved(tokens) => Some(tokens),
         TokenResolution::Invalid | TokenResolution::Cyclic => None,
         TokenResolution::NotHandled => return ConditionEvaluation::NotHandled,
     };
-    if registration.is_some()
-        // NB: `registration` is only populated when there is no function-local scope, so this property context has no
-        //     custom function identity.
-        && !context.guarded_contexts.contains_property(name, None)
-        && let Some(evaluate) = context.evaluate_style_query
-    {
-        let source = serialize_tokens(tokens);
-        crate::css::ffi_stats::bump_cpp_callback(crate::css::ffi_stats::FfiOp::EvaluateConditionCallback);
-        return match unsafe {
-            evaluate(
-                context.callback_context,
-                FfiUtf16View {
-                    ascii: std::ptr::null(),
-                    utf16: source.as_ptr(),
-                    length: source.len(),
-                },
-            )
-        } {
-            0 => ConditionEvaluation::Match(false),
-            1 => ConditionEvaluation::Match(true),
-            2 => ConditionEvaluation::Invalid,
-            3 => ConditionEvaluation::Cyclic,
-            _ => ConditionEvaluation::NotHandled,
+    let Some(query) = query else {
+        // A <style-feature-boolean> is true if the computed value differs from the property's initial value.
+        // NB: A function parameter's initial value is its argument, but a parameter holding one still matches.
+        let (Some(registry), Some(registration), Some(computed)) = (registry, registration, &computed) else {
+            return ConditionEvaluation::Match(computed.is_some());
         };
-    }
-    let Some(colon) = colon else {
-        return ConditionEvaluation::Match(computed.is_some());
+        let Some(initial) = &registration.initial_source else {
+            return ConditionEvaluation::Match(true);
+        };
+        return ConditionEvaluation::Match(!registered_style_query_values_are_equal(
+            registry,
+            &registration.syntax,
+            computed,
+            &tokenize_owned(initial),
+            context.style_query_length_resolution_context,
+            context.style_query_color_resolution_input.as_ref(),
+        ));
     };
-    let query = trim_whitespace(&tokens[colon + 1..]);
+    let query = trim_whitespace(query);
 
     if let Some(keyword) = single_css_wide_keyword(query) {
         if keyword.eq_ignore_ascii_case("revert") || keyword.eq_ignore_ascii_case("revert-layer") {
@@ -1703,6 +2287,8 @@ fn evaluate_style_feature(
                         .unwrap_or_else(|| &registration.expect("registered property").syntax),
                     &computed,
                     &expected,
+                    context.style_query_length_resolution_context,
+                    context.style_query_color_resolution_input.as_ref(),
                 )
             }
             (Some(computed), Some(expected)) => trim_whitespace(&computed) == trim_whitespace(&expected),
@@ -1721,10 +2307,54 @@ fn evaluate_style_feature(
             .or_else(|| registration.map(|registration| &registration.syntax)),
     ) {
         return ConditionEvaluation::Match(registered_style_query_values_are_equal(
-            registry, syntax, &computed, query,
+            registry,
+            syntax,
+            &computed,
+            query,
+            context.style_query_length_resolution_context,
+            context.style_query_color_resolution_input.as_ref(),
         ));
     }
     ConditionEvaluation::Match(serialize_tokens(trim_whitespace(&computed)) == serialize_tokens(query))
+}
+
+/// Evaluate a container query's style feature against a container's retained style: its
+/// custom-property environment, and lengths and colors as its record computes them. The custom
+/// properties the feature reads are noted in `dependencies`.
+pub(crate) fn evaluate_retained_container_style_feature(
+    store: Option<&CustomPropertyStore>,
+    registry: &CustomPropertyRegistry,
+    feature: &StyleFeature,
+    length_resolution_context: &crate::css::style_compute::FfiLengthResolutionContext,
+    color_resolution_input: crate::css::color_resolution::ColorResolutionInput<'_>,
+    dependencies: &mut Option<Box<StyleQueryDependencies>>,
+) -> MatchResult {
+    let mut context = ASFResolutionContext {
+        inheritance_store: store.and_then(|store| store.inheritance_parent.as_deref()),
+        style_query_length_resolution_context: Some(length_resolution_context),
+        style_query_color_resolution_input: Some(color_resolution_input),
+        style_query_dependencies: Some(dependencies),
+        ..Default::default()
+    };
+    let registry = Some(registry);
+    let result = match feature {
+        StyleFeature::Boolean(name) => evaluate_named_style_feature(store, registry, name, None, &mut context, 0),
+        StyleFeature::Plain { name, value, .. } => {
+            let query = tokenize_owned(&serialize_component_values_to_utf16(
+                value,
+                ComponentSerializationMode::Normalized,
+            ));
+            evaluate_named_style_feature(store, registry, name, Some(&query), &mut context, 0)
+        }
+        StyleFeature::Range { .. } => evaluate_style_range(store, registry, feature, &mut context, 0),
+    };
+    match result {
+        ConditionEvaluation::Match(true) => MatchResult::True,
+        ConditionEvaluation::Match(false) => MatchResult::False,
+        ConditionEvaluation::Invalid | ConditionEvaluation::NotHandled | ConditionEvaluation::Cyclic => {
+            MatchResult::Unknown
+        }
+    }
 }
 
 fn evaluate_style_query(
@@ -1739,6 +2369,7 @@ fn evaluate_style_query(
         Err(ConditionValidation::Invalid) => return ConditionEvaluation::Invalid,
         Err(ConditionValidation::Valid) => unreachable!(),
     };
+    context.load_style_query_inputs();
     evaluate_parsed_boolean_expression(&expression, &mut |feature| {
         evaluate_style_feature(store, registry, feature, context, recursion_depth + 1)
     })
@@ -2144,30 +2775,12 @@ fn replace_a_dashed_function(
                 .map(|definition| definition.scope_identity)
         })
         .unwrap_or(functions.caller_scope_identity);
-    let resolved_identity = context.resolve_custom_function.map(|resolve| unsafe {
-        resolve(
-            caller_scope_identity,
-            FfiUtf16View {
-                ascii: std::ptr::null(),
-                utf16: name.as_ptr(),
-                length: name.len(),
-            },
-        )
-    });
-    let definition = resolved_identity
-        .and_then(|identity| {
-            functions
-                .definitions
-                .iter()
-                .find(|definition| definition.identity == identity)
-        })
-        .or_else(|| {
-            resolved_identity.is_none().then(|| {
-                functions.definitions.iter().find(|definition| {
-                    definition.signature.name.units() == name && definition.scope_identity == caller_scope_identity
-                })
-            })?
-        });
+    let definition = functions
+        .visible
+        .iter()
+        .filter(|&&(scope, _)| scope == caller_scope_identity)
+        .map(|&(_, index)| &functions.definitions[index])
+        .find(|definition| definition.signature.name.units() == name);
     let Some(function) = definition else {
         return TokenResolution::Invalid;
     };
@@ -2648,9 +3261,10 @@ pub(crate) unsafe fn resolve_vars(
     value_data: *const c_void,
     environment: &mut VarResolutionEnvironment,
     attribute_names_are_ascii_case_insensitive: bool,
-    resolve_custom_function: Option<unsafe extern "C" fn(usize, FfiUtf16View) -> u64>,
     callback_context: *mut c_void,
-    evaluate_style_query: Option<unsafe extern "C" fn(*mut c_void, FfiUtf16View) -> u8>,
+    style_query_inputs: Option<&crate::css::cascaded_properties::FfiStyleQueryInputs>,
+    load_style_query_inputs: Option<LoadStyleQueryInputs>,
+    style_query_dependencies: Option<&mut Option<Box<StyleQueryDependencies>>>,
     final_custom_properties: Option<&HashMap<Vec<u16>, *const c_void>>,
 ) -> NativeVarResolution {
     let store = if store.is_null() {
@@ -2693,12 +3307,14 @@ pub(crate) unsafe fn resolve_vars(
         attribute_names_are_ascii_case_insensitive,
         contains_attr_tainted_values: false,
         custom_functions: Some(custom_functions),
-        resolve_custom_function,
         parse_context,
         media_environment,
         load_media_environment,
         callback_context,
-        evaluate_style_query,
+        style_query_length_resolution_context: style_query_inputs.map(|inputs| &inputs.length),
+        style_query_color_resolution_input: style_query_inputs.map(|inputs| inputs.color_input()),
+        load_style_query_inputs,
+        style_query_dependencies,
         final_custom_properties,
         token_cache: Some(token_cache),
         resolution_stats: Some(resolution_stats),
@@ -2895,6 +3511,7 @@ mod tests {
                 parameter_defaults: vec![None],
                 declarations: vec![(utf16("result"), tokenize_owned(b"var(--value)"), true)],
             }],
+            visible: vec![(1, 0)],
         };
         let mut context = ASFResolutionContext {
             custom_functions: Some(&functions),
@@ -2906,6 +3523,47 @@ mod tests {
             panic!("expected custom function substitution");
         };
         assert_eq!(serialize_tokens(&tokens), utf16("12px"));
+    }
+
+    #[test]
+    fn a_nested_call_names_the_function_its_caller_s_scope_sees() {
+        let definition = |identity, scope_identity, name: &str, result: &[u8]| CustomFunctionDefinition {
+            identity,
+            scope_identity,
+            signature: Arc::new(FunctionSignature {
+                name: crate::css::css_string::CssString::from_utf16(&utf16(name)),
+                parameters: Box::default(),
+                return_type: Arc::new(SyntaxNode::Universal),
+            }),
+            parameter_defaults: Vec::new(),
+            declarations: vec![(utf16("result"), tokenize_owned(result), true)],
+        };
+        // The document (scope 1) defines --inner, a shadow tree (scope 2) defines --outer and an
+        // --inner of its own. A call from the document reaches --outer, whose body calls --inner
+        // as the shadow tree names it.
+        let functions = CustomFunctionRegistry {
+            caller_scope_identity: 1,
+            definitions: vec![
+                definition(10, 2, "--outer", b"--inner()"),
+                definition(11, 2, "--inner", b"2px"),
+                definition(12, 1, "--inner", b"1px"),
+            ],
+            visible: vec![(1, 0), (1, 2), (2, 0), (2, 1)],
+        };
+        let substitute = |source: &[u8]| {
+            let mut context = ASFResolutionContext {
+                custom_functions: Some(&functions),
+                ..Default::default()
+            };
+            let TokenResolution::Resolved(tokens) =
+                substitute_tokens(None, None, &tokenize_owned(source), &mut context, 0)
+            else {
+                panic!("expected custom function substitution");
+            };
+            serialize_tokens(&tokens)
+        };
+        assert_eq!(substitute(b"--outer()"), utf16("2px"));
+        assert_eq!(substitute(b"--inner()"), utf16("1px"));
     }
 
     #[test]
@@ -2986,12 +3644,7 @@ mod tests {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_custom_property_registry_create() -> *mut c_void {
-    Box::into_raw(Box::new(CustomPropertyRegistry {
-        registrations: HashMap::new(),
-        document_url: Vec::new(),
-        document_base_url: Vec::new(),
-    }))
-    .cast()
+    Box::into_raw(Box::new(CustomPropertyRegistry::empty())).cast()
 }
 
 /// Replaces the effective registered custom-property names for one document.
@@ -3023,6 +3676,11 @@ pub unsafe extern "C" fn rust_custom_property_registry_update(
             .unwrap_or_default()
             .to_vec();
     registry.registrations.clear();
+    registry
+        .parses
+        .get_mut()
+        .expect("the parse memo is not poisoned")
+        .clear();
     registry.registrations.reserve(registrations.len());
     for registration in registrations {
         let name = unsafe { registration.name.to_utf16() }.expect("invalid registered custom property name");
@@ -3037,12 +3695,20 @@ pub unsafe extern "C" fn rust_custom_property_registry_update(
         let Some(syntax) = (unsafe { clone_syntax_handle(registration.syntax) }) else {
             continue;
         };
+        // SAFETY: The host lends a live style value for the call; the registry keeps a reference of
+        //         its own for as long as it holds the registration.
+        let computed_initial = unsafe {
+            RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(
+                registration.computed_initial_value.cast(),
+            ))
+        };
         registry.registrations.insert(
             name,
             RegisteredCustomProperty {
                 syntax,
                 inherits: registration.inherits,
                 initial_source,
+                computed_initial,
             },
         );
     }
@@ -3194,6 +3860,53 @@ pub unsafe extern "C" fn rust_custom_property_store_create_animation_overlay(
 pub unsafe extern "C" fn rust_custom_property_store_destroy(store: *const c_void) {
     crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CustomPropertyStoreLifecycleEntry);
     drop(unsafe { Arc::from_raw(store.cast::<CustomPropertyStore>()) });
+}
+
+/// Which names a store declares that the registry registers with a syntax, whose values its
+/// element's lengths compute.
+#[repr(u8)]
+pub enum FfiRegisteredValueDeclarations {
+    None,
+    /// Every registered value parses as declared, so the lengths it reads are known before it is
+    /// computed.
+    Parsed,
+    /// A registered value substitutes, so the container-relative lengths it reads are known only
+    /// once it is substituted.
+    Substituted,
+}
+
+/// What registered values a store declares, as `FfiRegisteredValueDeclarations` says.
+///
+/// # Safety
+/// `store` must be a live store pointer, and `registry` null or a live registry.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_custom_property_store_registered_value_declarations(
+    store: *const c_void,
+    registry: *const c_void,
+) -> FfiRegisteredValueDeclarations {
+    let store = unsafe { &*store.cast::<CustomPropertyStore>() };
+    let Some(registry) = (unsafe { registry.cast::<CustomPropertyRegistry>().as_ref() }) else {
+        return FfiRegisteredValueDeclarations::None;
+    };
+    let mut declarations = FfiRegisteredValueDeclarations::None;
+    for entry in store
+        .declared_names
+        .iter()
+        .filter_map(|name_raw| store.own_values.get(name_raw))
+    {
+        let is_registered = registry
+            .registrations
+            .get(&*entry.name)
+            .is_some_and(|registration| !matches!(registration.syntax, SyntaxNode::Universal));
+        if !is_registered {
+            continue;
+        }
+        if matches!(entry.value.data(), StyleValueData::Unresolved { .. }) {
+            return FfiRegisteredValueDeclarations::Substituted;
+        }
+        declarations = FfiRegisteredValueDeclarations::Parsed;
+    }
+    declarations
 }
 
 /// Hands every custom property a store declares itself to `callback`, in declaration order, with

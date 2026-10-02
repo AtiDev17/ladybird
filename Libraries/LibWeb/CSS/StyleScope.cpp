@@ -23,9 +23,11 @@
 #include <LibWeb/ComputedValuesRustFFI.h>
 #include <LibWeb/DOM/AdoptedStyleSheets.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/ValueParserRustFFI.h>
 
 namespace Web::CSS {
 
@@ -339,10 +341,11 @@ void StyleScope::build_rule_cache()
     }
 
     // A constructed-sheet cache can be shared by several shadow scopes. Its keyframes and other
-    // reference data are reusable, but each scope owns a distinct engine layer order and publishes
-    // this cache generation into that slot once.
+    // reference data are reusable, but each scope owns a distinct engine layer order and keyframes
+    // row, and publishes this cache generation into them once.
     if (m_published_layer_order_generation != style_cache.rule_cache_generation) {
         publish_cascade_layer_order();
+        publish_animation_keyframes();
         m_published_layer_order_generation = style_cache.rule_cache_generation;
     }
 }
@@ -369,6 +372,7 @@ void StyleScope::populate_rule_cache(StyleRuleCache& rule_cache)
 
 void StyleScope::invalidate_style_cache()
 {
+    document().note_style_sheet_set_change();
     invalidate_counter_style_cache();
     m_style_cache = nullptr;
     m_published_layer_order_generation = 0;
@@ -658,6 +662,49 @@ void StyleScope::publish_cascade_layer_order(StyleSheetState* pending_attachment
         [](void* document) { static_cast<DOM::Document*>(document)->flush_deferred_style_change_event(); });
 }
 
+// The `@keyframes` this scope defines, as the rule cache just built resolved them. The style computation resolves an
+// animation's keyframes from these, so it never builds a rule cache itself.
+void StyleScope::publish_animation_keyframes()
+{
+    auto const& keyframes = m_style_cache->rule_cache->rules_by_animation_keyframes;
+    Vector<u32> name_lengths;
+    Vector<u16> name_units;
+    Vector<size_t> keyframe_sets;
+    Vector<NonnullRefPtr<Animations::KeyframeEffect::KeyFrameSet const>> published;
+    name_lengths.ensure_capacity(keyframes.size());
+    keyframe_sets.ensure_capacity(keyframes.size());
+    published.ensure_capacity(keyframes.size());
+    for (auto const& [name, keyframe_set] : keyframes) {
+        name_lengths.unchecked_append(name.length_in_code_units());
+        for (size_t index = 0; index < name.length_in_code_units(); ++index)
+            name_units.append(name.code_unit_at(index));
+        keyframe_sets.unchecked_append(bit_cast<size_t>(keyframe_set.ptr()));
+        published.unchecked_append(*keyframe_set);
+    }
+    // A scope that defined nothing before and defines nothing now has no row to replace.
+    if (published.is_empty() && m_published_keyframe_sets.is_empty())
+        return;
+    StyleEngineFFI::style_engine_set_tree_scope_animation_keyframes(
+        document().style_computer().style_engine().rust_handle(), style_engine_tree_scope().value(),
+        bit_cast<FlatPtr>(as_if<DOM::ShadowRoot>(*m_node)), name_lengths.data(), name_units.data(), name_units.size(),
+        keyframe_sets.data(), name_lengths.size());
+    m_published_keyframe_sets = move(published);
+}
+
+Optional<StyleScope::DepartedAnimationKeyframes> StyleScope::take_published_animation_keyframes()
+{
+    // The scope publishes again in the document it joins, if it joins one, under the tree scope that document gives it.
+    m_published_layer_order_generation = 0;
+    auto* shadow_root = as_if<DOM::ShadowRoot>(*m_node);
+    if (!shadow_root || m_published_keyframe_sets.is_empty())
+        return {};
+    return DepartedAnimationKeyframes {
+        .tree_scope = shadow_root->style_engine_tree_scope(),
+        .shadow_root_identity = bit_cast<FlatPtr>(shadow_root),
+        .keyframe_sets = move(m_published_keyframe_sets),
+    };
+}
+
 TreeScopeID StyleScope::style_engine_tree_scope() const
 {
     return style_engine_tree_scope_for(*m_node);
@@ -667,11 +714,16 @@ void StyleScope::invalidate_counter_style_cache()
 {
     m_needs_counter_style_cache_update = true;
 
-    // FIXME: We only need to invalidate this style scope and those belonging to descendant shadow roots (since they may
-    //        include counter styles which extend the ones defined in this scope), not all style scopes in the document.
-    m_node->document().style_scope().m_needs_counter_style_cache_update = true;
+    // Only this style scope and those whose counter style names pass on to it, which may include counter styles that
+    // extend the ones defined in this scope, can resolve differently.
     m_node->document().for_each_shadow_root([&](DOM::ShadowRoot& shadow_root) {
-        shadow_root.style_scope().m_needs_counter_style_cache_update = true;
+        auto& scope = shadow_root.style_scope();
+        for (auto const* ancestor = scope.parent_counter_style_scope(); ancestor; ancestor = ancestor->parent_counter_style_scope()) {
+            if (ancestor == this) {
+                scope.m_needs_counter_style_cache_update = true;
+                break;
+            }
+        }
     });
 }
 
@@ -941,8 +993,11 @@ void StyleScope::build_counter_style_cache()
                 }
             }
         }
-        if (counter_style_environment_changed)
+        if (counter_style_environment_changed) {
             m_counter_style_environment_identity = document().next_counter_style_environment_identity();
+            // The style engine names the same registry on every record it computes against it.
+            document().style_computer().style_engine().set_counter_style_environment_identity(style_engine_tree_scope(), m_counter_style_environment_identity);
+        }
 
         m_is_doing_counter_style_cache_update = false;
         m_needs_counter_style_cache_update = false;
@@ -1051,7 +1106,72 @@ u64 StyleScope::counter_style_environment_identity() const
 {
     if (m_needs_counter_style_cache_update && !m_is_doing_counter_style_cache_update)
         const_cast<StyleScope*>(this)->build_counter_style_cache();
+    // NB: This is asked for whenever a style that depends on the counter style environment is published, which is
+    //     what the layout tree build and the generated content counter style comparison resolve counter styles
+    //     for, against the published registry.
+    if (!m_is_doing_counter_style_cache_update)
+        publish_counter_style_lookup_chain();
     return m_counter_style_environment_identity;
+}
+
+// The scope a counter style name this scope does not register is looked for in next, which is the chain
+// `dereference_global_tree_scoped_reference` walks.
+StyleScope* StyleScope::parent_counter_style_scope() const
+{
+    auto* shadow_root = as_if<DOM::ShadowRoot>(*m_node);
+    if (!shadow_root)
+        return nullptr;
+    auto* host = shadow_root->host();
+    if (!host)
+        return nullptr;
+    auto& root = host->root();
+    if (auto* host_shadow_root = as_if<DOM::ShadowRoot>(root)) {
+        if (host_shadow_root->uses_document_style_sheets())
+            return &root.document().style_scope();
+        return &host_shadow_root->style_scope();
+    }
+    if (auto* document = as_if<DOM::Document>(root))
+        return &document->style_scope();
+    // A detached host's node tree is rooted at an ordinary element, which carries no tree-scoped names of its own.
+    return nullptr;
+}
+
+// Settles every scope a counter style name used in this scope may be looked up in, and publishes what each registers
+// to the layout node arena, so that the arena answers every lookup the way get_registered_counter_style() would.
+void StyleScope::publish_counter_style_lookup_chain() const
+{
+    for (auto const* scope = this; scope; scope = scope->parent_counter_style_scope()) {
+        if (scope->m_needs_counter_style_cache_update && !scope->m_is_doing_counter_style_cache_update)
+            const_cast<StyleScope*>(scope)->build_counter_style_cache();
+        scope->publish_counter_styles_if_changed();
+    }
+}
+
+void StyleScope::publish_counter_styles_if_changed() const
+{
+    auto const* parent = parent_counter_style_scope();
+    auto parent_tree_scope = parent ? parent->style_engine_tree_scope() : Optional<TreeScopeID> {};
+    if (m_published_counter_style_environment_identity == m_counter_style_environment_identity && m_published_parent_counter_style_scope == parent_tree_scope)
+        return;
+
+    Vector<size_t> names;
+    Vector<Parser::ValueParserFFI::FfiRegisteredCounterStyle const*> counter_styles;
+    names.ensure_capacity(m_registered_counter_styles.size());
+    counter_styles.ensure_capacity(m_registered_counter_styles.size());
+    for (auto const& [name, counter_style] : m_registered_counter_styles) {
+        names.unchecked_append(name.to_raw_leaked());
+        counter_styles.unchecked_append(counter_style->rust_counter_style());
+    }
+    Parser::ValueParserFFI::rust_publish_counter_styles(
+        document().layout_node_arena().handle(),
+        style_engine_tree_scope().value(),
+        parent_tree_scope.has_value() ? parent_tree_scope->value() : 0,
+        parent_tree_scope.has_value(),
+        names.data(),
+        counter_styles.data(),
+        names.size());
+    m_published_counter_style_environment_identity = m_counter_style_environment_identity;
+    m_published_parent_counter_style_scope = parent_tree_scope;
 }
 
 DOM::Document& StyleScope::document() const

@@ -4,9 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use std::ops::ControlFlow;
+
 use smallvec::SmallVec;
 
-use super::cascade::{CascadeAttachment, CascadeContinuationID, Top1Winner};
+use super::cascade::{
+    CascadeAttachment, CascadeContinuationCeiling, CascadeContinuationID, Top1Winner, highest_candidate_below,
+};
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -367,6 +371,79 @@ impl RetainedState {
         )
     }
 
+    /// What one property of the node's cascade falls back to once substitutions turned some of its
+    /// declarations into `revert` or `revert-layer`. `reverted` names each such declaration by its
+    /// priority, with the keyword it substituted to. The property's candidates are gathered again
+    /// from the node's match answer, which keeps every declaration beaten by a winner whose
+    /// substitution may come out as a revert keyword (see
+    /// `compact_matches_for_cascade_with_scratch`), and from its own declarations, as the
+    /// cascade gathers them, and the cascade is resolved again with each reverted declaration
+    /// acting as its keyword. `Ok(None)` leaves the property undeclared. `Err` when the candidates are not
+    /// the ones the node's winners were reduced from: they miss a declaration `reverted` names.
+    pub(super) fn winner_below_substitution(
+        &self,
+        node: StyleNodeID,
+        pseudo_kind: Option<u8>,
+        property: u16,
+        reverted: &[(CascadePriority, CascadeOperator)],
+    ) -> Result<Option<PropertyWinner>, ()> {
+        let mut candidates = Vec::new();
+        let wants = |declared: u16| declared == property;
+        let answered =
+            self.try_for_each_answer_match(node, pseudo_kind, |rule, tree_scope, specificity, scope_proximity| {
+                // A gated rule is a candidate where its conditions held for the target as the
+                // node's winners were published.
+                if self.published_container_verdict_holds(node, rule, pseudo_kind.is_some()) {
+                    self.push_rule_cascade_candidates(
+                        rule,
+                        tree_scope,
+                        specificity,
+                        scope_proximity,
+                        &wants,
+                        &mut candidates,
+                    );
+                }
+                ControlFlow::Continue(())
+            });
+        if answered.is_none() {
+            return Err(());
+        }
+        if pseudo_kind.is_none() {
+            self.push_element_cascade_candidates(node, &wants, &mut candidates);
+        }
+        candidates.sort_unstable_by_key(|candidate| candidate.winner.priority);
+        // As `WinnerGroups::resolve_candidates` resolves, each revert keyword setting a ceiling the
+        // candidates below it have to be under.
+        let mut ceilings = SmallVec::<[CascadeContinuationCeiling; 2]>::new();
+        let mut end = candidates.len();
+        let mut reverted_reached = 0;
+        let winner = loop {
+            let Some(index) = highest_candidate_below(&candidates[..end], &ceilings) else {
+                break None;
+            };
+            let candidate = candidates[index];
+            let operator = match reverted
+                .iter()
+                .find(|(priority, _)| *priority == candidate.winner.priority)
+            {
+                Some(&(_, operator)) => {
+                    reverted_reached += 1;
+                    operator
+                }
+                None => candidate.winner.key.operator,
+            };
+            let Some(ceiling) = candidate.stratum.ceiling(operator) else {
+                break Some(candidate.winner);
+            };
+            ceilings.push(ceiling);
+            end = index;
+        };
+        if reverted_reached != reverted.len() {
+            return Err(());
+        }
+        Ok(winner)
+    }
+
     pub(super) fn resolved_cascade_winners_for_properties(
         &mut self,
         node: StyleNodeID,
@@ -385,76 +462,30 @@ impl RetainedState {
         properties: Option<&[u16]>,
         candidates: &mut Vec<OrderedCascadeCandidate>,
     ) -> Vec<PropertyWinner> {
-        let wants = |property| properties.is_none_or(|properties| properties.binary_search(&property).is_ok());
+        let wants = |property: u16| properties.is_none_or(|properties| properties.binary_search(&property).is_ok());
         candidates.clear();
-        for entry in matches.iter().filter(|entry| entry.pseudo_element == pseudo) {
-            let mut priority_and_stratum_by_importance = [None; 2];
-            for &declared in self.program.declared_properties_of(entry.rule) {
-                // A shorthand written with a substitution is declared whole beside the longhands
-                // it pends; the longhands are the winners, the shorthand names no column.
-                if !wants(declared.property) || !property_is_longhand(declared.property) {
-                    continue;
-                }
-                let (priority, stratum) = *priority_and_stratum_by_importance[declared.important as usize]
-                    .get_or_insert_with(|| {
-                        (
-                            self.cascade_priority_of(
-                                entry.rule,
-                                entry.tree_scope,
-                                entry.specificity,
-                                entry.scope_proximity,
-                                declared.important,
-                            ),
-                            self.cascade_stratum_of(entry.rule, entry.tree_scope, declared.important),
-                        )
-                    });
-                candidates.push(OrderedCascadeCandidate {
-                    winner: PropertyWinner {
-                        property: declared.property,
-                        important: declared.important,
-                        key: Self::retained_rule_winner_key(declared),
-                        priority,
-                        source: WinnerSource::Rule(entry.rule),
-                    },
-                    stratum,
-                });
-            }
+        // A gated rule is a candidate where its container conditions hold for the target now.
+        let conditions_hold = |rule: RuleID| {
+            !self.program.rule_is_gated_by_container_query(rule)
+                || self
+                    .rule_container_verdict(rule, node, pseudo.is_some())
+                    .is_some_and(|verdict| verdict.matches)
+        };
+        for entry in matches
+            .iter()
+            .filter(|entry| entry.pseudo_element == pseudo && conditions_hold(entry.rule))
+        {
+            self.push_rule_cascade_candidates(
+                entry.rule,
+                entry.tree_scope,
+                entry.specificity,
+                entry.scope_proximity,
+                &wants,
+                candidates,
+            );
         }
         if pseudo.is_none() {
-            for kind in ElementDeclarationKind::ALL {
-                // Custom properties an inline style declares beside its longhands leave those
-                // longhands as complete as any; the environment they decide is computed apart.
-                let (declared_properties, _) = self.facts.element_declared_properties(node, kind);
-                if !self
-                    .facts
-                    .element_declarations_are_complete_but_for_custom_properties(node, kind)
-                {
-                    continue;
-                }
-                let mut priority_and_stratum_by_importance = [None; 2];
-                for &declared in declared_properties {
-                    if !wants(declared.property) || !property_is_longhand(declared.property) {
-                        continue;
-                    }
-                    let (priority, stratum) = *priority_and_stratum_by_importance[declared.important as usize]
-                        .get_or_insert_with(|| {
-                            (
-                                self.element_cascade_priority(node, kind, declared.important),
-                                self.element_cascade_stratum(node, kind, declared.important),
-                            )
-                        });
-                    candidates.push(OrderedCascadeCandidate {
-                        winner: PropertyWinner {
-                            property: declared.property,
-                            important: declared.important,
-                            key: Self::retained_rule_winner_key(declared),
-                            priority,
-                            source: WinnerSource::Element(kind),
-                        },
-                        stratum,
-                    });
-                }
-            }
+            self.push_element_cascade_candidates(node, &wants, candidates);
         }
         candidates.sort_unstable_by_key(|candidate| candidate.winner.property);
         let mut winners = Vec::new();
@@ -468,6 +499,86 @@ impl RetainedState {
             start = end;
         }
         winners
+    }
+
+    /// Push the cascade candidates a matched rule declares for the longhands `wants` names. A
+    /// shorthand written with a substitution is declared whole beside the longhands it pends; the
+    /// longhands are the candidates, the shorthand names no column.
+    fn push_rule_cascade_candidates(
+        &self,
+        rule: RuleID,
+        tree_scope: TreeScopeID,
+        specificity: Specificity,
+        scope_proximity: u32,
+        wants: &impl Fn(u16) -> bool,
+        candidates: &mut Vec<OrderedCascadeCandidate>,
+    ) {
+        let mut priority_and_stratum_by_importance = [None; 2];
+        for &declared in self.program.declared_properties_of(rule) {
+            if !wants(declared.property) || !property_is_longhand(declared.property) {
+                continue;
+            }
+            let (priority, stratum) = *priority_and_stratum_by_importance[declared.important as usize]
+                .get_or_insert_with(|| {
+                    (
+                        self.cascade_priority_of(rule, tree_scope, specificity, scope_proximity, declared.important),
+                        self.cascade_stratum_of(rule, tree_scope, declared.important),
+                    )
+                });
+            candidates.push(OrderedCascadeCandidate {
+                winner: PropertyWinner {
+                    property: declared.property,
+                    important: declared.important,
+                    key: Self::retained_rule_winner_key(declared),
+                    priority,
+                    source: WinnerSource::Rule(rule),
+                },
+                stratum,
+            });
+        }
+    }
+
+    /// Push the cascade candidates a node's own declarations hold for the longhands `wants` names.
+    fn push_element_cascade_candidates(
+        &self,
+        node: StyleNodeID,
+        wants: &impl Fn(u16) -> bool,
+        candidates: &mut Vec<OrderedCascadeCandidate>,
+    ) {
+        for kind in ElementDeclarationKind::ALL {
+            // Custom properties an inline style declares beside its longhands leave those
+            // longhands as complete as any; the environment they decide is computed apart.
+            let (declared_properties, _) = self.facts.element_declared_properties(node, kind);
+            if !self
+                .facts
+                .element_declarations_are_complete_but_for_custom_properties(node, kind)
+            {
+                continue;
+            }
+            let mut priority_and_stratum_by_importance = [None; 2];
+            for &declared in declared_properties {
+                if !wants(declared.property) || !property_is_longhand(declared.property) {
+                    continue;
+                }
+                let (priority, stratum) = *priority_and_stratum_by_importance[declared.important as usize]
+                    .get_or_insert_with(|| {
+                        (
+                            self.element_cascade_priority(node, kind, declared.important),
+                            self.element_cascade_stratum(node, kind, declared.important),
+                        )
+                    });
+                candidates.push(OrderedCascadeCandidate {
+                    winner: PropertyWinner {
+                        property: declared.property,
+                        important: declared.important,
+                        key: Self::retained_rule_winner_key(declared),
+                        priority,
+                        source: WinnerSource::Element(kind),
+                    },
+                    stratum,
+                });
+            }
+        }
     }
 
     pub(super) fn intern_cascade_state(
@@ -558,6 +669,13 @@ impl RetainedState {
         }
         self.order_matches_in_cascade(all, can_have_scope_duplicates);
         counters.add(Counter::CascadeMatchesBeforeCompaction, all.len() as u64);
+        if let Some(node) = publish_winners_for
+            && all
+                .iter()
+                .any(|entry| self.program.rule_is_gated_by_container_query(entry.rule))
+        {
+            self.note_container_gates_for_publication(node, effects);
+        }
         let compaction_blocked = !self.cascade_winner_inventory_is_complete(all, publish_winners_for);
         let has_continuations = all.iter().any(|entry| {
             self.program.declared_properties_of(entry.rule).iter().any(|declared| {
@@ -621,15 +739,36 @@ impl RetainedState {
         top_1.clear();
         let element_top_1 = &mut workspace.element_top_1;
         element_top_1.clear();
+        // A gated rule's conditions are decided for the node over its containers as they stand:
+        // the rule is a candidate only where they hold, and the verdicts are kept with the winners,
+        // which the record loop checks again once the node's ancestors have settled. One the engine
+        // cannot decide is kept as undecided, not as failed: it leaves the node to the host.
+        let mut container_verdicts = Vec::new();
         for (match_index, entry) in all.iter().enumerate() {
             if compaction_blocked
-                && (entry.tree_scope != TreeScopeID::DOCUMENT
-                    || self.program.rule_is_gated_by_container_query(entry.rule)
+                && (!self.match_scope_is_complete_for(publish_winners_for, entry.tree_scope)
+                    || !self.container_gate_is_held(publish_winners_for, entry.rule)
                     || !self
                         .program
                         .declarations_are_complete_but_for_custom_properties(entry.rule))
             {
                 continue;
+            }
+            if self.program.rule_is_gated_by_container_query(entry.rule)
+                && let Some(node) = publish_winners_for
+            {
+                let pseudo = entry.pseudo_element.is_some();
+                let held = self
+                    .rule_container_verdict(entry.rule, node, pseudo)
+                    .map(|verdict| verdict.matches);
+                container_verdicts.push(PublishedContainerVerdict {
+                    rule: entry.rule,
+                    pseudo,
+                    held,
+                });
+                if held != Some(true) {
+                    continue;
+                }
             }
             let declared_properties = self.program.declared_properties_of(entry.rule);
             let mut priorities = [None; 2];
@@ -661,6 +800,7 @@ impl RetainedState {
             }
         }
         if let Some(node) = publish_winners_for {
+            self.publish_container_verdicts(node, container_verdicts);
             for kind in ElementDeclarationKind::ALL {
                 let (declared_properties, _) = self.facts.element_declared_properties(node, kind);
                 if !self
@@ -767,12 +907,29 @@ impl RetainedState {
                     .sparse()
                     .ok()
                     .map(|(_, state)| state);
-                let state = self.intern_cascade_state(winners, previous, counters);
+                // A pseudo-element whose rules declare custom properties past their longhand
+                // winners holds them in its state: the state then says all its rules declare.
+                let pseudo_custom_declarations = target
+                    .filter(|&target| {
+                        !self.cascade_winner_inventory_is_complete_for_target(all, Some(node), Some(target))
+                            && self.cascade_winner_inventory_is_complete_but_for_custom_properties_for_target(
+                                node, all, target,
+                            )
+                    })
+                    .and_then(|target| self.cascaded_pseudo_custom_declarations_in(node, all, target));
+                let state = match &pseudo_custom_declarations {
+                    Some(custom_declarations) => self.with_cascade_interning_counters(
+                        |groups| groups.intern_sorted_with_custom_declarations(winners, custom_declarations, previous),
+                        counters,
+                    ),
+                    None => self.intern_cascade_state(winners, previous, counters),
+                };
                 published_states.push(PublishedWinnerState {
                     target: *target,
                     state,
                     inventory_is_complete: target.is_none_or(|target| {
-                        self.cascade_winner_inventory_is_complete_for_target(all, Some(node), Some(target))
+                        pseudo_custom_declarations.is_some()
+                            || self.cascade_winner_inventory_is_complete_for_target(all, Some(node), Some(target))
                     }),
                 });
             }
@@ -792,12 +949,7 @@ impl RetainedState {
 
         let keep = &mut workspace.keep;
         keep.clear();
-        keep.resize(all.len(), false);
-        for (index, entry) in all.iter().enumerate() {
-            if self.program.sheet_origin(self.program.rule_sheet(entry.rule)) != CascadeOrigin::Author {
-                keep[index] = true;
-            }
-        }
+        keep.extend(all.iter().map(|entry| self.compaction_keeps_verbatim(entry.rule)));
         for winner in top_1.unordered_winners() {
             if let CascadeCompactionCandidate::Rule(match_index, _) = winner.payload {
                 keep[match_index] = true;
@@ -830,6 +982,51 @@ impl RetainedState {
                             .continuation(winner.key.continuation)
                             .and_then(|continuation| continuation.winner);
                     }
+                }
+            }
+        }
+
+        // A winner written with a substitution that may substitute a `revert` or `revert-layer`
+        // rolls its property back to the declarations it beat. A record computation gathers those
+        // from the answer again (`winner_below_substitution`), so a match declaring such a
+        // property is kept whatever else it loses.
+        if keep.iter().any(|kept| !kept) {
+            let may_substitute_revert = |value| match self.specified_values.value(value) {
+                Lookup::Known(value) => custom_property_cascade::value_may_substitute_revert(value),
+                _ => false,
+            };
+            let mut substituted: SmallVec<[(Option<tree::PseudoElementTarget>, u16); 4]> = SmallVec::new();
+            let top_1_winners = top_1.unordered_winners().map(|winner| (winner.key, winner.payload));
+            let element_winners = element_top_1
+                .winners
+                .iter()
+                .map(|winner| ((None, winner.key), winner.payload));
+            for (key, payload) in top_1_winners.chain(element_winners) {
+                let (CascadeCompactionCandidate::Rule(_, declared) | CascadeCompactionCandidate::Element(_, declared)) =
+                    payload;
+                if may_substitute_revert(declared.value) {
+                    substituted.push(key);
+                }
+            }
+            // A winner a continuation reached is not a top candidate.
+            if has_continuations {
+                for (target, range) in published_targets.iter() {
+                    for &winner in &published_winners[range.clone()] {
+                        if let Some(winner) = self.winner_groups.resolved_winner(winner)
+                            && may_substitute_revert(winner.key.value)
+                        {
+                            substituted.push((*target, winner.property));
+                        }
+                    }
+                }
+            }
+            if !substituted.is_empty() {
+                for (index, entry) in all.iter().enumerate() {
+                    keep[index] |= self
+                        .program
+                        .declared_properties_of(entry.rule)
+                        .iter()
+                        .any(|declared| substituted.contains(&(entry.pseudo_element, declared.property)));
                 }
             }
         }
@@ -946,6 +1143,26 @@ impl RetainedState {
         counters.add(Counter::CascadeNodeHandlesPublished, published_row_count as u64);
     }
 
+    /// Whether a winner of the state may substitute a revert keyword, which rolls its property back
+    /// to the declarations it beat: the general compaction keeps those, which the winners do not
+    /// name.
+    fn state_may_substitute_revert(&self, state: CascadeStateID) -> bool {
+        self.winner_groups.winners_in_state(state).any(|winner| {
+            matches!(
+                self.specified_values.value(winner.key.value),
+                Lookup::Known(value) if custom_property_cascade::value_may_substitute_revert(value)
+            )
+        })
+    }
+
+    /// Whether compacting a cascade input keeps a rule's matches whatever the winners say: a
+    /// non-author match keeps the origin the consumer resolves, and a container-gated one is
+    /// decided again when its containers move, where a rule that loses now may win.
+    pub(super) fn compaction_keeps_verbatim(&self, rule: RuleID) -> bool {
+        self.program.sheet_origin(self.program.rule_sheet(rule)) != CascadeOrigin::Author
+            || self.program.rule_is_gated_by_container_query(rule)
+    }
+
     /// Reuse a complete, freshly updated element winner state instead of reducing declarations
     /// again. Cascade continuations retain the general compaction path.
     pub(super) fn compact_matches_from_updated_winners(
@@ -982,14 +1199,14 @@ impl RetainedState {
         else {
             return false;
         };
+        if self.state_may_substitute_revert(state) {
+            return false;
+        }
         let Some(rules) = self.winner_groups.rules_for_compaction(state) else {
             return false;
         };
         counters.add(Counter::CascadeMatchesBeforeCompaction, all.len() as u64);
-        all.retain(|entry| {
-            self.program.sheet_origin(self.program.rule_sheet(entry.rule)) != CascadeOrigin::Author
-                || rules.binary_search(&entry.rule).is_ok()
-        });
+        all.retain(|entry| self.compaction_keeps_verbatim(entry.rule) || rules.binary_search(&entry.rule).is_ok());
         verify_style_answer_patch(self, counters, |verifier| {
             verifier.verify_cascade_answer(all, node, "compaction from updated winners");
         });
@@ -1012,6 +1229,9 @@ impl RetainedState {
         else {
             return false;
         };
+        if self.state_may_substitute_revert(state) {
+            return false;
+        }
         let Some(element_rules) = self.winner_groups.rules_for_compaction(state) else {
             return false;
         };
@@ -1035,16 +1255,19 @@ impl RetainedState {
             else {
                 return false;
             };
+            if self.state_may_substitute_revert(state) {
+                return false;
+            }
             let Some(rules) = self.winner_groups.rules_for_compaction(state) else {
                 return false;
             };
             // A target with no winning declarations still needs one match to preserve its
-            // presence. A non-author match already retained verbatim serves that purpose.
+            // presence. A match already retained verbatim serves that purpose.
             let marker = if rules.is_empty()
-                && !all.iter().any(|entry| {
-                    entry.pseudo_element == Some(pseudo)
-                        && self.program.sheet_origin(self.program.rule_sheet(entry.rule)) != CascadeOrigin::Author
-                }) {
+                && !all
+                    .iter()
+                    .any(|entry| entry.pseudo_element == Some(pseudo) && self.compaction_keeps_verbatim(entry.rule))
+            {
                 all.iter().position(|entry| entry.pseudo_element == Some(pseudo))
             } else {
                 None
@@ -1061,7 +1284,7 @@ impl RetainedState {
         counters.add(Counter::CascadeMatchesBeforeCompaction, all.len() as u64);
         let mut index = 0;
         all.retain(|entry| {
-            let retained = self.program.sheet_origin(self.program.rule_sheet(entry.rule)) != CascadeOrigin::Author
+            let retained = self.compaction_keeps_verbatim(entry.rule)
                 || match entry.pseudo_element {
                     None => element_rules.binary_search(&entry.rule).is_ok(),
                     Some(pseudo) => {
@@ -1386,9 +1609,9 @@ impl RetainedState {
             .iter()
             .filter(|entry| entry.pseudo_element == pseudo)
             .any(|entry| {
-                self.program.rule_is_gated_by_container_query(entry.rule)
+                !self.container_gate_is_held(node, entry.rule)
                     || !self.program.declarations_are_complete_for(entry.rule)
-                    || entry.tree_scope != TreeScopeID::DOCUMENT
+                    || !self.match_scope_is_complete_for(node, entry.tree_scope)
             })
             || (pseudo.is_none()
                 && node.is_some_and(|node| {
@@ -1396,6 +1619,83 @@ impl RetainedState {
                         .iter()
                         .any(|&kind| !self.facts.element_declared_properties(node, kind).1)
                 })))
+    }
+
+    /// Whether a pseudo-element's rules declare nothing past its longhand winners but custom
+    /// properties, which its state holds itself.
+    fn cascade_winner_inventory_is_complete_but_for_custom_properties_for_target(
+        &self,
+        node: StyleNodeID,
+        matches: &[RuleMatch],
+        pseudo: tree::PseudoElementTarget,
+    ) -> bool {
+        !matches
+            .iter()
+            .filter(|entry| entry.pseudo_element == Some(pseudo))
+            .any(|entry| {
+                !self.container_gate_is_held(Some(node), entry.rule)
+                    || !self
+                        .program
+                        .declarations_are_complete_but_for_custom_properties(entry.rule)
+                    || !self.match_scope_is_complete_for(Some(node), entry.tree_scope)
+            })
+    }
+
+    /// Whether the winners the cascade publishes for a node hold a match from a rule in the given
+    /// tree scope: a document rule's do, and so does a rule's from the element's own tree scope,
+    /// for the element and its pseudo-elements alike. A rule reaching across a shadow boundary
+    /// (`:host`, `::slotted`, `::part`) decides from its own context, and the winners hold it when
+    /// that context is one the element's cascade weighs where a rule's priority places it, which
+    /// is at its encapsulation depth, the same for every element it matches.
+    pub(super) fn match_scope_is_complete_for(&self, node: Option<StyleNodeID>, scope: TreeScopeID) -> bool {
+        if scope == TreeScopeID::DOCUMENT {
+            return true;
+        }
+        let Some(node) = node else {
+            return false;
+        };
+        self.tree.tree_scope(node) == scope
+            || self
+                .author_context_index(node, scope)
+                .is_some_and(|index| index == self.tree_scope_depth(scope))
+    }
+
+    /// Where a tree scope stands among the encapsulation contexts that decide for an element,
+    /// outermost first, the order its cascade applies them in: the document, the shadow trees the
+    /// element is in from the outermost inwards, the ones holding the slots it is assigned to along
+    /// its assignment chain, then the element's own shadow tree, for `:host`. `None` when the scope
+    /// is none of them.
+    pub(super) fn author_context_index(&self, node: StyleNodeID, scope: TreeScopeID) -> Option<u32> {
+        let mut contexts: SmallVec<[TreeScopeID; 8]> = SmallVec::new();
+        let mut append = |scope: TreeScopeID| {
+            if !contexts.contains(&scope) {
+                contexts.push(scope);
+            }
+        };
+        append(TreeScopeID::DOCUMENT);
+        let mut chain: SmallVec<[TreeScopeID; 4]> = SmallVec::new();
+        let mut current = self.tree.tree_scope(node);
+        while current != TreeScopeID::DOCUMENT {
+            if chain.contains(&current) {
+                return None;
+            }
+            chain.push(current);
+            let host = self.scope_root(current).and_then(|root| self.tree.host_of(root))?;
+            current = self.tree.tree_scope(host);
+        }
+        for &scope in chain.iter().rev() {
+            append(scope);
+        }
+        for slotted_into in self.scopes_slotted_into(node) {
+            append(slotted_into);
+        }
+        if let Some(shadow_root) = self.tree.shadow_root_of(node) {
+            append(self.tree.tree_scope(shadow_root));
+        }
+        contexts
+            .iter()
+            .position(|&context| context == scope)
+            .map(|index| index as u32)
     }
 
     pub(super) fn cascade_winner_inventory_is_complete(
@@ -1406,14 +1706,31 @@ impl RetainedState {
         // Checking every target covers every match. Check each inventory once instead
         // of scanning the answer again for every rule matching the same pseudo target.
         !matches.iter().any(|entry| {
-            self.program.rule_is_gated_by_container_query(entry.rule)
+            !self.container_gate_is_held(node, entry.rule)
                 || !self.program.declarations_are_complete_for(entry.rule)
-                || entry.tree_scope != TreeScopeID::DOCUMENT
+                || !self.match_scope_is_complete_for(node, entry.tree_scope)
         }) && !node.is_some_and(|node| {
             ElementDeclarationKind::ALL
                 .iter()
                 .any(|&kind| !self.facts.element_declared_properties(node, kind).1)
         })
+    }
+
+    /// As `cascade_winner_inventory_is_complete`, for winners published in the transaction `effects`
+    /// belong to. Whether a gated rule is held is noted as the node's winners are published, so
+    /// before that it is what held for the winners published last; an ancestor's answer that
+    /// moves now leaves the rule undecided again.
+    pub(super) fn cascade_winner_inventory_is_complete_in_transaction(
+        &self,
+        effects: &AnswerEffects,
+        matches: &[RuleMatch],
+        node: StyleNodeID,
+    ) -> bool {
+        self.cascade_winner_inventory_is_complete(matches, Some(node))
+            && !(matches
+                .iter()
+                .any(|entry| self.program.rule_is_gated_by_container_query(entry.rule))
+                && self.container_ancestor_answer_moves(node, effects))
     }
 
     /// Exactly match every style node in the document scope against the attached program.
@@ -1846,12 +2163,6 @@ impl StyleEngineState {
         }
         // Held back rather than owed: without a root there is no transaction to take them.
         self.host.deferred_element_style_inputs_are_pending = false;
-        self.host.externally_recorded_style_input_nodes.extend(
-            self.host
-                .deferred_element_style_inputs
-                .iter()
-                .filter_map(|input| input.key.style_node()),
-        );
         self.release_transaction(transaction);
     }
 
@@ -1906,6 +2217,7 @@ impl StyleEngineState {
             .resize_required_to(&mut self.retained.memory, 0);
         self.retained.facts.release_staging(&mut self.retained.memory);
         self.host.program_staging.clear();
+        self.host.environment_move_changed_names.clear();
         self.sweep_selector_programs();
         self.shed_routing_for_detached_sheets();
     }
@@ -1924,6 +2236,12 @@ impl StyleEngineState {
         visited += self.retained.facts.collect_atoms(&mut atoms);
         visited += self.retained.program.collect_atoms(&mut atoms);
         visited += self.retained.programs.collect_atoms(&mut atoms);
+        for reads in self.retained.host_var_reads.values() {
+            if let inputs::HostVarReads::Names(names) = reads {
+                atoms.extend(names.iter().copied());
+                visited += names.len() as u64;
+            }
+        }
         if !self.retained.html_element_namespace.is_none() {
             atoms.insert(self.retained.html_element_namespace);
         }
@@ -1931,9 +2249,7 @@ impl StyleEngineState {
     }
 
     pub(super) fn sweep_style_atoms(&mut self, counters: &mut Counters) {
-        let decision = self.retained.atoms.sweep_decision();
-        counters.add(Counter::AtomSweepPinReleasesSkipped, decision.skipped_pin_releases);
-        if !decision.should_sweep && self.host.replay_reclaimed_style_atoms.is_none() {
+        if !self.retained.atoms.should_sweep() && self.host.replay_reclaimed_style_atoms.is_none() {
             return;
         }
         if self.retained.batch_matching_traversal.is_some() {

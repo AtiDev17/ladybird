@@ -44,6 +44,10 @@ public:
 
     Gfx::Size<double> viewport_size_for_percentage_resolution();
 
+    // Republishes the element's parsed attributes to the layout node arena, which is where a running
+    // layout pass reads them.
+    void publish_svg_attribute_facts();
+
     GC::Ref<SVGAnimatedLength> svg_animated_length_for_attribute(Utf16FlyString const&, SVGLength::Directionality, SVGLengthValue default_value);
 
     virtual bool is_presentational_hint(Utf16FlyString const&) const final override;
@@ -52,7 +56,7 @@ public:
 
     virtual SVGFitToViewBox const* fit_to_view_box() const { return nullptr; }
 
-    void register_resource_box_referencing_element(Badge<Layout::LayoutTreeBuilderAccess>, DOM::Element&);
+    void register_resource_box_referencing_element(Badge<DOM::CommitMessages>, DOM::Element&);
     void mark_resource_box_referencing_elements_for_content_change();
     void note_svg_paint_resource_description_may_have_changed();
 

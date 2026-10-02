@@ -25,6 +25,7 @@
 #include <LibJS/Runtime/Object.h>
 #include <LibJS/Runtime/Reference.h>
 #include <LibJS/Runtime/VM.h>
+#include <LibMediaClient/Client.h>
 #include <LibURL/Parser.h>
 #include <LibWeb/ARIA/AriaData.h>
 #include <LibWeb/ARIA/StateAndProperties.h>
@@ -64,6 +65,7 @@
 #include <LibWeb/HTML/EventLoop/TaskQueue.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLElement.h>
+#include <LibWeb/HTML/HTMLIFrameElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
 #include <LibWeb/HTML/HistoryExecutor.h>
@@ -1158,12 +1160,14 @@ bool Internals::headless()
 
 bool Internals::needs_repaint()
 {
+    window().associated_document().drain_invalidation_journal();
     auto local_root = local_root_of(window());
     return local_root && local_root->needs_repaint();
 }
 
 bool Internals::needs_display_list_record()
 {
+    window().associated_document().drain_invalidation_journal();
     auto local_root = local_root_of(window());
     return local_root && local_root->needs_to_record_display_list();
 }
@@ -1362,6 +1366,14 @@ Utf16String Internals::dump_session_store_tab_state()
     return dump_string_to_utf16(window().associated_document().page().client().page_did_request_session_store_tab_state_for_testing());
 }
 
+bool Internals::has_populated_document(HTML::HTMLIFrameElement& iframe)
+{
+    auto navigable = iframe.content_navigable();
+    if (!navigable)
+        return false;
+    return window().associated_document().page().client().page_did_request_has_populated_document_for_testing(navigable->id());
+}
+
 Utf16String Internals::dump_site_isolation_process_tree()
 {
     return dump_string_to_utf16(window().associated_document().page().client().dump_site_isolation_process_tree_for_testing());
@@ -1370,6 +1382,21 @@ Utf16String Internals::dump_site_isolation_process_tree()
 void Internals::crash_remote_frame_processes()
 {
     window().associated_document().page().client().crash_remote_frame_processes_for_testing();
+}
+
+void Internals::stop_loading_through_ui_process()
+{
+    window().associated_document().page().client().stop_loading_through_ui_process_for_testing();
+}
+
+void Internals::reload_through_ui_process()
+{
+    window().associated_document().page().client().reload_through_ui_process_for_testing();
+}
+
+void Internals::traverse_history_through_ui_process(i32 delta)
+{
+    window().associated_document().page().client().traverse_history_by_delta_through_ui_process_for_testing(delta);
 }
 
 GC::Ref<WebIDL::Promise> Internals::flush_session_history_traversal_queue()
@@ -1499,6 +1526,12 @@ void Internals::set_media_element_paused(HTML::HTMLMediaElement& element, bool p
 void Internals::set_media_element_seeking(HTML::HTMLMediaElement& element, bool seeking)
 {
     element.set_seeking(seeking);
+}
+
+void Internals::disconnect_media_server()
+{
+    if (auto client = MediaClient::Client::acquire(); !client.is_error())
+        client.value()->shutdown();
 }
 
 void Internals::set_page_muted(bool muted)
@@ -2261,7 +2294,7 @@ GC::Ref<JS::Object> Internals::style_invalidation_counters_object() const
     object->define_direct_property("registeredPropertiesCacheRebuilds"_utf16_fly_string, JS::Value(counters.registered_properties_cache_rebuilds), JS::default_attributes);
     object->define_direct_property("scopeRuleCacheBuilds"_utf16_fly_string, JS::Value(counters.scope_rule_cache_builds), JS::default_attributes);
     object->define_direct_property("styleQueryContainerScans"_utf16_fly_string, JS::Value(counters.style_query_container_scans), JS::default_attributes);
-    object->define_direct_property("sizeQueryContainerScanVisits"_utf16_fly_string, JS::Value(counters.size_query_container_scan_visits), JS::default_attributes);
+    object->define_direct_property("sizeQueryContainerScanVisits"_utf16_fly_string, JS::Value(document.style_computer().style_engine().size_query_container_scan_visits(false)), JS::default_attributes);
     object->define_direct_property("styleEngineTransactionSetups"_utf16_fly_string, JS::Value(counters.style_engine_transaction_setups), JS::default_attributes);
     object->define_direct_property("styleEngineTransactionSetupMicroseconds"_utf16_fly_string, JS::Value(counters.style_engine_transaction_setup_microseconds), JS::default_attributes);
     object->define_direct_property("styleEnginePlanningMicroseconds"_utf16_fly_string, JS::Value(counters.style_update_bridge_microseconds), JS::default_attributes);

@@ -2605,9 +2605,8 @@ impl<'pass> FlexFormattingContext<'pass> {
                 let main_size_property = self.select_main(style.width(), style.height());
                 let main_min_size_property = self.select_main(style.min_width(), style.min_height());
                 let main_max_size_property = self.select_main(style.max_width(), style.max_height());
-                let node_id = unsafe { (self.callbacks.host.node_unique_id)(self.callbacks.shell(node)) };
                 items.push(formatting_context::FlexLayoutItem {
-                    node_id: (node_id >= 0).then_some(node_id),
+                    style_node: self.callbacks.arena().dom_node_style_node(node),
                     rect,
                     main_base_size: item.flex_base_size,
                     main_delta_size: item.target_main_size - item.flex_base_size,
@@ -2677,7 +2676,7 @@ impl<'pass> FlexFormattingContext<'pass> {
                 as u8,
             lines,
         };
-        self.container_used().rare_data_mut().flex_layout_data = Some(std::rc::Rc::new(data));
+        self.container_used().rare_data_mut().flex_layout_data = Some(std::sync::Arc::new(data));
     }
 
     // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-automatic

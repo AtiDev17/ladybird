@@ -823,6 +823,11 @@ static ReadonlySpan<CSS::ComputedValuesFFI::FfiAnimatedOverlayEntry> animated_ov
 
 AnimationUpdateContext::~AnimationUpdateContext()
 {
+    publish();
+}
+
+void AnimationUpdateContext::publish()
+{
     for (auto& it : elements) {
         auto style = it.value.target_style;
         if (!style)
@@ -864,27 +869,14 @@ AnimationUpdateContext::~AnimationUpdateContext()
         if (!style_computer.style_engine().animation_overlay_changed(it.value.style_record_before_update, style->animated_overlay()))
             continue;
 
-        auto computed_values = [&] {
-            auto previous_values = element.computed_style();
-            if (previous_values)
-                return style_computer.build_animated_computed_values(*style, element, element.style_scope(), *previous_values);
-            return style_computer.build_computed_values(*style, element, element.style_scope());
-        }();
-        Array<void const*, to_underlying(CSS::StyleGroupIndex::Count)> payloads;
-        for (size_t index = 0; index < payloads.size(); ++index)
-            payloads[index] = computed_values->style_group_payload(static_cast<CSS::StyleGroupIndex>(index));
-        auto animated_property_invalidation = style_computer.style_engine().compare_animation_overlay(
-            it.value.style_record_before_update,
-            style->animated_overlay(),
-            payloads,
-            !element.pseudo_element().has_value() && target->is_document_element());
+        auto [animated_property_invalidation, publication] = style_computer.publish_sampled_animation_overlay(element, *style, it.value.style_record_before_update, [&](auto const& overlay_invalidation) {
+            if (style->animated_overlay() && !animated_overlay_entries(style->animated_overlay()).is_empty()
+                && target->document().is_in_style_stabilization_epoch()
+                && (target->document().style_stabilization_has_style_reactions() || overlay_invalidation.requires_base_style_recomputation)) {
+                style_computer.record_transition_stabilization_baseline(element, it.value.style_record_before_update);
+            }
+        });
         auto invalidation = CSS::decode_style_invalidation(animated_property_invalidation.invalidation);
-        if (style->animated_overlay() && !animated_overlay_entries(style->animated_overlay()).is_empty()
-            && target->document().is_in_style_stabilization_epoch()
-            && (target->document().style_stabilization_has_style_reactions() || animated_property_invalidation.requires_base_style_recomputation)) {
-            target->document().style_computer().record_transition_stabilization_baseline(element);
-        }
-        auto publication = target->document().style_computer().publish_animation_overlay(element, *computed_values);
         target->refresh_computed_style(element.pseudo_element(), publication.new_style_record);
         if (auto* svg_element = as_if<SVG::SVGElement>(*target); svg_element && !element.pseudo_element().has_value())
             svg_element->note_svg_paint_resource_description_may_have_changed();
@@ -893,8 +885,9 @@ AnimationUpdateContext::~AnimationUpdateContext()
         // which an animation-only overlay update deliberately does not reconstruct. Publish an
         // exact feedback action so the ordinary reaction path re-cascades that base before the
         // frame becomes observable.
-        if (animated_property_invalidation.requires_base_style_recomputation)
-            target->document().style_computer().style_engine().record_element_style_input_change(target->style_node_id());
+        if (animated_property_invalidation.requires_base_style_recomputation && !it.value.base_is_current)
+            target->document().style_computer().style_engine().record_derived_element_style_input_change(
+                target->style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
 
         if (!element.pseudo_element().has_value() && invalidation.inherited_style_changed()) {
             // Recomputing pseudo-element styles can start transitions, which stay provisional until a stabilization
@@ -975,6 +968,7 @@ AnimationUpdateContext::~AnimationUpdateContext()
         if (repaint_layout_node && Painting::has_committed_box(*repaint_layout_node))
             Painting::repaint_after_style_change(*repaint_layout_node, invalidation);
     }
+    elements.clear();
 }
 
 }

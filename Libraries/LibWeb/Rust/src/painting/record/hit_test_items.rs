@@ -19,7 +19,6 @@ use crate::painting::paintable_data::*;
 use crate::painting::paintable_geometry;
 use crate::painting::text_fragment;
 use libgfx_rust::WindingRule;
-use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HitTestFacts {
@@ -440,7 +439,7 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
     }
 
     fn node_has_dom_node(&self, node: NodeSlotId) -> bool {
-        !self.layout_arena.node_dom_node(node).is_null()
+        self.layout_arena.node_is_dom_backed(node)
     }
 
     fn append_box(
@@ -499,7 +498,7 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
     fn append_svg_path(
         &mut self,
         target: NodeSlotId,
-        path: Rc<libgfx_rust::path::OwnedPath>,
+        path: std::sync::Arc<libgfx_rust::path::OwnedPath>,
         winding_rule: libgfx_rust::WindingRule,
         bounding_box: CssPixelRect,
         context: ContextRef,

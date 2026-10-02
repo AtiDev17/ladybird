@@ -23,7 +23,6 @@ use crate::painting::svg_filter::SvgFilterPrimitive;
 use libcompositing_rust::ffi::{ffi_slice, tree_from_handle};
 use libgfx_rust::filter::Filter;
 use std::ffi::c_void;
-use std::rc::Rc;
 
 /// SAFETY: `arena` must be a live handle from `layout_arena_create`, borrowed for this call on
 /// the document thread.
@@ -966,7 +965,7 @@ fn fresh_visual_context_tree_build(
         paintable_rows.drop_all_visual_context_records();
         fresh_tree.viewport_assignment.apply(&mut paintable_rows);
     }
-    state.tree = Some(Rc::new(fresh_tree.tree));
+    state.tree = Some(std::sync::Arc::new(fresh_tree.tree));
     state.dirty_boxes.clear();
     state.build_count += 1;
     let mut outcome = {
@@ -1185,7 +1184,7 @@ pub unsafe extern "C" fn layout_arena_update_visual_viewport_transform(
         return false;
     };
     let inputs = callbacks.tree_inputs();
-    Rc::make_mut(tree).set_visual_viewport_transform(
+    std::sync::Arc::make_mut(tree).set_visual_viewport_transform(
         crate::painting::visual_context::node_values::visual_viewport_transform_data(&inputs),
     );
     true
@@ -1478,6 +1477,73 @@ pub unsafe extern "C" fn layout_arena_set_replaced_image_paint_facts(
     )
 }
 
+/// One `<area>` of an image map, as the document hands it over: the style-tree identity to name as
+/// the hit target, the state of its `shape` attribute, and where its parsed `coords` sit in the
+/// flat array published beside it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiImageMapArea {
+    pub style_node: u32,
+    pub shape: u8,
+    pub coords_offset: u32,
+    pub coords_count: u32,
+}
+
+/// Publishes the `<area>` elements of the image map an image is associated with, in tree order.
+/// Publishing no area is how an image with no image map is named.
+///
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`. `areas` must point at `area_count`
+/// areas and `coords` at `coords_count` values, and every area's coordinate range must lie within
+/// them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_publish_image_map_areas(
+    arena: *mut c_void,
+    slot: NodeSlotId,
+    areas: *const FfiImageMapArea,
+    area_count: usize,
+    coords: *const f64,
+    coords_count: usize,
+) {
+    use crate::painting::image_map_areas::{AreaCoverage, AreaShape, PublishedImageMapArea};
+    let arena = unsafe { arena_from_handle(arena) };
+    let areas = unsafe { ffi_slice(areas, area_count) };
+    let coords = unsafe { ffi_slice(coords, coords_count) };
+    let published = areas
+        .iter()
+        .map(|area| {
+            let start = area.coords_offset as usize;
+            PublishedImageMapArea {
+                style_node: area.style_node,
+                coverage: AreaCoverage::new(
+                    AreaShape::from_raw(area.shape),
+                    &coords[start..start + area.coords_count as usize],
+                ),
+            }
+        })
+        .collect();
+    arena.image_map_areas().publish(slot, published);
+}
+
+/// The style-tree identity of the first `<area>` of the image's map, in tree order, whose shape
+/// covers the point. Zero when the image has no map, or when no shape covers the point.
+///
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_image_map_area_for_point(
+    arena: *mut c_void,
+    slot: NodeSlotId,
+    x: f32,
+    y: f32,
+) -> u32 {
+    unsafe { arena_from_handle(arena) }
+        .image_map_areas()
+        .area_for_point(slot, x, y)
+}
+
 /// # Safety
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread, and
@@ -1623,7 +1689,7 @@ pub unsafe extern "C" fn layout_arena_set_node_selection_pseudo_style(
             blur_radius: layer.blur_radius,
         })
         .collect();
-    let answer = std::rc::Rc::new(crate::painting::record::paint::text::SelectionStyleAnswer { facts, shadows });
+    let answer = std::sync::Arc::new(crate::painting::record::paint::text::SelectionStyleAnswer { facts, shadows });
     for row in rows {
         paint_state.selection_pseudo_styles.insert(row, answer.clone());
     }
@@ -1799,7 +1865,7 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
         consume(
             context,
             std::sync::Arc::into_raw(std::sync::Arc::new(recorded)).cast(),
-            Rc::into_raw(Rc::new(tree)).cast(),
+            std::sync::Arc::into_raw(std::sync::Arc::new(tree)).cast(),
         );
     }
 }
@@ -2612,13 +2678,19 @@ pub unsafe extern "C" fn layout_arena_paintable_flex_layout_json(
     container_node_id: i64,
     context: *mut c_void,
     consume: unsafe extern "C" fn(*mut c_void, *const u8, usize),
+    document_context: *const c_void,
+    resolve_node_id: unsafe extern "C" fn(*const c_void, u32) -> i64,
 ) {
     let arena = unsafe { arena_from_handle(arena) };
     if !arena.paintable_row_is_populated(paintable) {
         return;
     }
     if let Some(data) = crate::painting::paintable_geometry::committed_flex_layout_data(arena, paintable) {
-        let json = crate::painting::devtools_layout::serialize_flex_layout(&data, container_node_id);
+        // SAFETY: The host answers synchronously from the document the paintable belongs to.
+        let json = crate::painting::devtools_layout::serialize_flex_layout(&data, container_node_id, |style_node| {
+            let node_id = unsafe { resolve_node_id(document_context, style_node.raw()) };
+            (node_id >= 0).then_some(node_id)
+        });
         unsafe { consume(context, json.as_ptr(), json.len()) };
     }
 }
@@ -2656,7 +2728,9 @@ pub unsafe extern "C" fn layout_arena_main_visual_context_tree_retain(arena: *mu
         .visual_context
         .tree
         .as_ref()
-        .map_or(std::ptr::null(), |tree| Rc::into_raw(Rc::clone(tree)).cast())
+        .map_or(std::ptr::null(), |tree| {
+            std::sync::Arc::into_raw(std::sync::Arc::clone(tree)).cast()
+        })
 }
 
 /// # Safety
@@ -2881,19 +2955,18 @@ pub unsafe extern "C" fn layout_arena_publish_compositor_animations(
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread; the
 /// sink pointer must stay valid for this synchronous call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_hit_test_visit_caret_roots_and_chrome_widgets(
+pub unsafe extern "C" fn layout_arena_hit_test_visit_chrome_widgets(
     arena: *mut c_void,
     sink: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, NodeSlotId, u8, *mut c_void),
+    visit: unsafe extern "C" fn(*mut c_void, NodeSlotId, u8),
 ) {
-    with_hit_test_list_items_only(arena, (), |list, arena| {
+    with_hit_test_list_items_only(arena, (), |list, _arena| {
         for item in list.items.iter() {
-            let caret_node_shell = arena.shell_if_live(item.caret_node);
-            if item.chrome_widget_kind == crate::painting::hit_test::CHROME_WIDGET_NONE && caret_node_shell.is_null() {
+            if item.chrome_widget_kind == crate::painting::hit_test::CHROME_WIDGET_NONE {
                 continue;
             }
             // SAFETY: The C++ host consumes the visit synchronously.
-            unsafe { visit(sink, item.paintable, item.chrome_widget_kind, caret_node_shell) };
+            unsafe { visit(sink, item.paintable, item.chrome_widget_kind) };
         }
     });
 }
@@ -3003,12 +3076,12 @@ pub unsafe extern "C" fn layout_arena_hit_test_resolve_caret(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_hit_test_caret_line_for_position(
     arena: *mut c_void,
-    callbacks: crate::painting::host::FfiCaretPositionQueryCallbacks,
+    query: crate::painting::host::FfiCaretPositionQuery,
     offset: usize,
     affinity_is_downstream: bool,
 ) -> crate::painting::host::FfiCaretLineForPosition {
     with_hit_test_list_and_caret_lines(arena, Default::default(), |list, arena| {
-        match list.caret_line_for_position(arena, &callbacks, offset, affinity_is_downstream) {
+        match list.caret_line_for_position(arena, &query, offset, affinity_is_downstream) {
             Some(line_index) => crate::painting::host::FfiCaretLineForPosition {
                 has_line: true,
                 line_index,
@@ -3536,7 +3609,7 @@ mod tests {
                     root_layout_node: root,
                     ..Default::default()
                 });
-                state.visual_context.tree = Some(Rc::new(VisualContextTree::create(TransformData {
+                state.visual_context.tree = Some(std::sync::Arc::new(VisualContextTree::create(TransformData {
                     matrix: libgfx_rust::FloatMatrix4x4::identity(),
                     origin: Default::default(),
                     sorting_context_root_index: None,

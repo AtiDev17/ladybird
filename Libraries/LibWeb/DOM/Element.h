@@ -41,6 +41,7 @@
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWebCommon/Fullscreen/FullscreenRequestType.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 #include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::Animations {
@@ -212,12 +213,14 @@ public:
 
     Utf16String get_an_elements_target(Optional<Utf16String> target = {}) const;
     HTML::TokenizedFeature::NoOpener get_an_elements_noopener(URL::URL const& url, Utf16View target);
+    bool link_types_include(Utf16View) const;
 
     bool cannot_navigate() const;
 
     HTML::HTMLHyperlinkElementUtils const* created_hyperlink() const;
     bool creates_a_hyperlink() const;
     void follow_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML::UserNavigationInvolvement = HTML::UserNavigationInvolvement::None);
+    ReferrerPolicy::ReferrerPolicy hyperlink_referrer_policy() const;
     void download_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML::UserNavigationInvolvement = HTML::UserNavigationInvolvement::None);
     void activate_the_hyperlink(Event const&);
 
@@ -242,6 +245,20 @@ public:
 
     WebIDL::ExceptionOr<bool> toggle_attribute(Utf16FlyString const& name, Optional<bool> force);
     size_t attribute_list_size() const;
+
+    struct Attribute {
+        QualifiedName name;
+        Utf16String value;
+    };
+
+    // The element's attributes in order, borrowed until they next change.
+    ReadonlySpan<Attribute> attribute_list() const;
+
+    // A filter over the local names of the attributes of this element and its descendants: a name whose bit is clear
+    // is on none of them. Bits are only ever added, so a name may keep its bit after its last attribute is gone.
+    static u64 attribute_name_filter_bit(Utf16FlyString const& local_name) { return 1ull << (local_name.hash() % 64); }
+    u64 subtree_attribute_name_filter() const { return m_subtree_attribute_name_filter; }
+    void add_to_subtree_attribute_name_filter(u64 bits);
 
     GC::Ptr<NamedNodeMap const> attributes() const;
     GC::Ptr<NamedNodeMap> attributes();
@@ -311,17 +328,24 @@ public:
 
     bool has_class(Utf16View, CaseSensitivity = CaseSensitivity::CaseSensitive) const;
     bool has_class(Utf16FlyString const&, CaseSensitivity = CaseSensitivity::CaseSensitive) const;
-    Vector<Utf16FlyString> const& class_names() const { return m_classes; }
+    ReadonlySpan<Utf16FlyString> class_names() const { return m_classes; }
+
+    // https://drafts.csswg.org/selectors/#child-index
+    // The element's 1-based index among its inclusive element siblings, or among those with its type, counted from
+    // the first or from the last. An element remembers its indices until its parent's element children next move, so
+    // asking every child of a parent for its index walks them about once.
+    enum class ChildIndexAmong : u8 {
+        Siblings,
+        SiblingsOfType,
+    };
+    u32 child_index(ChildIndexAmong) const;
+    u32 child_index_from_end(ChildIndexAmong) const;
+    void forget_child_indices() { m_parent_child_index_generation = 0; }
 
     // The element's StyleEngine identity, or 0 while it has none. Disconnected and never-styled
     // elements keep 0, which is what makes them free.
     [[nodiscard]] CSS::StyleNodeID style_node_id() const { return m_style_node_id; }
-    void set_style_node_id(CSS::StyleNodeID style_node_id)
-    {
-        if (m_style_node_id != style_node_id)
-            m_published_presentational_hint_properties.clear();
-        m_style_node_id = style_node_id;
-    }
+    void set_style_node_id(CSS::StyleNodeID);
 
     // https://html.spec.whatwg.org/multipage/embedded-content-other.html#dimension-attributes
     virtual bool supports_dimension_attributes() const { return false; }
@@ -334,21 +358,59 @@ public:
 
     void run_attribute_change_steps(Utf16FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_);
 
-    enum class StyleRecomputeMode {
-        Normal,
-        Verification,
-    };
     enum class PseudoElementInputs {
         Changed,
         Unchanged,
     };
-    CSS::RequiredInvalidationAfterStyleChange apply_style_engine_reaction(bool& did_change_custom_properties, StyleRecomputeMode = StyleRecomputeMode::Normal, PseudoElementInputs = PseudoElementInputs::Changed);
+    CSS::RequiredInvalidationAfterStyleChange apply_style_engine_reaction(bool& did_change_custom_properties, PseudoElementInputs = PseudoElementInputs::Changed);
     // Apply a base style record the style engine computed itself from this element's moved cascade
     // winners: no style computation runs here, only the diff against the old record and its effects.
     // The synthetic pseudo-element records the style engine settled beside an engine-computed record: a kind it
     // decided holds the record, or none when the pseudo-element is not generated; a kind it left alone is unchanged.
     using EnginePseudoElementRecords = Array<Optional<CSS::StyleRecordID>, to_underlying(CSS::PseudoElement::KnownPseudoElementCount)>;
-    CSS::RequiredInvalidationAfterStyleChange apply_engine_computed_style_record(CSS::StyleRecordID new_style_record, EnginePseudoElementRecords const&, bool uses_substitution, bool& did_change_custom_properties);
+    // What the style engine answered a record's installation damages, for the move between the two
+    // records it names. Any other move is compared at installation.
+    struct EngineRecordDamage {
+        CSS::StyleRecordID old_style_record;
+        CSS::StyleRecordID new_style_record;
+        u32 packed { 0 };
+
+        [[nodiscard]] bool answers(CSS::StyleRecordID old_record, CSS::StyleRecordID new_record) const { return old_style_record == old_record && new_style_record == new_record; }
+    };
+    // A pseudo-element's move is decided against the originating element's record as well, so its
+    // answer also names that record.
+    struct EnginePseudoElementRecordDamage {
+        EngineRecordDamage move;
+        CSS::StyleRecordID originating_style_record;
+    };
+    // The damages the style engine answered an element's row and its pseudo-element rows with.
+    struct EngineRecordDamages {
+        Optional<EngineRecordDamage> element;
+        Array<Optional<EnginePseudoElementRecordDamage>, to_underlying(CSS::PseudoElement::KnownPseudoElementCount)> pseudo_elements {};
+    };
+    // Whether installing a record also applies the change of the element's display, or leaves that to a caller that
+    // first composes the element's animations over the record and runs its transition step, as a C++ computation does.
+    enum class DisplayNoneChange : u8 {
+        Apply,
+        LeftToCaller,
+    };
+    CSS::RequiredInvalidationAfterStyleChange apply_engine_computed_style_record(CSS::StyleRecordID new_style_record, EnginePseudoElementRecords const&, bool uses_substitution, u8 record_reads, u32 explicitly_inherited_non_inherited_style_groups, bool& did_change_custom_properties, DisplayNoneChange, EngineRecordDamages const* = nullptr);
+    // Whether an element's display is none, with its animations and ignoring them.
+    struct DisplayNoneState {
+        bool display_is_none { true };
+        bool display_ignoring_animations_is_none { true };
+
+        static DisplayNoneState of(CSS::ComputedValues const&);
+    };
+    // None for an element without style.
+    [[nodiscard]] Optional<DisplayNoneState> display_none_state() const;
+    // Terminates or resumes the animations of a subtree whose display, ignoring animations, left or entered none since
+    // `before`, and clears the styles of a subtree that became display:none.
+    void apply_display_none_change(DisplayNoneState before);
+    // Refreshes the pseudo-element styles of an element whose record the engine settled without them, once the host has
+    // composed the element's animations over the record, which the pseudo-elements inherit. `old_computed_values` is
+    // the style the element held before the record.
+    CSS::RequiredInvalidationAfterStyleChange refresh_pseudo_element_styles_over_composition(CSS::ComputedValues const* old_computed_values, bool& did_change_custom_properties);
     // The custom-property environment an engine-computed record was published with: the one the
     // element inherits, or one the engine resolved over it. Nothing when it cannot be installed.
     [[nodiscard]] RefPtr<CSS::CustomPropertyData const> custom_property_environment_of_engine_record(CSS::StyleRecordID, bool& installable) const;
@@ -387,6 +449,8 @@ public:
     }
     void set_computed_style(Optional<CSS::PseudoElement>, CSS::StyleRecordID);
     void refresh_computed_style(Optional<CSS::PseudoElement>, CSS::StyleRecordID);
+    // Install the custom properties beside a pseudo-element record the style engine derived.
+    void install_engine_pseudo_element_custom_property_data(CSS::PseudoElement, CSS::StyleRecordID);
     void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, Optional<CSS::PseudoElement>, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&);
     void update_animated_properties_for_abstract_element(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&);
 
@@ -515,9 +579,8 @@ public:
     void replace_custom_property_data(Optional<CSS::PseudoElement>, RefPtr<CSS::CustomPropertyData const>);
     [[nodiscard]] RefPtr<CSS::CustomPropertyData const> custom_property_data(Optional<CSS::PseudoElement>) const;
 
-    [[nodiscard]] bool refresh_inherited_custom_property_data();
-    // Publish the environment a refresh moved the element's custom-property data to on its record,
-    // so the engine reads the environment the element holds.
+    // Publish the environment the element's custom-property data moved to on its record, so the
+    // engine reads the environment the element holds.
     void republish_style_record_environment();
 
     // What the element's last computation was allowed to read, so a later one can ask whether any of
@@ -561,7 +624,7 @@ public:
     bool style_uses_tree_counting_function() const { return m_style_uses_tree_counting_function; }
     // Whether this element's style resolution called a custom function. Which one is not reported by
     // the substitution machinery, so an `@function` change reaches the elements that called any.
-    void set_style_uses_custom_function() { m_style_uses_custom_function = true; }
+    void set_style_uses_custom_function();
     bool style_uses_custom_function() const { return m_style_uses_custom_function; }
 
     bool style_uses_if_css_function() const { return m_style_uses_if_css_function; }
@@ -569,11 +632,41 @@ public:
     bool style_depends_on_viewport_metrics() const { return m_style_depends_on_viewport_metrics; }
     void set_style_depends_on_viewport_metrics();
     bool style_uses_inherit_css_function() const { return m_style_uses_inherit_css_function; }
-    void set_style_uses_inherit_css_function() { m_style_uses_inherit_css_function = true; }
+    void set_style_uses_inherit_css_function()
+    {
+        if (m_style_uses_inherit_css_function)
+            return;
+        bool const publishes = !style_recomputes_on_environment_move();
+        m_style_uses_inherit_css_function = true;
+        if (publishes)
+            publish_style_recomputes_on_environment_move();
+    }
     bool style_depends_on_size_container_query() const { return m_style_depends_on_size_container_query; }
-    void set_style_depends_on_size_container_query() { m_style_depends_on_size_container_query = true; }
+    void set_style_depends_on_size_container_query()
+    {
+        if (m_style_depends_on_size_container_query)
+            return;
+        m_style_depends_on_size_container_query = true;
+        publish_size_container_query_facts();
+    }
     bool style_depends_on_style_container_query() const { return m_style_depends_on_style_container_query; }
-    void set_style_depends_on_style_container_query() { m_style_depends_on_style_container_query = true; }
+    void set_style_depends_on_style_container_query()
+    {
+        if (m_style_depends_on_style_container_query)
+            return;
+        bool const publishes = !style_recomputes_on_environment_move();
+        m_style_depends_on_style_container_query = true;
+        if (publishes)
+            publish_style_recomputes_on_environment_move();
+    }
+    // Whether a moved custom-property environment computes this element again: whether its style reads the
+    // environment other than through var(), through if(), inherit(), a custom function or a style container query.
+    bool style_recomputes_on_environment_move() const
+    {
+        return m_style_uses_if_css_function || m_style_uses_inherit_css_function || m_style_uses_custom_function || m_style_depends_on_style_container_query;
+    }
+    // Tell the style engine.
+    void publish_style_recomputes_on_environment_move();
     // Set on the element a container query selected as its query container, so a change on it knows
     // whether anything under it was ever asking. Neither is ever cleared: a dependent that stops
     // asking republishes nothing, and answering "maybe" costs the scan the element used to pay
@@ -581,7 +674,16 @@ public:
     void set_is_style_query_container() { m_is_style_query_container = true; }
     bool is_style_query_container() const { return m_is_style_query_container; }
     bool is_size_query_container() const { return m_is_size_query_container; }
-    void set_is_size_query_container() { m_is_size_query_container = true; }
+    void set_is_size_query_container()
+    {
+        if (m_is_size_query_container)
+            return;
+        m_is_size_query_container = true;
+        publish_size_container_query_facts();
+    }
+    // Tell the style engine what this element's styles asked of size query containers, which is what
+    // finds the dependents a container's new box moves.
+    void publish_size_container_query_facts();
     void invalidate_descendant_styles_depending_on_style_container_query();
 
     bool child_style_uses_tree_counting_function() const { return m_child_style_uses_tree_counting_function; }
@@ -757,13 +859,8 @@ public:
 
     // An element el is rendered in the top layer if el is contained in its node document’s top layer,
     // FIXME: and el has overlay: auto.
-    void set_rendered_in_top_layer(bool rendered_in_top_layer) { m_rendered_in_top_layer = rendered_in_top_layer; }
+    void set_rendered_in_top_layer(bool rendered_in_top_layer);
     bool rendered_in_top_layer() const { return m_rendered_in_top_layer; }
-
-    bool has_non_empty_counters_set() const;
-    Optional<CSS::CountersSet const&> counters_set() const;
-    CSS::CountersSet& ensure_counters_set();
-    void set_counters_set(OwnPtr<CSS::CountersSet>&&);
 
     ProximityToTheViewport proximity_to_the_viewport() const;
     void determine_proximity_to_the_viewport();
@@ -820,8 +917,6 @@ public:
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#implicitly-potentially-render-blocking
     virtual bool is_implicitly_potentially_render_blocking() const { return false; }
 
-    double ensure_css_random_base_value(CSS::RandomCachingKey const&);
-
     struct PointerLockOptions {
         bool unadjusted_movement { false };
     };
@@ -869,15 +964,13 @@ protected:
     struct RareData;
 
 private:
-    struct Attribute {
-        QualifiedName name;
-        Utf16String value;
-    };
     using AttributeList = Vector<Attribute, 1>;
 
     AttributeList& ensure_attribute_list();
+    void append_to_attribute_list(QualifiedName, Utf16String value);
 
     void install_custom_property_data(Optional<CSS::PseudoElement>, RefPtr<CSS::CustomPropertyData const>);
+    void publish_var_reads();
     void synchronize_attribute(Utf16FlyString const& qualified_name) const;
     void synchronize_attribute_ns(Optional<Utf16FlyString> const&, Utf16FlyString const& local_name) const;
     void synchronize_style_attribute() const;
@@ -906,10 +999,11 @@ private:
     Utf16FlyString make_html_uppercased_qualified_name() const;
 
     void exit_fullscreen_on_element_removal();
-    CSS::RequiredInvalidationAfterStyleChange recompute_pseudo_element_styles(bool& did_change_custom_properties, bool had_list_marker, CSS::ComputedValues const* old_originating_style, CSS::StyleEngineMatchResult* = nullptr, PreservedPseudoElementStyles* = nullptr, EnginePseudoElementRecords const* = nullptr);
+    CSS::RequiredInvalidationAfterStyleChange recompute_pseudo_element_styles(bool& did_change_custom_properties, bool had_list_marker, CSS::ComputedValues const* old_originating_style, CSS::StyleEngineMatchResult* = nullptr, PreservedPseudoElementStyles* = nullptr, EnginePseudoElementRecords const* = nullptr, EngineRecordDamages const* = nullptr);
     void apply_computed_style_to_layout_node_if_needed(CSS::RequiredInvalidationAfterStyleChange const&);
     void apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(CSS::RequiredInvalidationAfterStyleChange const&);
     void publish_custom_property_names();
+    void update_anchor_name_registry(CSS::ComputedValues const* old_computed_values, CSS::ComputedValues const& new_computed_values);
     void replace_style_record(CSS::StyleRecordID);
     void clear_computed_styles_from_display_none_descendants();
 
@@ -921,9 +1015,14 @@ private:
     Optional<Directionality> contained_text_auto_directionality(bool can_exclude_root) const;
     Directionality parent_directionality() const;
 
+    // Selector matching reads the name, the ID and the classes of one element after another, so they sit together,
+    // and the class of an element with one is stored in place.
     QualifiedName m_qualified_name;
+    Optional<Utf16FlyString> m_id;
+    Vector<Utf16FlyString, 1> m_classes;
 
     OwnPtr<AttributeList> m_attributes;
+    u64 m_subtree_attribute_name_filter { 0 };
     GC::Ptr<CSS::CSSStyleProperties> m_inline_style;
     GC::Ptr<ShadowRoot> m_shadow_root;
 
@@ -933,7 +1032,6 @@ private:
     CSS::StyleRecordID m_style_record_identity;
     u64 m_animation_style_generation { 0 };
     u64 m_animation_subtree_style_generation { 0 };
-    RefPtr<CSS::CustomPropertyData const> m_custom_property_data;
     OwnPtr<CSS::StyleInputRecord> m_style_input_record;
     PublishedCustomPropertyNames m_published_custom_property_names;
     Vector<CSS::StyleProperty> m_published_presentational_hint_properties;
@@ -942,10 +1040,7 @@ private:
     SyntheticPseudoElement& ensure_synthetic_pseudo_element(CSS::PseudoElement) const;
     void clear_synthetic_pseudo_element_layout_nodes();
 
-    Vector<Utf16FlyString> m_classes;
     CSS::StyleNodeID m_style_node_id;
-
-    Optional<Utf16FlyString> m_id;
 
     friend class Attr;
     friend class NamedNodeMap;
@@ -970,6 +1065,12 @@ private:
     bool m_uses_document_global_custom_element_registry : 1 { false };
     bool m_has_name : 1 { false };
     mutable bool m_style_attribute_is_dirty : 1 { false };
+
+    // The child indices the element remembers, or zero for those not counted yet, and the generation of its parent's
+    // child list they were counted in; zero for none.
+    mutable u32 m_parent_child_index_generation { 0 };
+    mutable u32 m_child_index { 0 };
+    mutable u32 m_child_index_of_type { 0 };
 
     mutable Optional<Utf16String> m_lang_value;
 

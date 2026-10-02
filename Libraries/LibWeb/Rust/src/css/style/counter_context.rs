@@ -8,7 +8,6 @@ use super::bridge::{
     FfiElementArrival, FfiElementDeclarationDelta, FfiElementStyleInput, FfiLocalFeatureDelta, FfiStateDelta,
     FfiTreeDelta,
 };
-use super::matching::{SelectorQueryCache, SelectorQueryContext};
 use super::publication::ExactCascadeDonor;
 use super::*;
 use crate::css::declaration_block;
@@ -205,6 +204,12 @@ impl StyleEngine {
     #[inline]
     pub fn allocate_style_nodes(&mut self, out: &mut [u32]) {
         self.state.allocate_style_nodes(out, &mut self.counters);
+    }
+
+    /// Mint `out.len()` text identities in one call.
+    #[inline]
+    pub fn allocate_text_style_nodes(&mut self, out: &mut [u32]) {
+        self.state.allocate_text_style_nodes(out);
     }
 
     /// Stage a structural change. The normalized transaction installs the final relation rows at
@@ -650,57 +655,6 @@ impl StyleEngine {
     }
 
     #[inline]
-    pub fn prepare_selector_query(&mut self) {
-        self.state.prepare_selector_query(&mut self.counters);
-    }
-
-    #[inline]
-    pub(crate) fn selector_query_matches(
-        &mut self,
-        program: &SelectorProgram,
-        node: StyleNodeID,
-        scope_root: Option<StyleNodeID>,
-        shadow_root: Option<StyleNodeID>,
-        has_document_root: bool,
-    ) -> Result<bool, Incomplete> {
-        self.state.selector_query_matches(
-            program,
-            node,
-            scope_root,
-            shadow_root,
-            has_document_root,
-            &mut self.counters,
-        )
-    }
-
-    #[inline]
-    pub(crate) fn selector_query_all(
-        &mut self,
-        program: &SelectorProgram,
-        cache: &mut SelectorQueryCache,
-        context: SelectorQueryContext,
-    ) -> Result<Vec<StyleNodeID>, Incomplete> {
-        self.state
-            .selector_query_all(program, cache, context, &mut self.counters)
-    }
-
-    /// The first match in tree order, or None. One engine call serves a whole querySelector:
-    /// candidate enumeration, evaluation, and tree ordering all stay on this side of the
-    /// boundary — instead of one boundary crossing per walked element.
-    ///
-    /// When every entry's subject carries posting-backed dispatch keys, only posted candidates
-    /// are evaluated, in tree order, stopping at the first hit. Otherwise, the subtree is walked
-    /// in tree order, and each element evaluated — still one boundary crossing for the query.
-    #[inline]
-    pub(crate) fn selector_query_first(
-        &mut self,
-        program: &SelectorProgram,
-        context: SelectorQueryContext,
-    ) -> Result<Option<StyleNodeID>, Incomplete> {
-        self.state.selector_query_first(program, context, &mut self.counters)
-    }
-
-    #[inline]
     #[cfg(test)]
     pub(super) fn materialize_cold_matching_batch(
         &mut self,
@@ -1036,12 +990,51 @@ impl StyleEngine {
         self.state.acknowledge_engine_computed_record(node, &mut self.counters);
     }
 
+    /// C++ computes `node` itself rather than install what a record demand derived for it.
+    #[inline]
+    pub(crate) fn abandon_demanded_records(&mut self, node: StyleNodeID) {
+        self.state.abandon_demanded_records(node, &mut self.counters);
+    }
+
     /// Retry a record after C++ has installed earlier records in the same preorder batch. A record
     /// rejected while the batch was planned may become computable once its inheritance parent is
     /// authoritative.
     #[inline]
     pub(crate) fn retry_engine_record_after_ancestor(&mut self, node: StyleNodeID) -> publication::RetriedEngineRecord {
         self.state.retry_engine_record_after_ancestor(node, &mut self.counters)
+    }
+
+    /// Answer a read of one element's style the host makes before the next style update.
+    #[inline]
+    pub(super) fn answer_record_demand(
+        &mut self,
+        node: StyleNodeID,
+        demand: bridge::FfiRecordDemand,
+    ) -> publication::Drive<publication::RecordDemandAnswer> {
+        self.state.answer_record_demand(node, demand, &mut self.counters)
+    }
+
+    /// The record of an element no rule reaches, from its own declarations alone.
+    #[inline]
+    pub(super) fn declared_only_record(
+        &mut self,
+        subject: StyleNodeID,
+        facts: u32,
+        declarations: &[(ElementDeclarationKind, &crate::css::declaration_block::DeclaredProperty)],
+    ) -> publication::Drive<computed::FinalStyleRecordID> {
+        self.state
+            .declared_only_record(subject, facts, declarations, &mut self.counters)
+    }
+
+    /// Settle the pseudo-element records of an element whose record C++ just installed.
+    #[inline]
+    pub(crate) fn settle_pseudo_records_after_host_record(
+        &mut self,
+        node: StyleNodeID,
+        old_is_list_item: bool,
+    ) -> (publication::RetriedEngineRecord, bool) {
+        self.state
+            .settle_pseudo_records_after_host_record(node, old_is_list_item, &mut self.counters)
     }
 
     /// Publish the immutable computed-group payloads of one element's base style. This assigns

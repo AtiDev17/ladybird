@@ -354,6 +354,14 @@ impl CascadedPropertyStore {
         self.last_entry(property_id).map(|entry| entry.origin)
     }
 
+    /// The pointer identity of the shadow root the winning declaration of a property was written
+    /// in, or zero for one written in the document tree.
+    #[must_use]
+    pub(crate) fn winning_source_shadow_root_identity(&self, property_id: u16) -> usize {
+        self.last_entry(property_id)
+            .map_or(0, |entry| entry.source_shadow_root_identity)
+    }
+
     fn winning_entries(&self) -> impl Iterator<Item = (u16, &Entry)> + '_ {
         self.contained
             .iter()
@@ -599,6 +607,9 @@ pub struct FfiStyleComputationRequirements {
 struct StyleComputationRequirementsStorage {
     computed_property_words: [u64; LONGHAND_WORD_COUNT],
     unfixed_random_sharings: Box<[FfiUnfixedRandomSharing]>,
+    /// The registered custom property values whose random sharings `unfixed_random_sharings`
+    /// names.
+    _registered_custom_property_values: Vec<RetainedStyleValueData>,
 }
 
 fn longhand_is_selected(words: &[u64], property_id: u16) -> bool {
@@ -740,8 +751,15 @@ unsafe fn plan_style_computation(
     )
 }
 
+/// What a computation reads beside its cascaded longhands: for each longhand winner, and for each
+/// registered custom property `custom_properties` declares, which the computation finalizes with
+/// the longhands' inputs.
 pub(crate) unsafe fn collect_style_computation_requirements(
     store: *const CascadedPropertyStore,
+    custom_properties: Option<(
+        &CustomPropertyStore,
+        &crate::css::custom_properties::CustomPropertyRegistry,
+    )>,
     plan_input: Option<&StyleComputationPlanInput<'_>>,
 ) -> FfiStyleComputationRequirements {
     let store = unsafe { &*store };
@@ -750,6 +768,26 @@ pub(crate) unsafe fn collect_style_computation_requirements(
     let mut environment_requirements = 0;
     let mut sharings = Vec::new();
     let mut has_resource_context_dependent_values = false;
+    // A registered value computes against the element as a longhand does. What it reads is known
+    // where it parses before substitution; a value that substitutes is read where it is finalized.
+    let registered_custom_property_values: Vec<_> = custom_properties
+        .map(|(custom_properties, registry)| {
+            custom_properties
+                .declared_names
+                .iter()
+                .filter_map(|name_raw| {
+                    let entry = custom_properties.own_values.get(name_raw)?;
+                    registry.parse_declared_registered_value(&entry.name, &entry.value)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for value in &registered_custom_property_values {
+        let dependencies = crate::css::style_compute::collect_external_value_dependencies(value.data());
+        uses_tree_counting_function |= dependencies.uses_tree_counting_function;
+        container_relative_length_unit_mask |= dependencies.container_relative_length_unit_mask;
+        crate::css::style_compute::collect_unfixed_random_sharings_in_value(value.data(), &mut sharings);
+    }
     for (_, entry) in store.winning_entries() {
         let dependencies = entry.dependencies();
         has_resource_context_dependent_values |= dependencies.may_need_style_sheet_resource_context;
@@ -768,20 +806,14 @@ pub(crate) unsafe fn collect_style_computation_requirements(
     let unfixed_random_sharings = sharings
         .into_iter()
         .map(|source| {
-            let StyleValueData::RandomValueSharing {
-                has_name,
-                is_auto,
-                name,
-                element_shared,
-                ..
-            } = (unsafe { &*source })
-            else {
+            let sharing = unsafe { &*source };
+            let StyleValueData::RandomValueSharing { has_name, name, .. } = sharing else {
                 unreachable!();
             };
             FfiUnfixedRandomSharing {
                 source: source.cast(),
                 name: if *has_name { name.as_ptr() } else { std::ptr::null() },
-                element_shared: *element_shared || !*is_auto,
+                element_shared: crate::css::style_compute::random_caching_key(sharing).1,
             }
         })
         .collect::<Vec<_>>()
@@ -793,6 +825,7 @@ pub(crate) unsafe fn collect_style_computation_requirements(
     let storage = Box::new(StyleComputationRequirementsStorage {
         computed_property_words,
         unfixed_random_sharings,
+        _registered_custom_property_values: registered_custom_property_values,
     });
     let unfixed_random_sharings = storage.unfixed_random_sharings.as_ptr();
     let unfixed_random_sharing_count = storage.unfixed_random_sharings.len();
@@ -1181,13 +1214,44 @@ pub struct FfiCascadeResolutionContext {
     pub custom_functions: *const crate::css::custom_properties::FfiSubstitutionFunctionDefinition,
     pub custom_function_count: usize,
     pub custom_function_scope_identity: usize,
+    pub custom_function_visibilities: *const crate::css::custom_properties::FfiSubstitutionFunctionVisibility,
+    pub custom_function_visibility_count: usize,
     pub callback_context: *mut c_void,
     pub install_custom_properties: Option<
         unsafe extern "C" fn(*mut c_void, *const FfiCascadedCustomProperty, usize, *mut *const c_void) -> *const c_void,
     >,
-    pub resolve_custom_function: Option<unsafe extern "C" fn(usize, FfiUtf16View) -> u64>,
-    pub evaluate_style_query: Option<unsafe extern "C" fn(*mut c_void, FfiUtf16View) -> u8>,
+    /// What a style query resolves against, or null to have `load_style_query_inputs` load it
+    /// from the callback context the first time a query is evaluated.
+    pub style_query_inputs: *const FfiStyleQueryInputs,
+    pub load_style_query_inputs: Option<unsafe extern "C" fn(*mut c_void) -> *const FfiStyleQueryInputs>,
+    /// Null, or where the custom properties style queries read are kept: null until the first,
+    /// then a handle for `rust_style_query_dependencies_take`.
+    pub style_query_dependencies: *mut *mut c_void,
     pub note_substitution: Option<unsafe extern "C" fn(*mut c_void, *const c_void)>,
+}
+
+/// What a `style()` query in a substitution resolves against, as the queried element's style
+/// computes it: its lengths, and the color scheme and currentcolor its colors resolve with.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiStyleQueryInputs {
+    pub length: crate::css::style_compute::FfiLengthResolutionContext,
+    /// A PreferredColorScheme code.
+    pub color_scheme: u8,
+    /// The packed currentcolor, as the C++ Color::value() packs it.
+    pub current_color: u32,
+}
+
+impl FfiStyleQueryInputs {
+    pub(crate) fn color_input(&self) -> crate::css::color_resolution::ColorResolutionInput<'_> {
+        crate::css::color_resolution::ColorResolutionInput {
+            scheme: Some(self.color_scheme),
+            current_color: Some(crate::css::color_resolution::Rgba::from_packed(self.current_color)),
+            current_color_value: None,
+            length: Some(&self.length),
+            channels: None,
+        }
+    }
 }
 
 /// One unresolved value submitted to the bulk substitution resolver.
@@ -1210,6 +1274,11 @@ pub struct FfiCustomPropertyResolutionStats {
     pub final_value_hits: u64,
     pub final_value_misses: u64,
     pub cycle_participants: u64,
+    /// Whether computing a registered value resolved a viewport-relative length.
+    pub depends_on_viewport_metrics: bool,
+    /// Whether a registered value did not compute against the element's inputs, and took its
+    /// invalid fallback instead.
+    pub left_a_value_uncomputed: bool,
 }
 
 #[repr(C)]
@@ -1219,9 +1288,16 @@ pub struct FfiCustomPropertyDriveInput {
     pub resolved_parent_store: *const c_void,
     pub reuse_resolved_parent_if_empty: bool,
     pub resolution_context: *const FfiCascadeResolutionContext,
-    pub finalizer_context: *mut c_void,
-    pub finalize_component:
-        Option<unsafe extern "C" fn(*mut c_void, *const usize, *const u32, usize, *mut FfiResolvedStyleValue)>,
+    /// What a registered value computes against: the element's lengths as its style computes them
+    /// after line-height, null where it declares no registered name; the facts its longhands are
+    /// computed against, or null; and the color scheme its colors resolve with.
+    pub finalization_length_resolution_context: *const crate::css::style_compute::FfiLengthResolutionContext,
+    pub finalization_environment: *const crate::css::style_compute::FfiStyleComputationEnvironment,
+    pub finalization_color_scheme: u8,
+    /// Draws the random base value of a random caching key a registered value holds only once
+    /// substituted, which the host could not draw beforehand; none where nothing may be drawn.
+    pub draw_random_base_value: Option<unsafe extern "C" fn(*mut c_void, *const u16, usize, bool) -> f64>,
+    pub random_base_context: *mut c_void,
 }
 
 #[repr(C)]
@@ -1262,9 +1338,17 @@ fn custom_property_needs_resolution(value: &StyleValueData) -> bool {
     )
 }
 
+/// What the drive finalizes each declared value with: the store declaring the values, in the
+/// order of `names`, the registry and the environment inherited, and the element's finalization
+/// inputs.
 struct CustomPropertyFinalizerContext<'a> {
-    input: &'a FfiCustomPropertyDriveInput,
+    store: &'a CustomPropertyStore,
     names: &'a [usize],
+    registry: &'a crate::css::custom_properties::CustomPropertyRegistry,
+    inherited: Option<&'a CustomPropertyStore>,
+    finalization: crate::css::custom_properties::CustomPropertyFinalization<'a>,
+    depends_on_viewport_metrics: Cell<bool>,
+    left_a_value_uncomputed: Cell<bool>,
 }
 
 unsafe extern "C" fn finalize_custom_property_component(
@@ -1274,26 +1358,38 @@ unsafe extern "C" fn finalize_custom_property_component(
     outputs: *mut FfiResolvedStyleValue,
 ) {
     let context = unsafe { &*context.cast::<CustomPropertyFinalizerContext>() };
-    unsafe {
-        (context
-            .input
-            .finalize_component
-            .expect("custom-property drive finalizer"))(
-            context.input.finalizer_context,
-            context.names.as_ptr(),
-            members,
-            member_count,
-            outputs,
-        );
+    for &member in unsafe { std::slice::from_raw_parts(members, member_count) } {
+        let name_raw = context.names[member as usize];
+        let name = &context
+            .store
+            .own_values
+            .get(&name_raw)
+            .expect("declared custom property must be an own value")
+            .name;
+        // SAFETY: The resolver hands each member's output over with one transferred reference,
+        //         and takes one back.
+        let output = unsafe { &mut *outputs.add(member as usize) };
+        let substituted = unsafe { RetainedStyleValueData::from_retained_pointer(output.data.cast()) };
+        let (finalized, depends_on_viewport_metrics) = context
+            .registry
+            .finalize_custom_property_value(context.inherited, name_raw, name, substituted, &context.finalization)
+            .unwrap_or_else(|fallback| {
+                context.left_a_value_uncomputed.set(true);
+                (fallback, false)
+            });
+        if depends_on_viewport_metrics {
+            context.depends_on_viewport_metrics.set(true);
+        }
+        output.data = std::sync::Arc::into_raw(finalized.into_arc()).cast();
     }
 }
 
 /// Resolves every value declared by one custom-property store while the
-/// element style computation remains in Rust.
+/// element style computation remains in Rust, and finalizes each as the
+/// element computes it.
 ///
 /// # Safety
-/// Every pointer in `input` must remain valid for the call. The finalizer must
-/// replace each component output with one transferred style-value reference.
+/// Every pointer in `input` must remain valid for the call.
 pub(crate) unsafe fn drive_custom_property_resolution(
     input: &FfiCustomPropertyDriveInput,
 ) -> FfiResolvedCustomProperties {
@@ -1320,8 +1416,36 @@ pub(crate) unsafe fn drive_custom_property_resolution(
         .iter()
         .map(|_| FfiResolvedStyleValue { data: std::ptr::null() })
         .collect();
-    let mut finalizer_context = CustomPropertyFinalizerContext { input, names };
-    let stats = unsafe {
+    // SAFETY: The resolution context and what it names are live for the call.
+    let resolution_context = unsafe { &*input.resolution_context };
+    let mut finalizer_context = CustomPropertyFinalizerContext {
+        store,
+        names,
+        registry: unsafe {
+            resolution_context
+                .custom_property_registry
+                .cast::<crate::css::custom_properties::CustomPropertyRegistry>()
+                .as_ref()
+        }
+        .unwrap_or_else(crate::css::custom_properties::CustomPropertyRegistry::shared_empty),
+        inherited: unsafe {
+            resolution_context
+                .inheritance_custom_property_store
+                .cast::<CustomPropertyStore>()
+                .as_ref()
+        },
+        finalization: crate::css::custom_properties::CustomPropertyFinalization {
+            length: unsafe { input.finalization_length_resolution_context.as_ref() },
+            environment: unsafe { input.finalization_environment.as_ref() },
+            color_scheme: input.finalization_color_scheme,
+            draw_random_base_value: input
+                .draw_random_base_value
+                .map(|draw| (draw, input.random_base_context)),
+        },
+        depends_on_viewport_metrics: Cell::new(false),
+        left_a_value_uncomputed: Cell::new(false),
+    };
+    let mut stats = unsafe {
         rust_resolve_unresolved_style_values(
             input.resolution_context,
             inputs.as_ptr(),
@@ -1331,6 +1455,8 @@ pub(crate) unsafe fn drive_custom_property_resolution(
             Some(finalize_custom_property_component),
         )
     };
+    stats.depends_on_viewport_metrics = finalizer_context.depends_on_viewport_metrics.get();
+    stats.left_a_value_uncomputed = finalizer_context.left_a_value_uncomputed.get();
     let resolved_parent = if input.resolved_parent_store.is_null() {
         None
     } else {
@@ -1646,9 +1772,13 @@ pub(crate) fn resolve_cascade_value(
                 unresolved_data,
                 resolution_environment,
                 resolution_context.attribute_names_are_ascii_case_insensitive,
-                resolution_context.resolve_custom_function,
                 resolution_context.callback_context,
-                resolution_context.evaluate_style_query,
+                resolution_context.style_query_inputs.as_ref(),
+                resolution_context.load_style_query_inputs,
+                resolution_context
+                    .style_query_dependencies
+                    .cast::<Option<Box<crate::css::custom_properties::StyleQueryDependencies>>>()
+                    .as_mut(),
                 final_custom_properties,
             )
         },
@@ -1835,6 +1965,8 @@ pub unsafe extern "C" fn rust_resolve_unresolved_style_values(
             resolution_context.custom_functions,
             resolution_context.custom_function_count,
             resolution_context.custom_function_scope_identity,
+            resolution_context.custom_function_visibilities,
+            resolution_context.custom_function_visibility_count,
         )
     };
     let (components, cycle_participants, use_final_custom_properties) = if finalize_component.is_some() {
@@ -1889,6 +2021,8 @@ pub unsafe extern "C" fn rust_resolve_unresolved_style_values(
             .as_ref()
             .map_or(0, |environment| environment.final_value_misses()),
         cycle_participants,
+        depends_on_viewport_metrics: false,
+        left_a_value_uncomputed: false,
     }
 }
 
@@ -1998,6 +2132,8 @@ pub unsafe extern "C" fn rust_cascade_matched_blocks(
                         resolution_context.custom_functions,
                         resolution_context.custom_function_count,
                         resolution_context.custom_function_scope_identity,
+                        resolution_context.custom_function_visibilities,
+                        resolution_context.custom_function_visibility_count,
                     )
                 });
                 resolve_cascade_value(
@@ -2166,7 +2302,7 @@ mod tests {
             },
         ));
 
-        let requirements = unsafe { collect_style_computation_requirements(&store, None) };
+        let requirements = unsafe { collect_style_computation_requirements(&raw const store, None, None) };
         assert!(requirements.uses_tree_counting_function);
         assert_eq!(requirements.container_relative_length_unit_mask, 0b1111);
         assert_eq!(

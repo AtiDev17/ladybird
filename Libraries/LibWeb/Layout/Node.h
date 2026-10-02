@@ -18,8 +18,10 @@
 #include <LibGC/Cell.h>
 #include <LibGC/Root.h>
 #include <LibWeb/CSS/ComputedValues.h>
+#include <LibWeb/CSS/StyleEngineIdentifiers.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
+#include <LibWeb/DOM/NodeIdentity.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Layout/NodeArena.h>
@@ -49,7 +51,6 @@ public:
 
     virtual ~Node();
     static void delete_arena_owned_shell(Node&);
-    static void rebind_dom_node_to_surviving_shell(DOM::Node&, Node& shell);
     StringView class_name() const;
 
     static Compositing::RustFFI::NodeSlotId slot_id(Node const*);
@@ -189,9 +190,13 @@ public:
     bool insets_use_anchor_functions() const { return has_flag(RustFFI::NodeFlag::InsetsUseAnchorFunctions); }
     DOM::Node const* dom_node() const;
     DOM::Node* dom_node();
+    // The identity of the DOM node this row belongs to, which names nothing for an anonymous row
+    // and for a row whose node has left the tree.
+    DOM::NodeIdentity dom_node_identity() const;
 
     GC::Ptr<DOM::Element const> pseudo_element_generator() const;
     GC::Ptr<DOM::Element> pseudo_element_generator();
+    DOM::NodeIdentity pseudo_element_generator_identity() const;
 
     bool needs_layout_update() const { return has_flag(RustFFI::NodeFlag::NeedsLayoutUpdate); }
     bool retains_compositor_animated_content() const { return has_flag(RustFFI::NodeFlag::HasAnimatedOpacityOrTransform); }
@@ -233,6 +238,18 @@ public:
     bool is_generated_for_after_pseudo_element() const { return generated_for() == encode_generated_for(CSS::PseudoElement::After); }
     bool is_generated_for_backdrop_pseudo_element() const { return generated_for() == encode_generated_for(CSS::PseudoElement::Backdrop); }
     void set_generated_for(CSS::PseudoElement type, DOM::Element&);
+    static constexpr u8 encode_generated_for(CSS::PseudoElement pseudo_element)
+    {
+        static_assert(static_cast<u8>(CSS::PseudoElement::UnknownWebKit) < 0xff);
+        return static_cast<u8>(pseudo_element) + 1;
+    }
+
+    // The StyleNodeID of the element or text node this row is bound to, or of the element it is
+    // generated for, or 0.
+    CSS::StyleNodeID style_node_id() const;
+    // The StyleNodeID a row bound to this DOM node records, or 0 for a node that has none.
+    static CSS::StyleNodeID style_node_of(DOM::Node const*);
+    static void dom_node_style_node_changed(DOM::Node&, CSS::StyleNodeID old_style_node);
 
     void clear_committed_box();
     void prepare_for_detach_from_layout_tree();
@@ -299,7 +316,7 @@ public:
 
     bool is_editing_host() const { return has_flag(RustFFI::NodeFlag::IsEditingHost); }
     void set_is_editing_host(bool value) { set_flag(RustFFI::NodeFlag::IsEditingHost, value); }
-    bool refresh_dom_paint_facts();
+    static u8 dom_paint_facts_of(DOM::Node const*);
 
     // https://drafts.csswg.org/css-ui/#propdef-user-select
     CSS::UserSelect user_select_used_value() const;
@@ -338,12 +355,6 @@ protected:
 private:
     friend class NodeWithStyle;
 
-    static constexpr u8 encode_generated_for(CSS::PseudoElement pseudo_element)
-    {
-        static_assert(static_cast<u8>(CSS::PseudoElement::UnknownWebKit) < 0xff);
-        return static_cast<u8>(pseudo_element) + 1;
-    }
-
     Node* linked_node(RustFFI::FfiNodeLink link) const
     {
         return static_cast<Node*>(RustFFI::layout_arena_node_link_shell(m_arena->handle(), m_slot, link));
@@ -358,10 +369,6 @@ private:
 
     NonnullRefPtr<NodeArena> m_arena;
     Compositing::RustFFI::NodeSlotId m_slot;
-    // A DOM mutation can disconnect a node before the next layout-tree update. The arena roots the DOM node
-    // through Document::visit_edges while this slot is live, so detach hooks never observe a collected element.
-    GC::RawPtr<DOM::Node> m_dom_node;
-    GC::Weak<DOM::Element> m_pseudo_element_generator;
     RustFFI::NodeKind m_kind { RustFFI::NodeKind::Unset };
     bool m_arena_is_destroying_shell { false };
 };
@@ -579,7 +586,6 @@ public:
     CSS::TextTransform text_transform() const { return style_group<CSS::ComputedValues::InheritedTextValues>().text_transform_value(); }
     CSS::WhiteSpaceCollapse white_space_collapse() const { return style_group<CSS::ComputedValues::InheritedTextValues>().white_space_collapse_value(); }
     Color text_decoration_color() const { return Color::from_bgra(style_group<CSS::ComputedValues::TextResetValues>().text_decoration_color); }
-    Optional<CSS::ContentData> const& content() const { return m_content; }
     CSSPixels line_height() const { return style_group<CSS::ComputedValues::FontValues>().line_height_used; }
     CSSPixels font_size() const { return style_group<CSS::ComputedValues::FontValues>().font_size; }
     Gfx::FontCascadeList const& font_list() const { return style_group<CSS::ComputedValues::FontValues>().font_list_value(); }
@@ -674,7 +680,6 @@ public:
     void bind_generated_style_record(CSS::StyleRecordID);
 
     void set_display(CSS::Display);
-    void set_content(CSS::ContentData const&);
 
 private:
     CSS::ComputedStyleRecordView computed_style_record_view() const;
@@ -707,9 +712,6 @@ private:
     mutable Optional<CSS::BorderImageData> m_border_image;
     mutable Optional<CSS::ListStyleType> m_list_style_type;
     mutable Optional<RefPtr<CSS::AbstractImageStyleValue const>> m_list_style_image;
-    // The generated content this box was built from, kept for the accessible-name code. Not derived from the style
-    // record: An in-place restyle must leave it alone — since only a layout-tree rebuild can re-resolve it.
-    Optional<CSS::ContentData> m_content;
 };
 
 template<>

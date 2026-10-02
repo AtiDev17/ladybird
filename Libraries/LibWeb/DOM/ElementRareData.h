@@ -6,10 +6,8 @@
 
 #pragma once
 
-#include <LibWeb/CSS/CountersSet.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/StylePropertyMap.h>
-#include <LibWeb/CSS/StyleValues/RandomValueSharingStyleValue.h>
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/HTML/CustomElements/CustomStateSet.h>
@@ -63,10 +61,15 @@ struct Element::RareData
     // Every Element has a [[computedStyleMapCache]] internal slot, initially set to null, which caches the result of
     // the computedStyleMap() method when it is first called.
     GC::Ptr<CSS::StylePropertyMapReadOnly> computed_style_map_cache;
-    OwnPtr<CSS::CountersSet> counters_set;
 
     // https://drafts.csswg.org/css-values-5/#random-caching
-    HashMap<CSS::RandomCachingKey, double> element_specific_css_random_base_value_cache;
+    // The random base values of the keys that name the element, kept while it has no style node to keep them under.
+    struct RandomBaseValues {
+        Vector<u32> name_lengths;
+        Vector<u16> name_units;
+        Vector<u64> value_bits;
+    };
+    RandomBaseValues random_base_values_without_style_node;
 
     // https://dom.spec.whatwg.org/#concept-element-custom-element-definition
     GC::Ptr<HTML::CustomElementDefinition> custom_element_definition;

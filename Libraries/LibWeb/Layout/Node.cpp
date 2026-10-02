@@ -16,6 +16,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/DOM/Text.h>
 #include <LibWeb/Dump.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
@@ -40,7 +41,7 @@
 
 namespace Web::Layout {
 
-static u8 dom_paint_facts_of(GC::Ptr<DOM::Node const> node)
+u8 Node::dom_paint_facts_of(DOM::Node const* node)
 {
     if (!node)
         return 0;
@@ -56,12 +57,21 @@ static u8 dom_paint_facts_of(GC::Ptr<DOM::Node const> node)
     return facts;
 }
 
+// The StyleNodeID a row bound to this DOM node records: an element's or a text node's.
+CSS::StyleNodeID Node::style_node_of(DOM::Node const* node)
+{
+    if (auto const* element = as_if<DOM::Element>(node))
+        return element->style_node_id();
+    if (auto const* text = as_if<DOM::Text>(node))
+        return text->style_node_id();
+    return {};
+}
+
 static RustFFI::FfiNodeConstructionFacts build_node_construction_facts(DOM::Document& document, GC::Ptr<DOM::Node> node, RustFFI::NodeKind kind, void* shell)
 {
     return {
         .kind = kind,
         .shell = shell,
-        .dom_node = node.ptr(),
         .is_anonymous = node == nullptr,
         .is_html_input_element = node && is<HTML::HTMLInputElement>(*node),
         .is_html_html_element = node && node->is_html_html_element(),
@@ -70,30 +80,28 @@ static RustFFI::FfiNodeConstructionFacts build_node_construction_facts(DOM::Docu
         .uses_button_layout = node && is<HTML::HTMLElement>(*node) && static_cast<HTML::HTMLElement const&>(*node).uses_button_layout(),
         .is_editing_host = node && node->is_editing_host(),
         .is_body = node && node == GC::Ptr { document.body() },
-        .dom_paint_facts = dom_paint_facts_of(node),
+        .dom_paint_facts = Node::dom_paint_facts_of(node.ptr()),
+        .style_node = Node::style_node_of(node.ptr()).value(),
     };
-}
-
-bool Node::refresh_dom_paint_facts()
-{
-    return RustFFI::layout_arena_set_node_dom_paint_facts(m_arena->handle(), m_slot, dom_paint_facts_of(m_dom_node));
 }
 
 Node::Node(DOM::Document& document, GC::Ptr<DOM::Node> node, RustFFI::NodeKind kind, AttachToDOMNode attach_to_dom_node)
     : m_arena(document.layout_node_arena())
     , m_slot(m_arena->allocate(build_node_construction_facts(document, node, kind, this)))
-    , m_dom_node(node)
     , m_kind(kind)
 {
-    VERIFY(RustFFI::layout_arena_node_dom_node(m_arena->handle(), m_slot) == m_dom_node.ptr());
     update_has_scroll_offset_flag();
 
     if (!node)
         return;
-    if (auto const* row_already_bound_to_dom_node = node->unsafe_layout_node())
-        RustFFI::layout_arena_note_rows_share_dom_node(m_arena->handle(), row_already_bound_to_dom_node->m_slot, m_slot, attach_to_dom_node == AttachToDOMNode::Yes);
-    if (attach_to_dom_node == AttachToDOMNode::Yes)
-        node->set_layout_node({}, *this);
+    auto* row_already_bound_to_dom_node = node->unsafe_layout_node();
+    if (row_already_bound_to_dom_node)
+        RustFFI::layout_arena_note_rows_share_dom_node(m_arena->handle(), row_already_bound_to_dom_node->m_slot, m_slot);
+    if (attach_to_dom_node == AttachToDOMNode::Yes) {
+        if (row_already_bound_to_dom_node)
+            row_already_bound_to_dom_node->pin_style_record_for_detachment();
+        RustFFI::layout_arena_bind_row(m_arena->handle(), m_slot);
+    }
 }
 
 Node::Node(DOM::Document& document, BindToPreparedArenaSlot, Compositing::RustFFI::NodeSlotId slot, RustFFI::NodeKind kind)
@@ -101,7 +109,6 @@ Node::Node(DOM::Document& document, BindToPreparedArenaSlot, Compositing::RustFF
     , m_slot(slot)
     , m_kind(kind)
 {
-    VERIFY(RustFFI::layout_arena_node_dom_node(m_arena->handle(), m_slot) == nullptr);
     RustFFI::layout_arena_attach_shell(m_arena->handle(), m_slot, this);
 }
 
@@ -114,12 +121,6 @@ void Node::delete_arena_owned_shell(Node& node)
 {
     node.m_arena_is_destroying_shell = true;
     delete &node;
-}
-
-void Node::rebind_dom_node_to_surviving_shell(DOM::Node& dom_node, Node& shell)
-{
-    VERIFY(shell.m_dom_node.ptr() == &dom_node);
-    dom_node.rebind_layout_node({}, shell);
 }
 
 Compositing::RustFFI::NodeSlotId Node::slot_id(Node const* node)
@@ -205,11 +206,12 @@ void Node::pin_style_record_for_detachment()
 void Node::prepare_for_detach_from_layout_tree()
 {
     pin_style_record_for_detachment();
-    Painting::invalidate_paint_cache(*this);
+    // NB: A journal entry would resolve to whatever box replaces this one, so this box is cleaned now.
+    Painting::apply_paint_cache_invalidation(*this, Painting::PaintCacheInvalidation::PaintAndHitTest);
     if (auto* node_with_style = as_if<NodeWithStyle>(*this))
         node_with_style->clear_image_observers();
     if (kind() == RustFFI::NodeKind::ImageBox)
-        static_cast<Box&>(*this).image_provider().layout_node_was_detached();
+        static_cast<Box&>(*this).notify_owned_image_provider_of_detach();
 }
 
 void Node::prepare_subtree_for_detach_from_layout_tree()
@@ -230,13 +232,11 @@ Node* Node::topmost_layout_node_of_top_layer_placement()
     return direct_viewport_child_candidate;
 }
 
+// The flag is set on the box a pseudo-element is bound to and cleared when that binding moves, so
+// it answers without resolving the generator on the DOM side.
 bool Node::is_pseudo_element_principal_box() const
 {
-    auto pseudo_element = generated_for_pseudo_element();
-    if (!pseudo_element.has_value())
-        return false;
-    auto generator = pseudo_element_generator();
-    return generator && generator->pseudo_element_unsafe_layout_node(*pseudo_element) == this;
+    return has_flag(RustFFI::NodeFlag::IsPseudoElementPrincipalBox);
 }
 
 bool NodeWithStyle::establishes_an_absolute_positioning_containing_block() const
@@ -746,11 +746,6 @@ void NodeWithStyle::set_display(CSS::Display display)
     RustFFI::layout_arena_set_layout_display(arena_handle(), slot_id(this), bit_cast<u32>(display));
 }
 
-void NodeWithStyle::set_content(CSS::ContentData const& content)
-{
-    m_content = content;
-}
-
 bool overflow_value_makes_box_a_scroll_container(CSS::Overflow overflow)
 {
     switch (overflow) {
@@ -782,41 +777,92 @@ void Node::clear_committed_box()
 
 DOM::Node const* Node::dom_node() const
 {
-    if (is_anonymous())
-        return nullptr;
-    VERIFY(m_dom_node);
-    return m_dom_node.ptr();
+    return const_cast<Node*>(this)->dom_node();
 }
 
 DOM::Node* Node::dom_node()
 {
+    // NB: The document outlives every live row of its arena.
+    auto* document = m_arena->document();
+    VERIFY(document);
+    return dom_node_identity().resolve(*document).ptr();
+}
+
+DOM::NodeIdentity Node::dom_node_identity() const
+{
     if (is_anonymous())
-        return nullptr;
-    VERIFY(m_dom_node);
-    return m_dom_node.ptr();
+        return {};
+    // The document has no StyleNodeID; its row is the viewport.
+    if (m_kind == RustFFI::NodeKind::Viewport)
+        return DOM::NodeIdentity::of_document();
+    // A row kept after its node was removed has a StyleNodeID of 0 and names nothing.
+    return DOM::NodeIdentity::of_style_node(style_node_id());
 }
 
 GC::Ptr<DOM::Element const> Node::pseudo_element_generator() const
 {
-    VERIFY(is_generated_for_pseudo_element());
-    return m_pseudo_element_generator.ptr();
+    return const_cast<Node*>(this)->pseudo_element_generator();
 }
 
 GC::Ptr<DOM::Element> Node::pseudo_element_generator()
 {
+    auto* document = m_arena->document();
+    VERIFY(document);
+    return as_if<DOM::Element>(pseudo_element_generator_identity().resolve(*document).ptr());
+}
+
+DOM::NodeIdentity Node::pseudo_element_generator_identity() const
+{
     VERIFY(is_generated_for_pseudo_element());
-    return m_pseudo_element_generator.ptr();
+    // A stale row's StyleNodeID is 0 once its generator disconnects, so it names nothing.
+    return DOM::NodeIdentity::of_style_node(style_node_id());
 }
 
 void Node::set_generated_for(CSS::PseudoElement type, DOM::Element& element)
 {
     static_assert(encode_generated_for(CSS::PseudoElement::After) == RustFFI::GENERATED_FOR_AFTER);
+    static_assert(encode_generated_for(CSS::PseudoElement::Backdrop) == RustFFI::GENERATED_FOR_BACKDROP);
+    static_assert(encode_generated_for(CSS::PseudoElement::Before) == RustFFI::GENERATED_FOR_BEFORE);
     static_assert(encode_generated_for(CSS::PseudoElement::FirstLetter) == RustFFI::GENERATED_FOR_FIRST_LETTER);
     static_assert(encode_generated_for(CSS::PseudoElement::Marker) == RustFFI::GENERATED_FOR_MARKER);
-    RustFFI::layout_arena_set_node_generated_for(arena_handle(), slot_id(this), encode_generated_for(type));
-    m_pseudo_element_generator = element;
+    RustFFI::layout_arena_set_node_generated_for(arena_handle(), slot_id(this), encode_generated_for(type), element.style_node_id().value());
     if (auto* node_with_style = as_if<NodeWithStyle>(*this))
         node_with_style->bind_generated_style_record(element.style_record_identity(type));
+}
+
+void Node::dom_node_style_node_changed(DOM::Node& dom_node, CSS::StyleNodeID old_style_node)
+{
+    auto* arena = dom_node.document().layout_node_arena_if_created();
+    if (!arena)
+        return;
+    auto new_style_node = Node::style_node_of(&dom_node);
+    // The node's rows, and those of its pseudo-elements, take its new identity along with their
+    // bindings. Both are still keyed by the old identity here, so this precedes retiring it.
+    if (old_style_node != 0 && new_style_node != 0) {
+        RustFFI::layout_arena_move_bound_rows_to_style_node(arena->handle(), old_style_node.value(), new_style_node.value());
+        if (auto* element = as_if<DOM::Element>(dom_node)) {
+            element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement pseudo_element, DOM::SyntheticPseudoElement const&) {
+                RustFFI::layout_arena_move_bound_pseudo_element_rows_to_style_node(arena->handle(), old_style_node.value(), encode_generated_for(pseudo_element), new_style_node.value());
+            });
+        }
+    }
+    // A retired identity may be reused, so it leaves every row carrying it, including rows of a
+    // removed subtree that outlive the disconnection.
+    if (old_style_node != 0)
+        RustFFI::layout_arena_forget_style_node(arena->handle(), old_style_node.value());
+    // Nor does a layout tree update mark the identity's previous holder left: the marks are keyed by the identity alone.
+    if (new_style_node != 0)
+        RustFFI::layout_arena_clear_layout_tree_update_marks(arena->handle(), new_style_node.value());
+    // The arena tells a node about a change to its layout node through its StyleNodeID, so a node whose StyleNodeID
+    // changes is one it cannot name. Its box presence is committed again here instead. A node that had no StyleNodeID
+    // had no layout node either, and a fresh StyleNodeID has none bound yet, so it has nothing to commit.
+    if (old_style_node != 0)
+        arena->commit_box_presence(dom_node);
+}
+
+CSS::StyleNodeID Node::style_node_id() const
+{
+    return RustFFI::layout_arena_node_style_node(m_arena->handle(), m_slot);
 }
 
 // An element's box holds the element's scroll offset. Everything generated for a pseudo-element

@@ -17,7 +17,6 @@
 #include <AK/InsertionSort.h>
 #include <AK/JsonObjectSerializer.h>
 #include <AK/NeverDestroyed.h>
-#include <AK/Random.h>
 #include <AK/ScopeGuard.h>
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
@@ -62,7 +61,6 @@
 #include <LibWeb/CSS/FontFaceSet.h>
 #include <LibWeb/CSS/HypotheticalElement.h>
 #include <LibWeb/CSS/Invalidation/AdoptedStyleSheetInvalidator.h>
-#include <LibWeb/CSS/Invalidation/ContainerQueryInvalidator.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/CSS/Invalidation/LinkInvalidator.h>
 #include <LibWeb/CSS/Invalidation/MediaQueryInvalidator.h>
@@ -86,7 +84,6 @@
 #include <LibWeb/CSS/StyleValues/FilterStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/OpacityValueStyleValue.h>
-#include <LibWeb/CSS/StyleValues/RandomValueSharingStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
 #include <LibWeb/CSS/TransitionEvent.h>
@@ -103,6 +100,7 @@
 #include <LibWeb/DOM/CDATASection.h>
 #include <LibWeb/DOM/CaretPosition.h>
 #include <LibWeb/DOM/Comment.h>
+#include <LibWeb/DOM/CommitMessages.h>
 #include <LibWeb/DOM/CustomEvent.h>
 #include <LibWeb/DOM/DOMImplementation.h>
 #include <LibWeb/DOM/Document.h>
@@ -117,6 +115,7 @@
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/DOM/InputEventsTarget.h>
+#include <LibWeb/DOM/InvalidationJournal.h>
 #include <LibWeb/DOM/LiveNodeList.h>
 #include <LibWeb/DOM/MutationObserver.h>
 #include <LibWeb/DOM/MutationType.h>
@@ -232,6 +231,7 @@
 #include <LibWeb/ResizeObserver/ResizeObserverEntry.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWeb/SVG/SVGElement.h>
+#include <LibWeb/SVG/SVGPatternElement.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
@@ -623,6 +623,8 @@ Document::Document(Page& page, GC::Ref<EventTarget> relevant_global_event_target
     , m_font_computer(GC::Heap::the().allocate<CSS::FontComputer>(*this))
     , m_url(url)
     , m_relevant_global_event_target(relevant_global_event_target)
+    , m_invalidation_journal(make<InvalidationJournal>(*this))
+    , m_commit_messages(make<CommitMessages>(*this))
     , m_chrome_widget_registry(make_ref_counted<Painting::ChromeWidgetRegistry>())
     , m_fonts(CSS::FontFaceSet::create(relevant_settings_object()))
     , m_temporary_document_for_fragment_parsing(temporary_document_for_fragment_parsing == TemporaryDocumentForFragmentParsing::Yes)
@@ -671,6 +673,7 @@ Layout::NodeArena& Document::layout_node_arena()
             },
         };
         Layout::RustFFI::layout_arena_set_style_record_host_callbacks(m_layout_node_arena->handle(), style_record_host_callbacks);
+        m_layout_node_arena->start_reporting_box_presence({});
         Layout::RustFFI::layout_arena_set_shell_factory(m_layout_node_arena->handle(), this, [](void* context, Compositing::RustFFI::NodeSlotId slot, Layout::RustFFI::NodeKind kind) {
             auto& document = *static_cast<Document*>(context);
             switch (kind) {
@@ -701,6 +704,7 @@ Layout::NodeArena& Document::layout_node_arena()
 void Document::reset_style_invalidation_counters() const
 {
     m_style_invalidation_counters = {};
+    (void)const_cast<CSS::StyleEngine&>(style_computer().style_engine()).size_query_container_scan_visits(true);
     if (m_layout_node_arena)
         Layout::RustFFI::layout_arena_scrollable_overflow_recalculation_count(m_layout_node_arena->handle(), true);
     CSS::reset_longhand_wrappers_minted();
@@ -741,6 +745,8 @@ Layout::RustFFI::FfiLayoutTreeBuildStats Document::layout_tree_build_stats() con
 void Document::finalize()
 {
     stop_compositor_animation_timers();
+    if (m_layout_node_arena)
+        m_layout_node_arena->stop_reporting_box_presence({});
     tear_down_layout_tree();
     if (m_layout_node_arena) {
         Layout::RustFFI::layout_arena_clear_chrome_state_callback(m_layout_node_arena->handle());
@@ -795,6 +801,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     m_style_scope.visit_edges(visitor);
+    m_invalidation_journal->visit_edges(visitor);
+    m_commit_messages->visit_edges(visitor);
     for (auto const& import : m_pending_css_import_rules)
         import->visit_edges(visitor);
     visitor.visit(m_page);
@@ -851,7 +859,6 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_document_observers_being_notified);
     for (auto& pending_scroll_event : m_pending_scroll_events)
         visitor.visit(pending_scroll_event.event_target);
-    visitor.visit(m_query_containers_needing_container_query_evaluation_after_layout);
     m_scroll_state_query_containers.visit_edges(visitor);
     visitor.visit(m_list_owners_pending_item_renumber);
     visitor.visit(m_list_owners_with_stale_item_counters);
@@ -874,8 +881,6 @@ void Document::visit_edges(Cell::Visitor& visitor)
     m_anchor_name_map.visit_edges(visitor);
     if (m_query_selector_result_cache)
         m_query_selector_result_cache->visit_edges(visitor);
-    if (m_isolated_selector_query_engine_cache)
-        m_isolated_selector_query_engine_cache->visit_edges(visitor);
 
     for (auto& event : m_pending_animation_event_queue) {
         visitor.visit(event.event);
@@ -912,10 +917,6 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_dialog_pointerdown_target);
     visitor.visit(m_console_client);
     visitor.visit(m_previously_repainted_cursor_position);
-    if (m_hit_test_display_list)
-        m_hit_test_display_list->visit_edges(visitor);
-    if (m_layout_node_arena)
-        m_layout_node_arena->visit_dom_nodes(visitor);
     visitor.visit(m_editing_host_manager);
     visitor.visit(m_editing_history);
     visitor.visit(m_local_storage_holder);
@@ -1536,28 +1537,44 @@ WebIDL::ExceptionOr<void> Document::set_title(Utf16View title)
     return {};
 }
 
-void Document::set_layout_root(Compositing::RustFFI::NodeSlotId viewport_slot)
+Compositing::RustFFI::NodeSlotId Document::layout_root_slot() const
 {
-    auto* viewport_shell = static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_node_shell_if_live(layout_node_arena().handle(), viewport_slot));
-    VERIFY(viewport_shell);
-    auto& viewport = as<Layout::Viewport>(*viewport_shell);
-    if (m_layout_root == &viewport)
-        return;
-    if (auto* replaced_layout_root = exchange(m_layout_root, nullptr)) {
+    if (!m_layout_node_arena)
+        return Compositing::RustFFI::NodeSlotId_INVALID;
+    return Layout::RustFFI::layout_arena_layout_root(m_layout_node_arena->handle());
+}
+
+Layout::Node* Document::layout_root_if_live() const
+{
+    return m_layout_node_arena ? m_layout_node_arena->node_if_live(layout_root_slot()) : nullptr;
+}
+
+// The build records the root it placed in the arena itself, so what is left for the document is to
+// retire the tree that was replaced and give the new one a paint state.
+Layout::RustFFI::FfiLayoutTreeBuildOutcome Document::build_layout_tree()
+{
+    m_needs_throttled_animation_style_update_check = true;
+    auto replaced_root = layout_root_slot();
+    auto outcome = Layout::build_layout_tree(*this);
+    VERIFY(is<Layout::Viewport>(layout_node_arena().node_if_live(outcome.viewport)));
+    if (replaced_root.index == outcome.viewport.index)
+        return outcome;
+    if (auto* replaced_layout_root = layout_node_arena().node_if_live(replaced_root)) {
         replaced_layout_root->prepare_subtree_for_detach_from_layout_tree();
-        layout_node_arena().free_subtree(Layout::Node::slot_id(replaced_layout_root));
+        layout_node_arena().free_subtree(replaced_root);
     }
-    m_layout_root = &viewport;
     m_paint_state = make<Painting::DocumentPaintState>(layout_node_arena());
+    return outcome;
 }
 
 void Document::tear_down_layout_tree()
 {
-    if (m_layout_root)
-        m_layout_root->prepare_subtree_for_detach_from_layout_tree();
+    auto* layout_root = layout_root_if_live();
+    if (layout_root)
+        layout_root->prepare_subtree_for_detach_from_layout_tree();
     m_hit_test_display_list = nullptr;
     m_chrome_widget_registry->clear();
-    if (auto* layout_root = exchange(m_layout_root, nullptr))
+    if (layout_root)
         layout_node_arena().free_subtree(Layout::Node::slot_id(layout_root));
     m_paint_state = nullptr;
     set_needs_full_layout_tree_update(true);
@@ -1565,23 +1582,6 @@ void Document::tear_down_layout_tree()
 
 void Document::tear_down_layout_tree_for_svg_image_document(Badge<SVG::SVGDecodedImageData>)
 {
-    tear_down_layout_tree_for_inactive_document();
-}
-
-void Document::tear_down_layout_tree_for_inactive_document()
-{
-    // The walk only forgets the DOM-side pointers. The subtree teardown below prepares every node under the
-    // layout root for detachment once and frees the whole tree, so detaching each node or pseudo-element
-    // subtree on its own would only repeat that work one node at a time.
-    for_each_in_inclusive_subtree([&](auto& node) {
-        node.clear_layout_node({});
-        if (auto* element = as_if<Element>(node)) {
-            element->for_each_synthetic_pseudo_element([](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
-                pseudo_element.set_layout_node(nullptr);
-            });
-        }
-        return TraversalDecision::Continue;
-    });
     tear_down_layout_tree();
 }
 
@@ -1741,6 +1741,17 @@ void Document::respond_to_base_url_changes(URL::URL const& old_document_url, URL
         return TraversalDecision::Continue;
     });
 
+    // A table's, a table section's, a row's or a cell's background attribute maps to an image hint
+    // resolved against the base URL when it is published, so publish those hints again.
+    if (!base_url_unchanged) {
+        for_each_shadow_including_descendant([&](Node& node) {
+            if (auto* element = as_if<Element>(node); element && element->has_attribute(HTML::AttributeNames::background)
+                && element->is_presentational_hint(HTML::AttributeNames::background))
+                CSS::republish_presentational_hints(*element);
+            return TraversalDecision::Continue;
+        });
+    }
+
     // FIXME: 3. For each descendant of document's shadow-including descendants:
     //        ...
 
@@ -1853,7 +1864,7 @@ Optional<Utf16String> Document::encoding_parse_and_serialize_url(Utf16View url) 
 
 void Document::invalidate_layout_tree(InvalidateLayoutTreeReason reason)
 {
-    if (m_layout_root)
+    if (has_layout_root())
         dbgln_if(UPDATE_LAYOUT_DEBUG, "DROP TREE {}", to_string(reason));
     tear_down_layout_tree();
 }
@@ -1867,9 +1878,16 @@ void Document::record_partial_relayout_escape(PartialRelayoutEscapeReason reason
         Layout::RustFFI::layout_arena_record_partial_relayout_escape(m_layout_node_arena->handle());
 }
 
+// The style engine keeps the containers, and records their dependents once a full layout has committed their
+// boxes.
 void Document::set_needs_container_query_evaluation_after_layout(Element const& query_container)
 {
-    m_query_containers_needing_container_query_evaluation_after_layout.set(const_cast<Element&>(query_container));
+    style_computer().style_engine().note_size_container_needs_evaluation_after_layout(query_container.style_node_id());
+}
+
+bool Document::has_size_containers_needing_evaluation_after_layout() const
+{
+    return style_computer().style_engine().has_size_containers_needing_evaluation_after_layout();
 }
 
 void Document::begin_style_stabilization_epoch()
@@ -1940,7 +1958,7 @@ void Document::end_style_stabilization_epoch()
 void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed)
 {
     // NB: Called during layout update.
-    m_layout_root->invalidate_text_blocks_cache();
+    Layout::RustFFI::layout_arena_invalidate_searchable_text(layout_node_arena().handle());
 
     set_needs_to_record_display_list();
 
@@ -1972,7 +1990,7 @@ bool Document::is_clean_for_layout_geometry_read() const
         && !style_computer().style_engine().has_pending_transaction()
         && !m_needs_media_rule_evaluation
         && !m_needs_animated_style_update
-        && m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
+        && !has_size_containers_needing_evaluation_after_layout()
         && m_elements_with_pending_top_layer_membership_change.is_empty()
         && !m_top_layer_needs_layout_zone_rebuild;
 }
@@ -2013,7 +2031,7 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
         && layout_is_up_to_date()
         && !m_needs_media_rule_evaluation
         && !m_needs_animated_style_update
-        && m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
+        && !has_size_containers_needing_evaluation_after_layout()
         && m_elements_with_pending_top_layer_membership_change.is_empty()
         && !m_top_layer_needs_layout_zone_rebuild
         && !style_computer().style_engine().css_transitions_may_observe_style_changes()
@@ -2100,10 +2118,11 @@ bool Document::reconcile_stale_list_item_counters_after_tree_build()
     // A rebuilt subtree has re-resolved the counters sets of any stale owner inside it, and an owner that has left
     // the document renders nothing.
     HashTable<Node const*> rebuilt_dom_roots;
-    Layout::RustFFI::layout_arena_for_each_pending_rebuilt_subtree_root_dom_node(
+    Layout::RustFFI::layout_arena_for_each_pending_rebuilt_subtree_root(
         layout_node_arena().handle(), &rebuilt_dom_roots,
-        [](void* context, void* dom_node) {
-            static_cast<HashTable<Node const*>*>(context)->set(static_cast<Node const*>(dom_node));
+        [](void* context, void* layout_node) {
+            if (auto const* dom_node = static_cast<Layout::Node const*>(layout_node)->dom_node())
+                static_cast<HashTable<Node const*>*>(context)->set(dom_node);
         });
     m_list_owners_with_stale_item_counters.remove_all_matching([&](GC::Ref<Element> const& list_owner) {
         if (!list_owner->is_connected())
@@ -2128,7 +2147,7 @@ bool Document::reconcile_stale_list_item_counters_after_tree_build()
 
 bool Document::needs_style_update_after_layout()
 {
-    return !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
+    return has_size_containers_needing_evaluation_after_layout()
         || m_needs_animated_style_update
         || style_computer().style_engine().has_pending_transaction();
 }
@@ -2151,17 +2170,23 @@ void Document::clear_devtools_layout_inspection_data()
     clear_flexbox_highlighted_node(nullptr);
 }
 
+void Document::drain_invalidation_journal() const
+{
+    m_invalidation_journal->drain();
+}
+
 bool Document::layout_is_up_to_date() const
 {
     if (!navigable() || navigable()->active_document().ptr() != this)
         return true;
-    if (!m_layout_root)
+    // NB: Every question about pending layout work comes through here, so draining first keeps a journalled mark from
+    //     hiding behind an up-to-date answer.
+    drain_invalidation_journal();
+    // Without an arena there is no layout root either, so there is a tree to build.
+    if (!m_layout_node_arena)
         return false;
-    return !m_layout_root->needs_layout_update()
-        && !needs_layout_tree_update()
-        && !child_needs_layout_tree_update()
-        && !needs_full_layout_tree_update()
-        && (!m_layout_node_arena || !Layout::RustFFI::layout_arena_has_partial_relayout_boundary_roots(m_layout_node_arena->handle()));
+    return Layout::RustFFI::layout_arena_layout_is_up_to_date(m_layout_node_arena->handle(),
+        needs_layout_tree_update() || child_needs_layout_tree_update());
 }
 
 void Document::update_style_computer_viewport_rect()
@@ -2179,13 +2204,10 @@ void Document::set_quirks_mode(QuirksMode mode)
         return;
     m_quirks_mode = mode;
 
-    // Quirks mode changes how id and class selectors match, so cached query results must not survive it. Nor may
-    // the engines built for queries against disconnected trees, which have it compiled in.
+    // Quirks mode changes how id and class selectors match, so cached query results must not survive it.
     bump_dom_tree_version();
     if (m_query_selector_result_cache)
         m_query_selector_result_cache->clear();
-    if (m_isolated_selector_query_engine_cache)
-        m_isolated_selector_query_engine_cache->clear();
 
     // It also changes which case a rule cache buckets id and class selectors under, and brings a user
     // agent stylesheet with it, so no scope's rule cache and no element's style survives it either.
@@ -2228,18 +2250,24 @@ void Document::invalidate_style_for_viewport_change()
     invalidate_registered_initial_values(m_cached_registered_properties_from_css_property_rules);
 
     if (registered_initial_value_depends_on_viewport_metrics) {
+        // The custom-property registry holds the initial values just dropped, so the next style
+        // update has to publish the recomputed ones before it reads them.
+        m_rust_custom_property_registry_synced = false;
         // A registered initial value is shared by every element that does not specify the custom
         // property, so its consumers cannot be identified from their computed styles.
         record_style_environment_change();
         return;
     }
 
+    // The viewport is one of the document's published inputs, and the style engine drives a record
+    // that read it again once it moves, so the readers are rows the engine settles. They are still
+    // named here: what moved is in none of their winners.
     auto& style_engine = style_computer().style_engine();
     for (auto style_node : style_engine.viewport_dependent_style_nodes()) {
         auto element = style_computer().element_for_style_node(style_node.value());
         if (!element || !element->is_connected() || &element->document() != this)
             continue;
-        style_engine.record_element_style_input_change(style_node);
+        style_engine.record_derived_element_style_input_change(style_node, CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
     }
 
     // Descendants that inherit changed values are reached by the normal inherited-style reaction path.
@@ -2247,11 +2275,11 @@ void Document::invalidate_style_for_viewport_change()
     // computed-value dependency for the retained style engine to discover.
     auto elements = move(m_elements_with_viewport_dependent_style);
     for (auto& element : elements) {
-        if (&element.document() != this || (!element.style_uses_if_css_function() && !element.style_depends_on_viewport_metrics()))
+        if (&element.document() != this || (!element.style_uses_if_css_function() && !element.style_uses_custom_function() && !element.style_depends_on_viewport_metrics()))
             continue;
         m_elements_with_viewport_dependent_style.set(element);
         if (element.is_connected())
-            style_engine.record_element_style_input_change(element.style_node_id());
+            style_engine.record_derived_element_style_input_change(element.style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
     }
 }
 
@@ -2338,8 +2366,23 @@ void Document::sample_animation_effects_needing_style_update()
     m_force_throttled_animation_style_update = false;
 }
 
+void Document::note_animations_that_can_skip_per_frame_style_updates()
+{
+    if (!m_needs_throttled_animation_style_update_check || m_has_throttled_animation_style_update || !layout_is_up_to_date())
+        return;
+    m_needs_throttled_animation_style_update_check = false;
+    for (auto& animation : m_associated_animations) {
+        auto* effect = as_if<Animations::KeyframeEffect>(animation.effect().ptr());
+        if (effect && effect->can_skip_per_frame_style_update()) {
+            note_throttled_animation_style_update();
+            return;
+        }
+    }
+}
+
 void Document::flush_throttled_animation_style_update()
 {
+    note_animations_that_can_skip_per_frame_style_updates();
     if (!m_has_throttled_animation_style_update)
         return;
     auto task_generation = relevant_settings_object().responsible_event_loop().task_generation();
@@ -2353,10 +2396,12 @@ void Document::flush_throttled_animation_style_update()
 
 void Document::flush_throttled_animation_style_update_for_node(Node const& node)
 {
-    // Only an animation that skipped a per-frame style update has anything for this read to catch
-    // up on. The last sampling pass recorded whether any did, and the document-wide flush above
-    // already trusts that record, so walking every associated animation to find none is wasted on
-    // every synchronous geometry read of a page that animates.
+    // Only an animation that can skip a per-frame style update has anything for this read to catch
+    // up on. Sampling and painting record whether any can, as do reads after a visibility or layout
+    // tree change, and the document-wide flush above already trusts that record, so walking every
+    // associated animation to find none is wasted on every synchronous geometry read of a page that
+    // animates.
+    note_animations_that_can_skip_per_frame_style_updates();
     if (!m_has_throttled_animation_style_update)
         return;
 
@@ -2447,8 +2492,10 @@ bool Document::compositor_animation_observation_timer_is_active() const
 
 void Document::throttled_animation_visibility_changed()
 {
-    if (!m_has_throttled_animation_style_update)
+    if (!m_has_throttled_animation_style_update) {
+        m_needs_throttled_animation_style_update_check = true;
         return;
+    }
     flush_throttled_animation_style_update();
     page().client().request_frame();
 }
@@ -2517,7 +2564,11 @@ void Document::prepare_for_rendering()
 void Document::update_paint_and_hit_testing_properties_if_needed()
 {
     // NB: Called during paint property resolution.
+    // Everything that reads paint state comes through here, so the marks that describe it go through first.
+    drain_invalidation_journal();
+
     prepare_for_rendering();
+    Painting::publish_image_map_area_facts_if_needed(*this);
     if (m_needs_accumulated_visual_contexts_update) {
         m_needs_accumulated_visual_contexts_update = false;
         if (has_committed_viewport_box())
@@ -2532,7 +2583,7 @@ void Document::update_paint_and_hit_testing_properties_if_needed()
 
 bool Document::can_compute_client_rects_without_accumulated_visual_contexts_update(Layout::Node const& layout_node) const
 {
-    if (!m_needs_accumulated_visual_contexts_update || !m_layout_root)
+    if (!m_needs_accumulated_visual_contexts_update || !has_layout_root())
         return false;
 
     auto navigable = this->navigable();
@@ -2691,7 +2742,8 @@ Layout::Viewport* Document::unsafe_layout_node()
 
 bool Document::has_committed_viewport_box() const
 {
-    return m_layout_root && Painting::has_committed_box(*m_layout_root);
+    auto const* layout_root = layout_root_if_live();
+    return layout_root && Painting::has_committed_box(*layout_root);
 }
 
 void Document::set_inspected_node(GC::Ptr<Node> node)
@@ -5569,7 +5621,7 @@ void Document::destroy()
 
     // AD-HOC: Destruction does not go through did_stop_being_active_document_in_navigable().
     //         Tear the layout tree down now instead of holding it until finalization.
-    tear_down_layout_tree_for_inactive_document();
+    tear_down_layout_tree();
 
     // 7. Remove any tasks whose document is document from any task queue (without running those tasks).
     HTML::main_thread_event_loop().task_queue().remove_tasks_matching([this](auto& task) {
@@ -5841,6 +5893,15 @@ void Document::set_browsing_context(GC::Ptr<HTML::BrowsingContext> browsing_cont
         ensure_style_engine_tracks_tree();
 }
 
+void Document::set_style_node_id(CSS::StyleNodeID style_node_id)
+{
+    m_style_node_id = style_node_id;
+    // The identity may have named a node that has since left, and the layout arena keys layout tree update marks by
+    // identity alone, so the document starts with none.
+    if (m_layout_node_arena && style_node_id != 0)
+        Layout::RustFFI::layout_arena_clear_layout_tree_update_marks(m_layout_node_arena->handle(), style_node_id.value());
+}
+
 void Document::ensure_style_engine_tracks_tree()
 {
     // A document without a browsing context never updates style, so its tree is not tracked until the style of an
@@ -5848,6 +5909,7 @@ void Document::ensure_style_engine_tracks_tree()
     if (m_style_engine_tracks_tree)
         return;
     m_style_engine_tracks_tree = true;
+    CSS::record_document_tree_tracked(*this);
     for (auto* child = first_child(); child; child = child->next_sibling())
         CSS::record_subtree_connecting(*child);
 }
@@ -6033,7 +6095,7 @@ bool Document::is_allowed_to_use_feature(PolicyControlledFeature feature) const
 void Document::did_stop_being_active_document_in_navigable()
 {
     stop_compositor_animation_timers();
-    tear_down_layout_tree_for_inactive_document();
+    tear_down_layout_tree();
 
     schedule_html_parser_end_check();
 
@@ -7750,8 +7812,9 @@ void Document::update_compositor_animations()
         auto* layout_node = target.unsafe_layout_node();
         if (!layout_node)
             continue;
-        bool already_forced_effects_layer = any_of(layout_nodes_with_stale_forced_effects_layer, [&](auto const& stale_layout_node) {
-            return stale_layout_node.ptr() == layout_node;
+        auto layout_node_slot = Layout::Node::slot_id(layout_node);
+        bool already_forced_effects_layer = any_of(layout_nodes_with_stale_forced_effects_layer, [&](auto stale_slot) {
+            return stale_slot.index == layout_node_slot.index;
         });
         if (!missing_visual_context_node && !already_forced_effects_layer)
             continue;
@@ -7764,10 +7827,10 @@ void Document::update_compositor_animations()
             Painting::repaint_after_style_change(*layout_node, invalidation);
             forced_opacity_effects_layer = true;
         }
-        if (!any_of(m_layout_nodes_with_forced_compositor_effects_layer, [&](auto const& forced_layout_node) { return forced_layout_node.ptr() == layout_node; }))
-            m_layout_nodes_with_forced_compositor_effects_layer.append(*layout_node);
-        layout_nodes_with_stale_forced_effects_layer.remove_first_matching([&](auto const& stale_layout_node) {
-            return stale_layout_node.ptr() == layout_node;
+        if (!any_of(m_layout_nodes_with_forced_compositor_effects_layer, [&](auto forced_slot) { return forced_slot.index == layout_node_slot.index; }))
+            m_layout_nodes_with_forced_compositor_effects_layer.append(layout_node_slot);
+        layout_nodes_with_stale_forced_effects_layer.remove_first_matching([&](auto stale_slot) {
+            return stale_slot.index == layout_node_slot.index;
         });
     }
     if (forced_opacity_effects_layer)
@@ -7816,6 +7879,8 @@ void Document::update_compositor_animations()
                 effect.request_observation_sample();
                 requested_withdrawn_effect_sample = true;
             }
+            if (!m_has_throttled_animation_style_update && effect.can_skip_per_frame_style_update())
+                note_throttled_animation_style_update();
         };
         auto abstract_target = effect.target_abstract_element();
         if (!abstract_target.has_value() || effect.target_properties().is_empty())
@@ -7930,20 +7995,22 @@ void Document::update_compositor_animations()
         if (background_color_animation_was_built)
             background_color_was_handed_off = true;
         if (background_color_layout_node && background_color_animation_is_valid) {
-            if (!any_of(m_layout_nodes_with_forced_compositor_background_color_frame, [&](auto const& forced_layout_node) { return forced_layout_node.ptr() == background_color_layout_node; }))
-                m_layout_nodes_with_forced_compositor_background_color_frame.append(*background_color_layout_node);
-            layout_nodes_with_stale_forced_background_color_frame.remove_first_matching([&](auto const& stale_layout_node) {
-                return stale_layout_node.ptr() == background_color_layout_node;
+            auto background_color_layout_node_slot = Layout::Node::slot_id(background_color_layout_node);
+            if (!any_of(m_layout_nodes_with_forced_compositor_background_color_frame, [&](auto forced_slot) { return forced_slot.index == background_color_layout_node_slot.index; }))
+                m_layout_nodes_with_forced_compositor_background_color_frame.append(background_color_layout_node_slot);
+            layout_nodes_with_stale_forced_background_color_frame.remove_first_matching([&](auto stale_slot) {
+                return stale_slot.index == background_color_layout_node_slot.index;
             });
         }
         bool filter_was_handed_off = !selected_for_filter;
         if (filter_animation_was_built)
             filter_was_handed_off = true;
         if (filter_layout_node && filter_animation_is_valid) {
-            if (!any_of(m_layout_nodes_with_forced_compositor_effects_layer, [&](auto const& forced_layout_node) { return forced_layout_node.ptr() == filter_layout_node; }))
-                m_layout_nodes_with_forced_compositor_effects_layer.append(*filter_layout_node);
-            layout_nodes_with_stale_forced_effects_layer.remove_first_matching([&](auto const& stale_layout_node) {
-                return stale_layout_node.ptr() == filter_layout_node;
+            auto filter_layout_node_slot = Layout::Node::slot_id(filter_layout_node);
+            if (!any_of(m_layout_nodes_with_forced_compositor_effects_layer, [&](auto forced_slot) { return forced_slot.index == filter_layout_node_slot.index; }))
+                m_layout_nodes_with_forced_compositor_effects_layer.append(filter_layout_node_slot);
+            layout_nodes_with_stale_forced_effects_layer.remove_first_matching([&](auto stale_slot) {
+                return stale_slot.index == filter_layout_node_slot.index;
             });
         }
         bool transform_was_handed_off = !selected_for_transform;
@@ -8008,7 +8075,8 @@ void Document::update_compositor_animations()
         Painting::set_needs_repaint(*layout_node, InvalidateDisplayList::PaintCommandsAndHitTestList);
     }
 
-    for (auto& layout_node : layout_nodes_with_stale_forced_effects_layer) {
+    for (auto stale_slot : layout_nodes_with_stale_forced_effects_layer) {
+        auto* layout_node = layout_node_arena().node_if_live(stale_slot);
         if (!layout_node)
             continue;
         layout_node->set_needs_compositor_effects_layer(false);
@@ -8017,7 +8085,8 @@ void Document::update_compositor_animations()
         invalidation.ensure_at_least(CSS::InvalidationLevel::Repaint);
         Painting::repaint_after_style_change(*layout_node, invalidation);
     }
-    for (auto& layout_node : layout_nodes_with_stale_forced_background_color_frame) {
+    for (auto stale_slot : layout_nodes_with_stale_forced_background_color_frame) {
+        auto* layout_node = layout_node_arena().node_if_live(stale_slot);
         if (!layout_node)
             continue;
         layout_node->set_needs_compositor_background_color_frame(false);
@@ -8376,6 +8445,10 @@ void Document::element_id_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> ele
         element->document_or_shadow_root_element_by_id_map().add(new_id.value(), element);
     }
     note_svg_paint_resources_changed();
+    if (old_id.has_value())
+        republish_svg_patterns_inheriting_from(*old_id);
+    if (new_id.has_value())
+        republish_svg_patterns_inheriting_from(*new_id);
 }
 
 void Document::element_with_id_was_added(Badge<DOM::Element>, GC::Ref<DOM::Element> element)
@@ -8392,6 +8465,7 @@ void Document::element_with_id_was_added(Badge<DOM::Element>, GC::Ref<DOM::Eleme
     if (auto id = element->id(); id.has_value()) {
         element->document_or_shadow_root_element_by_id_map().add(id.value(), element);
         note_svg_paint_resources_changed();
+        republish_svg_patterns_inheriting_from(*id);
     }
 }
 
@@ -8405,6 +8479,7 @@ void Document::element_with_id_was_removed(Badge<DOM::Element>, GC::Ref<DOM::Ele
     if (auto id = element->id(); id.has_value()) {
         element->document_or_shadow_root_element_by_id_map().remove(id.value(), element);
         note_svg_paint_resources_changed();
+        republish_svg_patterns_inheriting_from(*id);
     }
 }
 
@@ -8660,8 +8735,11 @@ GC::Ptr<CaretPosition> Document::caret_position_from_point(double x, double y, C
     //           the descendants of the viewport, return a caret position for the text entry widget.
 
     // 5. Otherwise, retarget shadow tree positions whose roots are not allowed by options.shadowRoots.
-    auto start_node = caret_position->boundary.node;
-    auto start_offset = caret_position->boundary.offset;
+    auto boundary = caret_position->boundary_point();
+    if (!boundary.has_value())
+        return nullptr;
+    auto start_node = boundary->node;
+    auto start_offset = boundary->offset;
     auto* shadow_root = as_if<ShadowRoot>(start_node->root());
     while (shadow_root && !shadow_root_is_allowed_for_caret_position(*shadow_root, options)) {
         auto* host = shadow_root->host();
@@ -8992,14 +9070,6 @@ void Document::for_each_active_css_style_sheet(Function<void(CSS::StyleSheetStat
     }
 }
 
-double Document::ensure_element_shared_css_random_base_value(CSS::RandomCachingKey const& random_caching_key)
-{
-    return m_element_shared_css_random_base_value_cache.ensure(random_caching_key, []() {
-        static XorShift128PlusRNG random_number_generator;
-        return random_number_generator.get();
-    });
-}
-
 static Optional<CSS::StyleSheetState&> find_style_sheet_with_url(Utf16View url, CSS::StyleSheetState& style_sheet)
 {
     if (style_sheet.href_for_bindings() == url)
@@ -9070,11 +9140,38 @@ Optional<Utf16String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier
 void Document::register_shadow_root(Badge<DOM::ShadowRoot>, DOM::ShadowRoot& shadow_root)
 {
     m_shadow_roots.append(shadow_root);
+    note_style_sheet_set_change();
 }
 
 void Document::unregister_shadow_root(Badge<DOM::ShadowRoot>, DOM::ShadowRoot& shadow_root)
 {
     m_shadow_roots.remove(shadow_root);
+    note_style_sheet_set_change();
+    // The style engine names the keyframe sets of the root's `@keyframes` by pointer. The root may be leaving from a
+    // garbage collection's finalizer, which must not reach into the engine, so its row is given up before the next
+    // style transaction, and the sets stay alive until then.
+    if (auto departed = shadow_root.style_scope().take_published_animation_keyframes(); departed.has_value())
+        m_departed_animation_keyframes.append(departed.release_value());
+}
+
+// Resolving an animation's `@keyframes` is a lookup in what each style scope published to the style engine, which a
+// scope does whenever its rule cache is built. So before a style transaction, the rows of the shadow roots that left
+// are given up and every scope's rule cache is built. A rule cache is invalidated only with a change of the style sheet
+// set, as is a shadow root's departure, so without one since the last transaction every row is current.
+void Document::publish_animation_keyframes_for_style_update()
+{
+    if (m_animation_keyframes_published_generation == m_style_sheet_set_generation)
+        return;
+    // NB: Read before the walk, so that a change the walk itself makes walks again next time.
+    m_animation_keyframes_published_generation = m_style_sheet_set_generation;
+    auto* engine = style_computer().style_engine().rust_handle();
+    for (auto const& departed : m_departed_animation_keyframes)
+        CSS::StyleEngineFFI::style_engine_set_tree_scope_animation_keyframes(engine, departed.tree_scope.value(), departed.shadow_root_identity, nullptr, nullptr, 0, nullptr, 0);
+    m_departed_animation_keyframes.clear();
+    style_scope().build_rule_cache_if_needed();
+    for_each_shadow_root([](DOM::ShadowRoot& shadow_root) {
+        shadow_root.style_scope().build_rule_cache_if_needed();
+    });
 }
 
 // https://drafts.csswg.org/css-position-4/#add-an-element-to-the-top-layer
@@ -9166,7 +9263,7 @@ void Document::process_pending_top_layer_layout_changes()
     m_top_layer_needs_layout_zone_rebuild = false;
 
     // An already pending full build recreates every box anyway.
-    if (!m_layout_root || needs_full_layout_tree_update())
+    if (!has_layout_root() || needs_full_layout_tree_update())
         return;
 
     // Marks are applied only after every detach has run: detaching clears the flags across the
@@ -9255,13 +9352,14 @@ Vector<GC::Root<Range>> Document::find_matching_text(Utf16View query, CaseSensit
     Layout::RustFFI::layout_arena_find_matching_text(
         layout_node()->arena_handle(), Layout::Node::slot_id(layout_node()), query_view,
         case_sensitivity == CaseSensitivity::CaseSensitive,
-        [](void* dom_node) {
+        [](void* layout_node) {
             // Inert text is excluded from find-in-page.
-            return !static_cast<DOM::Text const*>(dom_node)->is_inert();
+            auto const* text = as_if<DOM::Text>(static_cast<Layout::Node const*>(layout_node)->dom_node());
+            return text && !text->is_inert();
         },
         &matches, [](void* context, Layout::RustFFI::FfiDomTextRange match) {
-            auto* start = static_cast<DOM::Text*>(match.start_node);
-            auto* end = static_cast<DOM::Text*>(match.end_node);
+            auto* start = as_if<DOM::Text>(static_cast<Layout::Node*>(match.start_layout_node)->dom_node());
+            auto* end = as_if<DOM::Text>(static_cast<Layout::Node*>(match.end_layout_node)->dom_node());
             if (!start || !end || &start->root() != &end->root()
                 || !start->is_connected() || !end->is_connected()
                 || match.start_offset > start->length() || match.end_offset > end->length())
@@ -9786,8 +9884,6 @@ void Document::set_navigable(GC::Ptr<HTML::LocalNavigable> navigable)
 
 void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display_list)
 {
-    auto navigable = this->navigable();
-
     switch (should_invalidate_display_list) {
     case InvalidateDisplayList::No:
         break;
@@ -9799,6 +9895,12 @@ void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display
         break;
     }
 
+    request_frame_for_pending_repaint();
+}
+
+void Document::request_frame_for_pending_repaint()
+{
+    auto navigable = this->navigable();
     if (!navigable)
         return;
 
@@ -9810,9 +9912,8 @@ void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display
         return;
     }
 
-    if (auto container = navigable->container()) {
-        container->document().set_needs_repaint(InvalidateDisplayList::No);
-    }
+    if (auto container = navigable->container())
+        container->document().request_frame_for_pending_repaint();
 }
 
 void Document::set_needs_accumulated_visual_contexts_update(bool value)
@@ -9820,6 +9921,39 @@ void Document::set_needs_accumulated_visual_contexts_update(bool value)
     m_needs_accumulated_visual_contexts_update = value;
     if (value)
         set_needs_repaint(InvalidateDisplayList::No);
+}
+
+// A pattern connecting or disconnecting needs no republication of its own here: one that can be named has an id, and
+// the id's arrival or departure republishes the patterns that name it.
+void Document::register_svg_pattern_element(Badge<SVG::SVGPatternElement>, SVG::SVGPatternElement& pattern)
+{
+    m_svg_pattern_elements.append(pattern);
+}
+
+void Document::unregister_svg_pattern_element(Badge<SVG::SVGPatternElement>, SVG::SVGPatternElement& pattern)
+{
+    m_svg_pattern_elements.remove(pattern);
+}
+
+// A <pattern> that names another pattern inherits the attributes it does not carry from it, so its published facts
+// are not a function of its own attributes: anything that changes what an id along its `href` chain names, or what a
+// pattern along that chain carries, changes them. Republish the patterns whose chain passes through `id`.
+void Document::republish_svg_patterns_inheriting_from(Utf16FlyString const& id)
+{
+    HashTable<SVG::SVGPatternElement const*> republished;
+    republish_svg_patterns_inheriting_from(id, republished);
+}
+
+void Document::republish_svg_patterns_inheriting_from(Utf16FlyString const& id, HashTable<SVG::SVGPatternElement const*>& republished)
+{
+    for (auto& pattern : m_svg_pattern_elements) {
+        // Each pattern is republished once, which also ends the walk along a cyclic chain.
+        if (pattern.linked_id() != id.view() || republished.set(&pattern) != AK::HashSetResult::InsertedNewEntry)
+            continue;
+        pattern.publish_svg_attribute_facts();
+        if (auto pattern_id = pattern.id(); pattern_id.has_value())
+            republish_svg_patterns_inheriting_from(*pattern_id, republished);
+    }
 }
 
 void Document::note_svg_paint_resources_changed()
@@ -9895,26 +10029,27 @@ void Document::forget_snapped_areas_of_scroll_container(Layout::Node const& scro
 
 void Document::register_scroll_snap_container(Layout::Node const& snap_container)
 {
-    if (any_of(m_scroll_snap_containers, [&](auto const& registered) { return registered.ptr() == &snap_container; }))
+    auto snap_container_slot = Layout::Node::slot_id(&snap_container);
+    if (any_of(m_scroll_snap_containers, [&](auto registered_slot) { return registered_slot.index == snap_container_slot.index; }))
         return;
-    m_scroll_snap_containers.append(snap_container.make_weak_ptr());
+    m_scroll_snap_containers.append(snap_container_slot);
 }
 
-Vector<WeakPtr<Layout::Node const>> Document::collect_scroll_snap_containers()
+Vector<Compositing::RustFFI::NodeSlotId> Document::collect_scroll_snap_containers()
 {
-    // A registered box whose layout node a style or layout update dropped is no longer a box of this document.
-    m_scroll_snap_containers.remove_all_matching([](auto const& registered) {
-        return !registered;
-    });
-
-    Vector<WeakPtr<Layout::Node const>> snap_containers;
+    Vector<Compositing::RustFFI::NodeSlotId> snap_containers;
     snap_containers.ensure_capacity(m_scroll_snap_containers.size());
-    for (auto const& registered : m_scroll_snap_containers) {
+    m_scroll_snap_containers.remove_all_matching([&](auto registered_slot) {
+        // A registered box whose layout node a style or layout update dropped is no longer a box of this document.
+        auto const* registered = layout_node_arena().node_if_live(registered_slot);
+        if (!registered)
+            return true;
         // The scroll snap properties of a registered box can stop making it a snap container without its layout node
         // being rebuilt, and a registered box the latest commit left out has no committed box to snap with.
         if (Painting::has_committed_box(*registered) && Painting::is_scroll_snap_container(*registered))
-            snap_containers.unchecked_append(registered);
-    }
+            snap_containers.unchecked_append(registered_slot);
+        return false;
+    });
     return snap_containers;
 }
 
@@ -10552,15 +10687,21 @@ void Document::sync_custom_property_registrations_to_rust()
 
     Vector<Utf16String> names;
     Vector<Optional<Utf16String>> initial_values;
+    Vector<NonnullRefPtr<CSS::StyleValue const>> computed_initial_values;
     Vector<CSS::ComputedValuesFFI::FfiCustomPropertyRegistration> registrations;
     names.ensure_capacity(effective_registrations.size());
     initial_values.ensure_capacity(effective_registrations.size());
+    computed_initial_values.ensure_capacity(effective_registrations.size());
     registrations.ensure_capacity(effective_registrations.size());
     for (auto const& [name, registration] : effective_registrations) {
         names.unchecked_append(name.to_utf16_string());
         initial_values.unchecked_append(registration->initial_value
                 ? Optional<Utf16String> { registration->initial_value->to_utf16_string(CSS::SerializationMode::ResolvedValueForReparse) }
                 : Optional<Utf16String> {});
+        // What the initial value computes to is a fact of the registration, computed against the
+        // document rather than any element, and memoized on it for every reader: the style engine
+        // takes it from here rather than computing it again.
+        computed_initial_values.unchecked_append(CSS::compute_registered_custom_property_initial_value(*this, *registration));
         auto const& name_string = names.last();
         auto const& initial_value = initial_values.last();
         registrations.unchecked_append({
@@ -10569,6 +10710,7 @@ void Document::sync_custom_property_registrations_to_rust()
             .inherits = registration->inherit,
             .has_initial_value = initial_value.has_value(),
             .initial_value = initial_value.has_value() ? ffi_utf16_view(*initial_value) : CSS::ComputedValuesFFI::FfiUtf16View {},
+            .computed_initial_value = computed_initial_values.last()->rust_style_value_data(),
         });
     }
     auto const& document_url = serialized_url();
@@ -10827,7 +10969,7 @@ RefPtr<SelectorQuery const> Document::selector_query_for(Utf16View selector_text
 
     RefPtr<SelectorQuery const> query;
     if (maybe_selectors.has_value())
-        query = SelectorQuery::create(const_cast<Document&>(*this), maybe_selectors.release_value());
+        query = SelectorQuery::create(maybe_selectors.release_value());
     mark_used(query);
 
     // Evict the query used least recently. A page cycling through a working set of selectors that fits the cache then
@@ -10855,13 +10997,6 @@ QuerySelectorResultCache& Document::query_selector_result_cache()
     if (!m_query_selector_result_cache)
         m_query_selector_result_cache = make<QuerySelectorResultCache>();
     return *m_query_selector_result_cache;
-}
-
-IsolatedSelectorQueryEngineCache& Document::isolated_selector_query_engine_cache()
-{
-    if (!m_isolated_selector_query_engine_cache)
-        m_isolated_selector_query_engine_cache = make<IsolatedSelectorQueryEngineCache>();
-    return *m_isolated_selector_query_engine_cache;
 }
 
 }

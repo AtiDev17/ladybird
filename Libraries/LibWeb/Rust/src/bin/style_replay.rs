@@ -218,11 +218,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     });
                     unsafe { bridge::style_engine_destroy(engine) };
                 }
-                EventKind::AllocateStyleNodes => {
+                EventKind::AllocateStyleNodes | EventKind::AllocateTextStyleNodes => {
                     let engine = read_engine(&mut event.payload, &live_engines)?;
                     let expected = event.payload.read_u32_vec()?;
                     let mut actual = vec![0; expected.len()];
-                    unsafe { bridge::style_engine_allocate_style_nodes(engine, actual.as_mut_ptr(), actual.len()) };
+                    let allocate = if event.kind == EventKind::AllocateStyleNodes {
+                        bridge::style_engine_allocate_style_nodes
+                    } else {
+                        bridge::style_engine_allocate_text_style_nodes
+                    };
+                    unsafe { allocate(engine, actual.as_mut_ptr(), actual.len()) };
                     if actual != expected {
                         return Err(
                             format!("style-node allocation diverged: expected {expected:?}, got {actual:?}").into(),
@@ -325,10 +330,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let expected = event.payload.read_u32()?;
                     let actual = unsafe { bridge::style_engine_intern_atom(engine, token) };
                     assert_identity("atom", expected, actual)?;
-                }
-                EventKind::SelectorQueryAtomMappings => {
-                    let engine = read_engine(&mut event.payload, &live_engines)?;
-                    replay_atom_mappings(engine, &mut event.payload)?;
                 }
                 EventKind::ReplaceStyleRuleSelectors => {
                     let (engine_index, engine) = read_engine_indexed(&mut event.payload, &live_engines)?;
@@ -747,6 +748,47 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &mut phase_times,
                     );
                 }
+                EventKind::AnswerRecordDemand => {
+                    let engine = read_engine(&mut event.payload, &live_engines)?;
+                    let node = event.payload.read_u32()?;
+                    let demand = bridge::FfiRecordDemand {
+                        targeted: event.payload.read_bool()?,
+                        read_only: event.payload.read_bool()?,
+                        exclude_inline_style: event.payload.read_bool()?,
+                        pseudo_kind_plus_one: event.payload.read_u8()?,
+                    };
+                    let expected = event.payload.read_u64()?;
+                    let expected_absent = event.payload.read_bool()?;
+                    let expected_uses_substitution = event.payload.read_bool()?;
+                    let expected_present = event.payload.read_u8()?;
+                    let actual = unsafe { bridge::style_engine_answer_record_demand(engine, node, demand) };
+                    if actual.record.style_record != expected
+                        || actual.is_absent != expected_absent
+                        || actual.record.uses_substitution != expected_uses_substitution
+                        || actual.record.pseudo_records_present != expected_present
+                    {
+                        return Err(format!(
+                            "record demand diverged for node {node}: expected {expected} (absent {expected_absent}, substitution {expected_uses_substitution}, present {expected_present:#x}), got {actual:?}"
+                        )
+                        .into());
+                    }
+                }
+                EventKind::SettlePseudoRecordsAfterHostRecord => {
+                    let engine = read_engine(&mut event.payload, &live_engines)?;
+                    let node = event.payload.read_u32()?;
+                    let old_is_list_item = event.payload.read_bool()?;
+                    let expected = event.payload.read_u64()?;
+                    let expected_present = event.payload.read_u8()?;
+                    let actual = unsafe {
+                        bridge::style_engine_settle_pseudo_records_after_host_record(engine, node, old_is_list_item)
+                    };
+                    if actual.style_record != expected || actual.pseudo_records_present != expected_present {
+                        return Err(format!(
+                            "pseudo records settled after a host record diverged for node {node}: expected {expected} (present {expected_present:#x}), got {actual:?}"
+                        )
+                        .into());
+                    }
+                }
                 EventKind::RetryEngineRecordAfterAncestor => {
                     let engine = read_engine(&mut event.payload, &live_engines)?;
                     let node = event.payload.read_u32()?;
@@ -1138,6 +1180,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .into());
                         }
                     }
+                }
+                EventKind::EnsureRandomBaseValue => {
+                    let engine = read_engine(&mut event.payload, &live_engines)?;
+                    let node = event.payload.read_u32()?;
+                    let name = event.payload.read_u16_vec()?;
+                    let element_shared = event.payload.read_bool()?;
+                    let value_bits = event.payload.read_u64()?;
+                    unsafe { bridge::replay_random_base_value(engine, node, &name, element_shared, value_bits) };
                 }
                 EventKind::AttributeValueTextRequirementsVersion => {
                     let _engine = read_engine(&mut event.payload, &live_engines)?;
@@ -2224,6 +2274,15 @@ fn read_style_transaction_outputs(
                     tag => return Err(format!("unknown style delta gap tag {tag}").into()),
                 },
                 uses_substitution: format_version >= 16 && payload.read_bool()?,
+                // NB: The recording does not carry the record reads, the explicit-inheritance marks,
+                //     the record damage or what a row owes the host and whether the host composes
+                //     it, and replay does not compare them.
+                record_reads: 0,
+                explicitly_inherited_groups: 0,
+                record_damage: 0,
+                owes_an_animation_plan: false,
+                owes_a_transition_step: false,
+                composed_by_the_host: false,
             });
         }
         emissions.push(StyleTransactionEmission {
@@ -2734,6 +2793,17 @@ extern "C" fn ladybird_utf16_fly_string_from_utf16(_data: *const u16, _length: u
 extern "C" fn ladybird_gfx_font_cascade_list_ref(_list: *const c_void) {}
 #[unsafe(no_mangle)]
 extern "C" fn ladybird_gfx_font_cascade_list_unref(_list: *const c_void) {}
+// Replay has no fonts to compare, so a list is equal only to itself, and a record move's damage
+// counts any other list as a change.
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_gfx_font_cascade_list_equals(list: *const c_void, other: *const c_void) -> bool {
+    list == other
+}
+// Replay has no C++ CustomPropertyData to count references on.
+#[unsafe(no_mangle)]
+extern "C" fn web_css_custom_property_data_reference(_data: *const c_void) {}
+#[unsafe(no_mangle)]
+extern "C" fn web_css_custom_property_data_unreference(_data: *const c_void) {}
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn unicode_rust_idna_to_ascii(
@@ -2973,6 +3043,12 @@ mod tests {
                     pseudo_kind: u8::MAX,
                     gap: FfiStyleDeltaGap::Computed,
                     uses_substitution: true,
+                    record_reads: 0,
+                    explicitly_inherited_groups: 0,
+                    record_damage: 0,
+                    owes_an_animation_plan: false,
+                    owes_a_transition_step: false,
+                    composed_by_the_host: false,
                 }],
             }],
             style_atoms_swept: false,

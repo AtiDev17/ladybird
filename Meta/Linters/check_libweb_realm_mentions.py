@@ -54,7 +54,7 @@ ALLOWED_REALM_MENTIONS = {
     "Geometry": (8, 8, "geometry constructors and structured clone still materialize JS-facing geometry objects"),
     "HTML": (
         73,
-        225,
+        223,
         "HTML algorithms still contain structured serialization, including posted-message preparation, canvas, navigation transfer/reconstruction, worker/worklet, and event realm use, and cross-origin Window/Location property functions are created in the current realm; RemoteWindow mirrors Window's postMessage",
     ),
     "IndexedDB": (
@@ -78,8 +78,8 @@ ALLOWED_REALM_MENTIONS = {
     "TrustedTypes": (2, 9, "Trusted Types policy factory operations still use selected realms"),
     "WebAssembly": (
         12,
-        104,
-        "WebAssembly constructors/exports instantiate JS objects/functions in spec-selected realms",
+        106,
+        "WebAssembly constructors/exports instantiate JS objects/functions in spec-selected realms; asynchronous compilation retains the origin realm for module installation and promise settlement",
     ),
     "WebAudio": (
         8,

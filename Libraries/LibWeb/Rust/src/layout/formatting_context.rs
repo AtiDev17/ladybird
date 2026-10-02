@@ -811,7 +811,7 @@ pub(crate) struct ChildLayoutResult {
 pub(crate) struct RunRootOutcome {
     pub(super) cells: used_values::UsedValuesCellState,
     pub(super) own_metrics_sealed: bool,
-    pub(super) line_data: Option<std::rc::Rc<inline_content::InlineContent>>,
+    pub(super) line_data: Option<std::sync::Arc<inline_content::InlineContent>>,
     pub(super) rare: Option<used_values::UsedValuesRareData>,
 }
 
@@ -876,7 +876,8 @@ pub(crate) enum FlexLayoutGrowthState {
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct FlexLayoutItem {
-    pub(crate) node_id: Option<i64>,
+    /// The style node naming the item's DOM node; the devtools reader resolves it to a node id.
+    pub(crate) style_node: Option<crate::css::style::tree::StyleNodeID>,
     pub(crate) rect: CssPixelRect,
     pub(crate) main_base_size: CssPixels,
     pub(crate) main_delta_size: CssPixels,
@@ -919,26 +920,18 @@ pub(crate) struct FlexLayoutData {
 #[repr(C)]
 pub struct FfiLayoutHostCallbacks {
     pub context: *mut c_void,
-    pub report_unexpected_fragmented_inline: unsafe extern "C" fn(*mut c_void, *mut c_void),
-    pub build_svg_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> svg_formatting_context::FfiSvgElementFacts,
-    pub compute_svg_path: unsafe extern "C" fn(
-        *mut c_void,
-        *mut c_void,
-        svg_formatting_context::FfiSvgPathRequest,
-    ) -> svg_formatting_context::FfiSvgPathResult,
-    pub svg_image_bounding_box:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, CssPixels, CssPixels) -> svg_formatting_context::FfiFloatRect,
     pub anchor_lookup: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *const *mut c_void, usize) -> NodeSlotId,
-    pub node_unique_id: unsafe extern "C" fn(*mut c_void) -> i64,
-    /// Commit notifications: a box whose content size changed for container queries, and the
-    /// viewport shells whose committed size their content navigables must learn about.
-    pub content_size_changed_for_container_queries: unsafe extern "C" fn(*mut c_void, *mut c_void),
-    pub finish_commit: unsafe extern "C" fn(*mut c_void, *const *mut c_void, usize),
+    /// The commit messages a finished commit leaves for the document, in the order it produced
+    /// them.
+    pub deliver_commit_messages: unsafe extern "C" fn(*mut c_void, *const commit::FfiCommitMessage, usize),
     /// Fills the replaced-content facts of a live box shell ahead of a pass.
     pub build_replaced_content_facts: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut FfiReplacedContentFacts),
     /// The document element and body facts the viewport propagation decides from.
     pub viewport_propagation_facts:
         unsafe extern "C" fn(*mut c_void) -> viewport_propagation::FfiViewportPropagationFacts,
+    /// What a container-relative length on the element of a live box shell resolves against.
+    pub container_length_bases:
+        unsafe extern "C" fn(*mut c_void, *mut c_void) -> svg_formatting_context::FfiContainerLengthBases,
 }
 
 /// # Safety
@@ -950,6 +943,19 @@ pub unsafe extern "C" fn layout_arena_set_layout_host_callbacks(arena: *mut c_vo
     assert!(!arena.is_null(), "layout node arena handle is null");
     // SAFETY: The caller keeps the arena alive for this synchronous call.
     unsafe { LayoutNodeArena::from_handle(arena) }.set_layout_host(Some(callbacks));
+}
+
+/// Records whether the document is an SVG file decoded as an image. It is fixed for the
+/// document's lifetime, so the layout stage holds it rather than asking at each SVG root.
+///
+/// # Safety
+///
+/// `arena` must be a live handle on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_set_document_is_decoded_svg(arena: *mut c_void, is_decoded_svg: bool) {
+    assert!(!arena.is_null(), "layout node arena handle is null");
+    // SAFETY: The caller keeps the arena alive for this synchronous call.
+    unsafe { LayoutNodeArena::from_handle(arena) }.set_document_is_decoded_svg(is_decoded_svg);
 }
 
 /// # Safety
@@ -971,7 +977,7 @@ pub(crate) struct FormattingContextRun<'pass> {
     pub(crate) should_collect_devtools_layout_data: bool,
     pub(crate) treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
     pub(crate) fragments: Option<std::rc::Rc<fragment_tree::RunFragmentBuilder>>,
-    pub(crate) previous_line_data: Option<std::rc::Rc<inline_content::InlineContent>>,
+    pub(crate) previous_line_data: Option<std::sync::Arc<inline_content::InlineContent>>,
 }
 
 impl<'pass> FormattingContextRun<'pass> {
@@ -1620,7 +1626,7 @@ fn execute_formatting_context_run(
     callbacks: LayoutPass<'_>,
     input: LayoutInput,
     parent_block: Option<&block_formatting_context::BlockFormattingContext>,
-    previous_line_data: Option<std::rc::Rc<inline_content::InlineContent>>,
+    previous_line_data: Option<std::sync::Arc<inline_content::InlineContent>>,
     table_inline_layout: Option<table_formatting_context::TableInlineLayout>,
 ) -> RunOutputs {
     assert!(!box_.is_invalid());
@@ -2355,6 +2361,7 @@ pub(crate) unsafe fn run_root_layout(
         arena,
         &host,
         CssPixels::from_raw(viewport_inline_size_raw),
+        CssPixels::from_raw(viewport_block_size_raw),
         document_in_quirks_mode,
     );
     let viewport_inline_size = CssPixels::from_raw(viewport_inline_size_raw);
@@ -2491,11 +2498,18 @@ pub unsafe extern "C" fn layout_arena_compute_subtree_layout(
     arena: *mut c_void,
     root: NodeSlotId,
     viewport_inline_size_raw: i32,
+    viewport_block_size_raw: i32,
     document_in_quirks_mode: bool,
 ) {
     // SAFETY: Guaranteed by the entry point's contract.
     unsafe {
-        compute_subtree_layout(arena, root, viewport_inline_size_raw, document_in_quirks_mode);
+        compute_subtree_layout(
+            arena,
+            root,
+            viewport_inline_size_raw,
+            viewport_block_size_raw,
+            document_in_quirks_mode,
+        );
     }
 }
 
@@ -2510,6 +2524,7 @@ pub(crate) unsafe fn compute_subtree_layout(
     arena_handle: *mut c_void,
     root: NodeSlotId,
     viewport_inline_size_raw: i32,
+    viewport_block_size_raw: i32,
     document_in_quirks_mode: bool,
 ) {
     assert!(!arena_handle.is_null(), "layout node arena handle is null");
@@ -2525,6 +2540,7 @@ pub(crate) unsafe fn compute_subtree_layout(
         arena,
         &host,
         CssPixels::from_raw(viewport_inline_size_raw),
+        CssPixels::from_raw(viewport_block_size_raw),
         document_in_quirks_mode,
     );
     // The boundary can be wider than the rebuilt roots that led to it, and laying it out may

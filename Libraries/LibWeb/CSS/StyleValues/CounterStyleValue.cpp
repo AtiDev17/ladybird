@@ -26,6 +26,13 @@ namespace Web::CSS {
 static_assert(to_underlying(CounterStyleValue::CounterFunction::Counter) == 0);
 static_assert(to_underlying(CounterStyleValue::CounterFunction::Counters) == 1);
 
+// So does a symbols() function's type, which the Rust counter style resolution reads.
+static_assert(to_underlying(SymbolsType::Cyclic) == 0);
+static_assert(to_underlying(SymbolsType::Numeric) == 1);
+static_assert(to_underlying(SymbolsType::Alphabetic) == 2);
+static_assert(to_underlying(SymbolsType::Symbolic) == 3);
+static_assert(to_underlying(SymbolsType::Fixed) == 4);
+
 static StyleValueFFI::StyleValueData const* make_counter_data(CounterStyleValue::CounterFunction function, Utf16FlyString const& counter_name, ValueComparingNonnullRefPtr<StyleValue const> const& counter_style, Utf16FlyString const& join_string)
 {
     // The Rust allocation takes ownership of one strong reference to the counter style data.
@@ -38,42 +45,5 @@ CounterStyleValue::CounterStyleValue(CounterFunction function, Utf16FlyString co
 }
 
 CounterStyleValue::~CounterStyleValue() = default;
-
-Utf16String CounterStyleValue::resolve(DOM::AbstractElement& element_reference) const
-{
-    // "If no counter named <counter-name> exists on an element where counter() or counters() is used,
-    // one is first instantiated with a starting value of 0."
-    auto& counters_set = element_reference.ensure_counters_set();
-    if (!counters_set.last_counter_with_name(counter_name()).has_value())
-        counters_set.instantiate_a_counter(counter_name(), element_reference, false, 0);
-
-    // counter( <counter-name>, <counter-style>? )
-    // "Represents the value of the innermost counter in the element’s CSS counters set named <counter-name>
-    // using the counter style named <counter-style>."
-    if (function_type() == CounterFunction::Counter) {
-        // NOTE: This should always be present because of the handling of a missing counter above.
-        auto& counter = counters_set.last_counter_with_name(counter_name()).value();
-        auto const& style_scope = element_reference.style_scope();
-        return generate_a_counter_representation(counter_style()->as_counter_style().resolve_counter_style(style_scope), style_scope, counter.value.value_or(0));
-    }
-
-    // counters( <counter-name>, <string>, <counter-style>? )
-    // "Represents the values of all the counters in the element’s CSS counters set named <counter-name>
-    // using the counter style named <counter-style>, sorted in outermost-first to innermost-last order
-    // and joined by the specified <string>."
-    // NOTE: The way counters sets are inherited, this should be the order they appear in the counters set.
-    Utf16StringBuilder stb;
-    for (auto const& counter : counters_set.counters()) {
-        if (counter.name != counter_name())
-            continue;
-
-        auto const& style_scope = element_reference.style_scope();
-        auto counter_string = generate_a_counter_representation(counter_style()->as_counter_style().resolve_counter_style(style_scope), style_scope, counter.value.value_or(0));
-        if (!stb.is_empty())
-            stb.append(join_string().view());
-        stb.append(counter_string);
-    }
-    return stb.to_string();
-}
 
 }

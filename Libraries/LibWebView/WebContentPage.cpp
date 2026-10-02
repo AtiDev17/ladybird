@@ -539,6 +539,37 @@ void WebContentPage::did_present_backing_stores(Vector<i32> bitmap_ids, Vector<G
     view().did_allocate_backing_stores({}, move(bitmap_ids), move(backing_stores));
 }
 
+void WebContentPage::did_add_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores)
+{
+    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI received {} additional backing stores for page {}", backing_stores.size(), m_id);
+    if (displays_tab()) {
+        view().did_add_backing_stores({}, move(bitmap_ids), move(backing_stores));
+        return;
+    }
+    if (!m_presented_backing_stores.has_value())
+        return;
+    m_presented_backing_stores->bitmap_ids.extend(move(bitmap_ids));
+    m_presented_backing_stores->backing_stores.extend(move(backing_stores));
+}
+
+void WebContentPage::did_retire_backing_stores(ReadonlySpan<i32> bitmap_ids)
+{
+    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI retiring backing stores {} for page {}", bitmap_ids, m_id);
+    if (displays_tab()) {
+        view().did_retire_backing_stores({}, bitmap_ids);
+        return;
+    }
+    if (!m_presented_backing_stores.has_value())
+        return;
+    // The first store is the one the view installs as its front buffer, which the compositor never retires.
+    for (size_t i = m_presented_backing_stores->bitmap_ids.size(); i-- > 1;) {
+        if (!bitmap_ids.contains_slow(m_presented_backing_stores->bitmap_ids[i]))
+            continue;
+        m_presented_backing_stores->bitmap_ids.remove(i);
+        m_presented_backing_stores->backing_stores.remove(i);
+    }
+}
+
 Optional<WebContentPage::PresentedBackingStores> WebContentPage::take_presented_backing_stores()
 {
     auto backing_stores = move(m_presented_backing_stores);
@@ -788,20 +819,40 @@ void WebContentPage::did_unhover_link()
         view().on_link_unhover();
 }
 
-void WebContentPage::did_click_link(URL::URL url, ByteString target, unsigned modifiers)
+static Optional<URL::Origin> initiator_origin_snapshot(URL::Origin const& given_origin, Web::HTML::NavigationSourceSnapshot const& source_snapshot_params, WebContentClient* hosting_client = nullptr);
+
+// A navigation a page asked the browser's UI to start for it, with the initiator origin the UI process takes from the
+// fetch client — as it does for a navigation the page starts itself, so a process names only a source it hosts.
+static Optional<Web::HTML::PreparedNavigationDescriptor> navigation_from_page(WebContentClient& requesting_client, Web::HTML::PreparedNavigationDescriptor navigation)
 {
+    // A page's own click or context menu names a document the page's process hosts, so only that process vouches for it.
+    auto initiator_origin = initiator_origin_snapshot(navigation.initiator_origin_snapshot, navigation.source_snapshot_params, &requesting_client);
+    if (!initiator_origin.has_value())
+        return {};
+    navigation.initiator_origin_snapshot = initiator_origin.release_value();
+    return navigation;
+}
+
+void WebContentPage::did_click_link(Web::HTML::PreparedNavigationDescriptor navigation, ByteString target, unsigned modifiers)
+{
+    auto verified_navigation = navigation_from_page(client(), move(navigation));
+    if (!verified_navigation.has_value())
+        return;
     auto open_in_background = modifiers == Web::UIEvents::Mod_PlatformCtrl;
     auto open_in_foreground = modifiers == (Web::UIEvents::Mod_PlatformCtrl | Web::UIEvents::Mod_Shift);
     if (open_in_background || open_in_foreground || target == "_blank"sv) {
-        view().open_url_in_new_tab(url, open_in_background ? Web::HTML::ActivateTab::No : Web::HTML::ActivateTab::Yes);
+        view().open_navigation_in_new_tab(verified_navigation.release_value(), open_in_background ? Web::HTML::ActivateTab::No : Web::HTML::ActivateTab::Yes);
     } else {
-        view().load(url);
+        view().load(verified_navigation.release_value());
     }
 }
 
-void WebContentPage::did_middle_click_link(URL::URL url, ByteString, unsigned)
+void WebContentPage::did_middle_click_link(Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned)
 {
-    view().open_url_in_new_tab(url, Web::HTML::ActivateTab::No);
+    auto verified_navigation = navigation_from_page(client(), move(navigation));
+    if (!verified_navigation.has_value())
+        return;
+    view().open_navigation_in_new_tab(verified_navigation.release_value(), Web::HTML::ActivateTab::No);
 }
 
 void WebContentPage::did_request_external_url(URL::URL url, URL::Origin initiator_origin, bool has_transient_activation)
@@ -1502,11 +1553,11 @@ void WebContentPage::did_resolve_dom_node_url(u64 request_id, String resolved_ur
     }
 }
 
-void WebContentPage::did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String> reason_phrase, Vector<HTTP::Header> response_headers, Requests::CameFromCache came_from_cache)
+void WebContentPage::did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String> reason_phrase, Vector<HTTP::Header> response_headers, Requests::CacheState cache_state)
 {
     if (displays_tab()) {
         if (view().on_network_response_headers_received)
-            view().on_network_response_headers_received(request_id, status_code, reason_phrase, response_headers, came_from_cache);
+            view().on_network_response_headers_received(request_id, status_code, reason_phrase, response_headers, cache_state);
     }
 }
 
@@ -1565,7 +1616,10 @@ void WebContentPage::did_request_set_system_visibility_state(Web::HTML::Visibili
 // NB: initiatorOriginSnapshot is sourceDocument's origin. The process names sourceDocument's relevant settings object as
 //     the fetch client, an environment that a process hosts, and the UI process takes the origin from it. Without a
 //     sourceDocument, the process gives a new opaque origin, which no document may hold yet.
-static Optional<URL::Origin> initiator_origin_snapshot(URL::Origin const& given_origin, Web::HTML::NavigationSourceSnapshot const& source_snapshot_params)
+// The origin of the environment a navigation names as its fetch client, from the process hosting that environment. A
+// navigation a page starts in another process's navigable continues in that process (step 8 of navigate), so the
+// process asking isn't necessarily the one hosting the client; a caller that knows the host names it.
+static Optional<URL::Origin> initiator_origin_snapshot(URL::Origin const& given_origin, Web::HTML::NavigationSourceSnapshot const& source_snapshot_params, WebContentClient* hosting_client)
 {
     if (!source_snapshot_params.fetch_client.has_value()) {
         if (!given_origin.is_opaque() || CanonicalTraversable::is_origin_held_by_a_document(given_origin))
@@ -1573,13 +1627,17 @@ static Optional<URL::Origin> initiator_origin_snapshot(URL::Origin const& given_
         return given_origin;
     }
     Optional<URL::Origin> origin;
-    WebContentClient::for_each_client([&](WebContentClient& client) {
+    auto take_origin_from = [&](WebContentClient& client) {
         auto source_settings = client.hosted_environment(source_snapshot_params.fetch_client->id);
         if (!source_settings.has_value())
             return IterationDecision::Continue;
         origin = source_settings->origin();
         return IterationDecision::Break;
-    });
+    };
+    if (hosting_client)
+        take_origin_from(*hosting_client);
+    else
+        WebContentClient::for_each_client(take_origin_from);
     return origin;
 }
 
@@ -1628,10 +1686,12 @@ void WebContentPage::did_request_navigation_start(Web::HTML::CrossProcessId navi
         return;
     }
 
+    auto retry = prepare_navigation_to_retry(*start_request);
     target_navigable->set_ongoing_navigation(CanonicalNavigation {
         .url = move(url),
         .navigation_id = navigation_id,
         .start_request = move(start_request),
+        .retry = move(retry),
         .sequence_number = sequence_number,
         .phase = CanonicalNavigation::Phase::AwaitingUnloadCheck,
     });
@@ -2090,22 +2150,31 @@ void WebContentPage::did_request_context_menu(Web::HTML::CrossProcessId local_ro
         target->view.did_request_page_context_menu({}, target->position, for_input_events_target);
 }
 
-void WebContentPage::did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, URL::URL url, ByteString, unsigned)
+void WebContentPage::did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned)
 {
+    auto verified_navigation = navigation_from_page(client(), move(navigation));
+    if (!verified_navigation.has_value())
+        return;
     if (auto target = view_position(local_root_id, content_position); target.has_value())
-        target->view.did_request_link_context_menu({}, target->position, move(url));
+        target->view.did_request_link_context_menu({}, target->position, verified_navigation.release_value());
 }
 
-void WebContentPage::did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, URL::URL url, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap)
+void WebContentPage::did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap)
 {
+    auto verified_navigation = navigation_from_page(client(), move(navigation));
+    if (!verified_navigation.has_value())
+        return;
     if (auto target = view_position(local_root_id, content_position); target.has_value())
-        target->view.did_request_image_context_menu({}, target->position, move(url), move(bitmap));
+        target->view.did_request_image_context_menu({}, target->position, verified_navigation.release_value(), move(bitmap));
 }
 
-void WebContentPage::did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu)
+void WebContentPage::did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu, Web::HTML::PreparedNavigationDescriptor navigation)
 {
+    auto verified_navigation = navigation_from_page(client(), move(navigation));
+    if (!verified_navigation.has_value())
+        return;
     if (auto target = view_position(local_root_id, content_position); target.has_value())
-        target->view.did_request_media_context_menu({}, *this, target->position, move(menu));
+        target->view.did_request_media_context_menu({}, *this, target->position, move(menu), verified_navigation.release_value());
 }
 
 void WebContentPage::did_get_highlighted_source(String html)
@@ -2416,6 +2485,26 @@ void WebContentPage::did_request_crash_of_remote_frame_processes_for_testing()
     });
 }
 
+// The tab's Stop and Reload buttons.
+void WebContentPage::did_request_stop_loading_for_testing()
+{
+    if (displays_tab())
+        view().stop_loading();
+}
+
+void WebContentPage::did_request_reload_for_testing()
+{
+    if (displays_tab())
+        view().reload();
+}
+
+// The tab's Back and Forward buttons, which traverse the history with no source document.
+void WebContentPage::did_request_traverse_history_by_delta_for_testing(i32 delta)
+{
+    if (displays_tab())
+        view().traverse_the_history_by_delta(delta);
+}
+
 void WebContentPage::did_reset_session_history_for_testing(Web::HTML::SessionHistoryEntryDescriptor active_entry)
 {
     if (displays_tab())
@@ -2441,6 +2530,19 @@ Messages::WebContentTestClient::DidRequestRegisterSessionStoreTabForTestingRespo
     if (displays_tab())
         return { view().register_session_store_tab_for_testing({}) };
     return { false };
+}
+
+// A document populated for a navigable is one the browser process created for it, and has not made active yet.
+Messages::WebContentTestClient::DidRequestHasPopulatedDocumentForTestingResponse WebContentPage::did_request_has_populated_document_for_testing(Web::HTML::CrossProcessId navigable_id) const
+{
+    auto navigable = traversable().top_level_traversable().find(navigable_id);
+    if (!navigable.has_value())
+        return false;
+    bool has_populated_document = false;
+    navigable->for_each_populated_document([&](auto const&) {
+        has_populated_document = true;
+    });
+    return has_populated_document;
 }
 
 Messages::WebContentTestClient::DidRequestSessionStoreTabStateForTestingResponse WebContentPage::did_request_session_store_tab_state_for_testing()

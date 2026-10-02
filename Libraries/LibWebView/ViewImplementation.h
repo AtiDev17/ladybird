@@ -36,7 +36,7 @@
 #include <LibGfx/SharedImage.h>
 #include <LibGfx/SharedImageBuffer.h>
 #include <LibHTTP/Header.h>
-#include <LibRequests/CameFromCache.h>
+#include <LibRequests/CacheState.h>
 #include <LibRequests/Forward.h>
 #include <LibRequests/NetworkError.h>
 #include <LibURL/Origin.h>
@@ -48,6 +48,7 @@
 #include <LibWebCommon/HTML/ColorPickerUpdateState.h>
 #include <LibWebCommon/HTML/FileFilter.h>
 #include <LibWebCommon/HTML/HistoryOperation.h>
+#include <LibWebCommon/HTML/PreparedNavigationDescriptor.h>
 #include <LibWebCommon/HTML/Scripting/ScriptRegistryTypes.h>
 #include <LibWebCommon/HTML/SelectItem.h>
 #include <LibWebCommon/Page/DragEvent.h>
@@ -137,6 +138,9 @@ public:
     void load_from_user_input(StringView, Optional<URL::URL> fallback_url);
     void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab);
     void open_url_in_new_window(URL::URL const&, IsPrivate);
+    void load(Web::HTML::PreparedNavigationDescriptor);
+    void open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor, Web::HTML::ActivateTab);
+    void open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor, IsPrivate);
     void set_next_history_visit_transition(HistoryVisitTransition transition) { m_history_visit_transition_for_next_load = transition; }
     void load_html(StringView);
     void load_navigation_error_page(StringView);
@@ -147,10 +151,9 @@ public:
     void cancel_uncommitted_top_level_navigation_for_browser_traversal();
 
     bool crash_overlay_active() const { return m_crash_state.has_value(); }
-    static constexpr StringView crash_overlay_title() { return "Ladybird flew off-course!"sv; }
-    static constexpr StringView crash_overlay_message() { return "The web page has crashed.\nYou can reload the page to try again."sv; }
-    static constexpr StringView crash_overlay_reload_button_text() { return "Reload Page"sv; }
     String crash_overlay_failed_url() const;
+    Optional<ByteString> crash_report_name() const;
+    Optional<String> crash_report_website() const;
 
     struct SessionHistoryTraversalMenuItem {
         i32 step { 0 };
@@ -378,6 +381,8 @@ public:
     Gfx::Color page_background_color() const { return m_page_background_color; }
 
     void did_allocate_backing_stores(Badge<WebContentPage>, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
+    void did_add_backing_stores(Badge<WebContentPage>, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
+    void did_retire_backing_stores(Badge<WebContentPage>, ReadonlySpan<i32> bitmap_ids);
     void install_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
 
     enum class ScreenshotType {
@@ -459,7 +464,7 @@ public:
     Function<void(JsonValue)> on_received_js_console_result;
     Function<void(ConsoleOutput)> on_console_message;
     Function<void(u64 request_id, URL::URL const&, ByteString const&, Vector<HTTP::Header> const&, ByteBuffer, Optional<String>, String, bool, Web::Fetch::Infrastructure::RequestPriority)> on_network_request_started;
-    Function<void(u64 request_id, u32 status_code, Optional<String> const&, Vector<HTTP::Header> const&, Requests::CameFromCache)> on_network_response_headers_received;
+    Function<void(u64 request_id, u32 status_code, Optional<String> const&, Vector<HTTP::Header> const&, Requests::CacheState)> on_network_response_headers_received;
     Function<void(u64 request_id, ByteBuffer)> on_network_response_body_received;
     Function<void(u64 request_id, u64 body_size, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const&)> on_network_request_finished;
     Function<void(i32 count_waiting)> on_resource_status_change;
@@ -493,6 +498,7 @@ public:
     };
     Function<void(WebContentCrashReason)> on_web_content_crashed;
     Function<void(bool)> on_crash_overlay_state_change;
+    Function<void()> on_crash_report_saved;
     Function<void()> on_web_content_process_change_for_cross_site_navigation;
 
     Menu& page_context_menu() { return *m_page_context_menu; }
@@ -506,9 +512,9 @@ public:
     Menu& bookmark_folder_context_menu() { return *m_bookmark_folder_context_menu; }
 
     void did_request_page_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target);
-    void did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, URL::URL url);
-    void did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, URL::URL url, Optional<Gfx::ShareableBitmap> bitmap);
-    void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu);
+    void did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor);
+    void did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<Gfx::ShareableBitmap> bitmap);
+    void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu, Web::HTML::PreparedNavigationDescriptor);
     void send_to_media_context_menu_page(Function<void(WebContentPage&)> const&);
 
     void did_request_color_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Color current_color);
@@ -577,6 +583,9 @@ protected:
     NonnullRefPtr<Core::Promise<Empty>> reset_session_history_for_testing();
 
     virtual void update_zoom();
+
+    // The view to show a tab or window opened from this view in, or null for the application to open one of its own.
+    virtual ViewImplementation* create_view_for_new_tab_or_window(IsPrivate) { return nullptr; }
     void apply_zoom_for_current_host();
 
     void handle_resize();
@@ -599,10 +608,20 @@ protected:
     WebContentPage& focused_navigable_host() const;
     void reset_page_media_state();
 
+    // A navigation to make again on reload: one the user stopped before its document was activated, or one a crash cut
+    // short. It's made again from the source it was first made from, when it has one (a javascript: URL has none).
+    struct NavigationToRetry {
+        URL::URL url;
+        Optional<Web::HTML::PreparedNavigationDescriptor> navigation;
+    };
+    Optional<NavigationToRetry> navigation_to_retry_for_ongoing_navigation() const;
+    void retry_navigation(NavigationToRetry, Web::Bindings::NavigationHistoryBehavior);
+
     struct CrashState;
     void handle_web_content_process_crash();
+    void did_save_crash_report(ByteString report_name);
     void respawn_web_content_process_after_crash();
-    void prepare_for_navigation_after_crash(Optional<URL::URL> navigation_to_retry = {});
+    void prepare_for_navigation_after_crash(Optional<NavigationToRetry> navigation_to_retry = {});
     void set_crash_state(Optional<CrashState>);
 
     String current_host_for_settings() const;
@@ -654,8 +673,9 @@ protected:
 
     struct CrashState {
         URL::URL failed_url;
-        Optional<URL::URL> navigation_to_retry;
+        Optional<NavigationToRetry> navigation_to_retry;
         bool recovery_started { false };
+        ByteString report_name {};
     };
     Optional<CrashState> m_crash_state;
 
@@ -705,6 +725,7 @@ protected:
     RefPtr<Action> m_download_linked_file_as_action;
     RefPtr<Action> m_copy_url_action;
     URL::URL m_context_menu_url;
+    Optional<Web::HTML::PreparedNavigationDescriptor> m_context_menu_navigation;
 
     RefPtr<Action> m_open_image_action;
     RefPtr<Action> m_save_image_action;
@@ -779,7 +800,7 @@ protected:
     };
     Optional<WebDriverNavigationObservation> m_webdriver_navigation_observation;
     u64 m_next_webdriver_navigation_id { 1 };
-    Optional<URL::URL> m_last_stopped_load_url;
+    Optional<NavigationToRetry> m_last_stopped_navigation;
 
     size_t m_crash_count = 0;
     RefPtr<Core::Timer> m_repeated_crash_timer;

@@ -8,6 +8,7 @@
 #include <AK/QuickSort.h>
 #include <AK/ScopeGuard.h>
 #include <LibGC/RootVector.h>
+#include <LibWeb/Animations/AnimationEffect.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/Invalidation/SlotInvalidator.h>
@@ -174,29 +175,39 @@ static StyleEngine::PublishedStyleDelta make_materialize_gap_delta(StyleNodeID s
         .pseudo_kind = NumericLimits<u8>::max(),
         .gap = StyleEngineFFI::FfiStyleDeltaGap::Materialize,
         .uses_substitution = false,
+        .record_reads = 0,
+        .explicitly_inherited_groups = 0,
+        .record_damage = 0,
+        .owes_an_animation_plan = false,
+        .owes_a_transition_step = false,
+        .composed_by_the_host = false,
     };
 }
 
-// The static inherited-group swap answers a pure inherited-style reaction without recomputing the element. That
-// is only sound while the element's computed style is a pure function of its cascade inputs and the swapped
-// groups: an element with animations may resolve keyframe values (`inherit`, neutral keyframes) against the
-// parent's style, and an element with transitions or transition-property entries must compare before-change and
-// after-change styles at every style change event. These are the conditions under which
-// Element::apply_style_engine_reaction declines its own inherited-style group swap.
-static bool element_style_depends_on_more_than_the_inherited_groups(DOM::Element& element)
+// The swapped groups are the parent's base values; a child of a parent holding animated values inherits the
+// animated ones, which the engine never sees.
+static bool parent_style_has_animated_values(DOM::Element& element)
 {
-    if (element.has_relevant_animations()
-        || element.has_css_defined_animations()
-        || !element.property_ids_with_existing_transitions({}).is_empty()
-        || !element.property_ids_with_matching_transition_property_entry({}).is_empty())
-        return true;
-    // The swapped groups are the parent's base values; a child of an animating parent inherits
-    // the animated ones, which the engine never sees.
-    if (auto parent = DOM::AbstractElement { element }.element_to_inherit_style_from(); parent.has_value()) {
-        if (auto parent_style = parent->computed_style(); parent_style && parent_style->has_animated_values())
-            return true;
-    }
-    return false;
+    auto parent = DOM::AbstractElement { element }.element_to_inherit_style_from();
+    if (!parent.has_value())
+        return false;
+    auto parent_style = parent->computed_style();
+    return parent_style && parent_style->has_animated_values();
+}
+
+// A C++ computation collects an element's animations into the style it computes. For a record the engine derived
+// beneath them, the host samples them over the record once it is installed, as an animation update samples them over
+// the record an element holds, and publishes what they compose.
+static void sample_animations_for_installed_record(DOM::AbstractElement abstract_element)
+{
+    auto style_record = abstract_element.style_record_identity();
+    if (!style_record)
+        return;
+    Animations::AnimationUpdateContext::ElementData element_data { style_record, abstract_element.document().style_computer().reconstruct_computed_properties_for_animation(style_record) };
+    element_data.base_is_current = true;
+    Animations::AnimationUpdateContext context;
+    context.elements.set(abstract_element, move(element_data));
+    context.publish();
 }
 
 // Whether the custom-property environment an engine-computed record was published with can be
@@ -209,276 +220,135 @@ static bool engine_computed_record_environment_is_installable(DOM::Element& elem
     return installable;
 }
 
-// Under verification, the environment the engine resolved for a record must hold, name for name,
-// what the C++ computation installed on the element.
-static void verify_engine_computed_record_environment(DOM::Element& element, StyleRecordID style_record)
+static RefPtr<CustomPropertyData const> custom_property_environment_base(DOM::Element const& element, RefPtr<CustomPropertyData const> data)
 {
-    auto& style_computer = element.document().style_computer();
-    auto identity = style_computer.style_engine().style_record_custom_property_environment(style_record);
-    if (!StyleEngine::is_engine_custom_property_environment(identity))
-        return;
-    auto actual = element.custom_property_data({});
-    if (actual && actual->is_animation_overlay())
-        actual = actual->parent();
-    bool installable = false;
-    auto expected = element.custom_property_environment_of_engine_record(style_record, installable);
-    VERIFY(installable && expected);
-    auto value_text = [](StyleProperty const* property) -> Optional<Utf16String> {
-        if (!property)
-            return {};
-        return property->value->to_utf16_string(SerializationMode::Normal);
-    };
-    auto check = [&](Utf16FlyString const& name) {
-        auto const* expected_property = expected->get(name);
-        auto const* actual_property = actual ? actual->get(name) : nullptr;
-        VERIFY(value_text(expected_property) == value_text(actual_property));
-        VERIFY(!expected_property || !actual_property || expected_property->important == actual_property->important);
-    };
-    expected->for_each_property([&](Utf16FlyString const& name, StyleProperty const&) { check(name); });
-    if (actual)
-        actual->for_each_property([&](Utf16FlyString const& name, StyleProperty const&) { check(name); });
-}
-
-static RefPtr<CustomPropertyData const> custom_property_environment_base(RefPtr<CustomPropertyData const> data)
-{
-    if (data && data->is_animation_overlay())
+    if (data && data->is_animation_overlay_for({ element }))
         return data->parent();
     return data;
 }
 
-// Every custom property whose value differs between the environment an element held and the one
-// it holds now. The names come from what either environment holds itself, then from the
-// environments above them; two chains that share an ancestor pair share that pair's answer, which
-// is worked out once per style update. Most moves under a root that redefines hundreds of names
-// meet the same root pair.
-class ChangedCustomPropertyNames {
-public:
-    Vector<Utf16FlyString> const& between(CustomPropertyData const* old_data, CustomPropertyData const* new_data)
-    {
-        if (old_data == new_data)
-            return m_none;
-        auto key = Pair { old_data ? old_data->identity() : 0, new_data ? new_data->identity() : 0 };
-        if (auto cached = m_memo.get(key); cached.has_value())
-            return *cached;
-        Vector<Utf16FlyString> names;
-        HashTable<Utf16FlyString> seen;
-        auto consider = [&](Utf16FlyString const& name) {
-            if (seen.set(name) != AK::HashSetResult::InsertedNewEntry)
-                return;
-            if (custom_property_value_moved(name, old_data, new_data))
-                names.append(name);
-        };
-        if (old_data) {
-            for (auto const& [name, property] : old_data->own_values())
-                consider(name);
-        }
-        if (new_data) {
-            for (auto const& [name, property] : new_data->own_values())
-                consider(name);
-        }
-        for (auto const& name : between(old_data ? old_data->parent().ptr() : nullptr, new_data ? new_data->parent().ptr() : nullptr))
-            consider(name);
-        quick_sort(names);
-        auto& stored = m_memo.ensure(key);
-        stored = move(names);
-        return stored;
-    }
-
-private:
-    struct Pair {
-        u64 old_data;
-        u64 new_data;
-        bool operator==(Pair const&) const = default;
-    };
-    struct PairTraits : public DefaultTraits<Pair> {
-        static unsigned hash(Pair const& pair) { return pair_int_hash(u64_hash(pair.old_data), u64_hash(pair.new_data)); }
-    };
-
-    HashMap<Pair, Vector<Utf16FlyString>, PairTraits> m_memo;
-    Vector<Utf16FlyString> m_none;
-};
-
-static bool sorted_names_intersect(ReadonlySpan<Utf16FlyString> a, ReadonlySpan<Utf16FlyString> b)
+// An element that has to compute again is recorded with a recompute reaction alone: its descendants
+// are the move's, or that computation's, to reach. (The engine fans an inherited custom-properties
+// reaction out to every child of an applied reaction.)
+static void record_environment_move_recompute(StyleEngine& style_engine, DOM::Element& element)
 {
-    size_t i = 0;
-    size_t j = 0;
-    while (i < a.size() && j < b.size()) {
-        if (a[i] == b[j])
-            return true;
-        if (a[i] < b[j])
-            ++i;
+    style_engine.record_derived_element_style_input_change(element.style_node_id(), StyleEngine::RecomputeStyle);
+}
+
+// The environments a moved element's pseudo-elements held: one that held the element's own takes the
+// moved one, and one that held what the element hands down takes what the moved one hands down. A
+// pseudo-element that resolved its own computes the element again.
+static void move_pseudo_element_environments(DOM::Document& document, DOM::Element& element, CustomPropertyData const* existing, CustomPropertyData const* existing_inheritable, RefPtr<CustomPropertyData const> const& moved)
+{
+    auto moved_inheritable = moved ? moved->inheritable(document) : nullptr;
+    auto& style_engine = document.style_computer().style_engine();
+    for (auto kind = 0; kind < to_underlying(PseudoElement::KnownPseudoElementCount); ++kind) {
+        auto pseudo_element = static_cast<PseudoElement>(kind);
+        auto pseudo_data = element.custom_property_data(pseudo_element);
+        if (!pseudo_data)
+            continue;
+        if (pseudo_data.ptr() == existing)
+            element.set_custom_property_data(pseudo_element, moved);
+        else if (pseudo_data.ptr() == existing_inheritable)
+            element.set_custom_property_data(pseudo_element, moved_inheritable);
         else
-            ++j;
+            record_environment_move_recompute(style_engine, element);
     }
-    return false;
+}
+
+static void move_custom_property_environment_below(DOM::Document&, DOM::Element&, RefPtr<CustomPropertyData const> const& old_base, RefPtr<CustomPropertyData const> const& new_base, CustomPropertyData const* changed_old_base, CustomPropertyData const* changed_new_base);
+
+// An element declaring custom properties of its own over the environment it inherits, whose
+// declared values stand because it reads nothing that changed: they are built again over the moved
+// environment, and the move goes on below the element.
+static void rebuild_custom_property_environment(DOM::Document& document, DOM::Element& element, RefPtr<CustomPropertyData const> const& new_parent_inheritable, CustomPropertyData const* changed_old_base, CustomPropertyData const* changed_new_base)
+{
+    auto existing_base = custom_property_environment_base(element, element.custom_property_data({}));
+    VERIFY(existing_base && existing_base->declared_count() > 0);
+    if (existing_base->parent().ptr() == new_parent_inheritable.ptr())
+        return;
+    OrderedHashMap<Utf16FlyString, StyleProperty> own_values;
+    size_t declared = 0;
+    for (auto const& [name, property] : existing_base->own_values()) {
+        if (declared++ >= existing_base->declared_count())
+            break;
+        own_values.set(name, property);
+    }
+    RefPtr<CustomPropertyData const> moved = CustomPropertyData::create(move(own_values), new_parent_inheritable);
+    auto existing_inheritable = existing_base->inheritable(document);
+    move_pseudo_element_environments(document, element, existing_base.ptr(), existing_inheritable.ptr(), moved);
+    element.set_custom_property_data({}, moved);
+    element.republish_style_record_environment();
+    move_custom_property_environment_below(document, element, existing_base, moved, changed_old_base, changed_new_base);
 }
 
 // An element's custom properties moved. Every styled descendant holds the environment it inherits
-// by identity, so each takes the moved one here, directly, and only the descendants whose cascades
-// read a name that changed value are asked to compute again. The engine is told nothing: the walk
-// is the propagation, in the flat tree the engine would have derived reactions over.
-class CustomPropertyEnvironmentMove {
-public:
-    CustomPropertyEnvironmentMove(DOM::Document& document, ChangedCustomPropertyNames& changed_custom_property_names, CustomPropertyData const* old_origin_base, CustomPropertyData const* new_origin_base)
-        : m_document(document)
-        , m_style_engine(document.style_computer().style_engine())
-        , m_changed_custom_property_names(changed_custom_property_names)
-        , m_old_origin_base(old_origin_base)
-        , m_new_origin_base(new_origin_base)
-    {
-    }
-
-    void visit_children(DOM::Element& parent, RefPtr<CustomPropertyData const> const& old_parent_data)
-    {
-        for (auto* child = parent.first_child(); child; child = child->next_sibling()) {
-            auto* element = as_if<DOM::Element>(*child);
-            if (!element || element->assigned_slot())
-                continue;
-            visit(*element, parent, old_parent_data);
-        }
-        if (auto shadow_root = parent.shadow_root()) {
-            for (auto* child = shadow_root->first_child(); child; child = child->next_sibling()) {
-                if (auto* element = as_if<DOM::Element>(*child))
-                    visit(*element, parent, old_parent_data);
-            }
-        }
-        if (auto* slot = as_if<HTML::HTMLSlotElement>(parent)) {
-            for (auto const& node : slot->assigned_nodes()) {
-                if (auto* element = as_if<DOM::Element>(*node))
-                    visit(*element, parent, old_parent_data);
-            }
-        }
-    }
-
-private:
-    // Whether the element's cascades read a name that changed, through var(); an element whose
-    // computation reads past what any list of names can say is asked to compute again outright.
-    bool var_reads_a_changed_name(DOM::Element& element) const
-    {
-        if (auto const* record = element.style_input_record()) {
-            if (!record->custom_property_reads_are_complete)
-                return true;
-            return sorted_names_intersect(record->custom_property_reads, changed_names());
-        }
-        // An element without a style input record has a record the engine computed: the engine
-        // knows whether that reads custom properties at all, and settles the reaction it gets.
-        return m_style_engine.node_style_reads_custom_properties(element.style_node_id());
-    }
-
-    // An element that has to compute again is recorded with a recompute reaction alone: its
-    // descendants are this walk's, or that computation's, to reach. (The engine fans an inherited
-    // custom-properties reaction out to every child of an applied reaction.)
-    // The names are worked out only once a descendant has to be asked about them. A move that reaches
-    // no styled descendant, such as an element arriving with its subtree, needs none of them.
-    Vector<Utf16FlyString> const& changed_names() const
-    {
-        if (!m_changed_names)
-            m_changed_names = &m_changed_custom_property_names.between(m_old_origin_base, m_new_origin_base);
-        return *m_changed_names;
-    }
-
-    bool needs_recompute(DOM::Element& element) const
-    {
-        return element.style_uses_if_css_function() || element.style_uses_inherit_css_function() || element.style_uses_custom_function()
-            || element.style_depends_on_style_container_query() || var_reads_a_changed_name(element);
-    }
-
-    void mark(DOM::Element& element)
-    {
-        m_style_engine.record_derived_element_style_input_change(element.style_node_id(), StyleEngine::RecomputeStyle);
-    }
-
-    void visit(DOM::Element& element, DOM::Element& parent, RefPtr<CustomPropertyData const> const& old_parent_data)
-    {
-        // An unstyled subtree materializes against whatever it inherits then.
-        if (!element.has_style())
-            return;
-        auto new_parent_inheritable = [&]() -> RefPtr<CustomPropertyData const> {
-            auto data = custom_property_environment_base(parent.custom_property_data({}));
-            return data ? data->inheritable(m_document) : nullptr;
-        }();
-        auto old_parent_inheritable = [&]() -> RefPtr<CustomPropertyData const> {
-            auto data = custom_property_environment_base(old_parent_data);
-            return data ? data->inheritable(m_document) : nullptr;
-        }();
-        auto existing = element.custom_property_data({});
-        bool const has_animation_overlay = existing && existing->is_animation_overlay();
-        auto existing_base = custom_property_environment_base(existing);
-        auto move_pseudo_element_environments = [&](RefPtr<CustomPropertyData const> const& moved) {
-            auto existing_inheritable = existing_base ? existing_base->inheritable(m_document) : nullptr;
-            auto moved_inheritable = moved ? moved->inheritable(m_document) : nullptr;
+// by identity, and the style engine keeps what each holds: it hands the moved environment to the
+// descendants that hold the one the element handed down before, with their records, and answers
+// what is left here. That is installing those records, the environments of element-backed
+// pseudo-elements, which the engine does not keep, and the custom properties a descendant declares
+// itself, built again over the moved environment. A descendant whose style reads a name whose value
+// differs between `changed_old_base` and `changed_new_base`, or reads the environment another way,
+// computes again.
+static void move_custom_property_environment_below(DOM::Document& document, DOM::Element& element, RefPtr<CustomPropertyData const> const& old_base, RefPtr<CustomPropertyData const> const& new_base, CustomPropertyData const* changed_old_base, CustomPropertyData const* changed_new_base)
+{
+    auto& style_computer = document.style_computer();
+    auto& style_engine = style_computer.style_engine();
+    auto old_inheritable = old_base ? old_base->inheritable(document) : nullptr;
+    auto new_inheritable = new_base ? new_base->inheritable(document) : nullptr;
+    auto named = [](CustomPropertyData const* data) -> StyleEngineFFI::FfiNamedEnvironment {
+        return { .identity = data ? data->identity() : 0, .store = data ? data->rust_store() : nullptr };
+    };
+    StyleEngineFFI::FfiEnvironmentMove const moved {
+        .old_base = named(changed_old_base),
+        .new_base = named(changed_new_base),
+        .old_inheritable = old_inheritable ? old_inheritable->identity() : 0,
+        .new_inheritable = named(new_inheritable.ptr()),
+        .new_inheritable_data = new_inheritable.ptr(),
+        .new_inheritable_declares = new_inheritable && new_inheritable->declared_count() > 0,
+    };
+    auto answer = StyleEngineFFI::style_engine_move_custom_property_environment(style_engine.rust_handle(), element.style_node_id().value(), moved);
+    // The answer lives until the engine is next called, which acting on it does.
+    Vector<StyleEngineFFI::FfiEnvironmentMoveAction> actions;
+    actions.append(answer.actions, answer.count);
+    for (auto const& action : actions) {
+        auto descendant = style_computer.element_for_style_node(StyleNodeID { action.node });
+        VERIFY(descendant);
+        switch (action.kind) {
+        case StyleEngineFFI::FfiEnvironmentMoveActionKind::Republish:
             for (auto kind = 0; kind < to_underlying(PseudoElement::KnownPseudoElementCount); ++kind) {
                 auto pseudo_element = static_cast<PseudoElement>(kind);
-                auto pseudo_data = element.custom_property_data(pseudo_element);
+                if (is_synthetic_pseudo_element(pseudo_element))
+                    continue;
+                auto pseudo_data = descendant->custom_property_data(pseudo_element);
                 if (!pseudo_data)
                     continue;
-                if (pseudo_data.ptr() == existing_base.ptr())
-                    element.set_custom_property_data(pseudo_element, moved);
-                else if (pseudo_data.ptr() == existing_inheritable.ptr())
-                    element.set_custom_property_data(pseudo_element, moved_inheritable);
+                if (pseudo_data->identity() == action.replaced)
+                    descendant->set_custom_property_data(pseudo_element, new_inheritable);
                 else
-                    mark(element);
+                    record_environment_move_recompute(style_engine, *descendant);
             }
-        };
-        // An element that has to compute again takes the moved environment in that computation,
-        // which reaches its own descendants in turn.
-        //
-        // An element declaring no custom property of its own holds the environment it inherits,
-        // whichever data it holds it in; its cascade declaring some now is a computation's to find.
-        bool const holds_inherited_environment = existing_base.ptr() == old_parent_inheritable.ptr()
-            || ((!existing_base || existing_base->declared_count() == 0) && !m_style_engine.node_declares_custom_properties(element.style_node_id()));
-        if (holds_inherited_environment && !has_animation_overlay) {
-            if (needs_recompute(element)) {
-                mark(element);
-                return;
-            }
-            if (new_parent_inheritable.ptr() == existing_base.ptr())
-                return;
-            move_pseudo_element_environments(new_parent_inheritable);
-            element.set_custom_property_data({}, new_parent_inheritable);
-            element.republish_style_record_environment();
-            visit_children(element, existing_base);
-            return;
+            if (action.style_record != descendant->style_record_identity().value())
+                descendant->refresh_computed_style({}, StyleRecordID { action.style_record });
+            break;
+        case StyleEngineFFI::FfiEnvironmentMoveActionKind::Rebuild:
+            rebuild_custom_property_environment(document, *descendant, new_inheritable, changed_old_base, changed_new_base);
+            break;
+        case StyleEngineFFI::FfiEnvironmentMoveActionKind::Recompute:
+            record_environment_move_recompute(style_engine, *descendant);
+            break;
         }
-        // The element declares custom properties of its own over the environment it inherits. Its
-        // declared values stand while it reads nothing that changed; a computation decides the rest.
-        if (!existing_base || existing_base->declared_count() == 0 || has_animation_overlay || needs_recompute(element)) {
-            mark(element);
-            return;
-        }
-        if (existing_base->parent().ptr() == new_parent_inheritable.ptr())
-            return;
-        OrderedHashMap<Utf16FlyString, StyleProperty> own_values;
-        size_t declared = 0;
-        for (auto const& [name, property] : existing_base->own_values()) {
-            if (declared++ >= existing_base->declared_count())
-                break;
-            own_values.set(name, property);
-        }
-        RefPtr<CustomPropertyData const> moved = CustomPropertyData::create(move(own_values), new_parent_inheritable);
-        move_pseudo_element_environments(moved);
-        element.set_custom_property_data({}, moved);
-        element.republish_style_record_environment();
-        visit_children(element, existing_base);
     }
+}
 
-    GC::Ref<DOM::Document> m_document;
-    StyleEngine& m_style_engine;
-    ChangedCustomPropertyNames& m_changed_custom_property_names;
-    CustomPropertyData const* m_old_origin_base { nullptr };
-    CustomPropertyData const* m_new_origin_base { nullptr };
-    mutable Vector<Utf16FlyString> const* m_changed_names { nullptr };
-};
-
-static void propagate_custom_property_environment_move(DOM::Document& document, DOM::Element& origin, RefPtr<CustomPropertyData const> old_origin_data, ChangedCustomPropertyNames& changed_custom_property_names)
+static void propagate_custom_property_environment_move(DOM::Document& document, DOM::Element& origin, RefPtr<CustomPropertyData const> old_origin_data)
 {
     // Nothing inherits from an element with nothing below it in the flat tree.
     if (!origin.first_element_child() && !origin.shadow_root() && !is<HTML::HTMLSlotElement>(origin))
         return;
-    auto old_origin_base = custom_property_environment_base(move(old_origin_data));
-    auto new_origin_base = custom_property_environment_base(origin.custom_property_data({}));
-    CustomPropertyEnvironmentMove walk { document, changed_custom_property_names, old_origin_base.ptr(), new_origin_base.ptr() };
-    walk.visit_children(origin, old_origin_base);
+    auto old_origin_base = custom_property_environment_base(origin, move(old_origin_data));
+    auto new_origin_base = custom_property_environment_base(origin, origin.custom_property_data({}));
+    move_custom_property_environment_below(document, origin, old_origin_base, new_origin_base, old_origin_base.ptr(), new_origin_base.ptr());
 }
 
 static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Document& document, Vector<StyleEngine::PublishedStyleDelta> const& reactions)
@@ -488,7 +358,8 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
     // engine's to derive: it reads each application and plans the children as the next
     // transaction of this style update.
     RequiredInvalidationAfterStyleChange transaction_invalidation;
-    ChangedCustomPropertyNames changed_custom_property_names;
+    document.style_computer().style_engine().begin_noting_declaration_changes_during_apply();
+    ScopeGuard end_noting_declaration_changes = [&] { document.style_computer().style_engine().end_noting_declaration_changes_during_apply(); };
     // Unstyled descendants of display:none need no record until a targeted read or visibility
     // change asks for one. SVG resources and existing animations can still consume style while
     // hidden, so retain their inheritance prerequisites in this batch. An element has animations when
@@ -513,16 +384,7 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
             auto element = document.style_computer().element_for_style_node(published_reaction.style_node);
             if (!element)
                 continue;
-            // A reaction the engine derived for this element while applying an earlier one in
-            // this batch joins the element's own reaction where it covers it.
             auto reaction = published_reaction;
-            if (auto absorbed = document.style_computer().style_engine().absorb_element_style_input(
-                    StyleNodeID { reaction.style_node }, reaction.reaction, reaction.inherited_style_groups,
-                    reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Materialize);
-                absorbed != 0) {
-                reaction.reaction = static_cast<u8>(absorbed & 0xff);
-                reaction.inherited_style_groups = static_cast<u8>(absorbed >> 8);
-            }
 
             if (!element->has_style() && !required_in_hidden_subtrees.contains(element->style_node_id())) {
                 bool hidden = false;
@@ -546,6 +408,11 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
                     retried.style_record != 0) {
                     reaction.new_style_record = retried.style_record;
                     reaction.uses_substitution = retried.uses_substitution;
+                    reaction.record_reads = retried.record_reads;
+                    reaction.explicitly_inherited_groups = retried.explicitly_inherited_groups;
+                    reaction.owes_an_animation_plan = retried.owes_an_animation_plan;
+                    reaction.owes_a_transition_step = retried.owes_a_transition_step;
+                    reaction.composed_by_the_host = retried.composed_by_the_host;
                     reaction.damage = StyleEngineFFI::FfiStyleDeltaDamage::Full;
                     reaction.gap = StyleEngineFFI::FfiStyleDeltaGap::Computed;
                     DOM::Element::EnginePseudoElementRecords pseudo_element_records {};
@@ -559,11 +426,32 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
                 }
             }
 
+            // A reaction the engine derived for this element while applying an earlier one in
+            // this batch joins the element's own reaction where it covers it, which a C++
+            // computation of the element, a failed retry's included, always does.
+            if (auto absorbed = document.style_computer().style_engine().absorb_element_style_input(
+                    StyleNodeID { reaction.style_node }, reaction.reaction, reaction.inherited_style_groups,
+                    reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Materialize);
+                absorbed != 0) {
+                reaction.reaction = static_cast<u8>(absorbed & 0xff);
+                reaction.inherited_style_groups = static_cast<u8>(absorbed >> 8);
+            }
+
+            // An element whose style was cleared on entry to display:none computes it here, before its descendants,
+            // unless the engine computed it for an ancestor that became visible, or for an SVG element whose style
+            // was cleared under a hidden ancestor: that record installs like a first one.
+            if (!element->has_style() && reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Computed && reaction.old_style_record != 0
+                && !(reaction.reaction & StyleEngine::AncestorBecameVisible) && !element->is_svg_element()) {
+                reaction.gap = StyleEngineFFI::FfiStyleDeltaGap::Materialize;
+                reaction.new_style_record = 0;
+                reaction.damage = StyleEngineFFI::FfiStyleDeltaDamage::None;
+                reaction.reaction |= StyleEngine::RecomputeStyle;
+            }
             // An engine-computed first record installs on an element without style; other record
             // deltas assume the style they move.
             if (!element->has_style()
                 && reaction.gap != StyleEngineFFI::FfiStyleDeltaGap::Materialize
-                && !(reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::Computed && reaction.old_style_record == 0))
+                && reaction.gap != StyleEngineFFI::FfiStyleDeltaGap::Computed)
                 continue;
             // An earlier display:none reaction in this batch can clear the style of a materialization gap after the
             // inheritance closure was built. The gap must then rematerialize rather than letting its descendants
@@ -594,9 +482,8 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
                 VERIFY(reaction.damage == StyleEngineFFI::FfiStyleDeltaDamage::Full);
             }
 
-            auto previous_style_record = element->style_record_identity();
             auto old_custom_property_data = element->custom_property_data({});
-            bool const was_unstyled = !previous_style_record;
+            bool const was_unstyled = !element->style_record_identity();
             auto const* previous_box_values = element->style_group<ComputedValues::BoxValues>();
             auto const previous_display = previous_box_values
                 ? Optional<Display> { display_from_ffi_display(previous_box_values->display) }
@@ -616,117 +503,56 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
             // inherits, which its cascade decides.
             bool const cascade_declares_custom_properties = document.style_computer().style_engine().node_declares_custom_properties(reaction.style_node);
             bool const needs_full_custom_property_recompute = needs_custom_property_recompute && (element->style_uses_var_css_function() || element->style_uses_inherit_css_function() || cascade_declares_custom_properties);
-            static bool const verify_engine_computed_records = getenv("LIBWEB_VERIFY_STYLE_RECORD_PATCH") != nullptr;
+            // The engine answered its records with what the moves from the records they name damage.
+            DOM::Element::EngineRecordDamages engine_record_damages;
+            if (reaction.record_damage & to_underlying(StyleEngineFFI::FfiStyleInvalidationField::EngineComputed))
+                engine_record_damages.element = DOM::Element::EngineRecordDamage { StyleRecordID { reaction.old_style_record }, StyleRecordID { reaction.new_style_record }, reaction.record_damage };
             // The engine settled the element's record, and the pseudo-element records beside it:
-            // C++ installs them. Under verification the ordinary computation runs instead and its
-            // records must equal the engine's by value.
+            // C++ installs them.
             auto apply_engine_computed_records = [&](DOM::Element::EnginePseudoElementRecords const& pseudo_element_records, bool acknowledge) {
                 auto& style_engine = document.style_computer().style_engine();
-                if (verify_engine_computed_records) {
-                    auto authoritative_custom_property_data = element->custom_property_data({});
-                    if (authoritative_custom_property_data && authoritative_custom_property_data->is_animation_overlay())
-                        authoritative_custom_property_data = authoritative_custom_property_data->parent();
-                    auto const authoritative_custom_property_environment = authoritative_custom_property_data
-                        ? authoritative_custom_property_data->identity()
-                        : 0;
-                    auto const production_packed = !!previous_style_record
-                        ? style_engine.compare_style_records(StyleRecordID { reaction.new_style_record }, previous_style_record, true, false, false)
-                        : to_underlying(StyleEngineFFI::FfiStyleInvalidationField::AnyComputedValueChanged);
-                    auto& counters = document.style_invalidation_counters();
-                    auto const counters_before_verification = counters;
-                    style_engine.begin_computed_record_verification();
-                    ScopeGuard end_computed_record_verification = [&] { style_engine.end_computed_record_verification(); };
-                    DOM::Element::EnginePseudoElementRecords previous_pseudo_element_records;
-                    for (size_t kind = 0; kind < previous_pseudo_element_records.size(); ++kind)
-                        previous_pseudo_element_records[kind] = element->style_record_identity(static_cast<PseudoElement>(kind));
-                    bool const production_computed_value_changed = production_packed & to_underlying(StyleEngineFFI::FfiStyleInvalidationField::AnyComputedValueChanged)
-                        && !style_engine.style_records_match_for_verification(reaction.style_node, NumericLimits<u8>::max(), StyleRecordID { reaction.new_style_record }, previous_style_record);
-                    style_engine.consume_recorded_element_style_input_change(reaction.style_node);
-                    bool verification_did_change_custom_properties = false;
-                    invalidation = element->apply_style_engine_reaction(verification_did_change_custom_properties, DOM::Element::StyleRecomputeMode::Verification);
-                    bool verification_pseudo_record_changed = false;
-                    for (size_t kind = 0; kind < previous_pseudo_element_records.size(); ++kind) {
-                        if (element->style_record_identity(static_cast<PseudoElement>(kind)) != previous_pseudo_element_records[kind]) {
-                            verification_pseudo_record_changed = true;
-                            break;
-                        }
-                    }
-                    auto packed = style_engine.compare_style_records(StyleRecordID { reaction.new_style_record }, element->style_record_identity(), true, false, false);
-                    VERIFY(!(packed & to_underlying(StyleEngineFFI::FfiStyleInvalidationField::AnyComputedValueChanged))
-                        || style_engine.style_records_match_for_verification(reaction.style_node, NumericLimits<u8>::max(), StyleRecordID { reaction.new_style_record }, element->style_record_identity()));
-                    // A custom-property environment reaction can jump over ancestors whose computed
-                    // values did not change. Their engine environments are authoritative, but the
-                    // legacy verification pass never materialized them, so it has no independent
-                    // environment to compare here. The computed record, including every var()
-                    // substitution, is still verified above.
-                    bool const legacy_environment_is_complete = !needs_custom_property_recompute;
-                    if (legacy_environment_is_complete)
-                        verify_engine_computed_record_environment(*element, StyleRecordID { reaction.new_style_record });
-                    for (size_t kind = 0; kind < pseudo_element_records.size(); ++kind) {
-                        auto const& engine_record = pseudo_element_records[kind];
-                        if (!engine_record.has_value())
-                            continue;
-                        auto installed = element->style_record_identity(static_cast<PseudoElement>(kind));
-                        if (!*engine_record) {
-                            VERIFY(!installed);
-                            continue;
-                        }
-                        VERIFY(!!installed);
-                        auto pseudo_packed = style_engine.compare_style_records(*engine_record, installed, true, false, false);
-                        VERIFY(!(pseudo_packed & to_underlying(StyleEngineFFI::FfiStyleInvalidationField::AnyComputedValueChanged))
-                            || style_engine.style_records_match_for_verification(reaction.style_node, kind, *engine_record, installed));
-                    }
-                    // A skipped ancestor can make the engine record temporarily unattachable only
-                    // because the verification pass installed a legacy environment on that
-                    // ancestor. Keep the old authoritative record in that case; a production pass
-                    // never creates this mixed environment chain.
-                    bool const engine_record_is_installable = engine_computed_record_environment_is_installable(*element, StyleRecordID { reaction.new_style_record });
-                    auto const verification_invalidation = invalidation;
-                    counters = counters_before_verification;
-                    auto const computed_style_changes_before_application = counters.element_computed_style_changes;
-                    if (engine_record_is_installable) {
-                        invalidation = element->apply_engine_computed_style_record(StyleRecordID { reaction.new_style_record }, pseudo_element_records, reaction.uses_substitution, did_change_custom_properties);
-                        // The reference pass already installed equal values, so applying the engine
-                        // record may be a no-op. Preserve the invalidation it proved the originating
-                        // record or pseudo-element transitions need.
-                        if (verification_pseudo_record_changed)
-                            invalidation |= verification_invalidation;
-                        else if (invalidation.is_none() && !!previous_style_record && production_computed_value_changed)
-                            invalidation = verification_invalidation;
-                        if (production_computed_value_changed
-                            && counters.element_computed_style_changes == computed_style_changes_before_application)
-                            ++counters.element_computed_style_changes;
-                    }
-                    // The legacy pass may already have installed the target environment, masking
-                    // the change that the production application would report to child planning.
-                    did_change_custom_properties |= authoritative_custom_property_environment
-                        != style_engine.style_record_custom_property_environment(StyleRecordID { reaction.new_style_record });
-                    // The reference computation recorded the current C++ inputs against its
-                    // temporary interned record. The authoritative record is equal by value, so
-                    // bind those inputs to it before the temporary verification pin is released.
-                    if (auto* style_input_record = element->style_input_record()) {
-                        style_input_record->computed_style_record = engine_record_is_installable
-                            ? StyleRecordID { reaction.new_style_record }
-                            : element->style_record_identity();
-                        style_input_record->bind_next_published_style = false;
-                    }
-                    for (size_t kind = 0; kind < previous_pseudo_element_records.size(); ++kind) {
-                        auto pseudo_element = static_cast<PseudoElement>(kind);
-                        if (is_synthetic_pseudo_element(pseudo_element)
-                            && pseudo_element != PseudoElement::Backdrop
-                            && !is_highlight_pseudo_element(pseudo_element)
-                            && !pseudo_element_records[kind].has_value())
-                            element->set_computed_style(pseudo_element, *previous_pseudo_element_records[kind]);
-                    }
-                } else {
-                    // A first record answers the element's recorded arrival; nothing is left for a
-                    // later transaction to plan.
-                    if (!element->has_style())
-                        style_engine.consume_recorded_element_style_input_change(reaction.style_node);
-                    invalidation = element->apply_engine_computed_style_record(StyleRecordID { reaction.new_style_record }, pseudo_element_records, reaction.uses_substitution, did_change_custom_properties);
-                }
+                // A C++ computation applies a change of the element's display once the record holds the element's
+                // animations and its transition step has run, and refreshes its pseudo-elements after its own style;
+                // so does the installation of the record the engine settled, below, from the style the element held.
+                auto const old_computed_values = element->computed_style();
+                // https://drafts.csswg.org/css-transitions-1/#starting
+                // The transition step the row owes compares the record the element moved away from with the one it
+                // installs, so the old record has to outlive its replacement until the step has read it.
+                StyleRecordPin const before_change { document.style_computer(), StyleRecordID { reaction.owes_a_transition_step ? reaction.old_style_record : 0 } };
+                // The record answers any style input the element owes, as the C++ computation it
+                // equals would: nothing is left for a later transaction to plan.
+                style_engine.consume_recorded_element_style_input_change(reaction.style_node);
+                invalidation = element->apply_engine_computed_style_record(StyleRecordID { reaction.new_style_record }, pseudo_element_records, reaction.uses_substitution, reaction.record_reads, reaction.explicitly_inherited_groups, did_change_custom_properties, DOM::Element::DisplayNoneChange::LeftToCaller, &engine_record_damages);
                 if (acknowledge)
                     style_engine.acknowledge_engine_computed_record(StyleNodeID { reaction.style_node });
+                // A C++ computation applies the animation plan it decides beside the record it computes and collects the
+                // element's animations, those the plan starts among them, into that record. The host composes them over
+                // the record the engine settled once it is installed; the engine asks for the element's children only
+                // after that. Which rows the host composes is the engine's to say, since it settles the pseudo-elements
+                // of every other row beside the record, and every element with animations is among them.
+                bool const composed_by_the_host = reaction.composed_by_the_host;
+                ASSERT(composed_by_the_host || !(element->has_relevant_animations() || element->has_associated_animations()));
+                if (composed_by_the_host) {
+                    DOM::AbstractElement abstract_element { *element };
+                    if (reaction.owes_an_animation_plan)
+                        document.style_computer().apply_settled_animation_plan(abstract_element);
+                    // https://drafts.csswg.org/css-transitions-2/#defining-before-change-style
+                    // Sampling the installed record can keep the epoch's before-change style, and the record the element
+                    // holds by then is the after-change one. A row that owes the step keeps the record it moved away from
+                    // first.
+                    if (!!before_change.style_record() && document.is_in_style_stabilization_epoch())
+                        document.style_computer().record_transition_stabilization_baseline(abstract_element, before_change.style_record());
+                    if (element->has_relevant_animations() || element->has_associated_animations())
+                        sample_animations_for_installed_record(abstract_element);
+                }
+                if (!!before_change.style_record())
+                    invalidation |= document.style_computer().run_transition_step_for_installed_record({ *element }, before_change.style_record(), StyleComputer::TransitionStepFollowUp::Request);
+                if (old_computed_values)
+                    element->apply_display_none_change(DOM::Element::DisplayNoneState::of(*old_computed_values));
+                // The pseudo-elements of a record the host composes inherit the composition, so the engine settles them
+                // only now.
+                if (reaction.composed_by_the_host)
+                    invalidation |= element->refresh_pseudo_element_styles_over_composition(old_computed_values ? &*old_computed_values : nullptr, did_change_custom_properties);
             };
             if (reaction.gap == StyleEngineFFI::FfiStyleDeltaGap::None) {
                 VERIFY(!needs_regular_style_recompute);
@@ -734,8 +560,11 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
                 VERIFY(!needs_custom_property_recompute);
                 VERIFY(reaction.pseudo_kind == NumericLimits<u8>::max());
                 // The engine swapped the element's inherited groups for its parent's: the record
-                // installs as an engine record.
-                if (element_style_depends_on_more_than_the_inherited_groups(*element))
+                // installs as an engine record. The engine refuses the swap to an element that
+                // animates, declares transitions, or inherits from an animating parent. A parent
+                // this batch recomputed may have taken animated values from its own ancestors
+                // since the engine swapped, which the element inherits in place of the base ones.
+                if (parent_style_has_animated_values(*element))
                     invalidation = element->apply_style_engine_reaction(did_change_custom_properties);
                 else
                     apply_engine_computed_records({}, false);
@@ -746,11 +575,21 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
                 VERIFY(needs_regular_style_recompute || needs_inherited_style_recompute || needs_custom_property_recompute);
                 VERIFY(reaction.pseudo_kind == NumericLimits<u8>::max());
                 auto pseudo_element_records = retried_pseudo_element_records.value_or({});
-                for (auto next = reaction_index + 1; next < reactions.size() && reactions[next].style_node == published_reaction.style_node && reactions[next].pseudo_kind != NumericLimits<u8>::max(); ++next)
-                    pseudo_element_records[reactions[next].pseudo_kind] = StyleRecordID { reactions[next].new_style_record };
-                if (!engine_computed_record_environment_is_installable(*element, StyleRecordID { reaction.new_style_record })) {
+                for (auto next = reaction_index + 1; next < reactions.size() && reactions[next].style_node == published_reaction.style_node && reactions[next].pseudo_kind != NumericLimits<u8>::max(); ++next) {
+                    auto const& pseudo_reaction = reactions[next];
+                    pseudo_element_records[pseudo_reaction.pseudo_kind] = StyleRecordID { pseudo_reaction.new_style_record };
+                    if (pseudo_reaction.record_damage & to_underlying(StyleEngineFFI::FfiStyleInvalidationField::EngineComputed)) {
+                        engine_record_damages.pseudo_elements[pseudo_reaction.pseudo_kind] = DOM::Element::EnginePseudoElementRecordDamage {
+                            .move = { StyleRecordID { pseudo_reaction.old_style_record }, StyleRecordID { pseudo_reaction.new_style_record }, pseudo_reaction.record_damage },
+                            .originating_style_record = StyleRecordID { reaction.new_style_record },
+                        };
+                    }
+                }
+                if (!engine_computed_record_environment_is_installable(*element, StyleRecordID { reaction.new_style_record })
+                    || document.style_computer().style_engine().declarations_changed_during_apply(StyleNodeID { reaction.style_node })) {
                     // The engine resolved the record's environment over the parent's own; when the
-                    // parent's inheritable environment differs, C++ computes the style.
+                    // parent's inheritable environment differs, C++ computes the style. So it does
+                    // when a host rewrote the element's declarations after the engine computed it.
                     document.style_computer().style_engine().consume_recorded_element_style_input_change(reaction.style_node);
                     invalidation = element->apply_style_engine_reaction(did_change_custom_properties);
                 } else {
@@ -770,19 +609,11 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
                 ScopeGuard reset_derived_reaction = [&] {
                     document.style_computer().set_materializing_for_derived_reaction(false);
                 };
-                invalidation = element->apply_style_engine_reaction(did_change_custom_properties, DOM::Element::StyleRecomputeMode::Normal, pseudo_element_inputs);
-            } else if (needs_custom_property_recompute && element->refresh_inherited_custom_property_data()) {
-                did_change_custom_properties = true;
-                element->republish_style_record_environment();
-                element->invalidate_descendant_styles_depending_on_style_container_query();
+                invalidation = element->apply_style_engine_reaction(did_change_custom_properties, pseudo_element_inputs);
             }
-
-            // NB: Making deferred pseudo-element styles observable changes only their inputs.
-            //     The originating element's cascade and computed style remain valid.
-            if (!needs_regular_style_recompute && !needs_inherited_style_recompute && !needs_full_custom_property_recompute
-                && (reaction.reaction & StyleEngine::PseudoInputsMayHaveChanged) && element->has_style()) {
-                invalidation |= element->recompute_pseudo_element_styles();
-            }
+            // A row that owes only a moved inherited environment on an element whose style reads none
+            // has nothing left for the host: the engine moved the element's environment, and the
+            // record over it, when its parent's moved.
 
             auto const* current_inherited_box_values = element->style_group<ComputedValues::InheritedBoxValues>();
             if (previous_visibility.has_value() && current_inherited_box_values
@@ -800,10 +631,11 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
             // a moved name are recorded for their own computation. The engine derives no reactions
             // for the move.
             if (did_change_custom_properties)
-                propagate_custom_property_environment_move(document, *element, old_custom_property_data, changed_custom_property_names);
-            if (invalidation.is_none())
+                propagate_custom_property_environment_move(document, *element, old_custom_property_data);
+            // A counter-style rebuild moves no style, so it is not what the children react to.
+            if (invalidation.style_change_is_none())
                 facts |= StyleEngine::InvalidationIsNone;
-            if (invalidation.needs_layout_tree_rebuild())
+            if (invalidation.style_change_needs_layout_tree_rebuild())
                 facts |= StyleEngine::NeedsLayoutTreeRebuild;
             if (invalidation.recompute_descendant_styles)
                 facts |= StyleEngine::RecomputeDescendants;
@@ -913,6 +745,14 @@ static void update_style(DOM::Document& document, DocumentWithoutBrowsingContext
         if (!document.style_computer().style_engine().has_pending_transaction())
             return;
     }
+
+    // Settle each tree scope's counter-style registry before the engine answers any row: a record
+    // naming a counter style names the registry it was computed against, and a shadow tree can
+    // define its own. None of it depends on layout.
+    (void)document.style_scope().counter_style_environment_identity();
+    document.for_each_shadow_root([](DOM::ShadowRoot& shadow_root) {
+        (void)shadow_root.style_scope().counter_style_environment_identity();
+    });
 
     // A style flush is a transaction boundary. Everything recorded since the last one crosses into
     // StyleEngine as one flat batch, is normalized there, and is routed into the region its
@@ -1093,9 +933,9 @@ static void note_targeted_style_reaction_applied(DOM::Element& element, Required
     u32 facts = 0;
     if (did_change_custom_properties)
         facts |= StyleEngine::DidChangeCustomProperties;
-    if (invalidation.is_none())
+    if (invalidation.style_change_is_none())
         facts |= StyleEngine::InvalidationIsNone;
-    if (invalidation.needs_layout_tree_rebuild())
+    if (invalidation.style_change_needs_layout_tree_rebuild())
         facts |= StyleEngine::NeedsLayoutTreeRebuild;
     if (invalidation.recompute_descendant_styles)
         facts |= StyleEngine::RecomputeDescendants;
@@ -1121,9 +961,38 @@ static void apply_targeted_style_invalidation(DOM::Element& element, RequiredInv
     apply_document_style_invalidation_after_style_change(element.document(), invalidation);
 }
 
+// Install the engine's answer to a targeted demand for the element's record, or return nothing where the read is
+// C++'s.
+static Optional<RequiredInvalidationAfterStyleChange> install_targeted_record_demand_answer(DOM::Element& element, bool& did_change_custom_properties)
+{
+    auto& style_engine = element.document().style_computer().style_engine();
+    auto answer = style_engine.answer_record_demand(element.style_node_id(), { .targeted = true, .read_only = false }).record;
+    if (answer.style_record == 0)
+        return {};
+    // The engine resolved the record's environment over the parent's own; when the parent's inheritable environment
+    // differs, C++ computes the style, and the engine takes back what the demand derived.
+    if (!engine_computed_record_environment_is_installable(element, StyleRecordID { answer.style_record })) {
+        style_engine.abandon_demanded_records(element.style_node_id());
+        return {};
+    }
+    DOM::Element::EnginePseudoElementRecords pseudo_element_records {};
+    for (size_t kind = 0; kind < array_size(answer.pseudo_records); ++kind) {
+        if ((answer.pseudo_records_present >> kind) & 1)
+            pseudo_element_records[kind] = StyleRecordID { answer.pseudo_records[kind] };
+    }
+    auto invalidation = element.apply_engine_computed_style_record(StyleRecordID { answer.style_record }, pseudo_element_records, answer.uses_substitution, answer.record_reads, answer.explicitly_inherited_groups, did_change_custom_properties, DOM::Element::DisplayNoneChange::Apply);
+    style_engine.acknowledge_engine_computed_record(element.style_node_id());
+    return invalidation;
+}
+
 static RequiredInvalidationAfterStyleChange materialize_style_for_targeted_update(DOM::Element& element, bool& did_change_custom_properties)
 {
     auto& style_computer = element.document().style_computer();
+
+    if (element.parent()) {
+        if (auto invalidation = install_targeted_record_demand_answer(element, did_change_custom_properties); invalidation.has_value())
+            return *invalidation;
+    }
 
     style_computer.style_engine().consume_recorded_element_style_input_change(element.style_node_id());
 
@@ -1310,8 +1179,7 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
     for (size_t i = inheritance_chain.size(); i > 0; --i) {
         auto& ancestor = inheritance_chain[i - 1];
         if (!topmost_element_requiring_style.has_value()
-            && (document.style_computer().style_engine().has_recorded_element_style_input_change(ancestor->style_node_id())
-                || document.style_computer().style_engine().has_deferred_element_style_input(ancestor->style_node_id())
+            && (document.style_computer().style_engine().has_deferred_element_style_input(ancestor->style_node_id())
                 || !ancestor->has_style())) {
             topmost_element_requiring_style = i - 1;
         }
@@ -1396,7 +1264,7 @@ void Document::update_selection_style_observability()
 
     auto record_element = [&](Node& node) {
         if (auto* element = as_if<Element>(node); element && element->has_style()) {
-            style_computer().style_engine().record_element_style_input_change(element->style_node_id(),
+            style_computer().style_engine().record_derived_element_style_input_change(element->style_node_id(),
                 CSS::StyleEngine::PseudoInputsMayHaveChanged);
         }
     };

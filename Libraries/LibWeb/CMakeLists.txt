@@ -170,6 +170,7 @@ set(SOURCES
     CSS/FontComputer.cpp
     CSS/FontFace.cpp
     CSS/FontLoading.cpp
+    CSS/FontResolution.cpp
     CSS/FontFaceSet.cpp
     CSS/FontFaceSetLoadEvent.cpp
     CSS/FontFeatureData.cpp
@@ -177,7 +178,6 @@ set(SOURCES
     CSS/HypotheticalElement.cpp
     CSS/Invalidation/AdoptedStyleSheetInvalidator.cpp
     CSS/Invalidation/AttributeInvalidator.cpp
-    CSS/Invalidation/ContainerQueryInvalidator.cpp
     CSS/Invalidation/CustomElementInvalidator.cpp
     CSS/Invalidation/EmbeddedContentInvalidator.cpp
     CSS/Invalidation/ElementStateInvalidator.cpp
@@ -300,6 +300,7 @@ set(SOURCES
     DOM/CaretPosition.cpp
     DOM/CharacterData.cpp
     DOM/Comment.cpp
+    DOM/CommitMessages.cpp
     DOM/CustomEvent.cpp
     DOM/Document.cpp
     DOM/DocumentFragment.cpp
@@ -319,6 +320,7 @@ set(SOURCES
     DOM/EventTarget.cpp
     DOM/HTMLCollection.cpp
     DOM/IDLEventListener.cpp
+    DOM/InvalidationJournal.cpp
     DOM/LiveNodeList.cpp
     DOM/MutationObserver.cpp
     DOM/MutationRecord.cpp
@@ -326,6 +328,7 @@ set(SOURCES
     DOM/NamedNodeMap.cpp
     DOM/Node.cpp
     DOM/NodeFilter.cpp
+    DOM/NodeIdentity.cpp
     DOM/NodeIterator.cpp
     DOM/NodeList.cpp
     DOM/NodeOperations.cpp
@@ -811,6 +814,7 @@ set(SOURCES
     Painting/ChromeWidget.cpp
     Painting/DocumentPaintState.cpp
     Painting/HitTestDisplayList.cpp
+    Painting/HitTestResult.cpp
     Painting/CompositorAnimationEffectState.cpp
     Painting/PaintingRustBridge.cpp
     Painting/ResizeHandle.cpp
@@ -1218,6 +1222,7 @@ import_rust_crate(
         StyleEngineBridgeGenerated.h
         StyleEngineBridgeGenerated.inc
         StyleEngineStateFactsGenerated.inc
+        SelectorStateFactsGenerated.inc
         Layout/TreeBuilderRustFFI.h
         Layout/LayoutRustFFI.h
 )

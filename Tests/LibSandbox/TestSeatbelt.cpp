@@ -9,6 +9,7 @@
 #if defined(AK_OS_MACOS)
 
 #    include <AK/Array.h>
+#    include <AK/Base64.h>
 #    include <AK/ByteString.h>
 #    include <AK/Function.h>
 #    include <AK/Vector.h>
@@ -21,6 +22,7 @@
 #    include <LibCore/System.h>
 #    include <LibSandbox/Sandbox.h>
 #    include <LibTest/TestCase.h>
+#    include <Security/Security.h>
 #    include <errno.h>
 #    include <fcntl.h>
 #    include <libproc.h>
@@ -479,13 +481,18 @@ TEST_CASE(sandboxed_process_cannot_change_shared_file_state_through_fcntl)
     char path[PATH_MAX];
     EXPECT_EQ(run_fcntl(F_GETPATH, path), Outcome::Denied);
 
-    // The GPU service needs F_GETPATH, and it never receives files from the Browser.
-    EXPECT_EQ(run_sandboxed({ .paths = paths, .system_services = Sandbox::SystemService::GPU }, [&] {
-        auto fd = open(fixture.granted_file.characters(), O_RDONLY | O_CLOEXEC);
-        char path[PATH_MAX];
-        return fd >= 0 && fcntl(fd, F_GETPATH, path) != -1;
-    }),
-        Outcome::Allowed);
+    // The GPU service and AudioToolbox's decoders need F_GETPATH, and the helpers that hold those services never
+    // receive files from the Browser. The renderer that plays WebAudio does, so the Audio service alone grants nothing.
+    auto run_getpath_with = [&](Sandbox::SystemService services) {
+        return run_sandboxed({ .paths = paths, .system_services = services }, [&] {
+            auto fd = open(fixture.granted_file.characters(), O_RDONLY | O_CLOEXEC);
+            char path[PATH_MAX];
+            return fd >= 0 && fcntl(fd, F_GETPATH, path) != -1;
+        });
+    };
+    EXPECT_EQ(run_getpath_with(Sandbox::SystemService::GPU), Outcome::Allowed);
+    EXPECT_EQ(run_getpath_with(Sandbox::SystemService::Audio | Sandbox::SystemService::AudioDecoding), Outcome::Allowed);
+    EXPECT_EQ(run_getpath_with(Sandbox::SystemService::Audio), Outcome::Denied);
 }
 
 TEST_CASE(sandboxed_process_cannot_preallocate_disk_space_through_inherited_files)
@@ -872,7 +879,7 @@ TEST_CASE(sandboxed_process_spawns_only_allowed_executables_and_cannot_fork)
         if (posix_spawn(&pid, executable.characters(), nullptr, nullptr, arguments, nullptr) != 0)
             return false;
         int status = 0;
-        return waitpid(pid, &status, 0) == pid;
+        return waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     }),
         Outcome::Allowed);
 
@@ -947,6 +954,49 @@ TEST_CASE(sandboxed_process_with_network_connects_only_to_network_hosts)
 
     close(local_listener);
     close(listener);
+}
+
+static bool can_verify_certificates()
+{
+    // A self-signed test CA, valid from 2020 to 2050. Use a fixed verification date and explicit anchors so the test
+    // does not depend on the system's trust store, the current date or network access.
+    auto certificate_bytes = MUST(decode_base64("MIIBODCB4KADAgECAgEBMAoGCCqGSM49BAMCMBsxGTAXBgNVBAMMEEFJQSBUZXN0IFJvb3QgQ0EwIBcNMjAwMTAxMDAwMDAwWhgPMjA1MDAxMDEwMDAwMDBaMBsxGTAXBgNVBAMMEEFJQSBUZXN0IFJvb3QgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQvFaFCRjw2v74zuhfRNy6CQSj16eQo3DvL5UjoJo6Ic+jlA/En7yPQWBTdksQFW/3mxWqeoSShdsEzEVEkC84toxMwETAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIFcoD2A6nwl2nz8sgjQUl1h/vEmP2ou36HfWDjHNrUDBAiBuf54FrlwV+CbAPcABgP5ktbYmt7Ho0zaKWSuDSI/EeA=="sv));
+    auto data = CFDataCreate(nullptr, certificate_bytes.data(), certificate_bytes.size());
+    auto certificate = SecCertificateCreateWithData(nullptr, data);
+    CFRelease(data);
+    VERIFY(certificate);
+    auto policy = SecPolicyCreateBasicX509();
+    SecTrustRef trust = nullptr;
+    VERIFY(SecTrustCreateWithCertificates(certificate, policy, &trust) == errSecSuccess);
+    CFRelease(policy);
+    void const* certificates[] = { certificate };
+    auto anchors = CFArrayCreate(nullptr, certificates, 1, &kCFTypeArrayCallBacks);
+    CFRelease(certificate);
+    VERIFY(SecTrustSetAnchorCertificates(trust, anchors) == errSecSuccess);
+    CFRelease(anchors);
+    VERIFY(SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess);
+    VERIFY(SecTrustSetNetworkFetchAllowed(trust, false) == errSecSuccess);
+    auto date = CFDateCreate(nullptr, 757382400); // 2025-01-01.
+    VERIFY(SecTrustSetVerifyDate(trust, date) == errSecSuccess);
+    CFRelease(date);
+    auto trusted = SecTrustEvaluateWithError(trust, nullptr);
+
+    // The same certificate must be rejected when it is no longer a trusted anchor.
+    anchors = CFArrayCreate(nullptr, nullptr, 0, &kCFTypeArrayCallBacks);
+    VERIFY(SecTrustSetAnchorCertificates(trust, anchors) == errSecSuccess);
+    CFRelease(anchors);
+    auto untrusted = SecTrustEvaluateWithError(trust, nullptr);
+    CFRelease(trust);
+    return trusted && !untrusted;
+}
+
+TEST_CASE(sandboxed_process_with_network_verifies_certificates)
+{
+    Vector<Sandbox::SeatbeltPath> paths;
+    MUST(Sandbox::add_seatbelt_path_if_exists(paths, MUST(Core::System::current_executable_path()), Sandbox::SeatbeltPath::Access::ReadOnly));
+
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [] { return can_verify_certificates(); }), Outcome::Denied);
+    EXPECT_EQ(run_sandboxed({ .paths = paths, .network_access = Sandbox::NetworkAccess::Allowed }, [] { return can_verify_certificates(); }), Outcome::Allowed);
 }
 
 TEST_CASE(sandboxed_process_maps_jit_memory_only_when_granted)

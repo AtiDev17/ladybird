@@ -52,8 +52,6 @@ pub struct FfiLayoutUpdateHostCallbacks {
 pub struct FfiLayoutUpdateDocumentFacts {
     /// The document is its navigable's active document; an inactive document counts as laid out.
     pub document_is_active: bool,
-    /// The document's layout root, invalid when it has none. Mirrors the arena's record.
-    pub layout_root: NodeSlotId,
     /// The document node or one of its descendants needs a layout tree update.
     pub document_needs_layout_tree_build: bool,
     pub container_query_evaluation_is_pending: bool,
@@ -104,10 +102,8 @@ impl FfiLayoutUpdateHostCallbacks {
         unsafe { (self.process_pending_top_layer_layout_changes)(self.context) }
     }
 
-    fn document_facts(&self, arena: &LayoutNodeArena) -> FfiLayoutUpdateDocumentFacts {
-        let facts = unsafe { (self.document_facts)(self.context) };
-        debug_assert_eq!(facts.layout_root, arena.layout_root());
-        facts
+    fn document_facts(&self) -> FfiLayoutUpdateDocumentFacts {
+        unsafe { (self.document_facts)(self.context) }
     }
 
     fn needs_style_update_after_layout(&self) -> bool {
@@ -143,20 +139,13 @@ impl FfiLayoutUpdateHostCallbacks {
     }
 }
 
-/// Mirrors the document's own predicate: an inactive document is left alone, a document without
-/// a tree needs one, and otherwise nothing may be pending on the root, the DOM, or a boundary.
+/// The same predicate the document exposes: an inactive document is left alone, and the arena
+/// answers for the tree it holds.
 fn layout_is_up_to_date(arena: &LayoutNodeArena, facts: &FfiLayoutUpdateDocumentFacts) -> bool {
     if !facts.document_is_active {
         return true;
     }
-    let layout_root = arena.layout_root();
-    if layout_root.is_invalid() {
-        return false;
-    }
-    !arena.node_needs_layout_update(layout_root)
-        && !facts.document_needs_layout_tree_build
-        && !arena.needs_full_layout_tree_update()
-        && !arena.has_partial_relayout_boundary_roots()
+    arena.layout_is_up_to_date(facts.document_needs_layout_tree_build)
 }
 
 /// The `TREEBUILD` and `LAYOUT` timing lines, off unless `LIBWEB_UPDATE_LAYOUT_TRACE` is set.
@@ -278,7 +267,7 @@ unsafe fn try_partial_relayout(
     }
 
     // The build may have resized this document's viewport through its embedding document.
-    let facts = host.document_facts(unsafe { arena(arena_handle) });
+    let facts = host.document_facts();
     unsafe { sync_enrolled_content_for_layout(arena_handle) };
     for &root in &partial_relayout_roots {
         unsafe {
@@ -286,6 +275,7 @@ unsafe fn try_partial_relayout(
                 arena_handle,
                 root,
                 facts.viewport_inline_size_raw,
+                facts.viewport_block_size_raw,
                 facts.document_in_quirks_mode,
             );
         }
@@ -295,10 +285,7 @@ unsafe fn try_partial_relayout(
 
     host.after_layout_commit(layout_tree_was_built_in_partial_branch);
     if host.needs_style_update_after_layout()
-        || !layout_is_up_to_date(
-            unsafe { arena(arena_handle) },
-            &host.document_facts(unsafe { arena(arena_handle) }),
-        )
+        || !layout_is_up_to_date(unsafe { arena(arena_handle) }, &host.document_facts())
     {
         return PartialRelayout::NeedsAnotherLayoutPass;
     }
@@ -330,7 +317,7 @@ unsafe fn update_layout(arena_handle: *mut c_void, inputs: &FfiLayoutUpdateInput
         host.process_pending_list_item_renumbers();
         host.process_pending_top_layer_layout_changes();
 
-        let facts = host.document_facts(unsafe { arena(arena_handle) });
+        let facts = host.document_facts();
         let force_devtools_layout_data_collection =
             facts.should_collect_devtools_layout_data && inputs.reason_is_inspect_devtools_layout_data;
 
@@ -369,7 +356,7 @@ unsafe fn update_layout(arena_handle: *mut c_void, inputs: &FfiLayoutUpdateInput
 
         // A build in the partial branch may have resized this document's viewport through its
         // embedding document.
-        let facts = host.document_facts(unsafe { arena(arena_handle) });
+        let facts = host.document_facts();
         let layout_started = trace.now();
 
         if needs_layout_tree_rebuild {
@@ -416,7 +403,7 @@ unsafe fn update_layout(arena_handle: *mut c_void, inputs: &FfiLayoutUpdateInput
             continue;
         }
 
-        let facts = host.document_facts(unsafe { arena(arena_handle) });
+        let facts = host.document_facts();
         // A zone rebuild requested during layout tree construction runs as another pass.
         if facts.top_layer_work_pending {
             continue;
@@ -429,10 +416,7 @@ unsafe fn update_layout(arena_handle: *mut c_void, inputs: &FfiLayoutUpdateInput
     }
 
     if host.needs_style_update_after_layout()
-        || !layout_is_up_to_date(
-            unsafe { arena(arena_handle) },
-            &host.document_facts(unsafe { arena(arena_handle) }),
-        )
+        || !layout_is_up_to_date(unsafe { arena(arena_handle) }, &host.document_facts())
     {
         host.record_stabilization_bound_failure();
         unreachable!("the layout update did not stabilize within its exact bound");
@@ -546,10 +530,9 @@ pub unsafe extern "C" fn layout_arena_layout_tree_build_stats(arena: *mut c_void
 mod tests {
     use super::*;
 
-    fn facts_for(arena: &LayoutNodeArena) -> FfiLayoutUpdateDocumentFacts {
+    fn facts_for() -> FfiLayoutUpdateDocumentFacts {
         FfiLayoutUpdateDocumentFacts {
             document_is_active: true,
-            layout_root: arena.layout_root(),
             document_needs_layout_tree_build: false,
             container_query_evaluation_is_pending: false,
             top_layer_work_pending: false,
@@ -563,7 +546,7 @@ mod tests {
     #[test]
     fn an_inactive_document_counts_as_laid_out_and_a_rootless_active_one_does_not() {
         let arena = LayoutNodeArena::new();
-        let mut facts = facts_for(&arena);
+        let mut facts = facts_for();
         assert!(!layout_is_up_to_date(&arena, &facts));
         facts.document_is_active = false;
         assert!(layout_is_up_to_date(&arena, &facts));
@@ -572,10 +555,10 @@ mod tests {
     #[test]
     fn dom_side_pending_work_keeps_a_rooted_document_from_being_laid_out() {
         let mut arena = LayoutNodeArena::new();
-        let viewport = arena.allocate_unbound(std::ptr::null_mut());
+        let viewport = arena.allocate_unbound();
         arena.set_layout_root(viewport);
         arena.reset_layout_update_flags_in_subtree(viewport);
-        let facts = facts_for(&arena);
+        let facts = facts_for();
         assert!(layout_is_up_to_date(&arena, &facts));
 
         let mut tree_build_pending = facts;

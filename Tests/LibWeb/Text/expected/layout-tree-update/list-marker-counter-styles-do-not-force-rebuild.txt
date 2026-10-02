@@ -1,0 +1,7 @@
+PRESERVED: recolouring a marker keeps the list item's box | list item
+STATS: recolouring a marker keeps the list item's box | no layout tree build
+PASS: recolouring a marker keeps the list item's box | incremental tree matches full rebuild
+PRESERVED: recolouring a marker of an unregistered counter style keeps the list item's box | list item
+STATS: recolouring a marker of an unregistered counter style keeps the list item's box | no layout tree build
+PASS: recolouring a marker of an unregistered counter style keeps the list item's box | incremental tree matches full rebuild
+2 cases; 2 matched; 0 mismatched

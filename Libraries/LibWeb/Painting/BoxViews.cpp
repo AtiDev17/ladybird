@@ -4,10 +4,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/DOM/InvalidationJournal.h>
 #include <LibWeb/DOM/Position.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
@@ -694,13 +696,24 @@ Optional<String> grid_layout_json(Layout::Node const& node, UniqueNodeID contain
     return result;
 }
 
+// The devtools protocol names a flex item by its DOM node's unique id, while the layout row that
+// recorded the item names it by its style node.
+static i64 devtools_node_id_for_style_node(void const* context, u32 style_node)
+{
+    auto const& document = *static_cast<DOM::Document const*>(context);
+    auto dom_node = document.style_computer().node_for_style_node(CSS::StyleNodeID { style_node });
+    return dom_node ? dom_node->unique_id().value() : -1;
+}
+
 Optional<String> flex_layout_json(Layout::Node const& node, UniqueNodeID container_node_id)
 {
     Optional<String> result;
-    Layout::RustFFI::layout_arena_paintable_flex_layout_json(node.arena_handle(), committed_row_slot(node), container_node_id.value(), &result,
+    Layout::RustFFI::layout_arena_paintable_flex_layout_json(
+        node.arena_handle(), committed_row_slot(node), container_node_id.value(), &result,
         [](void* context, u8 const* bytes, size_t length) {
             *static_cast<Optional<String>*>(context) = MUST(String::from_utf8(StringView { bytes, length }));
-        });
+        },
+        &node.document(), devtools_node_id_for_style_node);
     return result;
 }
 
@@ -801,7 +814,25 @@ public:
     }
 };
 
+DOM::NodeIdentity journal_identity_of(Layout::Node const& node)
+{
+    auto identity = node.dom_node_identity();
+    if (!identity || identity.bound_layout_node(node.node_arena()) != &node)
+        return {};
+    return identity;
+}
+
 void set_needs_repaint(Layout::Node const& node, InvalidateDisplayList should_invalidate_display_list)
+{
+    if (!has_committed_box(node))
+        return;
+    if (auto identity = journal_identity_of(node))
+        const_cast<DOM::Document&>(node.document()).invalidation_journal().note_needs_repaint(identity, should_invalidate_display_list);
+    else
+        apply_repaint_damage(node, should_invalidate_display_list);
+}
+
+void apply_repaint_damage(Layout::Node const& node, InvalidateDisplayList should_invalidate_display_list)
 {
     if (!has_committed_box(node))
         return;
@@ -815,24 +846,52 @@ void set_needs_repaint(Layout::Node const& node, InvalidateDisplayList should_in
         if (body_background_is_propagated_to_root(as<Layout::NodeWithStyle>(node))) {
             if (auto const* document_element = document.document_element()) {
                 if (auto const* document_element_layout_node = document_element->unsafe_layout_node())
-                    invalidate_paint_cache(*document_element_layout_node);
+                    apply_paint_cache_invalidation(*document_element_layout_node, PaintCacheInvalidation::PaintAndHitTest);
             }
         }
     }
     BoxViewRepaintAccess::set_document_needs_repaint(document, should_invalidate_display_list);
 }
 
+void apply_text_repaint_damage(Layout::TextNode const& node, InvalidateDisplayList should_invalidate_display_list)
+{
+    if (auto* containing_block = node.containing_block())
+        apply_repaint_damage(*containing_block, should_invalidate_display_list);
+
+    if (should_invalidate_display_list != InvalidateDisplayList::No)
+        Layout::RustFFI::layout_arena_invalidate_nearest_self_painting_inline_paint_cache(node.arena_handle(), Layout::Node::slot_id(&node));
+}
+
 void set_needs_repaint_in_subtree(Layout::Node const& node)
 {
     if (!has_committed_box(node))
         return;
-    Layout::RustFFI::layout_arena_paintable_invalidate_subtree_for_repaint(node.arena_handle(), committed_row_slot(node));
-    set_needs_repaint(node);
+    if (auto identity = journal_identity_of(node)) {
+        const_cast<DOM::Document&>(node.document()).invalidation_journal().note_needs_repaint_in_subtree(identity);
+        return;
+    }
+    apply_subtree_repaint_damage(node);
+    apply_repaint_damage(node, InvalidateDisplayList::PaintCommandsAndHitTestList);
 }
 
-void invalidate_paint_cache(Layout::Node const& node)
+void apply_subtree_repaint_damage(Layout::Node const& node)
 {
-    mirror_rust_invalidate_paint_cache(node);
+    if (!has_committed_box(node))
+        return;
+    Layout::RustFFI::layout_arena_paintable_invalidate_subtree_for_repaint(node.arena_handle(), committed_row_slot(node));
+}
+
+void invalidate_propagated_text_decoration_caches(Layout::Node const& node)
+{
+    if (auto identity = journal_identity_of(node))
+        const_cast<DOM::Document&>(node.document()).invalidation_journal().note_propagated_text_decoration_caches_invalidation(identity);
+    else
+        apply_paint_cache_invalidation(node, PaintCacheInvalidation::PropagatedTextDecorations);
+}
+
+void apply_paint_cache_invalidation(Layout::Node const& node, PaintCacheInvalidation invalidation)
+{
+    Layout::RustFFI::layout_arena_paintable_invalidate_paint_cache(node.arena_handle(), committed_row_slot(node), invalidation == PaintCacheInvalidation::PropagatedTextDecorations);
 }
 
 void repaint_after_style_change(Layout::Node const& node, CSS::RequiredInvalidationAfterStyleChange const& invalidation)
@@ -840,7 +899,7 @@ void repaint_after_style_change(Layout::Node const& node, CSS::RequiredInvalidat
     if (invalidation.needs_repaint())
         set_needs_repaint(node, invalidation.invalidates_hit_test_display_list() ? InvalidateDisplayList::PaintCommandsAndHitTestList : InvalidateDisplayList::PaintCommands);
     if (invalidation.repaint_propagated_text_decorations)
-        rust_invalidate_propagated_text_decoration_caches(node);
+        invalidate_propagated_text_decoration_caches(node);
     if (invalidation.needs_stacking_context_tree_rebuild()) {
         auto& document = const_cast<DOM::Document&>(node.document());
         document.schedule_accumulated_visual_context_update(node, DOM::Document::AccumulatedVisualContextUpdateScope::Structure);

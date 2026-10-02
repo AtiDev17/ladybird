@@ -124,6 +124,8 @@ public:
     void did_not_dispatch_input_event_through_compositor(u64 event_id);
     void did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id);
     void did_present_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
+    void did_add_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
+    void did_retire_backing_stores(ReadonlySpan<i32> bitmap_ids);
     // The backing stores the compositor presented while the page did not display the tab, for the view to install
     // once it does.
     struct PresentedBackingStores {
@@ -168,8 +170,8 @@ private:
     virtual void did_leave_tooltip_area() override;
     virtual void did_hover_link(URL::URL url) override;
     virtual void did_unhover_link() override;
-    virtual void did_click_link(URL::URL url, ByteString target, unsigned modifiers) override;
-    virtual void did_middle_click_link(URL::URL url, ByteString, unsigned) override;
+    virtual void did_click_link(Web::HTML::PreparedNavigationDescriptor navigation, ByteString target, unsigned modifiers) override;
+    virtual void did_middle_click_link(Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned) override;
     virtual void did_request_external_url(URL::URL url, URL::Origin initiator_origin, bool has_transient_activation) override;
     virtual void did_inspect_storage(u64 request_id, String storage_items) override;
     virtual void did_inspect_grid_layouts(String grid_layouts) override;
@@ -265,7 +267,7 @@ private:
     virtual void did_mutate_dom(Mutation mutation) override;
     virtual void did_get_dom_node_html(String html) override;
     virtual void did_resolve_dom_node_url(u64 request_id, String resolved_url) override;
-    virtual void did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String> reason_phrase, Vector<HTTP::Header> response_headers, Requests::CameFromCache came_from_cache) override;
+    virtual void did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String> reason_phrase, Vector<HTTP::Header> response_headers, Requests::CacheState cache_state) override;
     virtual void did_change_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String url, Optional<Utf16String> key, Optional<Utf16String> old_value, Optional<Utf16String> new_value) override;
     virtual void did_update_indexed_database(String update) override;
     virtual void did_request_clipboard_entries(u64 request_id) override;
@@ -291,9 +293,9 @@ private:
     virtual void did_finish_loading(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id) override;
     virtual void did_change_title(Utf16String title) override;
     virtual void did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target) override;
-    virtual void did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, URL::URL url, ByteString, unsigned) override;
-    virtual void did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, URL::URL url, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap) override;
-    virtual void did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu) override;
+    virtual void did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned) override;
+    virtual void did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap) override;
+    virtual void did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu, Web::HTML::PreparedNavigationDescriptor navigation) override;
     virtual void did_get_highlighted_source(String html) override;
     virtual void did_get_debugger_environments(u64 request_id, Optional<String> error, Vector<DebuggerEnvironment> environments) override;
     virtual void did_evaluate_javascript_in_debugger_frame(u64 request_id, Optional<String> error, DebuggerEvaluationResult result) override;
@@ -328,7 +330,11 @@ private:
     Messages::WebContentTestClient::DidRequestUiProcessSessionHistoryForTestingResponse did_request_ui_process_session_history_for_testing();
     Messages::WebContentTestClient::DidRequestSiteIsolationProcessTreeForTestingResponse did_request_site_isolation_process_tree_for_testing();
     virtual void did_request_crash_of_remote_frame_processes_for_testing() override;
+    virtual void did_request_stop_loading_for_testing() override;
+    virtual void did_request_reload_for_testing() override;
+    virtual void did_request_traverse_history_by_delta_for_testing(i32 delta) override;
     virtual void did_reset_session_history_for_testing(Web::HTML::SessionHistoryEntryDescriptor) override;
+    Messages::WebContentTestClient::DidRequestHasPopulatedDocumentForTestingResponse did_request_has_populated_document_for_testing(Web::HTML::CrossProcessId navigable_id) const;
     Messages::WebContentTestClient::DidRequestCaptureSessionHistorySnapshotForTestingResponse did_request_capture_session_history_snapshot_for_testing();
     Messages::WebContentTestClient::DidRequestRestoreSessionHistorySnapshotForTestingResponse did_request_restore_session_history_snapshot_for_testing();
     Messages::WebContentTestClient::DidRequestRegisterSessionStoreTabForTestingResponse did_request_register_session_store_tab_for_testing();

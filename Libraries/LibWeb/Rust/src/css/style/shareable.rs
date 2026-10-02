@@ -47,20 +47,17 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
         sheets_excluded_from_routing,
         routing_needs_detachment_sweep,
         match_workspace,
-        query_match_workspace,
-        selector_query_generation,
-        query_settled_transaction_version,
-        query_sorted_candidates,
-        query_sorted_candidates_stamp,
-        query_preorder_ranks,
-        query_preorder_ranks_stamp,
-        query_workspace_generation,
         exact_covered_scratch,
         cascade_compaction_scratch,
         cascade_compaction_scratch_memory,
         next_style_transaction_version,
         document_style_computation_inputs,
+        driven_viewport,
+        document_resource_contexts,
+        document_media,
+        document_functions,
         font_resolution,
+        monospace_font_family,
         layer_topology_version,
         sheet_order_version,
         specified_values,
@@ -68,14 +65,40 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
         computed_group_sets,
         custom_property_environments,
         nodes_with_substituted_records,
+        custom_declaration_reads,
+        nodes_with_tree_counting_records,
+        nodes_with_rolled_back_records,
+        element_custom_property_data,
+        pseudo_element_custom_property_data,
+        environment_move_recompute_nodes,
+        container_effects_for_host,
+        published_container_verdicts,
+        container_gates_unheld,
+        container_input_nodes,
+        container_query_inputs,
+        layout_style_snapshots,
+        size_container_queries,
+        counter_style_environment_identities,
+        held_style_records,
+        children_explicitly_inherit_marks,
+        host_var_reads,
+        css_defined_animations,
+        animation_keyframes,
+        animation_effect_descriptions,
+        held_root_font_inputs,
+        random_base_values,
+        transition_baselines,
         custom_property_registrations_changed,
         pending_element_style_computation_selections,
         pending_pseudo_style_computation_selections,
         engine_computed_records_pending,
+        demand_records,
         flush_stamp,
-        style_input_nodes_for_cpp,
         parent_inputs_moved_nodes,
         engine_pseudo_record_cache,
+        batch_answers_complete_but_for_custom_properties,
+        batch_custom_property_matches,
+        batch_backing_pseudo_matches,
         engine_cold_record_cache,
         engine_cold_record_donors,
         computed_group_set_memory,
@@ -138,32 +161,55 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
     assert_member_is_sync(sheets_excluded_from_routing);
     assert_member_is_sync(routing_needs_detachment_sweep);
     assert_member_is_sync(match_workspace);
-    assert_member_is_sync(query_match_workspace);
-    assert_member_is_sync(selector_query_generation);
-    assert_member_is_sync(query_settled_transaction_version);
-    assert_member_is_sync(query_sorted_candidates);
-    assert_member_is_sync(query_sorted_candidates_stamp);
-    assert_member_is_sync(query_preorder_ranks);
-    assert_member_is_sync(query_preorder_ranks_stamp);
-    assert_member_is_sync(query_workspace_generation);
     assert_member_is_sync(exact_covered_scratch);
     assert_member_is_sync(cascade_compaction_scratch);
     assert_member_is_sync(cascade_compaction_scratch_memory);
     assert_member_is_sync(next_style_transaction_version);
     assert_member_is_sync(document_style_computation_inputs);
+    assert_member_is_sync(driven_viewport);
+    assert_member_is_sync(document_resource_contexts);
+    assert_member_is_sync(document_media);
+    assert_member_is_sync(document_functions);
     assert_member_is_sync(layer_topology_version);
     assert_member_is_sync(sheet_order_version);
+    assert_member_is_sync(monospace_font_family);
     assert_member_is_sync(specified_values);
     assert_member_is_sync(winner_groups);
     assert_member_is_sync(nodes_with_substituted_records);
+    assert_member_is_sync(custom_declaration_reads);
+    assert_member_is_sync(nodes_with_tree_counting_records);
+    assert_member_is_sync(nodes_with_rolled_back_records);
+    assert_member_is_sync(element_custom_property_data);
+    assert_member_is_sync(pseudo_element_custom_property_data);
+    assert_member_is_sync(environment_move_recompute_nodes);
+    assert_member_is_sync(container_effects_for_host);
+    assert_member_is_sync(published_container_verdicts);
+    assert_member_is_sync(container_gates_unheld);
+    assert_member_is_sync(container_input_nodes);
+    assert_member_is_sync(container_query_inputs);
+    assert_member_is_sync(layout_style_snapshots);
+    assert_member_is_sync(size_container_queries);
+    assert_member_is_sync(counter_style_environment_identities);
+    assert_member_is_sync(held_style_records);
+    assert_member_is_sync(children_explicitly_inherit_marks);
+    assert_member_is_sync(host_var_reads);
+    assert_member_is_sync(css_defined_animations);
+    assert_member_is_sync(animation_keyframes);
+    assert_member_is_sync(animation_effect_descriptions);
+    assert_member_is_sync(held_root_font_inputs);
+    assert_member_is_sync(random_base_values);
+    assert_member_is_sync(transition_baselines);
     assert_member_is_sync(custom_property_registrations_changed);
     assert_member_is_sync(pending_element_style_computation_selections);
     assert_member_is_sync(pending_pseudo_style_computation_selections);
     assert_member_is_sync(engine_computed_records_pending);
+    assert_member_is_sync(demand_records);
     assert_member_is_sync(flush_stamp);
-    assert_member_is_sync(style_input_nodes_for_cpp);
     assert_member_is_sync(parent_inputs_moved_nodes);
     assert_member_is_sync(engine_pseudo_record_cache);
+    assert_member_is_sync(batch_answers_complete_but_for_custom_properties);
+    assert_member_is_sync(batch_custom_property_matches);
+    assert_member_is_sync(batch_backing_pseudo_matches);
     assert_member_is_sync(engine_cold_record_cache);
     assert_member_is_sync(engine_cold_record_donors);
     assert_member_is_sync(computed_group_set_memory);

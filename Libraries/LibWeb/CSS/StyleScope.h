@@ -124,7 +124,17 @@ public:
     [[nodiscard]] bool has_valid_rule_cache() const { return m_style_cache && m_style_cache->rule_cache; }
     void invalidate_style_cache();
     void publish_cascade_layer_order(StyleSheetState* pending_attachment = nullptr);
+    void publish_animation_keyframes();
     void invalidate_user_style_sheet();
+
+    // The `@keyframes` row a shadow root's scope published to the style engine, taken from the scope as the root
+    // leaves its document, with the keyframe sets the row names: they stay alive until the row is given up.
+    struct DepartedAnimationKeyframes {
+        TreeScopeID tree_scope;
+        FlatPtr shadow_root_identity { 0 };
+        Vector<NonnullRefPtr<Animations::KeyframeEffect::KeyFrameSet const>> keyframe_sets;
+    };
+    [[nodiscard]] Optional<DepartedAnimationKeyframes> take_published_animation_keyframes();
 
     void for_each_stylesheet(CascadeOrigin, Function<void(CSS::StyleSheetState&)> const&) const;
     static WEB_API void for_each_user_agent_stylesheet(bool include_quirks_mode_stylesheet, bool include_mathml_and_svg_stylesheets, Function<void(CSS::StyleSheetState&, StyleSheetIdentifier const&)> const&);
@@ -145,6 +155,7 @@ public:
     void build_counter_style_cache();
     u64 counter_style_environment_identity() const;
     RefPtr<CSS::CounterStyle const> get_registered_counter_style(Utf16FlyString const& name) const;
+    void publish_counter_style_lookup_chain() const;
 
     struct FunctionDefinitionAndScope {
         RustCompiledFunction function;
@@ -163,6 +174,10 @@ public:
 
     RefPtr<StyleCache> m_style_cache;
 
+    // The keyframe sets this scope last published. The style engine names them by pointer, so they stay alive after
+    // the rule cache they came from is invalidated, until the scope publishes again or gives its row up.
+    Vector<NonnullRefPtr<Animations::KeyframeEffect::KeyFrameSet const>> m_published_keyframe_sets;
+
     RefPtr<StyleSheetState> m_user_style_sheet;
 
     bool m_needs_counter_style_cache_update : 1 { true };
@@ -170,11 +185,18 @@ public:
     bool m_has_published_named_layer_order : 1 { false };
     u64 m_published_layer_order_generation { 0 };
     u64 m_counter_style_environment_identity { 0 };
+    // What the layout node arena last received from this scope: the counter style environment it registered, and the
+    // scope a name it does not register is looked for in next.
+    mutable Optional<u64> m_published_counter_style_environment_identity;
+    mutable Optional<TreeScopeID> m_published_parent_counter_style_scope;
     HashMap<Utf16FlyString, NonnullRefPtr<CSS::CounterStyle const>> m_registered_counter_styles;
 
     GC::Ref<DOM::Node> m_node;
 
 private:
+    [[nodiscard]] StyleScope* parent_counter_style_scope() const;
+    void publish_counter_styles_if_changed() const;
+
     void add_sheet(StyleSheetState&, StyleEngineUpdate);
     void remove_sheet(StyleSheetState&, StyleEngineUpdate);
     void insert_sheet_in_tree_order(StyleSheetState&);

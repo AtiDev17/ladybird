@@ -14,13 +14,12 @@
 #include <LibWeb/HTML/HTMLObjectElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/HTMLVideoElement.h>
-#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/ImageProvider.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/SVG/SVGImageElement.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
 
 namespace Web::Layout {
@@ -66,6 +65,16 @@ void Box::set_owned_image_provider(NonnullOwnPtr<ImageProvider> image_provider)
 {
     VERIFY(kind() == RustFFI::NodeKind::ImageBox);
     m_owned_image_provider = move(image_provider);
+}
+
+// An element's image provider outlives its box and keeps nothing about it, so only a provider the
+// box owns needs to hear about the detach. Detaching thus never needs the element, whose StyleNodeID
+// may already be retired.
+void Box::notify_owned_image_provider_of_detach()
+{
+    VERIFY(kind() == RustFFI::NodeKind::ImageBox);
+    if (m_owned_image_provider)
+        m_owned_image_provider->layout_node_was_detached();
 }
 
 bool Box::is_partial_relayout_boundary() const
@@ -212,6 +221,28 @@ CSS::SizeWithAspectRatio Box::auto_content_box_size() const
 RustFFI::FfiReplacedContentFacts Box::build_replaced_content_facts_for_arena() const
 {
     RustFFI::FfiReplacedContentFacts facts {};
+    // An SVG <image> runs the default sizing algorithm over its own geometry, so it publishes the intrinsic size exactly
+    // as the image reports it, absent rather than zero while nothing has decoded, together with the default object
+    // size that applies once something has.
+    if (kind() == RustFFI::NodeKind::SVGImageBox) {
+        auto const& image_element = as<SVG::SVGImageElement>(*dom_node());
+        auto intrinsic_width = image_element.intrinsic_width();
+        auto intrinsic_height = image_element.intrinsic_height();
+        auto intrinsic_aspect_ratio = image_element.intrinsic_aspect_ratio();
+        facts.has_auto_content_width = intrinsic_width.has_value();
+        facts.auto_content_width = intrinsic_width.value_or(0);
+        facts.has_auto_content_height = intrinsic_height.has_value();
+        facts.auto_content_height = intrinsic_height.value_or(0);
+        if (intrinsic_aspect_ratio.has_value()) {
+            facts.auto_content_aspect_ratio_numerator = intrinsic_aspect_ratio->numerator();
+            facts.auto_content_aspect_ratio_denominator = intrinsic_aspect_ratio->denominator();
+        }
+        if (image_element.decoded_image_data()) {
+            facts.default_preferred_width = 300;
+            facts.default_preferred_height = 150;
+        }
+        return facts;
+    }
     auto auto_content_size = auto_content_box_size();
     facts.has_auto_content_width = auto_content_size.has_width();
     facts.auto_content_width = auto_content_size.width.value_or(0);
@@ -244,14 +275,6 @@ RustFFI::FfiReplacedContentFacts Box::build_replaced_content_facts_for_arena() c
         }
     }
     return facts;
-}
-
-void Box::notify_content_navigable_of_committed_viewport()
-{
-    // A navigable another process hosts learns its viewport from the UI process, which the container tells of the
-    // viewport's rect when its document is painted.
-    if (auto* content_navigable = as_if<HTML::LocalNavigable>(as<HTML::NavigableContainer>(*dom_node()).content_navigable().ptr()))
-        content_navigable->set_viewport_size(Painting::content_size(*this));
 }
 
 }

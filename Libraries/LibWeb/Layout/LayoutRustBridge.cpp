@@ -10,48 +10,54 @@
 #include <AK/Math.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/NumericLimits.h>
-#include <AK/Utf16StringBuilder.h>
 #include <AK/Variant.h>
-#include <LibGfx/Path.h>
 #include <LibUnicode/CharacterTypes.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Display.h>
-#include <LibWeb/CSS/Invalidation/ContainerQueryInvalidator.h>
 #include <LibWeb/CSS/LengthBox.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/AnchorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/ValueType.h>
 #include <LibWeb/DOM/AbstractElement.h>
+#include <LibWeb/DOM/CommitMessages.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Node.h>
-#include <LibWeb/DOM/Text.h>
-#include <LibWeb/Dump.h>
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/HTMLBodyElement.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/Layout/Box.h>
-#include <LibWeb/Layout/DominantBaseline.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/PaintableTypes.h>
+#include <LibWeb/SVG/FragmentIdentifier.h>
+#include <LibWeb/SVG/SVGCircleElement.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
-#include <LibWeb/SVG/SVGGeometryElement.h>
+#include <LibWeb/SVG/SVGEllipseElement.h>
 #include <LibWeb/SVG/SVGImageElement.h>
+#include <LibWeb/SVG/SVGLineElement.h>
 #include <LibWeb/SVG/SVGMaskElement.h>
+#include <LibWeb/SVG/SVGPathElement.h>
 #include <LibWeb/SVG/SVGPatternElement.h>
+#include <LibWeb/SVG/SVGPolygonElement.h>
+#include <LibWeb/SVG/SVGPolylineElement.h>
+#include <LibWeb/SVG/SVGRectElement.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
+#include <LibWeb/SVG/SVGSymbolElement.h>
 #include <LibWeb/SVG/SVGTextElement.h>
 #include <LibWeb/SVG/SVGTextPathElement.h>
 #include <LibWeb/SVG/SVGTextPositioningElement.h>
+#include <LibWeb/SVG/SVGUseElement.h>
 
 namespace Web::Layout {
 
 static_assert(to_underlying(CSS::StyleGroupIndex::Count) == RustFFI::STYLE_GROUP_COUNT);
 static_assert(to_underlying(CSS::StyleGroupIndex::GridValues) == RustFFI::STYLE_GROUP_INDEX_GRID);
+static_assert(to_underlying(CSS::StyleGroupIndex::ContentValues) == RustFFI::STYLE_GROUP_INDEX_CONTENT);
 static_assert(to_underlying(CSS::StyleGroupIndex::AnchorValues) == RustFFI::STYLE_GROUP_INDEX_ANCHOR);
 static_assert(to_underlying(CSS::StyleGroupIndex::InheritedTableValues) == RustFFI::STYLE_GROUP_INDEX_INHERITED_TABLE);
 static_assert(to_underlying(CSS::StyleGroupIndex::InheritedTextValues) == RustFFI::STYLE_GROUP_INDEX_INHERITED_TEXT);
@@ -64,18 +70,6 @@ static_assert(to_underlying(CSS::StyleGroupIndex::SizingValues) == RustFFI::STYL
 static_assert(to_underlying(CSS::StyleGroupIndex::SurroundValues) == RustFFI::STYLE_GROUP_INDEX_SURROUND);
 static_assert(to_underlying(CSS::StyleGroupIndex::BoxValues) == RustFFI::STYLE_GROUP_INDEX_BOX);
 
-static RustFFI::FfiAffineTransform to_ffi_affine_transform(Gfx::AffineTransform const& transform)
-{
-    return {
-        .a = transform.a(),
-        .b = transform.b(),
-        .c = transform.c(),
-        .d = transform.d(),
-        .e = transform.e(),
-        .f = transform.f(),
-    };
-}
-
 static RustFFI::FfiSvgViewBox to_ffi_svg_view_box(SVG::ViewBox const& view_box)
 {
     return {
@@ -86,17 +80,98 @@ static RustFFI::FfiSvgViewBox to_ffi_svg_view_box(SVG::ViewBox const& view_box)
     };
 }
 
-static RustFFI::FfiSvgElementFacts build_svg_element_facts(NodeWithStyle const& node)
+static RustFFI::FfiSvgLengthValue to_ffi_svg_length_value(Optional<SVG::SVGLengthValue> const& value)
 {
-    auto const* dom_node = node.dom_node();
-    if (!dom_node)
-        return {};
+    if (!value.has_value())
+        return { .value = 0, .kind = RustFFI::SVG_LENGTH_KIND_NONE, .unit = 0 };
+    switch (value->kind()) {
+    case SVG::SVGLengthValue::Kind::Number:
+        return { .value = value->value(), .kind = RustFFI::SVG_LENGTH_KIND_NUMBER, .unit = 0 };
+    case SVG::SVGLengthValue::Kind::Length:
+        return { .value = value->value(), .kind = RustFFI::SVG_LENGTH_KIND_LENGTH, .unit = static_cast<u8>(to_underlying(value->unit())) };
+    case SVG::SVGLengthValue::Kind::Percentage:
+        return { .value = value->value(), .kind = RustFFI::SVG_LENGTH_KIND_PERCENTAGE, .unit = 0 };
+    }
+    VERIFY_NOT_REACHED();
+}
 
-    auto const* svg_element = as_if<SVG::SVGElement>(*dom_node);
-    auto const* fit_to_view_box = svg_element ? svg_element->fit_to_view_box() : nullptr;
+// The element an SVG reference names, as the style mirror's id index can answer for it: the URL's decoded fragment,
+// interned as the atom the element's id is indexed under. Parsing a URL is document work rather than layout work, so a
+// reference travels as an atom and the pass resolves it through the index instead of asking the document for the
+// element.
+// FIXME: A same-document fragment is all this carries, which is all SVG resolves today.
+static CSS::StyleAtomID svg_reference_fragment_atom(DOM::Element& element, Optional<Utf16String> const& url_string)
+{
+    if (!url_string.has_value())
+        return {};
+    auto url = element.document().encoding_parse_url(*url_string);
+    if (!url.has_value() || !url->fragment().has_value())
+        return {};
+    auto fragment = SVG::decode_fragment_identifier(*url->fragment());
+    // `#` alone names no element, as no element answers to an empty id.
+    if (fragment.is_empty())
+        return {};
+    return element.document().style_computer().style_engine().intern_atom(Utf16FlyString::from_utf16(fragment.utf16_view()));
+}
+
+// The same, for a reference a graphics element's style carries rather than its `href`.
+// `SVGGraphicsElement::resolve_url_to_element(CSS::URL const&)` takes the text after the first `#` of the URL as
+// written, with no base-URL resolution, so `url(other.svg#shape)` names `#shape` in this document. Reproduced here as
+// written.
+// FIXME: Complete and use the entire URL, not just the fragment.
+static CSS::StyleAtomID svg_style_reference_fragment_atom(DOM::Element& element, Optional<CSS::URL> const& url)
+{
+    if (!url.has_value())
+        return {};
+    auto fragment_offset = Utf16View { url->url() }.find_code_unit_offset('#');
+    if (!fragment_offset.has_value())
+        return {};
+    auto fragment = SVG::decode_fragment_identifier(url->url().substring_view(fragment_offset.value() + 1));
+    if (fragment.is_empty())
+        return {};
+    return element.document().style_computer().style_engine().intern_atom(Utf16FlyString::from_utf16(fragment.utf16_view()));
+}
+
+static Optional<CSS::URL> svg_paint_url(Optional<CSS::SVGPaint> const& paint)
+{
+    if (!paint.has_value() || !paint->is_url())
+        return {};
+    return paint->as_url();
+}
+
+// The four resources `mask`, `clip-path`, `fill` and `stroke` name. Read from the record's group payloads rather than
+// through a materialized view: this runs for every SVG graphics element whose style record is replaced, and pinning a
+// record to look at four properties is most of the cost of looking at them.
+static Array<CSS::StyleAtomID, 4> svg_style_reference_atoms(DOM::Element& element)
+{
+    if (!is<SVG::SVGGraphicsElement>(element))
+        return {};
+    auto const* payloads = static_cast<void const* const*>(element.style_record_payloads());
+    if (!payloads)
+        return {};
+    auto const* mask_payload = static_cast<CSS::ComputedValues::MaskValues const*>(payloads[CSS::ComputedValues::MaskValues::style_group_index]);
+    auto const* svg_payload = static_cast<CSS::ComputedValues::InheritedSVGValues const*>(payloads[CSS::ComputedValues::InheritedSVGValues::style_group_index]);
+    if (!mask_payload || !svg_payload)
+        return {};
+    auto const& mask = mask_payload->mask_value();
+    return {
+        svg_style_reference_fragment_atom(element, mask.has_value() ? Optional<CSS::URL> { mask->url() } : OptionalNone {}),
+        svg_style_reference_fragment_atom(element, mask_payload->clip_path_value()),
+        svg_style_reference_fragment_atom(element, svg_paint_url(svg_payload->fill_value())),
+        svg_style_reference_fragment_atom(element, svg_paint_url(svg_payload->stroke_value())),
+    };
+}
+
+// The SVG attributes an element parses, as the layout stage reads them.
+static RustFFI::FfiSvgAttributeFacts build_svg_attribute_facts(DOM::Element& dom_node)
+{
+    auto const* svg_element = as_if<SVG::SVGElement>(dom_node);
+    if (!svg_element)
+        return {};
+    auto const* fit_to_view_box = svg_element->fit_to_view_box();
 
     Optional<SVG::ViewBox> active_view_box;
-    if (auto const* svg_graphics_element = as_if<SVG::SVGGraphicsElement>(*dom_node))
+    if (auto const* svg_graphics_element = as_if<SVG::SVGGraphicsElement>(dom_node))
         active_view_box = svg_graphics_element->active_view_box();
     else if (fit_to_view_box)
         active_view_box = fit_to_view_box->view_box();
@@ -104,19 +179,8 @@ static RustFFI::FfiSvgElementFacts build_svg_element_facts(NodeWithStyle const& 
     SVG::PreserveAspectRatio preserve_aspect_ratio {};
     if (fit_to_view_box)
         preserve_aspect_ratio = fit_to_view_box->preserve_aspect_ratio().value_or(SVG::PreserveAspectRatio {});
-    else if (is<SVG::SVGMaskElement>(*dom_node) || is<SVG::SVGClipPathElement>(*dom_node))
+    else if (is<SVG::SVGMaskElement>(dom_node) || is<SVG::SVGClipPathElement>(dom_node))
         preserve_aspect_ratio = { SVG::PreserveAspectRatio::Align::None, {} };
-
-    Gfx::AffineTransform element_transform;
-    Gfx::AffineTransform additional_element_transform;
-    float visible_stroke_width = 0;
-    CSSPixels viewport_percentage_basis = 0;
-    if (auto const* graphics_element = as_if<SVG::SVGGraphicsElement>(*dom_node)) {
-        element_transform = node.used_svg_element_transform();
-        additional_element_transform = graphics_element->additional_element_transform();
-        visible_stroke_width = graphics_element->visible_stroke_width(node);
-        viewport_percentage_basis = graphics_element->viewport_percentage_basis();
-    }
 
     SVG::SVGUnits content_units {};
     SVG::SVGUnits pattern_units {};
@@ -127,36 +191,81 @@ static RustFFI::FfiSvgElementFacts build_svg_element_facts(NodeWithStyle const& 
     SVG::NumberPercentage mask_height = SVG::NumberPercentage::create_number(0);
     SVG::NumberPercentage pattern_width = SVG::NumberPercentage::create_number(0);
     SVG::NumberPercentage pattern_height = SVG::NumberPercentage::create_number(0);
-    if (node.is_svg_mask_box()) {
-        auto const& mask_element = as<SVG::SVGMaskElement>(*node.dom_node());
-        content_units = mask_element.mask_content_units();
-        mask_units = mask_element.mask_units();
-        mask_x = mask_element.mask_x();
-        mask_y = mask_element.mask_y();
-        mask_width = mask_element.mask_width();
-        mask_height = mask_element.mask_height();
-    } else if (node.is_svg_clip_box())
-        content_units = as<SVG::SVGClipPathElement>(*node.dom_node()).clip_path_units();
-    else if (node.is_svg_pattern_box()) {
-        auto const& pattern_element = as<SVG::SVGPatternElement>(*node.dom_node());
-        content_units = pattern_element.pattern_content_units();
-        pattern_units = pattern_element.pattern_units();
-        pattern_width = pattern_element.pattern_width();
-        pattern_height = pattern_element.pattern_height();
+    if (auto const* mask_element = as_if<SVG::SVGMaskElement>(dom_node)) {
+        content_units = mask_element->mask_content_units();
+        mask_units = mask_element->mask_units();
+        mask_x = mask_element->mask_x();
+        mask_y = mask_element->mask_y();
+        mask_width = mask_element->mask_width();
+        mask_height = mask_element->mask_height();
+    } else if (auto const* clip_path_element = as_if<SVG::SVGClipPathElement>(dom_node))
+        content_units = clip_path_element->clip_path_units();
+    else if (auto const* pattern_element = as_if<SVG::SVGPatternElement>(dom_node)) {
+        content_units = pattern_element->pattern_content_units();
+        pattern_units = pattern_element->pattern_units();
+        pattern_width = pattern_element->pattern_width();
+        pattern_height = pattern_element->pattern_height();
     }
 
+    auto geometry_kind = RustFFI::SVG_GEOMETRY_KIND_NONE;
+    if (is<SVG::SVGPathElement>(dom_node))
+        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_PATH;
+    else if (is<SVG::SVGRectElement>(dom_node))
+        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_RECT;
+    else if (is<SVG::SVGCircleElement>(dom_node))
+        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_CIRCLE;
+    else if (is<SVG::SVGEllipseElement>(dom_node))
+        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_ELLIPSE;
+    else if (is<SVG::SVGPolylineElement>(dom_node))
+        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_POLYLINE;
+    else if (is<SVG::SVGPolygonElement>(dom_node))
+        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_POLYGON;
+
+    SVG::NumberPercentage line_x1 = SVG::NumberPercentage::create_number(0);
+    SVG::NumberPercentage line_y1 = SVG::NumberPercentage::create_number(0);
+    SVG::NumberPercentage line_x2 = SVG::NumberPercentage::create_number(0);
+    SVG::NumberPercentage line_y2 = SVG::NumberPercentage::create_number(0);
+    if (auto const* line_element = as_if<SVG::SVGLineElement>(dom_node)) {
+        geometry_kind = RustFFI::SVG_GEOMETRY_KIND_LINE;
+        line_x1 = line_element->x1_value();
+        line_y1 = line_element->y1_value();
+        line_x2 = line_element->x2_value();
+        line_y2 = line_element->y2_value();
+    }
+
+    SVG::SVGTextPositioningElement::ParsedTextPositioning text_positioning;
+    if (auto const* text_positioning_element = as_if<SVG::SVGTextPositioningElement>(dom_node))
+        text_positioning = text_positioning_element->parsed_text_positioning();
+
+    CSS::StyleAtomID reference_fragment;
+    SVG::NumberPercentage start_offset = SVG::NumberPercentage::create_number(0);
+    if (auto const* text_path_element = as_if<SVG::SVGTextPathElement>(dom_node)) {
+        reference_fragment = svg_reference_fragment_atom(dom_node, text_path_element->href_attribute_value());
+        start_offset = text_path_element->parsed_start_offset().value_or(start_offset);
+    } else if (auto const* pattern_element = as_if<SVG::SVGPatternElement>(dom_node)) {
+        // The pattern a <pattern> inherits its content and attributes from. An empty href names nothing, rather than
+        // naming the document's own fragment.
+        auto link = pattern_element->href_attribute_value();
+        if (link.has_value() && !link->is_empty())
+            reference_fragment = svg_reference_fragment_atom(dom_node, link);
+    }
+
+    // The resources an element's style names. They live with the presentation attributes because both are read as a
+    // box is built, but they change with the element's style rather than with an attribute, so they have a
+    // republication of their own.
+    auto style_references = svg_style_reference_atoms(dom_node);
+
     return {
-        .is_document_element = node.document().document_element() == dom_node,
-        .document_is_decoded_svg = node.document().is_decoded_svg(),
+        .is_graphics_element = is<SVG::SVGGraphicsElement>(dom_node),
+        .is_use_element = is<SVG::SVGUseElement>(dom_node),
+        .is_svg_svg_element = is<SVG::SVGSVGElement>(dom_node),
+        .is_symbol_element = is<SVG::SVGSymbolElement>(dom_node),
+        .is_text_element = is<SVG::SVGTextElement>(dom_node),
         .is_fit_to_view_box = fit_to_view_box != nullptr,
         .has_active_view_box = active_view_box.has_value(),
         .active_view_box = active_view_box.has_value() ? to_ffi_svg_view_box(*active_view_box) : RustFFI::FfiSvgViewBox {},
         .preserve_aspect_ratio_align = static_cast<u8>(to_underlying(preserve_aspect_ratio.align)),
         .preserve_aspect_ratio_meet_or_slice = static_cast<u8>(to_underlying(preserve_aspect_ratio.meet_or_slice)),
-        .element_transform = to_ffi_affine_transform(element_transform),
-        .additional_element_transform = to_ffi_affine_transform(additional_element_transform),
-        .visible_stroke_width = visible_stroke_width,
-        .viewport_percentage_basis = viewport_percentage_basis,
         .content_units = static_cast<u8>(to_underlying(content_units)),
         .pattern_units = static_cast<u8>(to_underlying(pattern_units)),
         .pattern_width = to_ffi_number_percentage(pattern_width),
@@ -166,227 +275,63 @@ static RustFFI::FfiSvgElementFacts build_svg_element_facts(NodeWithStyle const& 
         .mask_y = to_ffi_number_percentage(mask_y),
         .mask_width = to_ffi_number_percentage(mask_width),
         .mask_height = to_ffi_number_percentage(mask_height),
+        .geometry_kind = geometry_kind,
+        .line_x1 = to_ffi_number_percentage(line_x1),
+        .line_y1 = to_ffi_number_percentage(line_y1),
+        .line_x2 = to_ffi_number_percentage(line_x2),
+        .line_y2 = to_ffi_number_percentage(line_y2),
+        .text_x = to_ffi_svg_length_value(text_positioning.x),
+        .text_y = to_ffi_svg_length_value(text_positioning.y),
+        .text_dx = to_ffi_svg_length_value(text_positioning.dx),
+        .text_dy = to_ffi_svg_length_value(text_positioning.dy),
+        .reference_fragment_atom = reference_fragment.value(),
+        .mask_reference_atom = style_references[0].value(),
+        .clip_path_reference_atom = style_references[1].value(),
+        .fill_reference_atom = style_references[2].value(),
+        .stroke_reference_atom = style_references[3].value(),
+        .text_path_start_offset = to_ffi_number_percentage(start_offset),
     };
 }
 
-static Utf16String rendered_svg_text_contents(SVG::SVGTextContentElement const& element)
+// The publication is keyed by the element's style node rather than by a row, because an element that draws nothing
+// itself has no row at all, while a mask, a clip or a pattern has one row per referencing element.
+void publish_svg_attribute_facts(DOM::Element& element)
 {
-    Utf16StringBuilder builder;
-    element.for_each_in_subtree_of_type<DOM::Text>([&](auto const& text_node) {
-        if (text_node.parent() && text_node.parent()->unsafe_layout_node()) {
-            if (auto content = text_node.text_content(); content.has_value())
-                builder.append(*content);
-        }
-        return TraversalDecision::Continue;
-    });
-    return builder.to_string().trim_ascii_whitespace();
+    VERIFY(element.style_node_id() != 0);
+    ReadonlySpan<Gfx::FloatPoint> points;
+    if (auto const* polygon = as_if<SVG::SVGPolygonElement>(element))
+        points = polygon->points();
+    else if (auto const* polyline = as_if<SVG::SVGPolylineElement>(element))
+        points = polyline->points();
+    static_assert(sizeof(Gfx::FloatPoint) == sizeof(RustFFI::FfiFloatPoint));
+    RustFFI::layout_arena_set_style_node_svg_attribute_facts(
+        element.document().layout_node_arena().handle(),
+        element.style_node_id().value(),
+        build_svg_attribute_facts(element),
+        reinterpret_cast<RustFFI::FfiFloatPoint const*>(points.data()),
+        points.size());
 }
 
-// The advance of the text run rendered by the given box; that is, of its direct child text content.
-static float svg_text_run_advance(Box const& text_box)
+// Republished on its own when an element's style record is replaced: the presentation attributes it sits beside are
+// unchanged, and parsing all of them again for four names would make every style change on every SVG element pay for
+// it.
+void publish_svg_style_references(DOM::Element& element)
 {
-    auto text_contents = static_cast<SVG::SVGTextContentElement const&>(*text_box.dom_node()).text_contents();
-    float advance = 0;
-    for (auto const& glyph_run : Gfx::shape_text({}, text_contents, text_box.font_list()))
-        advance += glyph_run->width();
-    return advance;
+    VERIFY(element.style_node_id() != 0);
+    auto references = svg_style_reference_atoms(element);
+    RustFFI::layout_arena_set_style_node_svg_style_references(
+        element.document().layout_node_arena().handle(),
+        element.style_node_id().value(),
+        references[0].value(),
+        references[1].value(),
+        references[2].value(),
+        references[3].value());
 }
 
-// https://svgwg.org/svg2-draft/text.html#TermTextChunk
-// Each new absolute positioning adjustment (due to an 'x' or 'y' attribute, or forced line break) creates a new text chunk.
-// https://svgwg.org/svg2-draft/text.html#TextElementXAttribute
-// NB: The initial value of 'x' and 'y' is "0 for 'text'; (none) for 'tspan'". So, a <text> element always positions its
-//     first character absolutely, and so always starts a chunk.
-static bool svg_text_box_starts_text_chunk(Box const& text_box)
+void clear_svg_attribute_facts(DOM::Document& document, CSS::StyleNodeID style_node)
 {
-    if (is<SVG::SVGTextElement>(*text_box.dom_node()))
-        return true;
-    auto text_positioning = as<SVG::SVGTextPositioningElement>(*text_box.dom_node()).text_positioning();
-    return !text_positioning.x.is_empty() || !text_positioning.y.is_empty();
-}
-
-struct SvgTextChunkMeasurement {
-    float advance { 0 };
-    CSS::TextAnchor anchor { CSS::TextAnchor::Start };
-};
-
-// Measures the total advance of the text chunk that starts at the given box, and determines the 'text-anchor' value
-// that applies to the chunk. The chunk extends in document order through the subtree of the containing <text> element
-// until the next box that starts a chunk of its own.
-static SvgTextChunkMeasurement measure_svg_text_chunk(Box const& chunk_start_box)
-{
-    auto const* subtree_root = &chunk_start_box;
-    for (auto const* ancestor = chunk_start_box.parent(); ancestor && ancestor->kind() == RustFFI::NodeKind::SVGTextBox; ancestor = ancestor->parent())
-        subtree_root = static_cast<Box const*>(ancestor);
-
-    SvgTextChunkMeasurement measurement;
-    bool found_chunk_start = false;
-    bool found_first_rendered_text = false;
-    subtree_root->for_each_in_inclusive_subtree([&](Node const& node) {
-        // AD-HOC: Text on a path is laid out independently; see compute_path_for_svg_text_path().
-        if (node.kind() == RustFFI::NodeKind::SVGTextPathBox)
-            return TraversalDecision::SkipChildrenAndContinue;
-        if (node.kind() != RustFFI::NodeKind::SVGTextBox)
-            return TraversalDecision::Continue;
-        auto const* text_box = static_cast<Box const*>(&node);
-        if (text_box == &chunk_start_box)
-            found_chunk_start = true;
-        else if (found_chunk_start && svg_text_box_starts_text_chunk(*text_box))
-            return TraversalDecision::Break;
-        if (found_chunk_start && !static_cast<SVG::SVGTextContentElement const&>(*text_box->dom_node()).text_contents().is_empty()) {
-            if (!found_first_rendered_text) {
-                // https://svgwg.org/svg2-draft/text.html#TextLayoutAlgorithm
-                // Adjust shift based on the value of 'text-anchor' and 'direction' of the element the character at index i.
-                // FIXME: Take text direction into account.
-                measurement.anchor = text_box->text_anchor();
-                found_first_rendered_text = true;
-            }
-            measurement.advance += svg_text_run_advance(*text_box);
-        }
-        return TraversalDecision::Continue;
-    });
-    return measurement;
-}
-
-struct SvgTextRun {
-    Gfx::Path path;
-    float advance { 0 };
-};
-
-static SvgTextRun compute_svg_text_run(Box const& text_box, Gfx::FloatPoint current_text_position)
-{
-    auto const& text_element = static_cast<SVG::SVGTextContentElement const&>(*text_box.dom_node());
-    auto text_contents = text_element.text_contents();
-
-    auto text_offset = current_text_position;
-    auto baseline_metric = resolve_dominant_baseline_metric(text_box);
-    // NB: The dominant-baseline offset is resolved against the metrics of the first available font — while each glyph
-    //     is rendered with the first font in the cascade that contains its code point.
-    text_offset.translate_by(0, dominant_baseline_offset(baseline_metric, text_box.first_available_font().pixel_metrics()));
-
-    SvgTextRun run;
-    for (auto const& glyph_run : Gfx::shape_text(text_offset, text_contents, text_box.font_list())) {
-        run.path.glyph_run(glyph_run);
-        run.advance += glyph_run->width();
-    }
-    return run;
-}
-
-static Gfx::Path compute_path_for_svg_text_path(Box const& text_path_box, CSSPixelSize viewport_size)
-{
-    auto const& text_path_element = as<SVG::SVGTextPathElement>(*text_path_box.dom_node());
-    auto path_or_shape = text_path_element.path_or_shape();
-    if (!path_or_shape)
-        return {};
-
-    auto text_contents = rendered_svg_text_contents(text_path_element);
-    auto glyph_runs = Gfx::shape_text({}, text_contents, text_path_box.font_list());
-
-    auto& shape_element = const_cast<SVG::SVGGeometryElement&>(*path_or_shape);
-    auto shape_path = shape_element.get_path(viewport_size, *shape_element.computed_style());
-    auto start_offset = text_path_element.start_offset_for_path_length(shape_path.length());
-
-    // FIXME: Take writing mode and text direction into account.
-    float total_advance = 0;
-    for (auto const& glyph_run : glyph_runs)
-        total_advance += glyph_run->width();
-    switch (text_path_element.text_anchor(text_path_box).value_or(SVG::TextAnchor::Start)) {
-    case SVG::TextAnchor::Start:
-        break;
-    case SVG::TextAnchor::Middle:
-        start_offset -= total_advance / 2;
-        break;
-    case SVG::TextAnchor::End:
-        start_offset -= total_advance;
-        break;
-    default:
-        VERIFY_NOT_REACHED();
-    }
-
-    return shape_path.place_glyph_runs_along(glyph_runs, start_offset);
-}
-
-static RustFFI::FfiSvgPathResult compute_svg_path(NodeWithStyle const& node, RustFFI::FfiSvgPathRequest const& request)
-{
-    auto const& graphics_box = as<Box>(node);
-    CSSPixelSize viewport_size {
-        request.viewport_width,
-        request.viewport_height,
-    };
-    Gfx::FloatPoint text_position {
-        request.current_text_position.x,
-        request.current_text_position.y,
-    };
-
-    Gfx::Path path;
-    if (graphics_box.is_svg_geometry_box()) {
-        auto& geometry_element = as<SVG::SVGGeometryElement>(const_cast<DOM::Node&>(*graphics_box.dom_node()));
-        path = geometry_element.get_path(viewport_size, *geometry_element.computed_style());
-    } else if (graphics_box.kind() == RustFFI::NodeKind::SVGTextBox) {
-        auto const* text_box = &graphics_box;
-        auto const& text_element = as<SVG::SVGTextPositioningElement>(*text_box->dom_node());
-        // https://svgwg.org/svg2-draft/text.html#TextElementXAttribute
-        // the starting X (Y) coordinate for rendering the glyphs corresponding to the given character is the X (Y) coordinate
-        // of the resulting current text position from the most recently rendered glyph for the current 'text' element.
-        // NB: The initial value of 'x' and 'y' is "0 for 'text'; (none) for 'tspan'": a <text> element starts at (0, 0)
-        //     regardless of the current text position, while a <tspan> without 'x'/'y' continues at the current text position.
-        if (is<SVG::SVGTextElement>(text_element))
-            text_position = {};
-        text_element.text_positioning().apply_to_text_position(viewport_size, text_position, 0u);
-        if (svg_text_box_starts_text_chunk(*text_box)) {
-            // https://svgwg.org/svg2-draft/text.html#TextAnchoringProperties
-            // The 'text-anchor' property is applied to each individual text chunk within a given 'text' element.
-            // AD-HOC: The spec applies 'text-anchor' as a shift of the chunk's rendered glyphs after layout; shifting
-            //         the chunk's starting position up front by the chunk's total advance is equivalent for horizontal
-            //         text — since every run in the chunk is laid out sequentially from this position.
-            auto chunk = measure_svg_text_chunk(*text_box);
-            switch (chunk.anchor) {
-            case CSS::TextAnchor::Start:
-                // The rendered characters are aligned such that the start of the resulting rendered text is at the
-                // initial current text position."
-                break;
-            case CSS::TextAnchor::Middle:
-                // The rendered characters are shifted such that the geometric middle of the resulting rendered text
-                // (determined from the initial and final current text position before applying the 'text-anchor'
-                // property) is at the initial current text position.
-                text_position.translate_by(-chunk.advance / 2, 0);
-                break;
-            case CSS::TextAnchor::End:
-                // The rendered characters are shifted such that the end of the resulting rendered text (final current
-                // text position before applying the 'text-anchor' property) is at the initial current text position."
-                text_position.translate_by(-chunk.advance, 0);
-                break;
-            default:
-                VERIFY_NOT_REACHED();
-            }
-        }
-        auto text_run = compute_svg_text_run(*text_box, text_position);
-        path = move(text_run.path);
-        // https://svgwg.org/svg2-draft/text.html#TextLayoutIntroduction
-        // After each glyph is placed, the current text position is advanced by the glyph's advance value (typically the
-        // width for horizontal text or height for vertical text).
-        // FIXME: Take writing mode and text direction into account.
-        text_position.translate_by(text_run.advance, 0);
-    } else if (graphics_box.kind() == RustFFI::NodeKind::SVGTextPathBox) {
-        path = compute_path_for_svg_text_path(graphics_box, viewport_size);
-    }
-
-    auto bounding_box = path.bounding_box();
-    // Rust adopts this heap-allocated path and destroys it via ladybird_gfx_path_destroy().
-    auto* path_handle = new Gfx::Path(move(path));
-    return {
-        .path_handle = path_handle,
-        .bounding_box = {
-            .x = bounding_box.x(),
-            .y = bounding_box.y(),
-            .width = bounding_box.width(),
-            .height = bounding_box.height(),
-        },
-        .text_position_after = {
-            .x = text_position.x(),
-            .y = text_position.y(),
-        },
-    };
+    if (auto* arena = document.layout_node_arena_if_created())
+        RustFFI::layout_arena_clear_style_node_svg_attribute_facts(arena->handle(), style_node.value());
 }
 
 static bool style_has_any_containment(CSS::ComputedValues::BoxValues const& values)
@@ -436,14 +381,6 @@ static RustFFI::FfiViewportPropagationFacts viewport_propagation_facts(DOM::Docu
     return facts;
 }
 
-static void invalidate_descendant_styles_for_container_query_size_change(GC::Ptr<DOM::Node> node)
-{
-    auto* element = as_if<DOM::Element>(node.ptr());
-    if (!element)
-        return;
-    CSS::Invalidation::invalidate_descendant_styles_depending_on_size_container_query(*element);
-}
-
 static Optional<DOM::AbstractElement> abstract_element_for_abspos_box(Box const& box)
 {
     if (box.is_generated_for_pseudo_element())
@@ -471,30 +408,6 @@ void register_layout_host(NodeArena& arena, DOM::Document& document)
     static_assert(to_underlying(SVG::SVGUnits::UserSpaceOnUse) == 1);
     RustFFI::FfiLayoutHostCallbacks callbacks {
         .context = &document,
-        .report_unexpected_fragmented_inline = [](void*, void* node) {
-            auto const& box = *static_cast<Box const*>(node);
-            dbgln("FIXME: InlineFormattingContext::dimension_box_on_line got unexpected box in inline context:");
-            dump_tree(box); },
-        .build_svg_facts = [](void*, void* node) {
-            auto const* node_with_style = as_if<NodeWithStyle>(*static_cast<Node const*>(node));
-            VERIFY(node_with_style);
-            return build_svg_element_facts(*node_with_style); },
-        .compute_svg_path = [](void*, void* node, RustFFI::FfiSvgPathRequest request) {
-            auto const* node_with_style = as_if<NodeWithStyle>(*static_cast<Node const*>(node));
-            VERIFY(node_with_style);
-            return compute_svg_path(*node_with_style, request); },
-        .svg_image_bounding_box = [](void*, void* node, CSSPixels viewport_width, CSSPixels viewport_height) {
-            auto const& image_element = as<SVG::SVGImageElement>(*static_cast<Node const*>(node)->dom_node());
-            auto bounding_box = image_element.bounding_box({
-                viewport_width,
-                viewport_height,
-            });
-            return RustFFI::FfiFloatRect {
-                .x = bounding_box.x(),
-                .y = bounding_box.y(),
-                .width = bounding_box.width(),
-                .height = bounding_box.height(),
-            }; },
         .anchor_lookup = [](void*, void* node, size_t anchor_name, void* const* eligible_anchor_boxes, size_t eligible_anchor_box_count) {
             auto const& box = *static_cast<Box const*>(node);
             auto abstract_element = abstract_element_for_abspos_box(box);
@@ -532,23 +445,27 @@ void register_layout_host(NodeArena& arena, DOM::Document& document)
             if (!anchor_box)
                 return Compositing::RustFFI::NodeSlotId_INVALID;
             return Node::slot_id(anchor_box); },
-        .node_unique_id = [](void* node) -> i64 {
-            auto const* dom_node = static_cast<Box const*>(node)->dom_node();
-            return dom_node ? dom_node->unique_id().value() : -1;
-        },
-        .content_size_changed_for_container_queries = [](void*, void* layout_node_shell) {
-            auto& layout_node = *static_cast<Node*>(layout_node_shell);
-            invalidate_descendant_styles_for_container_query_size_change(layout_node.dom_node()); },
-        .finish_commit = [](void*, void* const* viewport_shells, size_t viewport_count) {
-            for (size_t index = 0; index < viewport_count; ++index)
-                as<Box>(*static_cast<Node*>(viewport_shells[index])).notify_content_navigable_of_committed_viewport(); },
+        .deliver_commit_messages = [](void* context, RustFFI::FfiCommitMessage const* messages, size_t count) {
+            auto& commit_messages = static_cast<DOM::Document*>(context)->commit_messages();
+            for (size_t index = 0; index < count; ++index)
+                commit_messages.append(messages[index]);
+            // The pass that produced them reads back what they change before it ends.
+            commit_messages.apply(); },
         .build_replaced_content_facts = [](void*, void* node_shell, RustFFI::FfiReplacedContentFacts* facts) {
             auto const& node = *static_cast<Node const*>(node_shell);
             if (auto const* box = as_if<Box>(node))
                 *facts = box->build_replaced_content_facts_for_arena(); },
         .viewport_propagation_facts = [](void* context) { return viewport_propagation_facts(*static_cast<DOM::Document*>(context)); },
+        .container_length_bases = [](void*, void* node_shell) -> RustFFI::FfiContainerLengthBases {
+            auto const& element = as<DOM::Element>(*static_cast<Node const*>(node_shell)->dom_node());
+            auto context = CSS::Length::ResolutionContext::for_element(DOM::AbstractElement { element });
+            return {
+                .width = CSS::Length(100, CSS::LengthUnit::Cqw).to_px_without_rounding(context),
+                .height = CSS::Length(100, CSS::LengthUnit::Cqh).to_px_without_rounding(context),
+            }; },
     };
     RustFFI::layout_arena_set_layout_host_callbacks(arena.handle(), callbacks);
+    RustFFI::layout_arena_set_document_is_decoded_svg(arena.handle(), document.is_decoded_svg());
 }
 
 }
@@ -604,9 +521,4 @@ extern "C" WEB_API Web::Layout::RustFFI::FfiCodePointCategoryFacts ladybird_layo
 extern "C" WEB_API void ladybird_layout_node_shell_destroy(void* shell)
 {
     Web::Layout::Node::delete_arena_owned_shell(*static_cast<Web::Layout::Node*>(shell));
-}
-
-extern "C" WEB_API void ladybird_layout_node_rebind_dom_node(void* dom_node, void* shell)
-{
-    Web::Layout::Node::rebind_dom_node_to_surviving_shell(*static_cast<Web::DOM::Node*>(dom_node), *static_cast<Web::Layout::Node*>(shell));
 }

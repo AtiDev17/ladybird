@@ -173,7 +173,14 @@ interface Internals {
     boolean registerSessionStoreTab();
     DOMString dumpSessionStoreTabState();
     DOMString dumpSiteIsolationProcessTree();
+    // Reports if the browser process has created a document for the iframe that it hasn't made active yet.
+    boolean hasPopulatedDocument(HTMLIFrameElement iframe);
     undefined crashRemoteFrameProcesses();
+    // Stops loading and reloads as the browser's Stop and Reload buttons do.
+    undefined stopLoadingThroughUIProcess();
+    undefined reloadThroughUIProcess();
+    // Traverses the history by a delta as the browser's Back and Forward buttons do, with no source document.
+    undefined traverseHistoryThroughUIProcess(long delta);
     Promise<undefined> flushSessionHistoryTraversalQueue();
 
     boolean hasHTMLParserEndState(Document document);
@@ -274,6 +281,8 @@ interface Internals {
     undefined setMediaElementReadyState(HTMLMediaElement element, unsigned short readyState);
     undefined setMediaElementPaused(HTMLMediaElement element, boolean paused);
     undefined setMediaElementSeeking(HTMLMediaElement element, boolean seeking);
+    // Closes this process's connection to its media server, which is what a media server crash looks like from here.
+    undefined disconnectMediaServer();
     undefined setPageMuted(boolean muted);
 
     [ImplementedAs=async_scrolling_state_object] object asyncScrollingState();

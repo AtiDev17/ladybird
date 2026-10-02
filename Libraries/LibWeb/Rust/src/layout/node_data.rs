@@ -10,6 +10,8 @@ use std::ffi::c_void;
 
 pub use super::node_slot_id::INVALID_NODE_SLOT_INDEX;
 pub const GENERATED_FOR_AFTER: u8 = 1;
+pub const GENERATED_FOR_BACKDROP: u8 = 2;
+pub const GENERATED_FOR_BEFORE: u8 = 3;
 pub const GENERATED_FOR_FIRST_LETTER: u8 = 4;
 pub const GENERATED_FOR_MARKER: u8 = 6;
 
@@ -180,7 +182,6 @@ pub enum DomPaintFact {
 pub struct FfiNodeConstructionFacts {
     pub kind: NodeKind,
     pub shell: *mut c_void,
-    pub dom_node: *mut c_void,
     pub is_anonymous: bool,
     pub is_html_input_element: bool,
     pub is_html_html_element: bool,
@@ -190,6 +191,8 @@ pub struct FfiNodeConstructionFacts {
     pub is_editing_host: bool,
     pub is_body: bool,
     pub dom_paint_facts: u8,
+    /// The StyleNodeID of the element the row is bound to, or 0.
+    pub style_node: u32,
 }
 
 #[repr(C)]

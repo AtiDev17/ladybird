@@ -50,6 +50,7 @@ macro_rules! define_id {
     };
 }
 
+pub(crate) mod animations;
 mod atoms;
 pub mod batch_matcher;
 pub mod bridge;
@@ -60,11 +61,15 @@ mod child_reactions;
 mod column;
 pub mod compiler;
 mod computed;
+mod container_queries;
 mod counter_context;
 mod custom_property_cascade;
 mod custom_property_environments;
 #[cfg(test)]
 mod differential_tests;
+pub(crate) mod effect_descriptions;
+mod engine_sample;
+mod environment_move;
 pub mod exact_matcher;
 pub use crate::fast_hash;
 mod flush;
@@ -88,11 +93,15 @@ mod prefix;
 pub mod program;
 mod program_updates;
 mod publication;
+mod random_bases;
 #[cfg(feature = "style-recording")]
 pub mod record_replay;
+mod resource_contexts;
 mod routing;
 mod sorted_merge;
 mod style_invalidation;
+mod transition_baselines;
+mod weak_pool;
 #[cfg(not(feature = "style-recording"))]
 pub mod record_replay {
     include!(concat!(env!("OUT_DIR"), "/style_engine_event_kind_stub_generated.rs"));
@@ -125,6 +134,11 @@ pub mod record_replay {
         pub fn write_native_u16(&mut self, _value: u16) {}
         pub fn write_native_u32(&mut self, _value: u32) {}
         pub fn write_raw_slice<T: RawRecord>(&mut self, _values: &[T]) {}
+        pub fn write_applied_animation_definitions(
+            &mut self,
+            _definitions: &[super::bridge::FfiAppliedAnimationDefinition],
+        ) {
+        }
         pub fn write_raw_rows(
             &mut self,
             _count: usize,
@@ -144,20 +158,22 @@ pub mod record_replay {
 }
 pub mod relative_selector;
 pub mod selector;
+pub mod selector_evaluation;
 mod shareable;
 mod shared_vector;
 mod sheet_occurrences;
+mod size_container_invalidation;
 mod specified_value;
 pub mod transaction;
 mod transaction_view;
 pub mod tree;
 
 use atoms::DocumentAtoms;
-use atoms::PinnedAtoms;
 use atoms::ReclaimedStyleAtom;
 use catalog::*;
 use column::BitColumn;
 use column::Column;
+use container_queries::PublishedContainerVerdict;
 use fast_hash::FastMap as HashMap;
 use fast_hash::FastSet as HashSet;
 use planning::*;
@@ -189,6 +205,7 @@ use exact_matcher::ExactMatchContext;
 use exact_matcher::ExactMatcher;
 
 pub use counter_context::StyleEngine;
+pub use inputs::{PublishedBoxFacts, TextStyleParentFacts};
 
 use batch_matcher::AncestorRequirements;
 use batch_matcher::AncestorRequirementsCache;
@@ -464,7 +481,7 @@ mod verification {
         }
     }
 
-    /// Require a published style transaction to complete without another selector query.
+    /// Require a published style transaction to complete without another `match_element()` call.
     pub(super) fn published_style_transaction(engine: &RetainedState, check: impl FnOnce(&RetainedState)) {
         if enabled(
             &PUBLISHED_STYLE_TRANSACTION,
@@ -773,11 +790,14 @@ impl ProgramStaging {
     }
 }
 
-/// One document's style engine.
-struct QuerySortedCandidatesStamp {
-    generation: u64,
-    root: StyleNodeID,
-    keys: Vec<DispatchKey>,
+/// One match of an answer a transaction publishes, as the custom-property cascade reads it.
+#[derive(Clone, Copy)]
+pub(super) struct BatchCustomPropertyMatch {
+    rule: RuleID,
+    tree_scope: TreeScopeID,
+    specificity: Specificity,
+    scope_proximity: u32,
+    pseudo: Option<u16>,
 }
 
 /// Long-lived engine state: the document, its program, derived results and cross-flush
@@ -805,39 +825,32 @@ pub struct RetainedState {
     /// points for rules that can no longer decide.
     routing_needs_detachment_sweep: bool,
     match_workspace: MatchScratch,
-    /// Sibling positions and relation answers shared by the candidates of one DOM selector query.
-    /// A query can't mutate the tree it walks — so this is reset per-query, rather than per-candidate.
-    query_match_workspace: MatchScratch,
-    /// Advanced when a selector query settles over a changed document — so a run of queries over
-    /// an unchanged one shares a single workspace. A query that never asks a positional question
-    /// pays a comparison, rather than a workspace rebuild.
-    selector_query_generation: u64,
-    /// The transaction version the last selector query settled at; the change detector for the
-    /// generation above.
-    query_settled_transaction_version: StyleTransactionVersion,
-    /// Tree-ordered candidates of the last posting-driven selector query. querySelector in a loop
-    /// typically asks with the same subject keys every time — so collect-and-sort pays once per
-    /// document change, rather than once per query.
-    query_sorted_candidates: Vec<StyleNodeID>,
-    /// What `query_sorted_candidates` was computed from. Same stamp, same list.
-    query_sorted_candidates_stamp: Option<QuerySortedCandidatesStamp>,
-    /// node -> preorder rank under the stamped root; how candidates get their tree order without a
-    /// walk per query.
-    query_preorder_ranks: HashMap<StyleNodeID, u32>,
-    query_preorder_ranks_stamp: Option<(u64, StyleNodeID)>,
-    /// Which query `query_match_workspace` holds answers for.
-    query_workspace_generation: u64,
     /// Scratch for the fact rows one exact candidate evaluation covers, reused across candidates.
     exact_covered_scratch: Vec<StyleNodeID>,
     cascade_compaction_scratch: ordering::CascadeCompactionWorkspace,
     cascade_compaction_scratch_memory: MemoryLease,
     /// Monotonic identity assigned to each non-empty normalized style transaction.
     next_style_transaction_version: StyleTransactionVersion,
-    /// Latest document-wide scalar computation facts, copied at the transaction boundary.
-    document_style_computation_inputs: Option<bridge::FfiDocumentStyleComputationInputs>,
+    /// Latest document-wide scalar computation facts, copied at the transaction boundary. The host
+    /// publishes them with every transaction, before it asks for any row.
+    document_style_computation_inputs: bridge::FfiDocumentStyleComputationInputs,
+    /// The viewport, width and height, the last flush drove records against. A record holding a
+    /// value resolved against the viewport cannot stand once it moved, and the viewport is one of
+    /// the document's inputs, so comparing it is what tells the engine, not the host naming every
+    /// reader.
+    driven_viewport: (f64, f64),
+    /// The base URLs a `url()` resolves against, copied at the transaction boundary with the inputs.
+    document_resource_contexts: resource_contexts::DocumentResourceContexts,
+    /// The document's media features, copied from each transaction's inputs.
+    document_media: custom_property_cascade::DocumentMediaSnapshot,
+    /// The `@function` definitions each scope sees, retained from each transaction's inputs.
+    document_functions: custom_property_cascade::DocumentFunctionSnapshot,
     /// Every font resolution this document has been given. An evaluation step reads it; only a
     /// host round between passes adds to it.
     font_resolution: Option<font_resolution::FontResolutionCache>,
+    /// `font-family: monospace`, the family the monospace font-size recascade resolves an
+    /// ancestor's font-relative lengths against.
+    monospace_font_family: RetainedStyleValueData,
     layer_topology_version: u64,
     sheet_order_version: u64,
 
@@ -855,6 +868,85 @@ pub struct RetainedState {
     /// The nodes whose engine-computed record substituted a custom property into a winner: what
     /// C++ notes as reading custom properties when it installs the record.
     nodes_with_substituted_records: HashSet<StyleNodeID>,
+    /// What the custom declarations of an element, or of its pseudo-elements, read beyond the
+    /// environment they resolve over, as `FfiNodeRecordReads` bits, for the elements whose
+    /// declarations read anything: what the host notes beside their records.
+    custom_declaration_reads: HashMap<StyleNodeID, u8>,
+    /// Which of a node's records read its place among its siblings, written or produced by a
+    /// substitution: a bit for its own record and one per synthetic pseudo-element kind, which
+    /// each record the engine derives, or admits from C++, sets or clears as it is installed. A
+    /// change among the node's siblings drives a record that reads it again in full, and C++ notes
+    /// the node as reading it when it installs the engine's records.
+    nodes_with_tree_counting_records: HashMap<StyleNodeID, u16>,
+    /// The nodes whose last winner store, for the element or for one of its pseudo-elements (a
+    /// bit each, see `rolled_back_bit`), rolled a property back below a revert keyword a
+    /// substitution produced: what it rolled back to is a declaration the winners do not name, so
+    /// the node's records are its alone and are computed again whatever its winners say.
+    nodes_with_rolled_back_records: HashMap<StyleNodeID, u64>,
+    /// The custom-property environment each element holds, for the elements that hold one. This is
+    /// the only copy: the element reads its environment from here.
+    element_custom_property_data: HashMap<StyleNodeID, inputs::HeldCustomPropertyEnvironment>,
+    /// The custom-property environments of each element's synthetic pseudo-elements, by
+    /// pseudo-element kind, for the elements with a pseudo-element that holds one.
+    pseudo_element_custom_property_data: HashMap<StyleNodeID, Vec<(u8, inputs::HeldCustomPropertyEnvironment)>>,
+    /// The elements whose style reads their custom-property environment other than through `var()`,
+    /// which a moved environment computes again.
+    environment_move_recompute_nodes: HashSet<StyleNodeID>,
+    /// What the container conditions of the rows the engine answered read of their containers,
+    /// per element, taken when the host installs the element's record.
+    container_effects_for_host: HashMap<StyleNodeID, container_queries::ContainerVerdict>,
+    /// Each node's gated rules and whether their conditions held for their targets when its
+    /// winners were published, `None` where the engine could not decide them: the winners hold a
+    /// gated rule's declarations exactly where it held, and an undecided one leaves the node to
+    /// the host.
+    published_container_verdicts: HashMap<StyleNodeID, Vec<PublishedContainerVerdict>>,
+    /// Nodes whose winners were published while an ancestor's answer was moving in the same
+    /// transaction, so their gated rules' conditions could not be decided when they were.
+    container_gates_unheld: HashSet<StyleNodeID>,
+    /// Nodes a moved container asked to compute again in the transaction being recorded: what a
+    /// query or a container-relative length read of a container moved under them.
+    container_input_nodes: HashSet<StyleNodeID>,
+    /// Whether, and as what, each element's published record makes it a query container.
+    container_query_inputs: tree::ContainerQueryInputColumns,
+    /// What the last layout commit and scroll state say of each container's box, for the
+    /// container queries that ask about it: a size container's, and a scroll-state container's.
+    layout_style_snapshots: HashMap<StyleNodeID, crate::layout::style_snapshot::LayoutStyleSnapshotRow>,
+    /// What the host learned about size container queries, which finds the elements a size
+    /// query container's new box moves.
+    size_container_queries: size_container_invalidation::SizeContainerQueryFacts,
+    /// The counter-style registry each tree scope's style scope has, as one identity per scope:
+    /// what a record whose `list-style-type` names a counter style the registry may define names,
+    /// so that an edit to `@counter-style` moves it.
+    counter_style_environment_identities: HashMap<TreeScopeID, u64>,
+    /// The style record each element holds, for the elements that hold one, as the host reports
+    /// every record it installs or clears.
+    held_style_records: HashMap<StyleNodeID, u64>,
+    /// The elements and shadow roots the host marked as having a child that explicitly inherits
+    /// a non-inherited property: a move of the node's non-inherited groups reaches its children.
+    children_explicitly_inherit_marks: HashSet<StyleNodeID>,
+    /// What the style C++ computed for an element reads through `var()`, for the elements that
+    /// hold the input record of such a computation. An element without one holds a record the
+    /// engine computed, whose reads the engine knows.
+    host_var_reads: HashMap<StyleNodeID, inputs::HostVarReads>,
+    /// The names of the CSS animations the host holds for each element, which the computation of
+    /// its animation definitions matches them against.
+    css_defined_animations: animations::CssDefinedAnimations,
+    /// The `@keyframes` each of the document's style scopes defines, as the host's rule caches
+    /// resolved them, which an animation definition's keyframes are resolved from.
+    animation_keyframes: animations::AnimationKeyframes,
+    /// The animation effects the host holds for each element, described for sampling.
+    animation_effect_descriptions: effect_descriptions::AnimationEffectDescriptions,
+    /// The font metrics of the record the host holds for the document element, which a `rem` the
+    /// host resolves reads, once it holds one.
+    held_root_font_inputs: Option<publication::RootFontInputs>,
+    /// The random base value each random caching key has been given, for the random functions the
+    /// document's styles hold.
+    random_base_values: random_bases::RandomBaseValues,
+    /// https://drafts.csswg.org/css-transitions-2/#defining-before-change-style
+    /// Per transition target, by element and then pseudo-element kind, the before-change style its
+    /// transitions are decided against for the rest of the style stabilization epoch, pinned until
+    /// the epoch commits.
+    transition_baselines: HashMap<StyleNodeID, SmallVec<[(u8, u64); 1]>>,
     /// Whether the registrations used by this transaction differ from the preceding one. A
     /// previously substituted record must then be recomputed by C++, which implements registered
     /// custom properties, even when its cascade winners did not move.
@@ -869,18 +961,27 @@ pub struct RetainedState {
     /// the columns of the ones it never installed. Group records by node so acknowledging or
     /// abandoning one element visits only its own record and pseudo-elements.
     engine_computed_records_pending: HashMap<StyleNodeID, SmallVec<[publication::PendingEngineComputedRecord; 1]>>,
+    /// The record a private demand last answered for each target it was asked about, pinned for
+    /// the host to read: no node holds it.
+    demand_records: HashMap<computed::ComputedStyleTarget, computed::FinalStyleRecordID>,
     /// First records derived earlier, by what they were derived from, for later elements alike.
     /// Pseudo-element records the engine derived, by what they were derived from, for elements
     /// alike in that to share.
     /// Counts the style transactions taken; the winner rows record which one published them.
     flush_stamp: u64,
-    /// Nodes whose style input the C++ computation has to settle: C++ recorded one, or their
-    /// parent's display moved, which their box-type transformation reads.
-    style_input_nodes_for_cpp: HashSet<StyleNodeID>,
     /// Elements whose parent's display moved under their record this transaction: their
     /// box-type transformation reads it, so their record is driven again in full.
     parent_inputs_moved_nodes: HashSet<StyleNodeID>,
     engine_pseudo_record_cache: HashMap<publication::PseudoCohortKey, computed::FinalStyleRecordID>,
+    /// Whether the answer the current transaction publishes for each node has winners complete
+    /// but for custom properties, read for the record loop: the answers are installed after it.
+    batch_answers_complete_but_for_custom_properties: HashMap<StyleNodeID, bool>,
+    /// Beside them, the matches in each answer that declare custom properties, read the same way:
+    /// what the node's custom-property cascade runs over while its answer is not installed.
+    batch_custom_property_matches: HashMap<StyleNodeID, Vec<BatchCustomPropertyMatch>>,
+    /// Beside them, each published host's matches for the element-backed pseudo-elements, which
+    /// the elements backing them cascade from while the host's answer is not installed.
+    batch_backing_pseudo_matches: HashMap<StyleNodeID, Vec<RuleMatch>>,
     engine_cold_record_cache: HashMap<publication::ColdRecordKey, publication::ColdRecord>,
     engine_cold_record_donors: HashMap<publication::ColdRecordDonorKey, Vec<publication::ColdRecordDonor>>,
     computed_group_set_memory: MemoryLease,
@@ -997,15 +1098,14 @@ pub struct RetainedState {
 /// Host-facing engine state: C++ ownership, journal intake and the record/replay adapters.
 /// Never reachable from an evaluation step.
 pub struct HostState {
+    /// What the flush whose rows the host is installing moved under every row.
+    batch_moves_for_retries: publication::BatchMoves,
     /// The host's synchronous font resolver. A step that misses the cache returns `NeedsInput`;
     /// the round outside the step calls this and the node is retried.
     font_resolver: Option<font_resolution::FontResolverHost>,
     /// The capture-local document identity, absent when record-replay is disabled.
     #[cfg(feature = "style-recording")]
     recording_id: Option<u64>,
-    /// The instrumentation state to restore after C++ materializes a record for verification.
-    computed_record_verification_counters: Option<Box<Counters>>,
-    computed_record_verification_pins: Vec<u64>,
     journal: NormalizationJournal,
     /// Local selector facts through the latest geometry read which reused committed layout. A
     /// normal style observation merges this into `journal`; a newly introduced transition can
@@ -1017,10 +1117,11 @@ pub struct HostState {
     /// Whether the deferred element style inputs are owed to the next transaction, as opposed to
     /// held back by a flush without a document root.
     deferred_element_style_inputs_are_pending: bool,
-    /// The nodes whose deferred element style input C++ recorded and the engine did not also
-    /// derive as a child reaction: what makes the next transaction a new pass of a style change
-    /// rather than one more generation of the last one.
-    externally_recorded_style_input_nodes: HashSet<StyleNodeID>,
+    /// The custom properties whose values differ between the environments moves of this
+    /// transaction moved between.
+    environment_move_changed_names: environment_move::ChangedCustomPropertyNames,
+    /// What the last custom-property environment move answered the host, kept until the next one.
+    environment_move_actions: Vec<bridge::FfiEnvironmentMoveAction>,
     deferred_element_style_input_memory: MemoryLease,
     /// Whether any tree input batch has crossed into the engine. A first batch consisting entirely
     /// of unique arrivals can install its final relation rows as one bulk load.
@@ -1053,7 +1154,7 @@ pub struct HostState {
     /// Whether transaction settlement performed an atom sweep, including a sweep that reclaimed
     /// no identities. Recording consumes this alongside the release batch.
     style_atoms_swept: bool,
-    /// Replay reconstructs semantic engine state but not transient C++ query handles. The recorded
+    /// Replay reconstructs semantic engine state but not the C++ references to atoms. The recorded
     /// release batch supplies their lifetime boundary while still requiring every released atom to
     /// be reclaimable from replay's complete semantic root set.
     replay_reclaimed_style_atoms: Option<Vec<StyleAtomID>>,

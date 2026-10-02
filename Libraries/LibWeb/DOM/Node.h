@@ -350,6 +350,10 @@ public:
 
     bool is_connected() const { return m_is_connected; }
     void set_is_connected(bool is_connected) { m_is_connected = is_connected; }
+
+    // The generation of this node's child list in which its element children's child indices hold. A new one begins
+    // whenever an element child moves relative to the element children after it.
+    u32 child_index_generation() const { return m_child_index_generation; }
     bool is_tracked_by_style_engine() const;
 
     // Mirrors the slottable's assigned slot; see SlottableMixin::set_assigned_slot().
@@ -407,12 +411,18 @@ public:
     Layout::Node const* layout_node() const;
     Layout::Node* layout_node();
 
-    Layout::Node const* unsafe_layout_node() const { return m_layout_node.ptr(); }
-    Layout::Node* unsafe_layout_node() { return m_layout_node.ptr(); }
+    Layout::Node const* unsafe_layout_node() const;
+    Layout::Node* unsafe_layout_node() { return const_cast<Layout::Node*>(static_cast<Node const*>(this)->unsafe_layout_node()); }
     // Whether the last layout tree build gave this node a box, and whether layout committed geometry for it. Code
-    // that only needs to know whether there is a box should ask these instead of reaching for the box.
-    [[nodiscard]] bool has_layout_box() const { return m_layout_node; }
-    [[nodiscard]] bool is_rendered() const;
+    // that only needs to know whether there is a box should ask these instead of reaching for the box. The layout
+    // node arena writes both as it changes the boxes they describe, so asking reads the node, not the arena.
+    [[nodiscard]] bool has_layout_box() const { return m_has_layout_box; }
+    [[nodiscard]] bool is_rendered() const { return m_has_committed_box; }
+    void set_box_presence(Badge<Layout::NodeArena>, bool has_layout_box, bool has_committed_box)
+    {
+        m_has_layout_box = has_layout_box;
+        m_has_committed_box = has_committed_box;
+    }
     Element const* first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor) const;
     Element* first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor)
     {
@@ -420,6 +430,8 @@ public:
     }
 
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
+    // The facts about this node that its box paints (inertness, editability, and so on) may have changed.
+    void note_dom_paint_facts();
     void set_needs_layout_update(SetNeedsLayoutReason);
     void set_needs_layout_update(SetNeedsLayoutReason, Layout::LayoutUpdatePropagation);
 
@@ -430,21 +442,26 @@ public:
     // some item that stays in the list.
     static bool list_item_box_change_renumbers_list(Element const& list_item);
 
-    void clear_layout_node(Badge<Document>);
-    void set_layout_node(Badge<Layout::Node>, Layout::Node&);
-    void rebind_layout_node(Badge<Layout::Node>, Layout::Node&);
-    void detach_layout_node(Badge<Layout::LayoutTreeBuilderAccess>);
+    // Does what a removal does to the layout nodes of this subtree that stay until the parent's layout is rebuilt,
+    // while the StyleNodeIDs they are found through are still current.
+    void detach_remaining_layout_nodes_for_removal();
 
     virtual bool is_child_allowed(Node const&) const { return true; }
 
-    [[nodiscard]] bool needs_layout_tree_update() const { return m_needs_layout_tree_update; }
+    // The layout tree update marks live in the layout arena, keyed by the node's identity in the style mirror. A node
+    // the style mirror has not named holds none.
+    [[nodiscard]] bool needs_layout_tree_update() const;
     void set_needs_layout_tree_update(bool, SetNeedsLayoutTreeUpdateReason);
+    // The half of a layout tree update mark that reads the layout tree: whether the node's box relays out alone, defers
+    // to the insertion, or dirties its ancestors, and whether the rebuild has to climb past anonymous parents. The
+    // invalidation journal holds it back until it drains, and hands in the box it found bound to the node.
+    void apply_layout_tree_update_mark(Layout::Node&, SetNeedsLayoutTreeUpdateReason);
 
-    [[nodiscard]] bool needs_pseudo_element_layout_tree_update() const { return m_layout_tree_update_reuse_reasons & PseudoElementChange; }
-    [[nodiscard]] bool may_reuse_layout_node_for_child_list_insertion() const { return m_layout_tree_update_reuse_reasons & ChildListInsertion; }
+    [[nodiscard]] bool needs_pseudo_element_layout_tree_update() const { return layout_tree_update_reuse_reasons() & PseudoElementChange; }
+    [[nodiscard]] bool may_reuse_layout_node_for_child_list_insertion() const { return layout_tree_update_reuse_reasons() & ChildListInsertion; }
 
-    [[nodiscard]] bool child_needs_layout_tree_update() const { return m_child_needs_layout_tree_update; }
-    void set_child_needs_layout_tree_update(bool b) { m_child_needs_layout_tree_update = b; }
+    [[nodiscard]] bool child_needs_layout_tree_update() const;
+    void set_child_needs_layout_tree_update(bool);
 
     // The number of animations associated with this node's shadow-including inclusive subtree. A
     // synchronous read of layout geometry has to catch up the style of a throttled animation that
@@ -454,7 +471,9 @@ public:
     void change_associated_animation_count_in_subtree(i32 delta);
 
     [[nodiscard]] u32 children_explicitly_inherited_non_inherited_style_groups() const { return m_children_explicitly_inherited_non_inherited_style_groups; }
-    void add_children_explicitly_inherited_non_inherited_style_groups(u32 style_groups) { m_children_explicitly_inherited_non_inherited_style_groups |= style_groups; }
+    void add_children_explicitly_inherited_non_inherited_style_groups(u32 style_groups);
+    // Tell the style engine of this node's mark, which it keeps for the node's style node.
+    void publish_children_explicitly_inherit_mark();
 
     void record_style_environment_change();
     CSS::StyleScope& style_scope();
@@ -489,6 +508,8 @@ public:
     bool is_shadow_including_inclusive_ancestor_of(Node const&) const;
 
     [[nodiscard]] UniqueNodeID unique_id() const;
+    // The node's unique id, without giving it one if it has none.
+    [[nodiscard]] Optional<UniqueNodeID> unique_id_if_assigned() const;
     static Node* from_unique_id(UniqueNodeID);
 
     Optional<String> webdriver_node_id() const;
@@ -627,15 +648,15 @@ protected:
 
     GC::Ptr<Document> m_document;
     GC::Ptr<Node> m_root;
-    WeakPtr<Layout::Node> m_layout_node;
     NodeType m_type { NodeType::INVALID };
-    bool m_needs_layout_tree_update { false };
-    bool m_child_needs_layout_tree_update { false };
+    bool m_has_layout_box { false };
+    bool m_has_committed_box { false };
+    // Which narrower rebuilds the layout tree update marks collected so far still permit.
     enum LayoutTreeUpdateReuseReason : u8 {
         ChildListInsertion = 1,
         PseudoElementChange = 2,
     };
-    u8 m_layout_tree_update_reuse_reasons { 0 };
+    [[nodiscard]] u8 layout_tree_update_reuse_reasons() const;
 
     u32 m_children_explicitly_inherited_non_inherited_style_groups { 0 };
     u32 m_associated_animation_count_in_subtree { 0 };
@@ -643,6 +664,7 @@ protected:
     bool m_is_connected { false };
     bool m_has_assigned_slot { false };
     bool m_inside_blocking_wheel_event_handler { false };
+    u32 m_child_index_generation { 1 };
 
     void build_accessibility_tree(AccessibilityTreeNode& parent);
 
@@ -678,8 +700,8 @@ private:
     void insert_nodes_before(ReadonlySpan<GC::Ref<Node>>, GC::Ptr<Node> child, bool suppress_observers, GC::Ref<Node> metadata_node, ChildrenChangedMetadata::AffectsElements);
     void append_child_impl(GC::Ref<Node>);
     void remove_child_impl(GC::Ref<Node>);
+    void begin_child_index_generation();
     void set_root_for_subtree(Node&);
-    void clear_committed_layout_box();
 
     static Optional<Utf16View> first_valid_id(Utf16View, Document const&);
 

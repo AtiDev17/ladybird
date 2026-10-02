@@ -308,7 +308,7 @@ fn prepare_transition_values(
     }
     if let Some(entry) = after_overlay
         .and_then(|overlay| overlay.get(property.property_id))
-        .filter(|entry| !entry.result_of_transition)
+        .filter(|entry| !entry.result_of_transition && !entry.post_compute_adjustment)
     {
         property.before_change_value = entry.value_pointer();
         property.after_change_value = entry.value_pointer();
@@ -395,6 +395,89 @@ pub unsafe extern "C" fn rust_decide_transitions(
             ));
         };
     }
+}
+
+/// One `transition-property` entry's attributes, as they apply to one physical longhand.
+#[repr(C)]
+pub struct FfiTransitionEntry {
+    pub property_id: u16,
+    pub delay: f64,
+    pub duration: f64,
+    pub timing_function: *const crate::css::style_value::StyleValueData,
+    pub behavior: u8,
+}
+
+#[repr(C)]
+pub struct FfiTransitionEntries {
+    pub entries: *mut FfiTransitionEntry,
+    pub count: usize,
+}
+
+/// What a transition on an element resolves its lengths against, answered from the record the
+/// element has installed. Returns false where the engine cannot read the record.
+///
+/// # Safety
+/// `style_engine` must be a live style engine, and `context` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_transition_length_resolution_context(
+    style_engine: *const std::ffi::c_void,
+    style_record: u64,
+    context: *mut crate::css::animation::FfiAnimationLengthResolutionContext,
+) -> bool {
+    let style_engine = unsafe { &*style_engine.cast::<crate::css::style::StyleEngine>() };
+    let Some(length) = style_engine.transition_length_resolution_context(style_record) else {
+        return false;
+    };
+    unsafe { context.write(length) };
+    true
+}
+
+/// The transitions a computed longhand table declares, per physical longhand they name. What the
+/// timing functions point at is borrowed from the table.
+///
+/// # Safety
+/// `longhand_table` must point to a live computed longhand table. The result must be released with
+/// `rust_transition_entries_release`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_transition_entries(longhand_table: *const std::ffi::c_void) -> FfiTransitionEntries {
+    let table = unsafe { &*longhand_table.cast::<crate::css::computed_longhand_table::ComputedLonghandTable>() };
+    let entries = Box::into_raw(crate::css::style_compute::transition_entries(table).into_boxed_slice());
+    FfiTransitionEntries {
+        entries: entries.cast(),
+        count: entries.len(),
+    }
+}
+
+/// # Safety
+/// `entries` must come from `rust_transition_entries` and not have been released before.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_transition_entries_release(entries: FfiTransitionEntries) {
+    drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(entries.entries, entries.count)) });
+}
+
+/// Whether `rust_transition_entries` would answer any entry for the table, stopping at the first.
+///
+/// # Safety
+/// `longhand_table` must point to a live computed longhand table.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_transition_has_entries(longhand_table: *const std::ffi::c_void) -> bool {
+    crate::css::style_compute::has_transition_entries(unsafe {
+        &*longhand_table.cast::<crate::css::computed_longhand_table::ComputedLonghandTable>()
+    })
+}
+
+/// Whether the table's `transition-delay` and `transition-duration` are each the single value `0s`,
+/// which is how nearly every element declares no transition at all.
+///
+/// # Safety
+/// `longhand_table` must point to a live computed longhand table.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_transition_delay_and_duration_are_single_zero(
+    longhand_table: *const std::ffi::c_void,
+) -> bool {
+    crate::css::style_compute::transition_delay_and_duration_are_single_zero(unsafe {
+        &*longhand_table.cast::<crate::css::computed_longhand_table::ComputedLonghandTable>()
+    })
 }
 
 #[cfg(test)]

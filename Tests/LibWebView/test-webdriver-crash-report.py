@@ -112,7 +112,7 @@ def run_test(webdriver_binary, process_name):
                 reports[0].name,
             ), reports[0].name
             assert f"Process: {process_name}\n" in text, text
-            assert "Captured signal:" in text, text
+            assert re.search(r"^Crashed at: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", text, re.MULTILINE), text
             captured_signal = re.search(r"^Captured signal: (.+)$", text, re.MULTILINE)
             assert captured_signal is not None, text
             assert f"Termination signal: {captured_signal.group(1)}\n" in text, text
@@ -122,12 +122,12 @@ def run_test(webdriver_binary, process_name):
                 assert "Verification failed:" not in text and "Assertion failed:" not in text, text
             assert "Executable build ID:" in text, text
             assert re.search(r"^Git commit: ([0-9a-f]{40}|[0-9a-f]{64}|unknown)$", text, re.MULTILINE), text
-            assert "C++ compiler:" in text and "C++ flags (" in text and "Build options:" in text, text
+            assert "C++ compiler:" in text and "C++ flags:" in text and "Build options:" in text, text
             assert "#0 " in text and "#1 " in text, text
             assert " + 0x" in text or " at Services/" in text, text
             assert "PRIVATE_CRASH" not in text, text
             assert temporary not in text and str(Path.home()) not in text, text
-            assert reports[0].stat().st_mode & 0o777 == 0o600
+            assert reports[0].stat().st_mode & 0o777 == 0o400
             assert directory.stat().st_mode & 0o777 == 0o700
             webdriver_helpers.request(port, "DELETE", f"/session/{session}")
         finally:

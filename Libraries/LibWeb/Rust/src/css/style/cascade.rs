@@ -37,6 +37,7 @@ use super::intern_table::content_hash;
 use smallvec::SmallVec;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::css::cascaded_properties::CascadeOrigin;
 
@@ -147,6 +148,19 @@ impl CascadePriority {
             scope_proximity: u32::MAX - inputs.scope_proximity,
             sheet_rank: inputs.sheet_rank,
             rule_rank: inputs.rule_rank,
+        }
+    }
+
+    /// Where among an element's encapsulation contexts an author declaration's priority places it:
+    /// the `context_depth` it was built from. `None` for the other origins.
+    #[must_use]
+    pub fn author_context_depth(&self) -> Option<u32> {
+        if self.origin_importance == origin_importance_rank(CascadeOrigin::Author, false) {
+            Some(u32::MAX - self.context)
+        } else if self.origin_importance == origin_importance_rank(CascadeOrigin::Author, true) {
+            Some(self.context)
+        } else {
+            None
         }
     }
 
@@ -374,6 +388,17 @@ pub struct CascadeCandidate {
     pub stratum: CascadeStratum,
 }
 
+/// The index of the greatest of `candidates`, which are in cascade order, that every ceiling a
+/// `revert` or `revert-layer` set leaves standing.
+pub(super) fn highest_candidate_below(
+    candidates: &[CascadeCandidate],
+    ceilings: &[CascadeContinuationCeiling],
+) -> Option<usize> {
+    candidates
+        .iter()
+        .rposition(|candidate| ceilings.iter().all(|&ceiling| candidate.stratum.is_below(ceiling)))
+}
+
 /// The semantic winner rows which changed between two cascade states.
 ///
 /// Priority and provenance are deliberately absent. They explain why a declaration won, but a
@@ -494,6 +519,13 @@ where
 define_id! {
     /// Identity of an interned winner group.
     pub struct WinnerGroupID(pub);
+}
+
+define_id! {
+    /// Identity of the custom declarations one cascade target resolves, in the order its
+    /// custom-property environment lists them: each winning declaration's name, importance,
+    /// operator and specified value. Zero is the empty list.
+    default pub struct CustomDeclarationListID(pub);
 }
 
 impl InternIdentity for WinnerGroupID {
@@ -1027,6 +1059,70 @@ impl WinnerEffects {
         true
     }
 
+    /// A pseudo refresh may reduce the full cascade to get its pseudo winners, but the element
+    /// winner has already been compared with its computed record in this flush. Leave that row
+    /// and its identity intact when installing the refreshed pseudo rows.
+    pub(super) fn discard_element_row(&mut self, groups: &mut WinnerGroups, node: StyleNodeID) {
+        if let Some(index) = node.element_index().map(|index| index as usize)
+            && let Some(entry) = self.by_node.get(index).copied()
+            && entry != 0
+        {
+            self.entries[entry as usize - 1].element = None;
+        }
+        self.writes.retain(|write| {
+            if let WinnerNodeWrite::Set {
+                node: owner,
+                target: None,
+                state,
+                ..
+            } = write
+                && *owner == node
+            {
+                groups.release_pending(*state);
+                return false;
+            }
+            true
+        });
+    }
+
+    /// Refresh the version and stamp of an unchanged pseudo row without replacing the cascade
+    /// state shared by its cohort. Only a changed winner set needs a new state identity.
+    pub(super) fn preserve_equal_pseudo_states(&mut self, groups: &mut WinnerGroups, node: StyleNodeID) {
+        for write in &mut self.writes {
+            let WinnerNodeWrite::Set {
+                node: owner,
+                target: Some(pseudo),
+                state,
+                ..
+            } = write
+            else {
+                continue;
+            };
+            if *owner != node {
+                continue;
+            }
+            let Some((_, _, retained, _)) = groups.pseudo_states(node).find(|row| row.0 == *pseudo) else {
+                continue;
+            };
+            if retained == *state || !groups.states_are_semantically_equal(retained, *state) {
+                continue;
+            }
+            groups.retain_pending(retained);
+            groups.release_pending(*state);
+            *state = retained;
+            if let Some(index) = node.element_index().map(|index| index as usize)
+                && let Some(entry) = self.by_node.get(index).copied()
+                && entry != 0
+                && let Some(row) = self.entries[entry as usize - 1]
+                    .pseudos
+                    .iter_mut()
+                    .find(|row| row.pseudo == *pseudo)
+            {
+                row.state.0 = retained;
+            }
+        }
+    }
+
     pub(super) fn mark_pseudo_inventory_incomplete(&mut self, node: StyleNodeID, pseudo: PseudoElementTarget) {
         let index = self.by_node[node.element_index().expect("element winner") as usize] as usize - 1;
         if let Some(row) = self.entries[index].pseudos.iter_mut().find(|row| row.pseudo == pseudo) {
@@ -1314,6 +1410,27 @@ impl std::ops::Deref for WinnerView<'_> {
     }
 }
 
+/// A state's winners substitute `attr()`.
+pub(super) const STATE_READS_ATTRIBUTES: u8 = 1 << 0;
+/// A state's winners are written with a tree-counting function.
+pub(super) const STATE_READS_SIBLING_POSITION: u8 = 1 << 1;
+/// A state's winners substitute `inherit()`, which reads the parent's custom-property environment.
+pub(super) const STATE_READS_INHERIT_FUNCTION: u8 = 1 << 2;
+/// A state's winners substitute `if()`, whose conditions read the document's media features and
+/// the element's lengths.
+pub(super) const STATE_READS_IF_FUNCTION: u8 = 1 << 3;
+/// A state's winners call a custom function, whose definition and the conditions inside it the
+/// cascade does not decide.
+pub(super) const STATE_READS_CUSTOM_FUNCTION: u8 = 1 << 4;
+/// A state's winners are written with a random function whose random base value is drawn for the
+/// element.
+pub(super) const STATE_READS_ELEMENT_RANDOM_BASE: u8 = 1 << 5;
+/// A state's winners are written with a container-relative length, which reads the sizes of the
+/// element's query containers.
+pub(super) const STATE_READS_CONTAINER_UNITS: u8 = 1 << 6;
+/// What a state's winners read has been decided.
+const STATE_READS_DECIDED: u8 = 1 << 7;
+
 /// Interned per-node winning declarations.
 ///
 /// Sparse and shared: never one heap object per property per element. A node retains one state
@@ -1322,9 +1439,18 @@ impl std::ops::Deref for WinnerView<'_> {
 /// node's cascade input or from the exact cold cascade.
 pub struct WinnerGroups {
     states: InternTable<CascadeStateID, Box<[WinnerGroupRef]>>,
+    /// What a state holds beside its longhand winners: the target's custom declarations. Two
+    /// states with equal winners but different custom declarations are different states, so a
+    /// state that is unchanged is unchanged in the environment it declares as well.
+    state_custom_declarations: Vec<CustomDeclarationListID>,
+    custom_declaration_list_ids: HashMap<Box<[super::program::CustomDeclaration]>, CustomDeclarationListID>,
     state_reference_counts: Vec<u32>,
     state_pending_reference_counts: Vec<u32>,
     state_winning_rules: Vec<Box<[RuleID]>>,
+    /// What each state's winners read beyond the cascade, as `STATE_READS_*` bits, decided the
+    /// first time it is asked and `STATE_READS_DECIDED` from then on. A state's winners never
+    /// change, and neither does what they read.
+    state_reads: Vec<AtomicU8>,
     groups: InternTable<WinnerGroupID, Box<[SemanticPropertyWinner]>>,
     provenance_groups: InternTable<WinnerProvenanceGroupID, Box<[WinnerProvenance]>>,
     priorities: InternTable<CascadePriorityID, CascadePriority>,
@@ -1383,9 +1509,12 @@ impl Default for WinnerGroups {
     fn default() -> Self {
         Self {
             states: InternTable::default(),
+            state_custom_declarations: Vec::new(),
+            custom_declaration_list_ids: HashMap::default(),
             state_reference_counts: Vec::new(),
             state_pending_reference_counts: Vec::new(),
             state_winning_rules: Vec::new(),
+            state_reads: Vec::new(),
             groups: InternTable::default(),
             provenance_groups: InternTable::default(),
             priorities: InternTable::default(),
@@ -1426,9 +1555,16 @@ impl WinnerGroups {
             .sum::<usize>() as u64;
         Self {
             states: self.states.clone(),
+            state_custom_declarations: self.state_custom_declarations.clone(),
+            custom_declaration_list_ids: self.custom_declaration_list_ids.clone(),
             state_reference_counts: self.state_reference_counts.clone(),
             state_pending_reference_counts: self.state_pending_reference_counts.clone(),
             state_winning_rules: self.state_winning_rules.clone(),
+            state_reads: self
+                .state_reads
+                .iter()
+                .map(|reads| AtomicU8::new(reads.load(Ordering::Relaxed)))
+                .collect(),
             groups: self.groups.clone(),
             provenance_groups: self.provenance_groups.clone(),
             priorities: self.priorities.clone(),
@@ -1471,9 +1607,7 @@ impl WinnerGroups {
         candidates: &[CascadeCandidate],
         ceilings: &mut Vec<CascadeContinuationCeiling>,
     ) -> Option<PropertyWinner> {
-        let index = candidates
-            .iter()
-            .rposition(|candidate| ceilings.iter().all(|&ceiling| candidate.stratum.is_below(ceiling)))?;
+        let index = highest_candidate_below(candidates, ceilings)?;
         let candidate = candidates[index];
         let mut winner = candidate.winner;
         let Some(ceiling) = candidate.stratum.ceiling(candidate.winner.key.operator) else {
@@ -1530,6 +1664,39 @@ impl WinnerGroups {
 
     /// Intern an already sorted state, reusing unchanged groups directly from its previous state.
     pub fn intern_sorted(&mut self, winners: &[PropertyWinner], previous: Option<CascadeStateID>) -> CascadeStateID {
+        self.intern_sorted_with_custom_declarations(winners, &[], previous)
+    }
+
+    /// Intern the custom declarations a target resolves beside its winners.
+    pub(super) fn intern_custom_declaration_list(
+        &mut self,
+        declarations: &[super::program::CustomDeclaration],
+    ) -> CustomDeclarationListID {
+        if declarations.is_empty() {
+            return CustomDeclarationListID::default();
+        }
+        if let Some(&id) = self.custom_declaration_list_ids.get(declarations) {
+            return id;
+        }
+        // Every list is interned once, so the identities are dense.
+        let id = CustomDeclarationListID(
+            u32::try_from(self.custom_declaration_list_ids.len() + 1).expect("custom declaration list space exhausted"),
+        );
+        let list: Box<[_]> = declarations.into();
+        self.nested_residency.grow_committed(size_of_val(list.as_ref()) as u64);
+        self.custom_declaration_list_ids.insert(list, id);
+        id
+    }
+
+    /// Intern an already sorted state together with the custom declarations its target
+    /// resolves, reusing unchanged groups directly from its previous state.
+    pub(super) fn intern_sorted_with_custom_declarations(
+        &mut self,
+        winners: &[PropertyWinner],
+        custom_declarations: &[super::program::CustomDeclaration],
+        previous: Option<CascadeStateID>,
+    ) -> CascadeStateID {
+        let custom_declarations = self.intern_custom_declaration_list(custom_declarations);
         debug_assert!(winners.windows(2).all(|pair| pair[0].property < pair[1].property));
         let mut groups = SmallVec::new();
         let mut previous_group_index = 0;
@@ -1556,18 +1723,23 @@ impl WinnerGroups {
         }
         if let Some(previous) = previous
             && self.states[previous].as_ref() == groups.as_slice()
+            && self.state_custom_declarations[previous.0 as usize] == custom_declarations
         {
             return previous;
         }
-        self.intern_group_ids(groups)
+        self.intern_group_ids(groups, custom_declarations)
     }
 
-    fn intern_group_ids(&mut self, groups: SmallVec<[WinnerGroupRef; INLINE_WINNER_GROUP_COUNT]>) -> CascadeStateID {
-        let hash = content_hash(&groups);
-        if let Some(id) = self
-            .states
-            .find(hash, |_id, candidate| candidate.as_ref() == groups.as_slice())
-        {
+    fn intern_group_ids(
+        &mut self,
+        groups: SmallVec<[WinnerGroupRef; INLINE_WINNER_GROUP_COUNT]>,
+        custom_declarations: CustomDeclarationListID,
+    ) -> CascadeStateID {
+        let hash = content_hash((&groups, custom_declarations));
+        let state_custom_declarations = &self.state_custom_declarations;
+        if let Some(id) = self.states.find(hash, |id, candidate| {
+            candidate.as_ref() == groups.as_slice() && state_custom_declarations[id.0 as usize] == custom_declarations
+        }) {
             return id;
         }
         let id = CascadeStateID(u32::try_from(self.states.len()).expect("cascade state space exhausted"));
@@ -1595,9 +1767,11 @@ impl WinnerGroups {
         self.nested_residency
             .grow_committed((size_of_val(groups.as_ref()) + size_of_val(winning_rules.as_ref())) as u64);
         self.states.insert(hash, id, groups);
+        self.state_custom_declarations.push(custom_declarations);
         self.state_reference_counts.push(0);
         self.state_pending_reference_counts.push(0);
         self.state_winning_rules.push(winning_rules);
+        self.state_reads.push(AtomicU8::new(0));
         id
     }
 
@@ -1616,8 +1790,16 @@ impl WinnerGroups {
                 .iter()
                 .all(|update| update.winner.is_none_or(|winner| winner.property == update.property))
         );
+        // A state derived by property updates is for a target with no custom declarations: one
+        // with them never takes this path, so a state that held some no longer does.
         if updates.is_empty() {
-            return (previous, CascadeWinnerDelta::default());
+            let state = if self.state_custom_declarations[previous.0 as usize] == CustomDeclarationListID::default() {
+                previous
+            } else {
+                let groups = SmallVec::from_slice(&self.states[previous]);
+                self.intern_group_ids(groups, CustomDeclarationListID::default())
+            };
+            return (state, CascadeWinnerDelta::default());
         }
 
         let mut groups = SmallVec::from_slice(&self.states[previous]);
@@ -1688,10 +1870,12 @@ impl WinnerGroups {
             update_start = update_end;
         }
 
-        let state = if self.states[previous].as_ref() == groups.as_slice() {
+        let state = if self.states[previous].as_ref() == groups.as_slice()
+            && self.state_custom_declarations[previous.0 as usize] == CustomDeclarationListID::default()
+        {
             previous
         } else {
-            self.intern_group_ids(groups)
+            self.intern_group_ids(groups, CustomDeclarationListID::default())
         };
         (
             state,
@@ -1856,6 +2040,18 @@ impl WinnerGroups {
             })
     }
 
+    /// What `state`'s winners read beyond the cascade, as `STATE_READS_*` bits, once decided.
+    pub(super) fn state_reads(&self, state: CascadeStateID) -> Option<u8> {
+        let reads = self.state_reads.get(state.0 as usize)?.load(Ordering::Relaxed);
+        (reads & STATE_READS_DECIDED != 0).then_some(reads & !STATE_READS_DECIDED)
+    }
+
+    pub(super) fn note_state_reads(&self, state: CascadeStateID, reads: u8) {
+        if let Some(slot) = self.state_reads.get(state.0 as usize) {
+            slot.store(reads | STATE_READS_DECIDED, Ordering::Relaxed);
+        }
+    }
+
     pub(super) fn winner_count_in_state(&self, state: CascadeStateID) -> usize {
         self.states[state]
             .iter()
@@ -1878,10 +2074,16 @@ impl WinnerGroups {
 
     pub(super) fn states_are_semantically_equal(&self, left: CascadeStateID, right: CascadeStateID) -> bool {
         left == right
-            || self.states[left]
-                .iter()
-                .map(|group| group.winners)
-                .eq(self.states[right].iter().map(|group| group.winners))
+            || (self.custom_declarations_of(left) == self.custom_declarations_of(right)
+                && self.states[left]
+                    .iter()
+                    .map(|group| group.winners)
+                    .eq(self.states[right].iter().map(|group| group.winners)))
+    }
+
+    /// The custom declarations a state's target resolves: identical lists share one identity.
+    pub(super) fn custom_declarations_of(&self, state: CascadeStateID) -> CustomDeclarationListID {
+        self.state_custom_declarations[state.0 as usize]
     }
 
     pub(super) fn properties_in_state(&self, state: CascadeStateID) -> impl Iterator<Item = PropertyID> {
@@ -2383,9 +2585,12 @@ impl WinnerGroups {
         self.nested_residency.release();
         self.generation = self.generation.wrapping_add(1);
         self.states = InternTable::default();
+        self.state_custom_declarations = Vec::new();
+        self.custom_declaration_list_ids = HashMap::default();
         self.state_reference_counts = Vec::new();
         self.state_pending_reference_counts = Vec::new();
         self.state_winning_rules = Vec::new();
+        self.state_reads = Vec::new();
         self.groups = InternTable::default();
         self.provenance_groups = InternTable::default();
         self.priorities = InternTable::default();
@@ -2415,9 +2620,12 @@ impl WinnerGroups {
                 self.column,
                 self.pseudo_rows_by_node,
                 self.priority_current,
+                self.state_custom_declarations,
+                self.custom_declaration_list_ids,
                 self.state_reference_counts,
                 self.state_pending_reference_counts,
                 self.state_winning_rules,
+                self.state_reads,
                 self.winner_rule_references,
                 self.stamps,
             ];
@@ -2454,6 +2662,15 @@ impl WinnerGroups {
     #[must_use]
     pub(super) fn admits_new_rows(&self) -> bool {
         self.admitting
+    }
+
+    /// Admit rows until `restore_admission` puts back the returned admission.
+    pub(super) fn admit_demanded_rows(&mut self) -> bool {
+        std::mem::replace(&mut self.admitting, true)
+    }
+
+    pub(super) fn restore_admission(&mut self, admitting: bool) {
+        self.admitting = admitting;
     }
 }
 

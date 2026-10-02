@@ -363,6 +363,24 @@ impl PayloadWriter {
         }
     }
 
+    /// Writes applied animation definitions without the host pointers they name, which a replayed
+    /// engine could not read: a definition naming no timing function changes something, so a
+    /// replay hands every plan over.
+    pub fn write_applied_animation_definitions(
+        &mut self,
+        definitions: &[super::bridge::FfiAppliedAnimationDefinition],
+    ) {
+        let without_host_pointers: Vec<_> = definitions
+            .iter()
+            .map(|definition| super::bridge::FfiAppliedAnimationDefinition {
+                keyframe_set: std::ptr::null(),
+                timing_function: std::ptr::null(),
+                ..*definition
+            })
+            .collect();
+        self.write_raw_slice(&without_host_pointers);
+    }
+
     /// Writes `values` as their raw in-memory bytes, padded so the array's offset within the
     /// payload is a multiple of the row alignment. Payloads start eight-aligned in the file, so a
     /// replay over a page-aligned mapping reads the array back in place.
@@ -865,41 +883,6 @@ mod tests {
         assert_eq!(skipped, 2);
         let event = event.unwrap();
         assert_eq!(event.kind, EventKind::StyleRecordPayloads);
-    }
-
-    #[test]
-    fn selector_query_atom_mappings_event_round_trip() {
-        let mut output = Vec::new();
-        let mut writer = LogWriter::new(&mut output).unwrap();
-        let mut payload = PayloadWriter::default();
-        payload.write_u64(7);
-        payload.write_length(2);
-        payload.write_u8(0);
-        payload.write_u64(11);
-        payload.write_u32(1);
-        payload.write_u8(1);
-        payload.write_u32(2);
-        payload.write_u32(3);
-        payload.write_u32(4);
-        writer
-            .write_event(EventKind::SelectorQueryAtomMappings, &payload)
-            .unwrap();
-        writer.flush().unwrap();
-
-        let mut reader = LogReader::new(Cursor::new(output)).unwrap();
-        let mut event = reader.read_event().unwrap().unwrap();
-        assert_eq!(event.kind, EventKind::SelectorQueryAtomMappings);
-        assert_eq!(event.payload.read_u64().unwrap(), 7);
-        assert_eq!(event.payload.read_length().unwrap(), 2);
-        assert_eq!(event.payload.read_u8().unwrap(), 0);
-        assert_eq!(event.payload.read_u64().unwrap(), 11);
-        assert_eq!(event.payload.read_u32().unwrap(), 1);
-        assert_eq!(event.payload.read_u8().unwrap(), 1);
-        assert_eq!(event.payload.read_u32().unwrap(), 2);
-        assert_eq!(event.payload.read_u32().unwrap(), 3);
-        assert_eq!(event.payload.read_u32().unwrap(), 4);
-        event.payload.finish().unwrap();
-        assert!(reader.read_event().unwrap().is_none());
     }
 
     #[test]

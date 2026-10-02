@@ -34,7 +34,6 @@ use super::fast_hash::FastMap as HashMap;
 use super::fast_hash::FastSet as HashSet;
 use super::shared_vector::{SharedVector, SharedVectorPool};
 use crate::css::style_value::RetainedStyleValueData;
-use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -52,9 +51,6 @@ use super::program::DeclaredProperty;
 use super::program::EntryID;
 use super::program::RuleID;
 use super::program::SelectorProgramID;
-use super::selector::AttributeCase;
-use super::selector::AttributeOperator;
-use super::selector::AttributeTest;
 use super::sorted_merge::SortedMergeEntry;
 use super::sorted_merge::merge_sorted_by;
 use super::transaction::ElementDeclarationKind;
@@ -74,55 +70,6 @@ impl StyleAtomID {
     #[must_use]
     pub fn is_none(self) -> bool {
         self == Self::NONE
-    }
-}
-
-fn attribute_value_equals(value: &[u16], literal: &[u16], insensitive: bool) -> bool {
-    if !insensitive {
-        return value == literal;
-    }
-    value.len() == literal.len()
-        && value.iter().zip(literal).all(|(&left, &right)| {
-            left == right
-                || match (u8::try_from(left), u8::try_from(right)) {
-                    (Ok(left), Ok(right)) => left.eq_ignore_ascii_case(&right),
-                    _ => false,
-                }
-        })
-}
-
-fn attribute_value_starts_with(value: &[u16], literal: &[u16], insensitive: bool) -> bool {
-    value.len() >= literal.len() && attribute_value_equals(&value[..literal.len()], literal, insensitive)
-}
-
-fn attribute_value_may_match(value: &[u16], literal: &[u16], operator: AttributeOperator, insensitive: bool) -> bool {
-    match operator {
-        AttributeOperator::Presence => true,
-        AttributeOperator::Exact => attribute_value_equals(value, literal, insensitive),
-        AttributeOperator::Includes => {
-            !literal.is_empty()
-                && value
-                    .split(|unit| matches!(unit, 0x20 | 0x09 | 0x0A | 0x0C | 0x0D))
-                    .any(|token| attribute_value_equals(token, literal, insensitive))
-        }
-        AttributeOperator::DashMatch => {
-            attribute_value_equals(value, literal, insensitive)
-                || (value.len() > literal.len()
-                    && value[literal.len()] == u16::from(b'-')
-                    && attribute_value_starts_with(value, literal, insensitive))
-        }
-        AttributeOperator::Prefix => !literal.is_empty() && attribute_value_starts_with(value, literal, insensitive),
-        AttributeOperator::Suffix => {
-            !literal.is_empty()
-                && value.len() >= literal.len()
-                && attribute_value_equals(&value[value.len() - literal.len()..], literal, insensitive)
-        }
-        AttributeOperator::Substring => {
-            !literal.is_empty()
-                && value.len() >= literal.len()
-                && (0..=value.len() - literal.len())
-                    .any(|start| attribute_value_equals(&value[start..start + literal.len()], literal, insensitive))
-        }
     }
 }
 
@@ -354,10 +301,6 @@ impl<T: Clone + Default> PagedOwnedColumn<T> {
         self.values.iter_mut()
     }
 
-    fn indexed_iter(&self) -> impl Iterator<Item = (usize, &T)> {
-        self.indices.iter().copied().zip(self.values.iter())
-    }
-
     fn indexed_iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> {
         self.indices.iter().copied().zip(self.values.iter_mut())
     }
@@ -372,6 +315,9 @@ impl<T: Clone + Default> ShallowCapacityBytes for PagedOwnedColumn<T> {
 #[derive(Clone, Default)]
 struct AttributeCatalogs {
     name_forms: PagedCopyColumn<AttributeNameForms>,
+    /// The local name an `attr()` reads an attribute by, kept only for an attribute in no
+    /// namespace, which is the only kind substitution reads.
+    substitution_names: PagedOwnedColumn<Option<Box<[u16]>>>,
     value_texts: PagedOwnedColumn<Option<Box<[u16]>>>,
     language_texts: PagedOwnedColumn<Option<Box<[u16]>>>,
 }
@@ -1578,9 +1524,6 @@ pub enum FeatureKey {
     Id(StyleAtomID),
     Class(StyleAtomID),
     AttributeName(StyleAtomID),
-    /// The complete interned value of an attribute. This is query acceleration rather than a CSS
-    /// dispatch key: attribute value queries use it to reach only values that can match.
-    AttributeValue(StyleAtomID),
     Directionality(StyleAtomID),
     Root,
     State(StateFact),
@@ -1625,7 +1568,6 @@ impl FeatureKey {
             | Self::Id(_)
             | Self::Class(_)
             | Self::AttributeName(_)
-            | Self::AttributeValue(_)
             | Self::Directionality(_) => true,
             Self::State(fact) => fact.has_selector_posting(),
             _ => false,
@@ -1640,7 +1582,6 @@ impl FeatureKey {
             | Self::Id(atom)
             | Self::Class(atom)
             | Self::AttributeName(atom)
-            | Self::AttributeValue(atom)
             | Self::Directionality(atom)
             | Self::AnimationName(atom) => Some(atom),
             Self::Root
@@ -2479,17 +2420,27 @@ impl Default for RuleDispatchTopology {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct AncestorDispatchTopologyID(usize);
 
-thread_local! {
-    static SHARED_CASCADE_RULE_PAGES: RefCell<SharedVectorPool<CascadeOrderRule>> =
-        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
-    static SHARED_DISPATCH_BINDINGS: RefCell<SharedVectorPool<DispatchEntryBinding>> =
-        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
-    static SHARED_CASCADE_ORDERS: RefCell<SharedVectorPool<u32>> =
-        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
-    static SHARED_CASCADE_PROPERTIES: RefCell<SharedVectorPool<u16>> =
-        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
-    static SHARED_CASCADE_ENTRIES: RefCell<SharedVectorPool<CascadeEntryData>> =
-        RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
+/// The pools for the rule bindings and cascade projections of dispatches.
+pub(super) struct DispatchStoragePools {
+    cascade_rule_pages: SharedVectorPool<CascadeOrderRule>,
+    dispatch_bindings: SharedVectorPool<DispatchEntryBinding>,
+    cascade_orders: SharedVectorPool<u32>,
+    cascade_properties: SharedVectorPool<u16>,
+    cascade_entries: SharedVectorPool<CascadeEntryData>,
+    pub(super) prefixes: super::prefix::PrefixPools,
+}
+
+impl Default for DispatchStoragePools {
+    fn default() -> Self {
+        Self {
+            cascade_rule_pages: SharedVectorPool::new(MemoryCategory::RuleProgram),
+            dispatch_bindings: SharedVectorPool::new(MemoryCategory::RuleProgram),
+            cascade_orders: SharedVectorPool::new(MemoryCategory::RuleProgram),
+            cascade_properties: SharedVectorPool::new(MemoryCategory::RuleProgram),
+            cascade_entries: SharedVectorPool::new(MemoryCategory::RuleProgram),
+            prefixes: super::prefix::PrefixPools::default(),
+        }
+    }
 }
 
 pub struct RuleDispatch {
@@ -2505,12 +2456,6 @@ pub struct RuleDispatch {
     cascade_entries: SharedVector<CascadeEntryData>,
     topology: Arc<RuleDispatchTopology>,
     residency: MemoryLease,
-}
-
-impl Drop for RuleDispatchEntries {
-    fn drop(&mut self) {
-        super::matching::forget_dead_shared_dispatches();
-    }
 }
 
 /// Weak references to the actual shared storage, independent of a particular scope wrapper.
@@ -2535,12 +2480,6 @@ impl WeakRuleDispatch {
             cascade_entries: SharedVector::default(),
             residency: MemoryLease::new(MemoryCategory::RuleProgram),
         })
-    }
-}
-
-impl Drop for RuleDispatchTopology {
-    fn drop(&mut self) {
-        super::matching::forget_dead_shared_dispatches();
     }
 }
 
@@ -2777,7 +2716,7 @@ impl RuleDispatch {
         }
     }
 
-    pub(super) fn finish_prefixes(&mut self) {
+    pub(super) fn finish_prefixes(&mut self, pools: &mut super::prefix::PrefixPools) {
         debug_assert!(!self.topology.finalized, "a dispatch can only be finalized once");
         // Finished templates are cloned before extension, so their spare builder capacity
         // does not contribute to subsequent edits.
@@ -2791,7 +2730,7 @@ impl RuleDispatch {
             entries.entry_tails = Vec::new();
         }
         self.entry_bindings.make_mut().shrink_to_fit();
-        self.topology_mut().prefixes.finish();
+        self.topology_mut().prefixes.finish(pools);
         self.finalize_bucket_directories();
         self.rebuild_universal_with_parent_filter();
         self.rebuild_non_prefix_index();
@@ -3015,8 +2954,9 @@ impl RuleDispatch {
     ///
     /// Cascade matching reads this directly while walking candidates. Keeping it in the immutable
     /// dispatch avoids looking the rule up through several program maps for every element.
-    pub fn assign_cascade_properties<Properties: ExactSizeIterator<Item = u16>>(
+    pub(super) fn assign_cascade_properties<Properties: ExactSizeIterator<Item = u16>>(
         &mut self,
+        pools: &mut DispatchStoragePools,
         mut blocks_pruning: impl FnMut(DispatchEntry) -> bool,
         mut properties_of: impl FnMut(DispatchEntry) -> Option<Properties>,
     ) {
@@ -3049,12 +2989,12 @@ impl RuleDispatch {
         // These complete projections retain only numeric identities and declaration inventories.
         // Equal bindings can share across scopes while their mutable match results stay separate.
         for page in self.cascade_order_rule_pages.iter_mut().flatten() {
-            page.share(&SHARED_CASCADE_RULE_PAGES);
+            page.share(&mut pools.cascade_rule_pages);
         }
-        self.entry_bindings.share(&SHARED_DISPATCH_BINDINGS);
-        self.cascade_orders_by_rule_entry.share(&SHARED_CASCADE_ORDERS);
-        self.cascade_properties.share(&SHARED_CASCADE_PROPERTIES);
-        self.cascade_entries.share(&SHARED_CASCADE_ENTRIES);
+        self.entry_bindings.share(&mut pools.dispatch_bindings);
+        self.cascade_orders_by_rule_entry.share(&mut pools.cascade_orders);
+        self.cascade_properties.share(&mut pools.cascade_properties);
+        self.cascade_entries.share(&mut pools.cascade_entries);
     }
 
     #[must_use]
@@ -3359,6 +3299,17 @@ struct ElementDeclarationRow {
     custom_written_values: Option<Box<[RetainedStyleValueData]>>,
 }
 
+/// An element's inline declaration, taken out of its row while a private demand computes the
+/// element as though it had none.
+pub(super) struct HiddenInlineDeclarations {
+    declared: Option<ElementDeclaredProperties>,
+    written: Option<Box<[RetainedStyleValueData]>>,
+    checks: Box<[super::publication::WrittenValueChecks]>,
+    complete: bool,
+    custom: Option<Box<[CustomDeclaration]>>,
+    custom_written: Option<Box<[RetainedStyleValueData]>>,
+}
+
 impl Default for ElementDeclarationRow {
     fn default() -> Self {
         Self {
@@ -3650,8 +3601,6 @@ pub struct ElementFactStore {
     language_live_counts: PagedCopyColumn<u32>,
     attribute_name_live_counts: PagedCopyColumn<u32>,
     attribute_value_live_counts: PagedCopyColumn<u32>,
-    /// Changes whenever a newly published value can change an attribute-value query plan.
-    attribute_value_catalog_version: u64,
     custom_property_set_live_counts: Vec<u64>,
     /// Attribute-name forms and value text shared by the primary and each bounded fact batch.
     ///
@@ -4024,7 +3973,6 @@ impl Default for ElementFactStore {
             language_live_counts: PagedCopyColumn::default(),
             attribute_name_live_counts: PagedCopyColumn::default(),
             attribute_value_live_counts: PagedCopyColumn::default(),
-            attribute_value_catalog_version: 1,
             custom_property_set_live_counts: vec![0],
             element_declared_properties: ElementDeclarationRows::default(),
         };
@@ -4305,12 +4253,6 @@ impl ElementFactStore {
                         return None;
                     }
                 }
-                if !attribute.value.is_none() {
-                    let key = SelectorPostingKey::AttributeValue(attribute.value);
-                    if !self.rebuild_missing_posting(&mut rebuilt, key, node, memory) {
-                        return None;
-                    }
-                }
             }
             if let Some(metadata) = self.metadata_of(node) {
                 for &name in &metadata.animation_names {
@@ -4361,8 +4303,8 @@ impl ElementFactStore {
             return;
         }
 
-        // NB: Rebuilding needs to admit new postings. Avoid scanning every fact on each
-        //     selector query while admission is closed, and retry once it reopens.
+        // NB: Rebuilding needs to admit new postings. Avoid scanning every fact each time
+        //     staged facts are applied while admission is closed, and retry once it reopens.
         if !memory.is_tier3_admitting(MemoryCategory::FeaturePosting) {
             return;
         }
@@ -4577,12 +4519,6 @@ impl ElementFactStore {
                         || forms.folded_local == name
                 })
             }),
-            DispatchKey::AttributeValue(value) => row.is_some_and(|row| {
-                self.rows
-                    .attributes_of(row)
-                    .iter()
-                    .any(|attribute| attribute.value == value)
-            }),
             DispatchKey::TagName(tag) => {
                 row.is_some_and(|row| self.rows.tag_of(row) == tag || self.rows.folded_tag_of(row) == tag)
             }
@@ -4597,6 +4533,21 @@ impl ElementFactStore {
             | DispatchKey::Universal => return None,
             _ => return None,
         })
+    }
+
+    /// What an `attr()` can read of an element: each of its attributes in no namespace, by its
+    /// local name, with the text of its value.
+    pub fn substitution_attributes(&self, node: StyleNodeID) -> impl Iterator<Item = (&[u16], Option<&[u16]>)> {
+        self.rows
+            .row_of(node)
+            .map_or(&[][..], |row| self.rows.attributes_of(row))
+            .iter()
+            .filter_map(|&attribute| {
+                Some((
+                    self.attribute_substitution_name(attribute.name)?,
+                    self.rows.text_of(attribute),
+                ))
+            })
     }
 
     pub fn attributes_of_node(&self, node: StyleNodeID) -> impl Iterator<Item = StyleAtomID> {
@@ -4789,6 +4740,12 @@ impl ElementFactStore {
         self.metadata_mut(node).animation_names = sorted;
     }
 
+    /// Whether this element's last style resolution called a custom function.
+    pub fn uses_custom_functions(&self, node: StyleNodeID) -> bool {
+        self.metadata_of(node)
+            .is_some_and(|metadata| metadata.uses_custom_functions)
+    }
+
     /// Whether this element's style resolution called a custom function.
     pub fn set_uses_custom_functions(&mut self, node: StyleNodeID, uses: bool, memory: &mut MemoryController) {
         if self
@@ -4938,16 +4895,22 @@ impl ElementFactStore {
         // foldings of both, which is how `[aB]` reaches an attribute written either way. The extra
         // names are postings rather than facts, so they say only that at least one attribute of the
         // element answers to them.
-        let (old_value, changed) = self.edit_staged_row(node, |facts| {
+        let changed = self.edit_staged_row(node, |facts| {
             let found = facts.attributes.binary_search_by_key(&name, |entry| entry.0);
             match (present, found) {
-                (true, Ok(index)) => (Some(std::mem::replace(&mut facts.attributes[index].1, value)), false),
+                (true, Ok(index)) => {
+                    facts.attributes[index].1 = value;
+                    false
+                }
                 (true, Err(index)) => {
                     facts.attributes.insert(index, (name, value));
-                    (None, true)
+                    true
                 }
-                (false, Ok(index)) => (Some(facts.attributes.remove(index).1), true),
-                (false, Err(_)) => (None, false),
+                (false, Ok(index)) => {
+                    facts.attributes.remove(index);
+                    true
+                }
+                (false, Err(_)) => false,
             }
         });
         if changed && present {
@@ -4964,62 +4927,6 @@ impl ElementFactStore {
                 }
             }
         }
-        if !present || old_value != Some(value) {
-            if let Some(old_value) = old_value {
-                let old_value_is_still_present = self
-                    .staging
-                    .get(node)
-                    .is_some_and(|facts| facts.attributes.iter().any(|&(_, candidate)| candidate == old_value));
-                if !old_value.is_none() && !old_value_is_still_present {
-                    self.postings
-                        .remove(SelectorPostingKey::AttributeValue(old_value), node);
-                }
-            }
-            if present && !value.is_none() {
-                self.postings
-                    .insert(SelectorPostingKey::AttributeValue(value), node, memory);
-            }
-        }
-    }
-
-    pub(super) fn matching_attribute_values(&self, test: AttributeTest, literal: &[u16]) -> Vec<StyleAtomID> {
-        if test.operator == AttributeOperator::Exact
-            && test.case == AttributeCase::Sensitive
-            && !test.value_atom.is_none()
-        {
-            return vec![test.value_atom];
-        }
-
-        let insensitive = test.case != AttributeCase::Sensitive;
-        let mut values = Vec::new();
-        for (index, text) in self.attribute_catalogs.value_texts.indexed_iter() {
-            let Some(text) = text else {
-                continue;
-            };
-            if !attribute_value_may_match(text, literal, test.operator, insensitive) {
-                continue;
-            }
-            let value = StyleAtomID(u32::try_from(index).expect("attribute-value atom index exceeds u32"));
-            values.push(value);
-        }
-        values
-    }
-
-    pub(super) fn attribute_value_candidates(&self, values: &[StyleAtomID]) -> Option<Vec<StyleNodeID>> {
-        let mut candidates = Vec::new();
-        for &value in values {
-            match self.postings.lookup(SelectorPostingKey::AttributeValue(value)) {
-                Lookup::Known(posting) => posting.append_candidates_to(&mut candidates),
-                Lookup::KnownAbsent => {}
-                Lookup::Missing(_) => return None,
-            }
-        }
-        Some(candidates)
-    }
-
-    #[must_use]
-    pub(super) fn attribute_value_catalog_version(&self) -> u64 {
-        self.attribute_value_catalog_version
     }
 
     /// Whether any attribute the node still carries is indexed under `key`.
@@ -5058,6 +4965,58 @@ impl ElementFactStore {
         self.memory_dirty = true;
         self.element_declared_properties
             .set_custom(node, custom_declarations, custom_written_values);
+    }
+
+    /// Take the node's inline declaration out of its row while a private demand computes the node
+    /// as though it had none. The demand puts it back before it returns.
+    pub(super) fn hide_inline_declarations_for_demand(
+        &mut self,
+        node: StyleNodeID,
+    ) -> Option<HiddenInlineDeclarations> {
+        let index = node.element_index()? as usize;
+        let rows = &mut self.element_declared_properties;
+        let row = rows.rows.get_mut(index)?.as_mut()?;
+        let before = row.storage_bytes();
+        let kind = ElementDeclarationKind::InlineStyle.index();
+        let hidden = HiddenInlineDeclarations {
+            declared: row.by_kind[kind].take(),
+            written: row.written_by_kind[kind].take(),
+            checks: std::mem::take(&mut row.written_checks_by_kind[kind]),
+            complete: std::mem::replace(&mut row.complete[kind], true),
+            custom: row.custom_declarations.take(),
+            custom_written: row.custom_written_values.take(),
+        };
+        if hidden.custom.is_some() {
+            rows.rows_with_custom_declarations -= 1;
+        }
+        rows.payload_bytes = rows.payload_bytes - before + row.storage_bytes();
+        self.memory_dirty = true;
+        Some(hidden)
+    }
+
+    pub(super) fn restore_inline_declarations_after_demand(
+        &mut self,
+        node: StyleNodeID,
+        hidden: HiddenInlineDeclarations,
+    ) {
+        let index = node.element_index().expect("only an element has an inline declaration") as usize;
+        let rows = &mut self.element_declared_properties;
+        let row = rows.rows[index]
+            .as_mut()
+            .expect("a private demand keeps the element's declaration row");
+        let before = row.storage_bytes();
+        let kind = ElementDeclarationKind::InlineStyle.index();
+        row.by_kind[kind] = hidden.declared;
+        row.written_by_kind[kind] = hidden.written;
+        row.written_checks_by_kind[kind] = hidden.checks;
+        row.complete[kind] = hidden.complete;
+        row.custom_declarations = hidden.custom;
+        row.custom_written_values = hidden.custom_written;
+        if row.custom_declarations.is_some() {
+            rows.rows_with_custom_declarations += 1;
+        }
+        rows.payload_bytes = rows.payload_bytes - before + row.storage_bytes();
+        self.memory_dirty = true;
     }
 
     /// The custom properties the node's inline style declares, in declaration order.
@@ -5122,9 +5081,6 @@ impl ElementFactStore {
         self.element_declared_properties.get(node, kind)
     }
 
-    /// Record what one attribute-value atom spells, so a value operator can test it.
-    ///
-    /// Values repeat heavily across a document, so the text is held once per distinct value.
     /// Record that `name` is an attribute name whose any-namespace form is `local`.
     ///
     /// Published where the two atoms are minted, which is the only place that knows the pair. It is
@@ -5133,6 +5089,23 @@ impl ElementFactStore {
     pub fn note_attribute_name_forms(&mut self, name: StyleAtomID, forms: AttributeNameForms) {
         self.memory_dirty = true;
         self.attribute_catalogs_mut().name_forms.insert(name.0 as usize, forms);
+    }
+
+    /// Record the local name an `attr()` reads the attribute `name` by, which is in no namespace.
+    pub fn note_attribute_substitution_name(&mut self, name: StyleAtomID, local_name: &[u16]) {
+        self.memory_dirty = true;
+        self.attribute_catalogs_mut()
+            .substitution_names
+            .insert(name.0 as usize, Some(local_name.into()));
+    }
+
+    /// The local name an `attr()` reads an attribute by, if the attribute is in no namespace.
+    #[must_use]
+    pub fn attribute_substitution_name(&self, name: StyleAtomID) -> Option<&[u16]> {
+        self.attribute_catalogs
+            .substitution_names
+            .get(name.0 as usize)
+            .and_then(Option::as_deref)
     }
 
     /// The other names an attribute name answers to, all `NONE` if the name has not been published.
@@ -5153,6 +5126,8 @@ impl ElementFactStore {
             .filter_map(move |(index, key)| (!key.is_none() && !keys[..index].contains(&key)).then_some(key))
     }
 
+    /// Record what one attribute-value atom spells, for a value operator to test or an `attr()` to
+    /// read. Values repeat heavily across a document, so the text is held once per distinct value.
     pub fn set_attribute_value_text(&mut self, value: StyleAtomID, text: &[u16]) {
         let index = value.0 as usize;
         if value.is_none()
@@ -5168,10 +5143,6 @@ impl ElementFactStore {
         self.attribute_catalogs_mut()
             .value_texts
             .insert(index, Some(text.into()));
-        self.attribute_value_catalog_version = self
-            .attribute_value_catalog_version
-            .checked_add(1)
-            .expect("attribute-value catalog version overflow");
     }
 
     #[must_use]
@@ -5280,12 +5251,9 @@ impl ElementFactStore {
         {
             self.postings.remove(SelectorPostingKey::State(state), node);
         }
-        for &AttributeFact { name, value, .. } in self.rows.attributes_of(row) {
+        for &AttributeFact { name, .. } in self.rows.attributes_of(row) {
             for key in self.attribute_name_keys(name) {
                 self.postings.remove(SelectorPostingKey::AttributeName(key), node);
-            }
-            if !value.is_none() {
-                self.postings.remove(SelectorPostingKey::AttributeValue(value), node);
             }
         }
         Arc::get_mut(&mut self.rows)
@@ -5398,6 +5366,9 @@ impl ElementFactStore {
             if catalogs.name_forms.get(index).is_some() {
                 catalogs.name_forms.insert(index, AttributeNameForms::default());
             }
+            if let Some(name) = catalogs.substitution_names.get_mut(index) {
+                *name = None;
+            }
             if let Some(text) = catalogs.value_texts.get_mut(index) {
                 *text = None;
             }
@@ -5497,6 +5468,13 @@ impl ElementFactStore {
             .flatten()
             .map(|text| text.len() * size_of::<u16>())
             .sum::<usize>();
+        let substitution_name_payloads = self
+            .attribute_catalogs
+            .substitution_names
+            .iter()
+            .flatten()
+            .map(|name| name.len() * size_of::<u16>())
+            .sum::<usize>();
 
         capacity_bytes! {
             shallow [
@@ -5511,6 +5489,7 @@ impl ElementFactStore {
                 self.attribute_catalogs.language_texts,
                 self.attribute_catalogs.value_texts,
                 self.attribute_catalogs.name_forms,
+                self.attribute_catalogs.substitution_names,
             ];
             cached [];
             nested [
@@ -5520,6 +5499,7 @@ impl ElementFactStore {
                 custom_property_name_index_payloads,
                 language_payloads,
                 attribute_value_payloads,
+                substitution_name_payloads,
             ];
             skip [];
         }
@@ -5610,10 +5590,6 @@ impl ElementFactStore {
         self.memory.resize_required_to(memory, current);
         self.memory_dirty = false;
         self.rebuild_missing_postings(memory);
-    }
-
-    pub fn prepare_selector_query(&mut self, memory: &mut MemoryController) {
-        self.apply_staged(memory);
     }
 
     /// Snapshot the committed rows which staged local facts will replace at the barrier.
@@ -6249,7 +6225,7 @@ mod tests {
     }
 
     #[test]
-    fn selector_queries_defer_posting_rebuilds_while_admission_is_closed() {
+    fn applying_staged_facts_defers_posting_rebuilds_while_admission_is_closed() {
         let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
         let mut facts = ElementFactStore::new();
         let node = StyleNodeID::element(1);
@@ -6267,7 +6243,7 @@ mod tests {
         assert!(!memory.is_tier3_admitting(MemoryCategory::FeaturePosting));
 
         for _ in 0..3 {
-            facts.prepare_selector_query(&mut memory);
+            facts.apply_staged(&mut memory);
             assert!(facts.classes_of_node(node).is_empty());
             // NB: Even resolving an empty missing posting requires scanning the facts.
             assert!(matches!(facts.postings().lookup(key), Lookup::Missing(gap) if gap == key));
@@ -6275,7 +6251,7 @@ mod tests {
 
         memory.set_tier3_limit_for_test(u64::MAX);
         memory.begin_tier3_quota_period();
-        facts.prepare_selector_query(&mut memory);
+        facts.apply_staged(&mut memory);
         assert!(matches!(facts.postings().lookup(key), Lookup::KnownAbsent));
     }
 
@@ -6664,7 +6640,7 @@ mod tests {
             entry(2, Some(DispatchKey::Class(StyleAtomID(11)))),
         );
         dispatch.insert(DispatchKey::Universal, entry(3, None));
-        dispatch.finish_prefixes();
+        dispatch.finish_prefixes(&mut Default::default());
 
         let mut facts = StyleNodeFacts::new();
         facts.push_row(
@@ -6914,6 +6890,7 @@ mod tests {
                 folded_local: StyleAtomID(43),
             },
         );
+        store.note_attribute_substitution_name(atom, &[11, 12]);
         store.set_attribute_value_text(atom, &[1, 2, 3]);
         store.set_language_text(atom, &[4, 5, 6]);
         store
@@ -6923,6 +6900,7 @@ mod tests {
         store.forget_atoms(&[atom, StyleAtomID(42)]);
 
         assert_eq!(store.attribute_name_forms(atom), AttributeNameForms::default());
+        assert_eq!(store.attribute_substitution_name(atom), None);
         assert!(!store.has_attribute_value_text(atom));
         assert_eq!(
             store.attribute_catalogs.language_texts.get(atom.0 as usize),

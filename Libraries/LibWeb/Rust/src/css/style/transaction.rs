@@ -231,6 +231,10 @@ pub const STYLE_REACTION_INHERITED_CUSTOM_PROPERTIES: u8 = 1 << 3;
 pub const STYLE_REACTION_RECOMPUTE_DESCENDANT_STYLES: u8 = 1 << 4;
 pub const STYLE_REACTION_ANCESTOR_BECAME_VISIBLE: u8 = 1 << 5;
 pub const STYLE_REACTION_PSEUDO_INPUTS_MAY_HAVE_CHANGED: u8 = 1 << 6;
+/// The element's font environment moved: a face its font cascade names became available, failed
+/// or changed. The `@font-face` table that decides the cascade is published to the engine and
+/// versioned by the font-environment generation.
+pub const STYLE_REACTION_FONT_INPUTS_CHANGED: u8 = 1 << 7;
 
 impl InputKey {
     #[must_use]
@@ -599,6 +603,13 @@ impl NormalizationJournal {
     #[must_use]
     pub fn pending_old(&self, key: InputKey) -> Option<InputValue> {
         self.entries.get(&key).map(|entry| entry.0)
+    }
+
+    /// A demand for one node's record has answered that node's inputs. Every other entry stays
+    /// for the next transaction, including entries of the same input kind.
+    pub(super) fn acknowledge_node(&mut self, node: StyleNodeID, memory: &mut MemoryController) {
+        self.entries.retain(|key, _| key.style_node() != Some(node));
+        self.settle(memory);
     }
 
     /// Discard a transaction whose invalidation result is already known to cover its complete scope.

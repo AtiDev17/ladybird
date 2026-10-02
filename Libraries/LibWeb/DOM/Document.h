@@ -60,6 +60,7 @@
 #include <LibWeb/Painting/HitTestResult.h>
 #include <LibWeb/Painting/ScrollSnap.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
+#include <LibWeb/SVG/SVGPatternElement.h>
 #include <LibWeb/SVG/SVGUseElement.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/XPath/EvaluateResult.h>
@@ -381,8 +382,6 @@ public:
 
     void for_each_active_css_style_sheet(Function<void(CSS::StyleSheetState&)> const& callback) const;
 
-    double ensure_element_shared_css_random_base_value(CSS::RandomCachingKey const&);
-
     Optional<Utf16String> get_style_sheet_source(CSS::StyleSheetIdentifier const&) const;
 
     virtual Utf16FlyString node_name() const override { return "#document"_utf16_fly_string; }
@@ -451,6 +450,10 @@ public:
     bool style_engine_tracks_tree() const { return m_style_engine_tracks_tree; }
     void ensure_style_engine_tracks_tree();
 
+    // The document's identity in the style mirror, which only names it as the root of the DOM child sequence.
+    [[nodiscard]] CSS::StyleNodeID style_node_id() const { return m_style_node_id; }
+    void set_style_node_id(CSS::StyleNodeID);
+
     Page& page();
     Page const& page() const;
     GC::Ref<EventTarget> relevant_global_event_target() const { return m_relevant_global_event_target; }
@@ -481,6 +484,7 @@ public:
 
     void update_style();
     void note_throttled_animation_style_update() { m_has_throttled_animation_style_update = true; }
+    void note_animations_that_can_skip_per_frame_style_updates();
     void flush_throttled_animation_style_update();
     void flush_throttled_animation_style_update_for_node(Node const&);
     void schedule_compositor_animation_wakeup(double delay_ms);
@@ -529,6 +533,12 @@ public:
         m_effects_needing_animated_style_update_after_current_update.clear();
     }
     [[nodiscard]] bool is_running_update_layout() const;
+
+    // The marks the DOM side has made on this document's layout and paint state but not written there yet.
+    [[nodiscard]] InvalidationJournal& invalidation_journal() { return *m_invalidation_journal; }
+    void drain_invalidation_journal() const;
+    // What layout has told this document and the document has not acted on yet.
+    [[nodiscard]] CommitMessages& commit_messages() { return *m_commit_messages; }
 
     void invalidate_layout_tree(InvalidateLayoutTreeReason);
 
@@ -860,6 +870,7 @@ public:
     }
     void set_needs_registered_properties_cache_update() { m_needs_registered_properties_cache_update = true; }
     void set_needs_container_query_evaluation_after_layout(Element const& query_container);
+    [[nodiscard]] bool has_size_containers_needing_evaluation_after_layout() const;
 
     [[nodiscard]] bool needs_full_layout_tree_update() const;
     void set_needs_full_layout_tree_update(bool);
@@ -867,6 +878,8 @@ public:
     CSS::ScrollStateQueryContainers& scroll_state_query_containers() { return m_scroll_state_query_containers; }
 
     [[nodiscard]] Layout::NodeArena& layout_node_arena();
+    [[nodiscard]] Layout::NodeArena* layout_node_arena_if_created() { return m_layout_node_arena; }
+    [[nodiscard]] Layout::NodeArena const* layout_node_arena_if_created() const { return m_layout_node_arena; }
     Painting::ChromeWidgetRegistry& chrome_widget_registry() { return *m_chrome_widget_registry; }
     Painting::ChromeWidgetRegistry const& chrome_widget_registry() const { return *m_chrome_widget_registry; }
 
@@ -1157,7 +1170,6 @@ public:
         u64 registered_properties_cache_rebuilds { 0 };
         u64 scope_rule_cache_builds { 0 };
         u64 style_query_container_scans { 0 };
-        u64 size_query_container_scan_visits { 0 };
         u64 style_engine_transaction_setups { 0 };
         u64 style_engine_transaction_setup_microseconds { 0 };
         // Exclusive intervals within style_update_microseconds. Rust phases subdivide bridge.
@@ -1192,7 +1204,12 @@ public:
         Structure,
     };
     void set_needs_accumulated_visual_contexts_update(bool);
+    void set_image_map_areas_need_publication() { m_image_map_areas_need_publication = true; }
+    [[nodiscard]] bool take_image_map_areas_need_publication() { return exchange(m_image_map_areas_need_publication, false); }
     void note_svg_paint_resources_changed();
+    void register_svg_pattern_element(Badge<SVG::SVGPatternElement>, SVG::SVGPatternElement&);
+    void unregister_svg_pattern_element(Badge<SVG::SVGPatternElement>, SVG::SVGPatternElement&);
+    void republish_svg_patterns_inheriting_from(Utf16FlyString const& id);
     bool has_enrolled_svg_paint_resources() const;
     void schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason);
     bool can_compute_client_rects_without_accumulated_visual_contexts_update(Layout::Node const&) const;
@@ -1213,7 +1230,7 @@ public:
     [[nodiscard]] bool may_have_scroll_snap_areas() const { return m_may_have_scroll_snap_areas; }
 
     void register_scroll_snap_container(Layout::Node const&);
-    [[nodiscard]] Vector<WeakPtr<Layout::Node const>> collect_scroll_snap_containers();
+    [[nodiscard]] Vector<Compositing::RustFFI::NodeSlotId> collect_scroll_snap_containers();
 
     virtual Vector<Utf16FlyString> supported_property_names() const override;
     Vector<GC::Ref<DOM::Element>> const& potentially_named_elements() const { return m_potentially_named_elements; }
@@ -1225,8 +1242,14 @@ public:
     [[nodiscard]] bool has_active_resize_observations();
     [[nodiscard]] bool has_skipped_resize_observations();
 
+    // Moves on whenever a style sheet may have come or gone for the document or one of its shadow roots, as with a
+    // scope's rule cache or the document's shadow roots.
+    u64 style_sheet_set_generation() const { return m_style_sheet_set_generation; }
+    void note_style_sheet_set_change() { ++m_style_sheet_set_generation; }
+
     void register_shadow_root(Badge<DOM::ShadowRoot>, DOM::ShadowRoot&);
     void unregister_shadow_root(Badge<DOM::ShadowRoot>, DOM::ShadowRoot&);
+    void publish_animation_keyframes_for_style_update();
     template<typename Callback>
     void for_each_shadow_root(Callback&& callback)
     {
@@ -1307,6 +1330,10 @@ public:
     {
         set_needs_repaint(should_invalidate_display_list);
     }
+
+    // A repaint mark the journal holds applies its damage when the journal drains, but the frame that drains it has to
+    // be asked for when the mark is made.
+    void request_frame_for_pending_repaint(Badge<InvalidationJournal>) { request_frame_for_pending_repaint(); }
 
     RefPtr<Compositing::DisplayList> record_display_list(HTML::PaintConfig, Compositing::DisplayListResourceStorage&, Painting::PaintCommandCacheMode);
     Painting::HitTestDisplayList const* hit_test_display_list() const { return m_hit_test_display_list.ptr(); }
@@ -1476,7 +1503,6 @@ public:
 
     RefPtr<SelectorQuery const> selector_query_for(Utf16View) const;
     QuerySelectorResultCache& query_selector_result_cache();
-    IsolatedSelectorQueryEngineCache& isolated_selector_query_engine_cache();
 
     GC::Ptr<HTML::CustomElementRegistry> custom_element_registry() const;
     void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry> custom_element_registry) { m_custom_element_registry = custom_element_registry; }
@@ -1506,12 +1532,15 @@ private:
     void did_add_supported_property_name();
     friend struct AdoptedStyleSheetsAccess;
 
+    void republish_svg_patterns_inheriting_from(Utf16FlyString const& id, HashTable<SVG::SVGPatternElement const*>& republished);
+
     void finish_animated_style_update();
     void service_compositor_animation_wakeup(double timestamp);
 
     GC::Ref<WebIDL::ObservableArray> adopted_style_sheets() const;
 
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
+    void request_frame_for_pending_repaint();
 
     // ^JS::Object
     virtual bool is_dom_document() const final { return true; }
@@ -1521,8 +1550,13 @@ private:
 
     virtual void finalize() override final;
 
-    void tear_down_layout_tree_for_inactive_document();
-    void set_layout_root(Compositing::RustFFI::NodeSlotId viewport_slot);
+    Layout::RustFFI::FfiLayoutTreeBuildOutcome build_layout_tree();
+
+    // The row the document's layout tree is rooted at. The tree build records it in the arena, so
+    // the document keeps no copy of its own.
+    [[nodiscard]] Compositing::RustFFI::NodeSlotId layout_root_slot() const;
+    [[nodiscard]] bool has_layout_root() const { return layout_root_slot().index != Compositing::RustFFI::INVALID_NODE_SLOT_INDEX; }
+    [[nodiscard]] Layout::Node* layout_root_if_live() const;
     void tear_down_layout_tree();
     void process_pending_top_layer_layout_changes();
 
@@ -1599,9 +1633,10 @@ private:
     GC::Ref<DOM::EventTarget> m_relevant_global_event_target;
 
     RefPtr<Layout::NodeArena> m_layout_node_arena;
+    NonnullOwnPtr<InvalidationJournal> m_invalidation_journal;
+    NonnullOwnPtr<CommitMessages> m_commit_messages;
     OwnPtr<Painting::DocumentPaintState> m_paint_state;
     NonnullRefPtr<Painting::ChromeWidgetRegistry> m_chrome_widget_registry;
-    Layout::Viewport* m_layout_root { nullptr };
     bool m_may_have_content_visibility_auto_style { false };
 
     GC::Ptr<Node> m_hovered_node;
@@ -1751,10 +1786,10 @@ private:
 
     bool m_has_completed_style_update { false };
     bool m_style_engine_tracks_tree { false };
+    CSS::StyleNodeID m_style_node_id;
     GC::WeakHashSet<Element> m_elements_with_dirty_style_attributes;
     GC::WeakHashSet<Element> m_elements_with_viewport_dependent_style;
     bool m_suppresses_attribute_style_invalidation { false };
-    HashTable<GC::Ref<Element>> m_query_containers_needing_container_query_evaluation_after_layout;
     CSS::ScrollStateQueryContainers m_scroll_state_query_containers;
 
     bool m_is_decoded_svg { false };
@@ -1764,6 +1799,7 @@ private:
     GC::WeakHashSet<Animations::KeyframeEffect> m_effects_needing_animated_style_update_after_current_update;
     bool m_is_updating_animated_style { false };
     bool m_has_throttled_animation_style_update { false };
+    bool m_needs_throttled_animation_style_update_check { false };
     bool m_force_throttled_animation_style_update { false };
     Optional<u64> m_last_forced_throttled_animation_style_update_task_generation;
 
@@ -1885,8 +1921,8 @@ private:
     Optional<MonotonicTime> m_compositor_animation_wakeup_deadline;
     RefPtr<Core::Timer> m_compositor_animation_observation_timer;
     bool m_force_visual_context_tree_rebuild_on_next_compositor_animation_update_for_testing { false };
-    Vector<WeakPtr<Layout::Node>> m_layout_nodes_with_forced_compositor_effects_layer;
-    Vector<WeakPtr<Layout::Node>> m_layout_nodes_with_forced_compositor_background_color_frame;
+    Vector<Compositing::RustFFI::NodeSlotId> m_layout_nodes_with_forced_compositor_effects_layer;
+    Vector<Compositing::RustFFI::NodeSlotId> m_layout_nodes_with_forced_compositor_background_color_frame;
 
     bool m_temporary_document_for_fragment_parsing { false };
 
@@ -1932,14 +1968,19 @@ private:
 
     Vector<GC::Ref<DOM::Element>> m_potentially_named_elements;
 
+    // Every connected <pattern>, which is what lets a pattern that inherits attributes from the pattern its `href` names
+    // be republished when the chain changes.
+    SVG::SVGPatternElement::DocumentPatternElementList m_svg_pattern_elements;
+
     AnchorNameMap m_anchor_name_map;
 
     bool m_design_mode_enabled { false };
 
     bool m_needs_accumulated_visual_contexts_update { false };
+    bool m_image_map_areas_need_publication { false };
 
     HashMap<Web::AsyncScrollNodeStableID, Compositing::SnappedAreas> m_scroll_container_snapped_areas;
-    Vector<WeakPtr<Layout::Node const>> m_scroll_snap_containers;
+    Vector<Compositing::RustFFI::NodeSlotId> m_scroll_snap_containers;
     bool m_needs_scroll_container_resnap { false };
     bool m_may_have_scroll_snap_areas { false };
 
@@ -1959,6 +2000,11 @@ private:
     // Document should not visit ShadowRoot list to avoid leaks.
     // It's responsibility of object that allocated ShadowRoot to keep it alive.
     ShadowRoot::DocumentShadowRootList m_shadow_roots;
+    u64 m_style_sheet_set_generation { 0 };
+    // The `@keyframes` rows the style engine still holds for shadow roots that left this document.
+    Vector<CSS::StyleScope::DepartedAnimationKeyframes> m_departed_animation_keyframes;
+    // The style sheet set generation the `@keyframes` rows were last brought up to date at.
+    Optional<u64> m_animation_keyframes_published_generation;
 
     Optional<Utf16String> m_content_blocker_style_sheet;
     // Class/id tokens already covered by the cached content blocker stylesheet.
@@ -2080,9 +2126,6 @@ private:
 
     CSS::StyleScope m_style_scope;
 
-    // https://drafts.csswg.org/css-values-5/#random-caching
-    HashMap<CSS::RandomCachingKey, double> m_element_shared_css_random_base_value_cache;
-
     // Cache of parsed selector queries for querySelectorAll/querySelector/matches/closest.
     // A null value means the selector string failed to parse.
     mutable HashMap<Utf16String, RefPtr<SelectorQuery const>> m_selector_query_cache;
@@ -2091,9 +2134,6 @@ private:
 
     // Cache of querySelectorAll results, validated lazily against the query root's dom_tree_version/character_data_version.
     OwnPtr<QuerySelectorResultCache> m_query_selector_result_cache;
-
-    // Style engines for selector queries against disconnected trees, one per tree root, validated the same way.
-    OwnPtr<IsolatedSelectorQueryEngineCache> m_isolated_selector_query_engine_cache;
 
     // https://fullscreen.spec.whatwg.org/#list-of-pending-fullscreen-events
     Vector<PendingFullscreenEvent> m_pending_fullscreen_events;

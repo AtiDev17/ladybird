@@ -5,6 +5,7 @@ set(TEST_SOURCES
     TestAutocompleteRanker.cpp
     TestCanonicalBrowsingContextGroup.cpp
     TestCookieJar.cpp
+    TestCrashReportDiagnostics.cpp
     TestDownloadSegmentation.cpp
     TestDownloadStore.cpp
     TestExternalURLHandler.cpp
@@ -20,13 +21,14 @@ set(TEST_SOURCES
     TestSessionHistoryTraversalQueue.cpp
     TestSessionStore.cpp
     TestSiteCompatibilityDataLoading.cpp
+    TestSpoofingSettings.cpp
     TestStorageJar.cpp
     TestTabPerformanceStats.cpp
     TestWebViewURL.cpp
 )
 
 if (APPLE OR LINUX)
-    list(APPEND TEST_SOURCES TestCrashReport.cpp TestFontService.cpp)
+    list(APPEND TEST_SOURCES TestCrashReport.cpp TestCrashReportReview.cpp TestCrashReportStore.cpp TestFontService.cpp)
 endif()
 
 if (APPLE)
@@ -147,6 +149,13 @@ if (NOT WIN32)
         target_compile_definitions(TestRendererOriginClaims PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
 
+    add_executable(TestCrashReportSubmission TestCrashReportSubmission.cpp)
+    add_dependencies(TestCrashReportSubmission ${ladybird_helper_processes})
+    target_link_libraries(TestCrashReportSubmission PRIVATE AK LibCore LibCrypto LibFileSystem LibIPC LibMain LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestCrashReportSubmission PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
     add_executable(TestRequestServerClientSessions TestRequestServerClientSessions.cpp)
     add_dependencies(TestRequestServerClientSessions ${ladybird_helper_processes})
     target_link_libraries(TestRequestServerClientSessions PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
@@ -170,6 +179,13 @@ if (BUILD_TESTING AND NOT WIN32)
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-crash-report.py $<TARGET_FILE:WebDriver>
         )
         set_tests_properties(TestWebDriverCrashReport PROPERTIES TIMEOUT 120)
+        add_test(
+            NAME TestWebDriverBrowserCrashRecovery
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-browser-crash-recovery.py
+                $<TARGET_FILE:WebDriver>
+        )
+        set_tests_properties(TestWebDriverBrowserCrashRecovery PROPERTIES TIMEOUT 120)
         set(crash_report_helpers WebWorker RequestServer ImageDecoder Compositor)
         if (ENABLE_CRANELIFT_JIT)
             list(APPEND crash_report_helpers WasmCompiler)
@@ -199,6 +215,12 @@ if (BUILD_TESTING AND NOT WIN32)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-content-blockers.py $<TARGET_FILE:WebDriver>
     )
     set_tests_properties(TestWebDriverContentBlockers PROPERTIES TIMEOUT 180)
+
+    add_test(
+        NAME TestWebDriverSearchEngineSettings
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-search-engine-settings.py $<TARGET_FILE:WebDriver>
+    )
+    set_tests_properties(TestWebDriverSearchEngineSettings PROPERTIES TIMEOUT 120)
 
     add_test(
         NAME TestWebDriverSessionHistory
@@ -248,6 +270,8 @@ if (BUILD_TESTING AND NOT WIN32)
     set_tests_properties(TestRendererCookieAccess PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestRendererOriginClaims COMMAND $<TARGET_FILE:TestRendererOriginClaims>)
     set_tests_properties(TestRendererOriginClaims PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+    add_test(NAME TestCrashReportSubmission COMMAND $<TARGET_FILE:TestCrashReportSubmission>)
+    set_tests_properties(TestCrashReportSubmission PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestRequestServerClientSessions COMMAND $<TARGET_FILE:TestRequestServerClientSessions>)
     set_tests_properties(TestRequestServerClientSessions PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestTabPerformanceMonitor COMMAND $<TARGET_FILE:TestTabPerformanceMonitor>)

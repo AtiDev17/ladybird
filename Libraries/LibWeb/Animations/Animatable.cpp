@@ -12,17 +12,18 @@
 #include <LibWeb/CSS/CSSAnimation.h>
 #include <LibWeb/CSS/CSSAnimationProperties.h>
 #include <LibWeb/CSS/CSSTransition.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
+#include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/StyleValueRustFFI.h>
 
 namespace Web::Animations {
 
 struct Animatable::Transition {
     AK_ALLOC_WITH_KMALLOC;
 
-    HashMap<CSS::PropertyID, size_t> transition_attribute_indices;
-    Vector<TransitionAttributes> transition_attributes;
     HashMap<CSS::PropertyID, GC::Ref<CSS::CSSTransition>> associated_transitions;
 };
 
@@ -254,18 +255,40 @@ void Animatable::on_document_changed(DOM::Document& old_document, DOM::Document&
     }
 }
 
+// The computation of an element's animation definitions matches them against the animations the
+// element already has, so the names of those animations are an input to it, and so is the definition
+// each one last had applied: a plan that would apply the same again changes nothing.
+static void publish_css_defined_animations(Animatable& animatable, size_t index, Vector<GC::Ref<CSS::CSSAnimation>> const& animations)
+{
+    auto* element = as_if<DOM::Element>(animatable);
+    if (!element)
+        return;
+
+    Vector<Utf16FlyString> names;
+    Vector<CSS::StyleEngineFFI::FfiAppliedAnimationDefinition> definitions;
+    names.ensure_capacity(animations.size());
+    definitions.ensure_capacity(animations.size());
+    for (auto const& animation : animations) {
+        names.unchecked_append(animation->animation_name());
+        definitions.unchecked_append(animation->applied_definition());
+    }
+    CSS::record_element_css_defined_animations(*element, static_cast<u8>(index), names, definitions);
+}
+
 void Animatable::cancel_css_animations_and_transitions()
 {
     if (!m_impl)
         return;
 
     GC::RootVector<GC::Ref<Animation>> animations_to_cancel;
-    for (auto& animations : m_impl->css_defined_animations) {
-        if (!animations)
+    for (size_t index = 0; index < m_impl->css_defined_animations.size(); ++index) {
+        auto& animations = m_impl->css_defined_animations[index];
+        if (!animations || animations->is_empty())
             continue;
         for (auto& animation : *animations)
             animations_to_cancel.append(animation);
         animations->clear();
+        publish_css_defined_animations(*this, index, *animations);
     }
     for (auto& transition : m_impl->transitions) {
         if (!transition)
@@ -273,8 +296,6 @@ void Animatable::cancel_css_animations_and_transitions()
         for (auto& animation : transition->associated_transitions)
             animations_to_cancel.append(animation.value);
         transition->associated_transitions.clear();
-        transition->transition_attribute_indices.clear();
-        transition->transition_attributes.clear();
     }
     m_impl->has_css_defined_animations = false;
 
@@ -282,41 +303,46 @@ void Animatable::cancel_css_animations_and_transitions()
         animation->cancel(Animation::ShouldInvalidate::No);
 }
 
-void Animatable::add_transitioned_properties(Optional<CSS::PseudoElement> pseudo_element, Vector<CSS::TransitionProperties> const& transitions)
+static void const* installed_longhand_table(DOM::Element const& element, Optional<CSS::PseudoElement> pseudo_element)
 {
-    auto* maybe_transition = ensure_transition(pseudo_element);
-    if (!maybe_transition)
-        return;
-
-    auto& transition = *maybe_transition;
-    for (size_t i = 0; i < transitions.size(); i++) {
-        size_t index_of_this_transition = transition.transition_attributes.size();
-        transition.transition_attributes.empend(transitions[i].delay, transitions[i].duration, transitions[i].timing_function, transitions[i].transition_behavior);
-
-        for (auto const& property : transitions[i].properties)
-            transition.transition_attribute_indices.set(property, index_of_this_transition);
-    }
+    auto style_record = element.style_record_identity(pseudo_element);
+    if (!style_record)
+        return nullptr;
+    auto style = element.document().style_computer().style_engine().style_record_view(style_record);
+    return style.present ? style.longhand_table : nullptr;
 }
 
+// A declaration whose delay and duration are each the single value 0s starts nothing, so it gives no longhand a
+// matching entry unless the element already holds a transition, which such an entry could still cancel.
+bool Animatable::has_matching_transition_property_entry(Optional<CSS::PseudoElement> pseudo_element, void const* longhand_table) const
+{
+    if (!longhand_table)
+        return false;
+    if (CSS::StyleValueFFI::rust_transition_delay_and_duration_are_single_zero(longhand_table)
+        && property_ids_with_existing_transitions(pseudo_element).is_empty())
+        return false;
+    return CSS::StyleValueFFI::rust_transition_has_entries(longhand_table);
+}
+
+bool Animatable::has_matching_transition_property_entry(Optional<CSS::PseudoElement> pseudo_element) const
+{
+    return has_matching_transition_property_entry(pseudo_element, installed_longhand_table(static_cast<DOM::Element const&>(*this), pseudo_element));
+}
+
+// The longhands the element's installed style gives a matching transition-property entry, read from
+// the style's transition longhands.
 Vector<CSS::PropertyID> Animatable::property_ids_with_matching_transition_property_entry(Optional<CSS::PseudoElement> pseudo_element) const
 {
-    auto const* maybe_transition = transition_if_exists(pseudo_element);
-
-    if (!maybe_transition)
+    auto const* longhand_table = installed_longhand_table(static_cast<DOM::Element const&>(*this), pseudo_element);
+    if (!has_matching_transition_property_entry(pseudo_element, longhand_table))
         return {};
-
-    return maybe_transition->transition_attribute_indices.keys();
-}
-
-Optional<Animatable::TransitionAttributes const&> Animatable::property_transition_attributes(Optional<CSS::PseudoElement> pseudo_element, CSS::PropertyID property) const
-{
-    auto const* maybe_transition = transition_if_exists(pseudo_element);
-    if (!maybe_transition)
-        return {};
-    auto& transition = *maybe_transition;
-    if (auto maybe_attr_index = transition.transition_attribute_indices.get(property); maybe_attr_index.has_value())
-        return transition.transition_attributes[maybe_attr_index.value()];
-    return {};
+    auto entries = CSS::StyleValueFFI::rust_transition_entries(longhand_table);
+    Vector<CSS::PropertyID> property_ids;
+    property_ids.ensure_capacity(entries.count);
+    for (auto const& entry : ReadonlySpan<CSS::StyleValueFFI::FfiTransitionEntry> { entries.entries, entries.count })
+        property_ids.unchecked_append(static_cast<CSS::PropertyID>(entry.property_id));
+    CSS::StyleValueFFI::rust_transition_entries_release(entries);
+    return property_ids;
 }
 
 Vector<CSS::PropertyID> Animatable::property_ids_with_existing_transitions(Optional<CSS::PseudoElement> pseudo_element) const
@@ -360,17 +386,6 @@ void Animatable::remove_transition(Optional<CSS::PseudoElement> pseudo_element, 
     VERIFY(removed_transition.has_value());
     transition.associated_transitions.remove(property_id);
     removed_transition.value()->schedule_disassociation_from_target();
-}
-
-void Animatable::clear_registered_transitions(Optional<CSS::PseudoElement> pseudo_element)
-{
-    auto maybe_transition = ensure_transition(pseudo_element);
-    if (!maybe_transition)
-        return;
-
-    auto& transition = *maybe_transition;
-    transition.transition_attribute_indices.clear();
-    transition.transition_attributes.clear();
 }
 
 void Animatable::visit_edges(JS::Cell::Visitor& visitor)
@@ -449,7 +464,11 @@ void Animatable::set_css_defined_animations(Optional<CSS::PseudoElement> pseudo_
     //     is one flag for all of them.
     if (!animations.is_empty())
         impl.has_css_defined_animations = true;
+    // NB: Every element goes through this step; one that had no animations and still has none has nothing to publish.
+    bool had_animations = impl.css_defined_animations[index] && !impl.css_defined_animations[index]->is_empty();
     impl.css_defined_animations[index] = make<Vector<GC::Ref<CSS::CSSAnimation>>>(move(animations));
+    if (had_animations || !impl.css_defined_animations[index]->is_empty())
+        publish_css_defined_animations(*this, index, *impl.css_defined_animations[index]);
 }
 
 Animatable::Impl& Animatable::ensure_impl() const

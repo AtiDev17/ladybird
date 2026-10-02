@@ -6,7 +6,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::rc::Rc;
+use std::sync::Arc;
 
 unsafe extern "C" {
     fn ladybird_gfx_font_snapshot(font: *const c_void, out_snapshot: *mut FfiFontSnapshot);
@@ -28,6 +28,7 @@ unsafe extern "C" {
     fn ladybird_gfx_font_unref(font: *const c_void);
     fn ladybird_gfx_font_cascade_list_ref(list: *const c_void);
     fn ladybird_gfx_font_cascade_list_unref(list: *const c_void);
+    fn ladybird_gfx_font_cascade_list_equals(list: *const c_void, other: *const c_void) -> bool;
     fn ladybird_gfx_emoji_presentation_for_code_point(
         code_point: u32,
         next_code_point: u32,
@@ -66,6 +67,17 @@ struct FontEntry {
     facts: FontFacts,
 }
 
+// SAFETY: Gfx::Font is atomically reference counted, and the retained reference this entry owns
+// keeps it live. Everything the entry answers with is fixed at construction: the snapshot it
+// copied, and the typeface tables the glyph queries read. The font's lazily filled members are
+// each internally synchronized - the HarfBuzz font behind `call_once`, the emoji verdict and the
+// hinting memo behind an atomic word. NB: none of this holds for `Gfx::FontCascadeList`,
+// which writes several unsynchronized caches from its `const` lookups; `FontCascadeListHandle`
+// below is deliberately neither `Send` nor `Sync`.
+unsafe impl Send for FontEntry {}
+// SAFETY: See the Send implementation above.
+unsafe impl Sync for FontEntry {}
+
 impl Drop for FontEntry {
     fn drop(&mut self) {
         // SAFETY: FontHandle::intern took the reference this releases.
@@ -74,7 +86,7 @@ impl Drop for FontEntry {
 }
 
 #[derive(Clone)]
-pub struct FontHandle(Rc<FontEntry>);
+pub struct FontHandle(Arc<FontEntry>);
 
 impl FontHandle {
     /// # Safety
@@ -89,7 +101,7 @@ impl FontHandle {
         // SAFETY: The caller guarantees the font is live; the reference taken
         // here keeps it that way until the entry drops.
         unsafe { ladybird_gfx_font_ref(raw.as_ptr()) };
-        Self(Rc::new(FontEntry {
+        Self(Arc::new(FontEntry {
             id: FontId(snapshot.id),
             raw,
             facts: FontFacts {
@@ -231,6 +243,18 @@ impl FontCascadeListHandle {
     #[inline]
     pub fn as_raw(&self) -> *const c_void {
         self.pointer
+    }
+
+    /// Whether both cascades resolve every code point to the same fonts. A cascade still waiting
+    /// on a face may resolve differently once it loads, so it equals no other, not even itself.
+    /// This is not `==`, which compares the lists' identities.
+    pub fn resolves_like(&self, other: &Self) -> bool {
+        assert!(
+            !self.pointer.is_null() && !other.pointer.is_null(),
+            "Gfx::FontCascadeList pointer must not be null"
+        );
+        // SAFETY: Both handles keep their lists live.
+        unsafe { ladybird_gfx_font_cascade_list_equals(self.pointer, other.pointer) }
     }
 
     pub fn font_for_code_point(

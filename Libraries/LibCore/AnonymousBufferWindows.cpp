@@ -70,12 +70,30 @@ ErrorOr<AnonymousBuffer> AnonymousBuffer::create_from_anon_fd(int fd, size_t siz
 
 ErrorOr<AnonymousBuffer> AnonymousBuffer::snapshot(Sealability sealability) const
 {
+    return snapshot(0, size(), sealability);
+}
+
+ErrorOr<AnonymousBuffer> AnonymousBuffer::snapshot(size_t offset, size_t size, Sealability sealability) const
+{
     if (!is_valid())
         return Error::from_string_literal("Cannot snapshot an invalid anonymous buffer");
 
-    auto copy = TRY(create_with_size(size(), sealability));
-    bytes().copy_to({ copy.data<u8>(), copy.size() });
+    if (offset > this->size() || size > this->size() - offset)
+        return Error::from_string_literal("Anonymous buffer snapshot range is out of bounds");
+
+    auto copy = TRY(create_with_size(size, sealability));
+    bytes().slice(offset, size).copy_to({ copy.data<u8>(), copy.size() });
     return copy;
+}
+
+ErrorOr<void> AnonymousBuffer::validate_backing_size() const
+{
+    if (!is_valid())
+        return Error::from_string_literal("Cannot validate the backing store of an invalid anonymous buffer");
+
+    // MapViewOfFile refuses a view that extends past the section, so the mapping AnonymousBufferImpl::create made
+    // already proved the section covers the size.
+    return {};
 }
 
 }

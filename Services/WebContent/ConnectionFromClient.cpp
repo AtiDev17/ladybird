@@ -1086,15 +1086,16 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
                 for (auto& child : node->children_as_vector())
                     nodes_to_visit.enqueue(child.ptr());
                 if (auto* element = as_if<Web::DOM::Element>(node)) {
-                    auto styles = doc->style_computer().materialize_style_record({ *element });
-                    dump_style(MUST(String::formatted("Element {}", node->debug_description())), *styles, element->custom_property_data({}));
+                    doc->update_style_for_element(Web::DOM::AbstractElement { *element });
+                    if (auto styles = element->computed_style())
+                        dump_style(MUST(String::formatted("Element {}", node->debug_description())), *styles, element->custom_property_data({}));
 
-                    element->for_each_synthetic_pseudo_element([&](Web::CSS::PseudoElement pseudo_element_type, Web::DOM::PseudoElement const& pseudo_element) {
+                    element->for_each_synthetic_pseudo_element([&](Web::CSS::PseudoElement pseudo_element_type, Web::DOM::PseudoElement const&) {
                         auto computed_values = element->computed_style(pseudo_element_type);
                         if (!computed_values)
                             return;
 
-                        dump_style(MUST(String::formatted("PseudoElement {}::{}", node->debug_description(), Web::CSS::pseudo_element_name(pseudo_element_type))), *computed_values, pseudo_element.custom_property_data());
+                        dump_style(MUST(String::formatted("PseudoElement {}::{}", node->debug_description(), Web::CSS::pseudo_element_name(pseudo_element_type))), *computed_values, element->custom_property_data(pseudo_element_type));
                     });
                 }
             }
@@ -3108,6 +3109,10 @@ void ConnectionFromClient::set_document_cookie_version_index(Web::PageId page_id
 void ConnectionFromClient::cookies_changed(Web::PageId page_id, Vector<HTTP::Cookie::Cookie> cookies)
 {
     if (auto page = this->page(page_id); page.has_value()) {
+        // Cookie notifications can arrive after a process switch has made this page's traversable remote.
+        if (!page->page().has_local_traversable())
+            return;
+
         auto window = page->page().local_traversable()->active_window();
         if (!window)
             return;

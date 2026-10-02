@@ -170,16 +170,21 @@ static Optional<Painting::CaretPosition> caret_position_from_editable_hit_node(D
         return {};
     }
 
-    auto* layout_node = boundary_node->unsafe_layout_node();
+    auto* arena = hit_node.document().layout_node_arena_if_created();
+    if (!arena)
+        return {};
+
+    auto boundary_identity = DOM::NodeIdentity::of(*boundary_node);
+    auto* layout_node = boundary_identity.bound_layout_node(*arena);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
-        layout_node = hit_node.unsafe_layout_node();
+        layout_node = DOM::NodeIdentity::of(hit_node).bound_layout_node(*arena);
     if (!layout_node || !Painting::has_committed_box(*layout_node))
         return {};
 
     return Painting::CaretPosition {
         .paintable = Painting::committed_row_slot(*layout_node),
-        .arena = layout_node->node_arena(),
-        .boundary = { *boundary_node, 0 },
+        .arena = *arena,
+        .boundary = { boundary_identity, 0 },
     };
 }
 
@@ -189,9 +194,10 @@ static bool should_use_caret_position_from_editable_hit_node(Optional<Painting::
         return true;
     if (!caret_position.has_value())
         return true;
-    if (!caret_position->boundary.node->is_inclusive_descendant_of(editing_host))
+    auto boundary_node = caret_position->boundary_node();
+    if (!boundary_node || !boundary_node->is_inclusive_descendant_of(editing_host))
         return true;
-    if (caret_position->boundary.node.ptr() == &editing_host && first_editable_leaf_descendant(editing_host))
+    if (boundary_node.ptr() == &editing_host && first_editable_leaf_descendant(editing_host))
         return true;
     return false;
 }
@@ -209,6 +215,14 @@ Layout::Node* EventHandler::Target::layout_node() const
     return Painting::layout_node_for_committed_slot(*arena, hit_node);
 }
 
+GC::Ptr<DOM::Node> EventHandler::Target::dom_node() const
+{
+    auto* document = arena->document();
+    if (!document)
+        return nullptr;
+    return node.resolve(*document);
+}
+
 void EventHandler::visit_edges(JS::Cell::Visitor& visitor) const
 {
     if (m_mouse_selection_target)
@@ -224,8 +238,11 @@ void EventHandler::visit_edges(JS::Cell::Visitor& visitor) const
 
 static CSS::UserSelect user_select_used_value_for_caret_position(Painting::CaretPosition const& caret_position)
 {
-    if (auto* layout_node = caret_position.boundary.node->layout_node())
+    if (auto* layout_node = caret_position.boundary_layout_node()) {
+        // NB: The position comes from a hit test on up to date layout, which nothing has changed since.
+        VERIFY(layout_node->document().layout_is_up_to_date());
         return layout_node->user_select_used_value();
+    }
     if (auto* layout_node = caret_position.layout_node())
         return layout_node->user_select_used_value();
     return CSS::UserSelect::Auto;
@@ -254,35 +271,49 @@ static Optional<EventResult> dispatch_event_to_nested_navigable(Layout::Node con
     return {};
 }
 
+// Whether the identity names an element. The document names itself rather than a style node, and a text node's style
+// node says so in its top bit. A row that has gone stale names nothing at all. A shadow root takes an element-kind
+// StyleNodeID too, but no row and no hit test result names one.
+static bool identity_names_element(DOM::NodeIdentity identity)
+{
+    auto style_node = identity.style_node();
+    return style_node != CSS::StyleNodeID {} && !CSS::style_node_is_text(style_node);
+}
+
 static bool parent_element_for_event_dispatch(Layout::Node& target_layout_node, GC::Ptr<DOM::Node>& node, Layout::Node*& layout_node)
 {
+    auto& arena = target_layout_node.node_arena();
+    auto identity = DOM::NodeIdentity::of(*node);
     layout_node = &target_layout_node;
     if (target_layout_node.is_generated_for_backdrop_pseudo_element()
         || target_layout_node.is_generated_for_after_pseudo_element()
         || target_layout_node.is_generated_for_before_pseudo_element()) {
-        node = target_layout_node.pseudo_element_generator();
-        if (auto* generator_layout_node = node->layout_node())
+        identity = target_layout_node.pseudo_element_generator_identity();
+        if (auto* generator_layout_node = identity.bound_layout_node(arena))
             layout_node = generator_layout_node;
     }
 
-    auto* current_ancestor_node = node.ptr();
-    do {
-        auto const* form_associated_element = as_if<HTML::FormAssociatedElement>(current_ancestor_node);
-        if (form_associated_element && !form_associated_element->enabled()) {
+    // An event aimed at a disabled form control is not dispatched, and neither is one aimed at
+    // anything under one.
+    // NB: The document outlives every live row of its arena.
+    VERIFY(arena.document());
+    auto& document = *arena.document();
+    for (auto ancestor = identity.resolve(document); ancestor; ancestor = ancestor->parent()) {
+        if (auto const* form_associated_element = as_if<HTML::FormAssociatedElement>(*ancestor); form_associated_element && !form_associated_element->enabled())
             return false;
-        }
-    } while ((current_ancestor_node = current_ancestor_node->parent()));
+    }
 
-    while (layout_node && node && !node->is_element()) {
-        auto* dom_node = layout_node->is_anonymous() ? nullptr : layout_node->dom_node();
-        if (dom_node && dom_node != node.ptr()) {
-            node = dom_node;
+    while (layout_node && identity && !identity_names_element(identity)) {
+        auto row_identity = layout_node->is_anonymous() ? DOM::NodeIdentity {} : layout_node->dom_node_identity();
+        if (row_identity && row_identity != identity) {
+            identity = row_identity;
             continue;
         }
         if (!layout_node->parent())
             break;
         layout_node = layout_node->parent();
     }
+    node = identity.resolve(document);
     return node && layout_node;
 }
 
@@ -452,10 +483,13 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
             auto layout_node_description = "(gone)"_string;
             if (auto const* layout_node = caret_position->layout_node())
                 layout_node_description = layout_node->debug_description();
+            auto boundary_description = "(gone)"_utf16;
+            if (auto boundary_node = caret_position->boundary_node())
+                boundary_description = boundary_node->debug_description();
             dbgln("Caret hit test: point=({}, {}) boundary=({}, {}) layout_node={} debug_rect={}",
                 visual_viewport_position.x(),
                 visual_viewport_position.y(),
-                caret_position->boundary.node->debug_description(),
+                boundary_description,
                 caret_position->boundary.offset,
                 layout_node_description,
                 caret_position->debug_rect);
@@ -2501,7 +2535,7 @@ Optional<EventHandler::Target> EventHandler::target_for_mouse_position(CSSPixelP
             .hit_node = result->hit_node,
             .arena = result->arena,
             .chrome_widget = result->chrome_widget,
-            .node = result->dom_node(),
+            .node = result->node,
             .index_in_node = result->index_in_node,
             .is_text_fragment = result->is_text_fragment,
         };
@@ -2716,7 +2750,11 @@ static bool form_control_selection_contains_position(InputEventsTarget& target, 
 
 static bool selection_contains_position(DOM::Document& document, Painting::CaretPosition const& caret_position)
 {
-    if (auto* target = document.active_input_events_target(&*caret_position.boundary.node)) {
+    auto boundary_node = caret_position.boundary_node();
+    if (!boundary_node)
+        return false;
+
+    if (auto* target = document.active_input_events_target(boundary_node.ptr())) {
         if (form_control_selection_contains_position(*target, caret_position))
             return true;
     }
@@ -2729,7 +2767,7 @@ static bool selection_contains_position(DOM::Document& document, Painting::Caret
     if (!range)
         return false;
 
-    auto contains_position = range->is_point_in_range(*caret_position.boundary.node, caret_position.boundary.offset);
+    auto contains_position = range->is_point_in_range(*boundary_node, caret_position.boundary.offset);
     if (contains_position.is_error())
         return false;
 
@@ -2795,8 +2833,12 @@ void EventHandler::finish_selection_from_preserved_mousedown(DOM::Document& docu
     if (!caret_position.has_value())
         return;
 
-    if (auto* target = document.active_input_events_target(&*caret_position->boundary.node)) {
-        target->set_selection_anchor(*caret_position->boundary.node, caret_position->boundary.offset, caret_position->affinity);
+    auto boundary_node = caret_position->boundary_node();
+    if (!boundary_node)
+        return;
+
+    if (auto* target = document.active_input_events_target(boundary_node.ptr())) {
+        target->set_selection_anchor(*boundary_node, caret_position->boundary.offset, caret_position->affinity);
     } else if (auto selection = document.get_selection()) {
         selection->remove_all_ranges();
         document.set_needs_repaint(Badge<EventHandler> {}, InvalidateDisplayList::PaintCommands);
@@ -2811,10 +2853,16 @@ void EventHandler::run_activation_behavior(GC::Ref<DOM::Node> node, unsigned but
         auto href = link->href();
 
         if (auto url = document->encoding_parse_url(href); url.has_value()) {
+            // The UI process opens the link in a new tab, but navigates to it from this document — as following it
+            // would, so the request carries the page's origin and referrer.
+            auto const& element = link->hyperlink_element_utils_element();
+            auto navigation = [&] {
+                return HTML::prepare_navigation_from_document(*document, url.release_value(), element.hyperlink_referrer_policy());
+            };
             if (button == UIEvents::MouseButton::Primary && (modifiers & UIEvents::Mod_PlatformCtrl) != 0) {
-                m_navigable->page().client().page_did_click_link(*url, link->target().to_byte_string(), modifiers);
+                m_navigable->page().client().page_did_click_link(navigation(), link->target().to_byte_string(), modifiers);
             } else if (button == UIEvents::MouseButton::Middle) {
-                m_navigable->page().client().page_did_middle_click_link(*url, link->target().to_byte_string(), modifiers);
+                m_navigable->page().client().page_did_middle_click_link(navigation(), link->target().to_byte_string(), modifiers);
             }
         }
     }
@@ -2873,8 +2921,10 @@ void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCo
         auto href = link->href();
         auto url = document->encoding_parse_url(href);
         if (url.has_value()) {
-            m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Link, .target = const_cast<DOM::Element&>(link->hyperlink_element_utils_element()) });
-            m_navigable->page().client().page_did_request_link_context_menu(local_root_id, page_viewport_position, *url, link->target().to_byte_string(), modifiers);
+            auto const& element = link->hyperlink_element_utils_element();
+            auto navigation = HTML::prepare_navigation_from_document(*document, url.release_value(), element.hyperlink_referrer_policy());
+            m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Link, .target = const_cast<DOM::Element&>(element) });
+            m_navigable->page().client().page_did_request_link_context_menu(local_root_id, page_viewport_position, move(navigation), link->target().to_byte_string(), modifiers);
         }
     } else {
         // AD-HOC: Skip up the tree to the first ancestor that is not a UA shadow DOM node, and use its context menu.
@@ -2896,8 +2946,9 @@ void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCo
                 if (auto frame = image_element.current_image_frame(); frame.has_value())
                     bitmap = &frame->bitmap();
 
+                auto navigation = HTML::prepare_navigation_from_document(image_element.document(), image_url.release_value(), ReferrerPolicy::ReferrerPolicy::EmptyString);
                 m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Image, .target = image_element });
-                m_navigable->page().client().page_did_request_image_context_menu(local_root_id, page_viewport_position, *image_url, "", modifiers, bitmap);
+                m_navigable->page().client().page_did_request_image_context_menu(local_root_id, page_viewport_position, move(navigation), "", modifiers, bitmap);
             }
         } else if (is<HTML::HTMLMediaElement>(*context_menu_node)) {
             auto& media_element = as<HTML::HTMLMediaElement>(*context_menu_node);
@@ -2913,8 +2964,9 @@ void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCo
                 .is_fullscreen = is_video && media_element.is_fullscreen_element(),
             };
 
+            auto navigation = HTML::prepare_navigation_from_document(media_element.document(), menu.media_url, ReferrerPolicy::ReferrerPolicy::EmptyString);
             m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Media, .target = media_element });
-            m_navigable->page().did_request_media_context_menu(media_element.unique_id(), local_root_id, page_viewport_position, "", modifiers, menu);
+            m_navigable->page().did_request_media_context_menu(media_element.unique_id(), local_root_id, page_viewport_position, "", modifiers, menu, move(navigation));
         } else {
             select_context_menu_text(document, coordinates.visual_viewport_position);
 
@@ -2937,30 +2989,32 @@ static bool is_middle_click_paste_target(DOM::Node const& node)
     }) != nullptr;
 }
 
-static DOM::BoundaryPoint choose_caret_boundary_for_selection_focus(Painting::CaretPosition const& caret_position, DOM::BoundaryPoint anchor)
+static Painting::BoundaryIdentity choose_caret_boundary_for_selection_focus(DOM::Document& document, Painting::CaretPosition const& caret_position, DOM::BoundaryPoint anchor)
 {
     // Atomic and replaced boxes expose both DOM edges as possible caret positions. When extending a selection,
     // use the edge that keeps the new focus on the side of the box away from the existing anchor.
     if (!caret_position.secondary_boundary.has_value())
         return caret_position.boundary;
 
-    auto primary_boundary = caret_position.boundary;
-    auto secondary_boundary = caret_position.secondary_boundary.value();
-    if (&anchor.node->shadow_including_root() != &primary_boundary.node->shadow_including_root()
-        || &anchor.node->shadow_including_root() != &secondary_boundary.node->shadow_including_root())
-        return primary_boundary;
+    auto primary_boundary = caret_position.boundary.resolve(document);
+    auto secondary_boundary = caret_position.secondary_boundary->resolve(document);
+    if (!primary_boundary.has_value() || !secondary_boundary.has_value())
+        return caret_position.boundary;
+    if (&anchor.node->shadow_including_root() != &primary_boundary->node->shadow_including_root()
+        || &anchor.node->shadow_including_root() != &secondary_boundary->node->shadow_including_root())
+        return caret_position.boundary;
 
-    auto anchor_to_primary = DOM::position_of_boundary_point_relative_to_other_boundary_point(anchor, primary_boundary);
-    auto anchor_to_secondary = DOM::position_of_boundary_point_relative_to_other_boundary_point(anchor, secondary_boundary);
-    auto primary_to_secondary = DOM::position_of_boundary_point_relative_to_other_boundary_point(primary_boundary, secondary_boundary);
+    auto anchor_to_primary = DOM::position_of_boundary_point_relative_to_other_boundary_point(anchor, *primary_boundary);
+    auto anchor_to_secondary = DOM::position_of_boundary_point_relative_to_other_boundary_point(anchor, *secondary_boundary);
+    auto primary_to_secondary = DOM::position_of_boundary_point_relative_to_other_boundary_point(*primary_boundary, *secondary_boundary);
 
     if (anchor_to_primary == DOM::RelativeBoundaryPointPosition::Before && anchor_to_secondary == DOM::RelativeBoundaryPointPosition::Before)
-        return primary_to_secondary == DOM::RelativeBoundaryPointPosition::Before ? secondary_boundary : primary_boundary;
+        return primary_to_secondary == DOM::RelativeBoundaryPointPosition::Before ? *caret_position.secondary_boundary : caret_position.boundary;
 
     if (anchor_to_primary == DOM::RelativeBoundaryPointPosition::After && anchor_to_secondary == DOM::RelativeBoundaryPointPosition::After)
-        return primary_to_secondary == DOM::RelativeBoundaryPointPosition::Before ? primary_boundary : secondary_boundary;
+        return primary_to_secondary == DOM::RelativeBoundaryPointPosition::Before ? caret_position.boundary : *caret_position.secondary_boundary;
 
-    return primary_boundary;
+    return caret_position.boundary;
 }
 
 bool EventHandler::maybe_request_paste_for_middle_click(DOM::Document& document, CSSPixelPoint visual_viewport_position)
@@ -2973,8 +3027,8 @@ bool EventHandler::maybe_request_paste_for_middle_click(DOM::Document& document,
     if (!caret_position.has_value())
         return false;
 
-    auto hit_node = caret_position->boundary.node;
-    if (!is_middle_click_paste_target(*hit_node))
+    auto hit_node = caret_position->boundary_node();
+    if (!hit_node || !is_middle_click_paste_target(*hit_node))
         return false;
 
     if (auto focus_candidate = focus_candidate_for_position(visual_viewport_position))
@@ -2982,7 +3036,7 @@ bool EventHandler::maybe_request_paste_for_middle_click(DOM::Document& document,
     else if (auto editing_host = hit_node->editing_host())
         HTML::run_focusing_steps(editing_host, nullptr, HTML::FocusTrigger::Click);
 
-    auto* target = document.active_input_events_target(&*hit_node);
+    auto* target = document.active_input_events_target(hit_node.ptr());
     if (!target)
         return false;
 
@@ -3132,10 +3186,12 @@ static void set_user_selection(GC::Ptr<DOM::Node> anchor_node, size_t anchor_off
 
 bool EventHandler::initiate_character_selection(DOM::Document& document, Painting::CaretPosition const& caret_position, CSS::UserSelect user_select, bool shift_held)
 {
-    auto hit_node = caret_position.boundary.node;
+    auto hit_node = caret_position.boundary_node();
+    if (!hit_node)
+        return false;
 
     size_t index = caret_position.boundary.offset;
-    if (InputEventsTarget* active_target = document.active_input_events_target(&*hit_node)) {
+    if (InputEventsTarget* active_target = document.active_input_events_target(hit_node.ptr())) {
         m_mouse_selection_target = active_target;
 
         if (shift_held)
@@ -3159,12 +3215,13 @@ bool EventHandler::initiate_character_selection(DOM::Document& document, Paintin
 
 bool EventHandler::initiate_word_selection(DOM::Document& document, Painting::CaretPosition const& caret_position, CSS::UserSelect user_select)
 {
-    if (!is<DOM::Text>(*caret_position.boundary.node))
+    auto* boundary_node = as_if<DOM::Text>(caret_position.boundary_node().ptr());
+    if (!boundary_node)
         return false;
 
-    auto& hit_node = as<DOM::Text>(*caret_position.boundary.node);
+    auto& hit_node = *boundary_node;
     auto hit_index = caret_position.boundary.offset;
-    auto const* hit_layout_text_node = as_if<Layout::TextNode>(hit_node.unsafe_layout_node());
+    auto const* hit_layout_text_node = as_if<Layout::TextNode>(caret_position.boundary_layout_node());
     if (!hit_layout_text_node)
         return false;
 
@@ -3235,10 +3292,11 @@ static GC::Ref<DOM::Range> find_paragraph_range(DOM::Text& text_node, WebIDL::Un
 
 bool EventHandler::initiate_paragraph_selection(DOM::Document& document, Painting::CaretPosition const& caret_position, CSS::UserSelect user_select)
 {
-    if (!is<DOM::Text>(*caret_position.boundary.node))
+    auto* boundary_node = as_if<DOM::Text>(caret_position.boundary_node().ptr());
+    if (!boundary_node)
         return false;
 
-    auto& hit_node = as<DOM::Text>(*caret_position.boundary.node);
+    auto& hit_node = *boundary_node;
     size_t hit_index = caret_position.boundary.offset;
 
     // For input/textarea elements, select the current line (delimited by newlines).
@@ -3281,7 +3339,11 @@ bool EventHandler::select_context_menu_text(DOM::Document& document, CSSPixelPoi
         if (!range)
             return false;
 
-        auto position = range->compare_point(caret_position.boundary.node, caret_position.boundary.offset);
+        auto boundary_node = caret_position.boundary_node();
+        if (!boundary_node)
+            return false;
+
+        auto position = range->compare_point(*boundary_node, caret_position.boundary.offset);
         if (position.is_error())
             return false;
 
@@ -3304,7 +3366,7 @@ bool EventHandler::select_context_menu_text(DOM::Document& document, CSSPixelPoi
 
 bool EventHandler::select_context_menu_url_token(DOM::Document& document, Painting::CaretPosition const& caret_position, CSS::UserSelect user_select)
 {
-    auto* hit_node = as_if<DOM::Text>(*caret_position.boundary.node);
+    auto* hit_node = as_if<DOM::Text>(caret_position.boundary_node().ptr());
     if (!hit_node)
         return false;
 
@@ -3394,16 +3456,19 @@ void EventHandler::apply_mouse_selection(CSSPixelPoint visual_viewport_position)
     Optional<size_t> anchor_offset;
 
     if (auto selection = document.get_selection(); selection && selection->anchor_node()) {
-        focus_boundary = choose_caret_boundary_for_selection_focus(*caret_position, { *selection->anchor_node(), selection->anchor_offset() });
+        focus_boundary = choose_caret_boundary_for_selection_focus(document, *caret_position, { *selection->anchor_node(), selection->anchor_offset() });
     }
 
-    GC::Ref<DOM::Node> focus_node = focus_boundary.node;
-    size_t focus_index = focus_boundary.offset;
+    auto focus_boundary_point = focus_boundary.resolve(document);
+    if (!focus_boundary_point.has_value())
+        return;
+
+    GC::Ref<DOM::Node> focus_node = focus_boundary_point->node;
+    size_t focus_index = focus_boundary_point->offset;
 
     // In word selection mode, extend selection by whole words.
     if (m_selection_mode == SelectionMode::Word && m_selection_origin && is<DOM::Text>(*focus_node)) {
-        auto& hit_text_node = as<DOM::Text>(*focus_node);
-        auto const* text_layout_node = as_if<Layout::TextNode>(hit_text_node.unsafe_layout_node());
+        auto const* text_layout_node = as_if<Layout::TextNode>(focus_boundary.node.bound_layout_node(*caret_position->arena));
         if (!text_layout_node)
             return;
         auto word_range = text_layout_node->word_range_at(focus_index);
@@ -3474,7 +3539,7 @@ void EventHandler::apply_mouse_selection(CSSPixelPoint visual_viewport_position)
         // The hit test affinity only applies when the focus is exactly the hit position; word and paragraph selection
         // modes override the focus with segment boundaries.
         auto focus_affinity = m_selection_mode == SelectionMode::Character
-                && focus_node == caret_position->boundary.node && focus_index == caret_position->boundary.offset
+                && focus_boundary.node == caret_position->boundary.node && focus_index == caret_position->boundary.offset
             ? caret_position->affinity
             : TextAffinity::Downstream;
         m_mouse_selection_target->set_selection_focus(*focus_node, focus_index, focus_affinity);

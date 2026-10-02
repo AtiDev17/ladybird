@@ -115,6 +115,8 @@ public:
     ComputedValuesFFI::AnimatedOverlay* prepare_animated_overlay_for_rust_finalization(Badge<StyleComputer>, CreateAnimatedOverlay);
     ComputedValuesFFI::AnimatedOverlay const* animated_overlay(Badge<StyleComputer>) const;
     void finish_animated_overlay_rust_mutation(Badge<StyleComputer>);
+    // Hold every value of `overlay` as the working set's animated values, as the computation that sampled them did.
+    void install_animated_overlay(Badge<StyleComputer>, ComputedValuesFFI::AnimatedOverlay const*);
     void did_apply_style_finalization_from_rust(u16 invalidated_longhands);
     bool requires_animated_post_compute_adjustments() const;
     void prepare_for_animated_post_compute_adjustments(Badge<StyleComputer>);
@@ -161,7 +163,10 @@ public:
     float stop_opacity() const;
     float flood_opacity() const;
 
-    ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> computed_font_list(FontComputer const&) const;
+    // The font list for text in the given tree scope, whose @font-feature-values font-variant-alternates reads.
+    ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> computed_font_list(FontComputer const&, TreeScopeID) const;
+    // The platform font and font facts the font group is built from. The font list it names stays cached here.
+    ComputedValuesFFI::FfiFontGroupBuildInputs font_group_build_inputs(DOM::Document const&, TreeScopeID) const;
     ValueComparingNonnullRefPtr<Gfx::Font const> first_available_computed_font(FontComputer const&) const;
 
     int math_depth() const;
@@ -232,6 +237,7 @@ private:
     OrderedHashMap<Utf16FlyString, NonnullRefPtr<StyleValue const>> m_animated_custom_properties;
 
     mutable RefPtr<Gfx::FontCascadeList const> m_cached_computed_font_list;
+    mutable TreeScopeID m_cached_computed_font_list_scope;
     mutable RefPtr<Gfx::Font const> m_cached_first_available_computed_font;
 };
 
@@ -274,6 +280,15 @@ NonnullRefPtr<StyleValue const> wrap_computed_longhand_slot(void const* value_da
 
 // https://drafts.csswg.org/css-inline-3/#valdef-line-height-normal
 [[nodiscard]] CSSPixels normal_line_height(Gfx::FontPixelMetrics const&);
+
+// The computed values the font resolver reads beside the family. The style engine resolves a font without a working
+// set to read them from, so each converter below is reachable on its own.
+[[nodiscard]] Optional<FontVariantAlternates> font_variant_alternates_from_style_value(StyleValue const&);
+[[nodiscard]] Optional<FontVariantEastAsian> font_variant_east_asian_from_style_value(StyleValue const&);
+[[nodiscard]] Optional<FontVariantLigatures> font_variant_ligatures_from_style_value(StyleValue const&);
+[[nodiscard]] Optional<FontVariantNumeric> font_variant_numeric_from_style_value(StyleValue const&);
+[[nodiscard]] HashMap<Utf16FlyString, u8> font_feature_settings_from_style_value(StyleValue const&);
+[[nodiscard]] HashMap<Utf16FlyString, double> font_variation_settings_from_style_value(StyleValue const&);
 
 // How many C++ longhand wrappers have been minted process-wide, counting the on-demand mints
 // property() performs and the specified-value wrappers the drive's side effects still need.

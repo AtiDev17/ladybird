@@ -915,14 +915,14 @@ void PageClient::page_did_unhover_link()
     client().async_did_unhover_link(m_id);
 }
 
-void PageClient::page_did_click_link(URL::URL const& url, ByteString const& target, unsigned modifiers)
+void PageClient::page_did_click_link(Web::HTML::PreparedNavigationDescriptor navigation, ByteString const& target, unsigned modifiers)
 {
-    client().async_did_click_link(m_id, url, target, modifiers);
+    client().async_did_click_link(m_id, move(navigation), target, modifiers);
 }
 
-void PageClient::page_did_middle_click_link(URL::URL const& url, ByteString const& target, unsigned modifiers)
+void PageClient::page_did_middle_click_link(Web::HTML::PreparedNavigationDescriptor navigation, ByteString const& target, unsigned modifiers)
 {
-    client().async_did_middle_click_link(m_id, url, target, modifiers);
+    client().async_did_middle_click_link(m_id, move(navigation), target, modifiers);
 }
 
 void PageClient::page_did_request_external_url(URL::URL const& url, URL::Origin const& initiator_origin, bool has_transient_activation)
@@ -1071,23 +1071,23 @@ void PageClient::page_did_request_context_menu(Web::HTML::CrossProcessId local_r
     client().async_did_request_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), for_input_events_target);
 }
 
-void PageClient::page_did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, URL::URL const& url, ByteString const& target, unsigned modifiers)
+void PageClient::page_did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString const& target, unsigned modifiers)
 {
-    client().async_did_request_link_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), url, target, modifiers);
+    client().async_did_request_link_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), move(navigation), target, modifiers);
 }
 
-void PageClient::page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, URL::URL const& url, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*> bitmap_pointer)
+void PageClient::page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*> bitmap_pointer)
 {
     Optional<Gfx::ShareableBitmap> bitmap;
     if (bitmap_pointer.has_value() && bitmap_pointer.value())
         bitmap = bitmap_pointer.value()->to_shareable_bitmap();
 
-    client().async_did_request_image_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), url, target, modifiers, bitmap);
+    client().async_did_request_image_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), move(navigation), target, modifiers, bitmap);
 }
 
-void PageClient::page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const& menu)
+void PageClient::page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const& menu, Web::HTML::PreparedNavigationDescriptor navigation)
 {
-    client().async_did_request_media_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), target, modifiers, menu);
+    client().async_did_request_media_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), target, modifiers, menu, move(navigation));
 }
 
 void PageClient::set_geolocation_emulated_position(WebView::GeolocationPositionData const& position, Optional<u16> error_code)
@@ -1627,6 +1627,13 @@ String PageClient::page_did_request_ui_process_session_history_for_testing()
     return "{}"_string;
 }
 
+bool PageClient::page_did_request_has_populated_document_for_testing(Web::HTML::CrossProcessId navigable_id)
+{
+    if (auto* test_connection = client().test_connection())
+        return test_connection->did_request_has_populated_document_for_testing(m_id, navigable_id);
+    return false;
+}
+
 String PageClient::dump_site_isolation_process_tree_for_testing()
 {
     if (auto* test_connection = client().test_connection())
@@ -1644,6 +1651,24 @@ void PageClient::page_did_spoof_document_origin_for_testing(Web::HTML::Environme
 {
     if (auto* test_connection = client().test_connection())
         test_connection->did_spoof_document_origin_for_testing(m_id, environment.id, origin);
+}
+
+void PageClient::stop_loading_through_ui_process_for_testing()
+{
+    if (auto* test_connection = client().test_connection())
+        test_connection->async_did_request_stop_loading_for_testing(m_id);
+}
+
+void PageClient::reload_through_ui_process_for_testing()
+{
+    if (auto* test_connection = client().test_connection())
+        test_connection->async_did_request_reload_for_testing(m_id);
+}
+
+void PageClient::traverse_history_by_delta_through_ui_process_for_testing(i32 delta)
+{
+    if (auto* test_connection = client().test_connection())
+        test_connection->async_did_request_traverse_history_by_delta_for_testing(m_id, delta);
 }
 
 void PageClient::send_bad_ipc_message_for_testing(StringView kind, URL::URL const& active_document_url)
@@ -1927,9 +1952,9 @@ void PageClient::page_did_start_network_request(u64 request_id, URL::URL const& 
     client().async_did_start_network_request(m_id, request_id, url, method, request_headers, request_body, move(initiator_type), referrer_policy, is_navigation_request, priority);
 }
 
-void PageClient::page_did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String> reason_phrase, Vector<HTTP::Header> const& response_headers, Requests::CameFromCache came_from_cache)
+void PageClient::page_did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String> reason_phrase, Vector<HTTP::Header> const& response_headers, Requests::CacheState cache_state)
 {
-    client().async_did_receive_network_response_headers(m_id, request_id, status_code, move(reason_phrase), response_headers, came_from_cache);
+    client().async_did_receive_network_response_headers(m_id, request_id, status_code, move(reason_phrase), response_headers, cache_state);
 }
 
 void PageClient::page_did_receive_network_response_body(u64 request_id, ReadonlyBytes data)
