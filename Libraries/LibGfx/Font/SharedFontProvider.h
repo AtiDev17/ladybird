@@ -10,6 +10,7 @@
 #include <AK/HashFunctions.h>
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
+#include <AK/Mutex.h>
 #include <AK/OwnPtr.h>
 #include <LibCore/MappedFile.h>
 #include <LibGfx/Font/FontCatalog.h>
@@ -38,6 +39,7 @@ struct BrokeredFont {
     Variant<Empty, BrokeredFontFile, SystemFontReference> source;
 };
 
+// Any thread may ask these. The provider asks one question at a time.
 struct SharedFontProviderCallbacks {
     Function<BrokeredFont(u64 generation, u64 face_id)> open_font;
     Function<BrokeredFont(String const& name)> match_local_font;
@@ -58,16 +60,12 @@ public:
     static ErrorOr<NonnullOwnPtr<SharedFontProvider>> create_empty(u64 generation, SharedFontProviderCallbacks&&);
     virtual ~SharedFontProvider() override;
 
-    ErrorOr<void> replace_catalog(NonnullOwnPtr<Core::MappedFile>, u64 generation);
-    ErrorOr<void> replace_catalog(IPC::File, u64 size, u64 generation);
-
     virtual RefPtr<Gfx::Font> get_font(FlyString const& family, float point_size, unsigned weight, unsigned width, unsigned slope, Optional<FontVariationSettings> const& = {}, Optional<Gfx::ShapeFeatures> const& = {}) override;
     virtual void for_each_typeface_with_family_name(FlyString const&, Function<void(Typeface const&)>) override;
     virtual RefPtr<Typeface> get_typeface_by_id(u64 generation, u64 face_id) override;
     virtual RefPtr<Typeface> get_typeface_by_local_name(String const&) override;
     virtual RefPtr<Gfx::Font> get_font_for_code_point(u32 code_point, float point_size, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) override;
     virtual Optional<FlyString> resolve_generic_family(StringView family_name, u16 weight, u8 slope) override;
-    virtual StringView name() const LIFETIME_BOUND override { return "Shared"sv; }
 
 private:
     struct CodePointCacheKey {
@@ -90,15 +88,20 @@ private:
 
     SharedFontProvider(NonnullOwnPtr<Core::MappedFile>, NonnullOwnPtr<FontCatalog>, SharedFontProviderCallbacks);
 
+    // NB: These run with m_mutex held.
     RefPtr<Typeface> load_catalog_face(FontCatalogFace const&);
     RefPtr<Typeface> load_brokered_font(BrokeredFont);
     RefPtr<Typeface> load_font_file(u64 face_id, u32 ttc_index, FontFileFormat, IPC::File);
     RefPtr<Typeface> load_font_reference(u64 face_id, SystemFontReference const&);
-    void clear_typeface_cache();
 
-    NonnullOwnPtr<Core::MappedFile> m_catalog_mapping;
-    NonnullOwnPtr<FontCatalog> m_catalog;
-    SharedFontProviderCallbacks m_callbacks;
+    NonnullOwnPtr<Core::MappedFile> const m_catalog_mapping;
+    NonnullOwnPtr<FontCatalog> const m_catalog;
+    SharedFontProviderCallbacks const m_callbacks;
+
+    // Guards everything below. A font cascade can be resolved off the document thread, and every resolution fills
+    // these caches on its way past. The lock is held across a round trip to the font service, so that one face is
+    // opened once however many threads want it.
+    Mutex m_mutex;
     PathFontProvider m_resource_fonts;
     HashMap<u64, NonnullRefPtr<Typeface>> m_typeface_cache;
     HashTable<u64> m_failed_face_ids;

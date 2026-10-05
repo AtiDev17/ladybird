@@ -16,6 +16,7 @@
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/WebSocket.h>
 #include <LibURL/Parser.h>
+#include <LibURL/Site.h>
 #include <LibWebSocket/ConnectionInfo.h>
 #include <LibWebSocket/Message.h>
 #include <RequestServer/AIA.h>
@@ -83,9 +84,10 @@ static auto time_curl_call(StringView label, F&& f)
 static constexpr i64 BURST_WINDOW_MS = 100;
 static constexpr u64 BURST_REPORT_THRESHOLD = 5;
 
-ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, IsPrivate is_private, ConnectionMap& connections, RequestTransferLeaseMap& request_transfer_leases, Optional<HTTP::DiskCache&> disk_cache, ByteString alt_svc_cache_path)
+ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, IsPrivate is_private, SiteBinding site_binding, ConnectionMap& connections, RequestTransferLeaseMap& request_transfer_leases, Optional<HTTP::DiskCache&> disk_cache, ByteString alt_svc_cache_path)
     : IPC::ConnectionFromClient<RequestClientEndpoint, RequestServerEndpoint>(*this, move(transport), s_client_ids.allocate())
     , m_is_private(is_private)
+    , m_site_binding(site_binding)
     , m_connections(connections)
     , m_request_transfer_leases(request_transfer_leases)
     , m_disk_cache(disk_cache)
@@ -187,6 +189,39 @@ void ConnectionFromClient::die()
         Core::EventLoop::current().quit(0);
 }
 
+void ConnectionFromClient::bind_to_site(Badge<ControlConnectionFromClient>, Utf16String const& top_level_site, Optional<Utf16String> const& frame_site)
+{
+    m_bound_top_level_sites.set(top_level_site);
+    if (frame_site.has_value())
+        m_bound_sites.set({ top_level_site, *frame_site });
+}
+
+// A bound client may use only the network isolation keys of the documents that the UI process has its process host, so a
+// compromised process cannot reach the cache entries of another site.
+bool ConnectionFromClient::may_use_network_isolation_key(HTTP::NetworkIsolationKey const& key, URL::URL const* request_url) const
+{
+    if (m_site_binding == SiteBinding::Unrestricted)
+        return true;
+
+    // FIXME: The process of the document that starts a navigation makes the navigation's requests, not the process that
+    //        will host the new document. Until the UI process makes navigation requests itself, a client may make a
+    //        request whose key is that of a navigation to the request's URL. Such keys only reach the partitions of
+    //        navigations, never the one a site's own documents use for their subresources.
+    if (request_url) {
+        auto url_site = URL::Site::serialize_for_partitioning(request_url->origin());
+        if (url_site.has_value() && key.frame_site == url_site) {
+            if (!key.is_subframe_document && key.is_cross_site_main_frame_navigation && key.top_level_site == *url_site)
+                return true;
+            if (key.is_subframe_document && m_bound_top_level_sites.contains(key.top_level_site))
+                return true;
+        }
+    }
+
+    if (!key.frame_site.has_value())
+        return m_bound_top_level_sites.contains(key.top_level_site);
+    return m_bound_sites.contains(BoundSite { key.top_level_site, *key.frame_site });
+}
+
 Messages::RequestServer::InitTransportResponse ConnectionFromClient::init_transport([[maybe_unused]] int peer_pid)
 {
 #ifdef AK_OS_WINDOWS
@@ -208,7 +243,7 @@ Messages::RequestServer::GetClientIdResponse ConnectionFromClient::get_client_id
     return client_id();
 }
 
-void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL::URL url, Vector<HTTP::Header> request_headers, ByteBuffer request_body, HTTP::CacheMode cache_mode, HTTP::Cookie::IncludeCredentials include_credentials, bool create_transfer_lease, Optional<u32> address_selection_hint, bool notify_on_cache_miss, i32 originating_process_id, u64 originating_page_id)
+void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL::URL url, Vector<HTTP::Header> request_headers, ByteBuffer request_body, HTTP::CacheMode cache_mode, Optional<HTTP::NetworkIsolationKey> network_isolation_key, HTTP::Cookie::IncludeCredentials include_credentials, bool create_transfer_lease, Optional<u32> address_selection_hint, bool notify_on_cache_miss, i32 originating_process_id, u64 originating_page_id)
 {
     note_event_tick("ipc-start-request"sv);
     dbgln_if(REQUESTSERVER_DEBUG, "RequestServer: start_request({}, {})", request_id, url);
@@ -216,6 +251,12 @@ void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL:
     Requests::RequestTransferLeaseKey lease_key { client_id(), request_id };
     if (m_active_requests.contains(request_id) || m_request_transfer_leases.contains(lease_key)) {
         did_misbehave("reused live request ID");
+        return;
+    }
+
+    if (network_isolation_key.has_value() && !may_use_network_isolation_key(*network_isolation_key, &url)) {
+        dbgln("RequestServer: Client {} is not bound to the network isolation key of its request for {}", client_id(), url);
+        async_request_finished(request_id, 0, {}, Requests::NetworkError::Unknown);
         return;
     }
 
@@ -236,7 +277,7 @@ void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL:
     auto transfer_lease = create_transfer_lease
         ? Optional<Requests::RequestTransferLeaseKey> { lease_key }
         : Optional<Requests::RequestTransferLeaseKey> {};
-    auto request = Request::fetch(request_id, m_disk_cache, cache_mode, *this, m_curl_multi, m_resolver, move(url), move(method), HTTP::HeaderList::create(move(request_headers)), move(request_body), include_credentials, m_alt_svc_cache_path, transfer_lease, address_selection_hint, notify_on_cache_miss);
+    auto request = Request::fetch(request_id, m_disk_cache, move(network_isolation_key), cache_mode, *this, m_curl_multi, m_resolver, move(url), move(method), HTTP::HeaderList::create(move(request_headers)), move(request_body), include_credentials, m_alt_svc_cache_path, transfer_lease, address_selection_hint, notify_on_cache_miss);
     request->set_performance_origin(originating_process_id, originating_page_id);
     m_active_requests.set(request_id, move(request));
 
@@ -318,14 +359,14 @@ void ConnectionFromClient::release_request_transfer_lease(int source_client_id, 
     }
 }
 
-void ConnectionFromClient::start_revalidation_request(Badge<Request>, ByteString method, URL::URL url, NonnullRefPtr<HTTP::HeaderList> request_headers, ByteBuffer request_body, HTTP::Cookie::IncludeCredentials include_credentials)
+void ConnectionFromClient::start_revalidation_request(Badge<Request>, HTTP::NetworkIsolationKey network_isolation_key, ByteString method, URL::URL url, NonnullRefPtr<HTTP::HeaderList> request_headers, ByteBuffer request_body, HTTP::Cookie::IncludeCredentials include_credentials)
 {
     note_event_tick("ipc-start-revalidation"sv);
     auto request_id = m_next_revalidation_request_id++;
 
     dbgln_if(REQUESTSERVER_DEBUG, "RequestServer: start_revalidation_request({}, {})", request_id, url);
 
-    auto request = Request::revalidate(request_id, m_disk_cache, *this, m_curl_multi, m_resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, m_alt_svc_cache_path);
+    auto request = Request::revalidate(request_id, m_disk_cache, move(network_isolation_key), *this, m_curl_multi, m_resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, m_alt_svc_cache_path);
     m_active_revalidation_requests.set(request_id, move(request));
 }
 
@@ -626,12 +667,16 @@ void ConnectionFromClient::ensure_connection(u64 request_id, URL::URL url, ::Req
     m_active_requests.set(request_id, move(request));
 }
 
-Messages::RequestServer::StoreCacheAssociatedDataResponse ConnectionFromClient::store_cache_associated_data(URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data, Core::AnonymousBuffer data)
+Messages::RequestServer::StoreCacheAssociatedDataResponse ConnectionFromClient::store_cache_associated_data(Optional<HTTP::NetworkIsolationKey> network_isolation_key, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data, Core::AnonymousBuffer data)
 {
-    if (!m_disk_cache.has_value() || !data.is_valid())
+    if (network_isolation_key.has_value() && !may_use_network_isolation_key(*network_isolation_key))
         return false;
 
-    auto result = m_disk_cache->store_associated_data(url, method, *HTTP::HeaderList::create(move(request_headers)), vary_key, associated_data, data.bytes());
+    auto partition = network_isolation_key.has_value() ? network_isolation_key->disk_cache_partition() : OptionalNone {};
+    if (!m_disk_cache.has_value() || !partition.has_value() || !data.is_valid())
+        return false;
+
+    auto result = m_disk_cache->store_associated_data(*partition, url, method, *HTTP::HeaderList::create(move(request_headers)), vary_key, associated_data, data.bytes());
     if (result.is_error()) {
         dbgln("Failed to store cache associated data for {}: {}", url, result.error());
         return false;
@@ -640,12 +685,16 @@ Messages::RequestServer::StoreCacheAssociatedDataResponse ConnectionFromClient::
     return result.value();
 }
 
-Messages::RequestServer::RetrieveCacheAssociatedDataResponse ConnectionFromClient::retrieve_cache_associated_data(URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data)
+Messages::RequestServer::RetrieveCacheAssociatedDataResponse ConnectionFromClient::retrieve_cache_associated_data(Optional<HTTP::NetworkIsolationKey> network_isolation_key, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data)
 {
-    if (!m_disk_cache.has_value())
+    if (network_isolation_key.has_value() && !may_use_network_isolation_key(*network_isolation_key))
         return Optional<Core::AnonymousBuffer> {};
 
-    auto data = m_disk_cache->retrieve_associated_data(url, method, *HTTP::HeaderList::create(move(request_headers)), vary_key, associated_data);
+    auto partition = network_isolation_key.has_value() ? network_isolation_key->disk_cache_partition() : OptionalNone {};
+    if (!m_disk_cache.has_value() || !partition.has_value())
+        return Optional<Core::AnonymousBuffer> {};
+
+    auto data = m_disk_cache->retrieve_associated_data(*partition, url, method, *HTTP::HeaderList::create(move(request_headers)), vary_key, associated_data);
     if (data.is_error()) {
         dbgln("Failed to retrieve cache associated data for {}: {}", url, data.error());
         return Optional<Core::AnonymousBuffer> {};
@@ -663,12 +712,16 @@ Messages::RequestServer::RetrieveCacheAssociatedDataResponse ConnectionFromClien
     return Optional<Core::AnonymousBuffer> { buffer.release_value() };
 }
 
-Messages::RequestServer::CreateSyntheticCacheEntryResponse ConnectionFromClient::create_synthetic_cache_entry(URL::URL url, ByteString method)
+Messages::RequestServer::CreateSyntheticCacheEntryResponse ConnectionFromClient::create_synthetic_cache_entry(Optional<HTTP::NetworkIsolationKey> network_isolation_key, URL::URL url, ByteString method)
 {
-    if (!m_disk_cache.has_value())
+    if (network_isolation_key.has_value() && !may_use_network_isolation_key(*network_isolation_key))
         return false;
 
-    auto result = m_disk_cache->create_synthetic_entry(url, method);
+    auto partition = network_isolation_key.has_value() ? network_isolation_key->disk_cache_partition() : OptionalNone {};
+    if (!m_disk_cache.has_value() || !partition.has_value())
+        return false;
+
+    auto result = m_disk_cache->create_synthetic_entry(*partition, url, method);
     if (result.is_error()) {
         dbgln("Failed to create synthetic cache entry for {}: {}", url, result.error());
         return false;
@@ -676,8 +729,14 @@ Messages::RequestServer::CreateSyntheticCacheEntryResponse ConnectionFromClient:
     return result.value();
 }
 
-void ConnectionFromClient::websocket_connect(u64 websocket_id, URL::URL url, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers)
+void ConnectionFromClient::websocket_connect(u64 websocket_id, URL::URL url, Optional<HTTP::NetworkIsolationKey> network_isolation_key, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers)
 {
+    if (network_isolation_key.has_value() && !may_use_network_isolation_key(*network_isolation_key)) {
+        dbgln("RequestServer: Client {} is not bound to the network isolation key of its WebSocket for {}", client_id(), url);
+        fail_websocket(websocket_id, Requests::WebSocket::Error::CouldNotEstablishConnection);
+        return;
+    }
+
     // The handshake carries the user's cookies for the URL, which we retrieve from the UI process ourselves. The client
     // does not get to choose them.
     additional_request_headers.remove_all_matching([](auto const& header) {
@@ -706,7 +765,10 @@ void ConnectionFromClient::websocket_connect(u64 websocket_id, URL::URL url, Byt
                                                       },
                                                   });
 
-    control_connection->async_retrieve_http_cookie(client_id(), websocket_id, RequestType::WebSocket, cookie_request_id, url);
+    Optional<HTTP::Cookie::PartitionContext> partition_context;
+    if (network_isolation_key.has_value())
+        partition_context = HTTP::Cookie::PartitionContext { network_isolation_key->top_level_site, network_isolation_key->has_cross_site_ancestor };
+    control_connection->async_retrieve_http_cookie(client_id(), websocket_id, RequestType::WebSocket, cookie_request_id, url, move(partition_context));
 }
 
 bool ConnectionFromClient::websocket_retrieved_http_cookie(Badge<ControlConnectionFromClient>, u64 websocket_id, u64 cookie_request_id, String cookie)

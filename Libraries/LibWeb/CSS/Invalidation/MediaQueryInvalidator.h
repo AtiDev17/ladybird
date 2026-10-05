@@ -6,11 +6,7 @@
 
 #pragma once
 
-namespace Web::DOM {
-
-class Document;
-
-}
+#include <LibWeb/Forward.h>
 
 namespace Web::CSS::Invalidation {
 

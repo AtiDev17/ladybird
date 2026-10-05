@@ -85,7 +85,7 @@ class WebContentView final
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    WebContentView(QWidget* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, Web::PageId page_index = 0, WebContentViewInitialState initial_state = {});
+    WebContentView(QWidget* window, Optional<WebView::CanonicalTraversable&> traversable = {}, WebContentViewInitialState initial_state = {});
     virtual ~WebContentView() override;
 
 #if !defined(LADYBIRD_QT_USE_RHI_WIDGET) && !defined(LADYBIRD_QT_USE_IOSURFACE_LAYER)
@@ -123,6 +123,8 @@ public:
     void prepare_for_window_move();
     void finish_window_move();
     void close_select_dropdown_after_crash();
+    // Offers the reports of earlier crashes on the crash screen, once this view is shown.
+    void show_earlier_crash_reports();
 
     enum class PaletteMode {
         Default,
@@ -131,8 +133,6 @@ public:
     void update_palette(PaletteMode = PaletteMode::Default);
     void update_palette(WebView::WebContentPage&, PaletteMode = PaletteMode::Default);
     Optional<QPixmap> tab_preview_pixmap(QSize const& maximum_size) const;
-
-    using ViewImplementation::client;
 
     QPoint map_point_to_global_position(Gfx::IntPoint) const;
 
@@ -188,7 +188,11 @@ private:
     void update_screen_rects(WebView::WebContentPage&);
 
     void set_crash_overlay_visible(bool);
-    void show_crash_report_review();
+    enum class CrashScreen : u8 {
+        ThisPage,
+        Earlier,
+    };
+    void show_crash_report_review(CrashScreen = CrashScreen::ThisPage);
 
     bool m_tooltip_override { false };
     Optional<ByteString> m_tooltip_text;
@@ -210,6 +214,7 @@ private:
     QShortcut* m_crash_overlay_reload_shortcut { nullptr };
     QWidget* m_crash_report_container { nullptr };
     CrashReportReviewWidget* m_crash_report_review { nullptr };
+    bool m_show_earlier_crash_reports_when_shown { false };
 
 #ifdef LADYBIRD_QT_USE_IOSURFACE_LAYER
     bool ensure_iosurface_layer_attached_to_native_view();

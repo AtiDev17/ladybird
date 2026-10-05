@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<style>
+    #target { display: list-item; }
+    #target::before { content: "before"; color: rgb(0, 128, 0); }
+    #target::marker { color: rgb(255, 0, 0); }
+    #target.changed::before { content: "changed"; }
+</style>
+<ul><li id="target" style="--width: 10cqw; width: var(--width)"></li></ul>
+<script>
+    test(() => {
+        // The element's pseudo-elements settle beside its own record, which substitutes a
+        // container unit and so stays out of every record cache.
+        const target = document.getElementById("target");
+        internals.updateStyle();
+        const start = internals.styleEngineCounters();
+        const startRecomputations = internals.getStyleInvalidationCounters().elementStyleRecomputations;
+        target.className = "changed";
+        internals.updateStyle();
+        const end = internals.styleEngineCounters();
+        println(`C++ recomputations: ${internals.getStyleInvalidationCounters().elementStyleRecomputations - startRecomputations}`);
+        const before = getComputedStyle(target, "::before");
+        println(`before: ${before.content} ${before.color}`);
+        println(`marker: ${getComputedStyle(target, "::marker").color}`);
+        println(`engine pseudo records: ${end.engineComputedPseudoRecords - start.engineComputedPseudoRecords}`);
+    });
+</script>

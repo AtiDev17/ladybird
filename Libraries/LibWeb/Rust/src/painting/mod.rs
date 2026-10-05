@@ -5,7 +5,7 @@
  */
 
 pub mod border_radii;
-mod caret;
+pub(crate) mod caret;
 pub(crate) mod chrome_geometry;
 pub(crate) mod client_rects;
 pub(crate) mod content_visibility;
@@ -23,14 +23,19 @@ pub(crate) mod intersection_observer;
 pub(crate) mod layer_image_paint_facts;
 pub mod layout_tree_dump;
 pub(crate) mod node_painting;
+pub(crate) mod paint_changes;
 pub(crate) mod paint_order;
 pub(crate) mod paint_order_plan;
+pub(crate) mod paint_passes;
+pub(crate) mod paint_read;
 pub mod paint_state;
 pub mod paintable_build;
 pub mod paintable_data;
 pub mod paintable_geometry;
 pub(crate) mod paintable_rows;
+pub(crate) mod published_frame;
 pub mod record;
+pub(crate) mod recording_slot;
 pub(crate) mod rect_to_viewport_transform;
 pub(crate) mod replaced_paint_facts;
 pub(crate) mod scroll_chain;

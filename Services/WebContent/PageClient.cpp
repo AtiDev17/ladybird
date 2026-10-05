@@ -1246,14 +1246,14 @@ void PageClient::page_did_receive_document_cookie_version_index(Web::UniqueNodeI
         document->set_cookie_version_index(document_index);
 }
 
-Vector<HTTP::Cookie::Cookie> PageClient::page_did_request_all_cookies_webdriver(URL::URL const& url)
+Vector<HTTP::Cookie::Cookie> PageClient::page_did_request_all_cookies_webdriver(URL::URL const& url, Optional<HTTP::Cookie::PartitionContext> const& partition_context)
 {
-    return client().did_request_all_cookies_webdriver(url);
+    return client().did_request_all_cookies_webdriver(url, partition_context);
 }
 
-Vector<HTTP::Cookie::Cookie> PageClient::page_did_request_all_cookies_cookiestore(URL::URL const& url)
+Vector<HTTP::Cookie::Cookie> PageClient::page_did_request_all_cookies_cookiestore(Web::HTML::EnvironmentId const& environment_id, URL::URL const& url)
 {
-    return client().did_request_all_cookies_cookiestore(m_id, url);
+    return client().did_request_all_cookies_cookiestore(m_id, environment_id, url);
 }
 
 Optional<HTTP::Cookie::Cookie> PageClient::page_did_request_named_cookie(URL::URL const& url, String const& name)
@@ -1261,9 +1261,9 @@ Optional<HTTP::Cookie::Cookie> PageClient::page_did_request_named_cookie(URL::UR
     return client().did_request_named_cookie(url, name);
 }
 
-HTTP::Cookie::VersionedCookie PageClient::page_did_request_cookie(URL::URL const& url, HTTP::Cookie::Source source)
+HTTP::Cookie::VersionedCookie PageClient::page_did_request_cookie(Optional<Web::HTML::EnvironmentId> const& environment_id, URL::URL const& url, HTTP::Cookie::Source source)
 {
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestCookie>(m_id, url, source);
+    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestCookie>(m_id, environment_id, url, source);
     if (!response) {
         dbgln("WebContent client disconnected during DidRequestCookie. Exiting peacefully.");
         Core::Process::terminate_immediately(0);
@@ -1271,9 +1271,9 @@ HTTP::Cookie::VersionedCookie PageClient::page_did_request_cookie(URL::URL const
     return response->take_cookie();
 }
 
-void PageClient::page_did_set_cookie(URL::URL const& url, HTTP::Cookie::ParsedCookie const& cookie, HTTP::Cookie::Source source)
+void PageClient::page_did_set_cookie(Optional<Web::HTML::EnvironmentId> const& environment_id, URL::URL const& url, HTTP::Cookie::ParsedCookie const& cookie, HTTP::Cookie::Source source)
 {
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidSetCookie>(m_id, url, cookie, source);
+    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidSetCookie>(m_id, environment_id, url, cookie, source);
     if (!response) {
         dbgln("WebContent client disconnected during DidSetCookie. Exiting peacefully.");
         Core::Process::terminate_immediately(0);
@@ -1674,7 +1674,7 @@ void PageClient::traverse_history_by_delta_through_ui_process_for_testing(i32 de
 void PageClient::send_bad_ipc_message_for_testing(StringView kind, URL::URL const& active_document_url)
 {
     if (kind == "cookie-request-unknown-page-id"sv)
-        (void)client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestCookie>(0, active_document_url, HTTP::Cookie::Source::NonHttp);
+        (void)client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestCookie>(0, OptionalNone {}, active_document_url, HTTP::Cookie::Source::NonHttp);
 }
 
 bool PageClient::page_did_request_capture_session_history_snapshot_for_testing()
@@ -1810,6 +1810,70 @@ void PageClient::page_did_change_audio_play_state(Web::HTML::AudioPlayState play
 void PageClient::page_did_change_screen_wake_lock_state(Web::ScreenWakeLockState wake_lock_state)
 {
     client().async_did_change_screen_wake_lock_state(m_id, wake_lock_state);
+}
+
+void PageClient::page_did_start_using_gamepads()
+{
+    client().notify_started_using_gamepads();
+}
+
+void PageClient::page_did_play_gamepad_effect(Web::Gamepad::GamepadHandle handle, Web::Gamepad::GamepadEffect const& effect)
+{
+    client().async_gamepad_play_effect(handle, effect);
+}
+
+void PageClient::page_did_request_stop_gamepad_effects(Web::Gamepad::GamepadHandle handle)
+{
+    client().async_gamepad_stop_effects(handle);
+}
+
+Optional<Web::Gamepad::VirtualGamepad> PageClient::create_virtual_gamepad()
+{
+    auto* test_connection = client().test_connection();
+    if (!test_connection)
+        return {};
+
+    auto response = test_connection->send_sync_but_allow_failure<Messages::WebContentTestClient::CreateVirtualGamepad>();
+    if (!response)
+        return {};
+    return response->take_virtual_gamepad();
+}
+
+void PageClient::set_virtual_gamepad_button(Web::Gamepad::GamepadHandle handle, i32 button, bool down)
+{
+    if (auto* test_connection = client().test_connection())
+        test_connection->async_set_virtual_gamepad_button(handle, button, down);
+}
+
+void PageClient::set_virtual_gamepad_axis(Web::Gamepad::GamepadHandle handle, i32 axis, i16 value)
+{
+    if (auto* test_connection = client().test_connection())
+        test_connection->async_set_virtual_gamepad_axis(handle, axis, value);
+}
+
+void PageClient::disconnect_virtual_gamepad(Web::Gamepad::GamepadHandle handle)
+{
+    if (!client().is_open())
+        return;
+    if (auto* test_connection = client().test_connection(); test_connection && test_connection->is_open())
+        test_connection->async_disconnect_virtual_gamepad(handle);
+}
+
+Web::Gamepad::ReceivedRumbleEffects PageClient::virtual_gamepad_received_rumble_effects(Web::Gamepad::GamepadHandle handle)
+{
+    auto* test_connection = client().test_connection();
+    if (!test_connection)
+        return {};
+
+    auto response = test_connection->send_sync_but_allow_failure<Messages::WebContentTestClient::GetVirtualGamepadReceivedRumbleEffects>(handle);
+    if (!response)
+        return {};
+    return { response->take_dual_rumble_effects(), response->take_trigger_rumble_effects() };
+}
+
+void PageClient::pump_gamepad_events()
+{
+    client().pump_and_dispatch_gamepad_events();
 }
 
 Web::HTML::WorkerAgentId PageClient::start_worker_agent(Web::HTML::WorkerAgentStartRequest&& request)

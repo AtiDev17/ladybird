@@ -20,6 +20,7 @@
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Export.h>
+#include <LibWebView/RequestServerSiteBindings.h>
 #include <WebWorker/WebWorkerClientEndpoint.h>
 #include <WebWorker/WebWorkerServerEndpoint.h>
 
@@ -38,6 +39,7 @@ public:
 
     RefPtr<BrowsingSession> session() const { return m_session.strong_ref(); }
     IsPrivate is_private() const { return m_is_private; }
+    RequestServerSiteBindings& request_server_site_bindings() { return m_request_server_site_bindings; }
     void remove_blob_url_entries();
 
     pid_t pid() const { return m_pid; }
@@ -59,10 +61,6 @@ public:
     virtual void did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage) override;
     virtual Messages::WebWorkerClient::StartWorkerAgentResponse start_worker_agent(Web::HTML::WorkerAgentStartRequest request) override;
     virtual void close_worker_agent(Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken) override;
-    virtual Messages::WebWorkerClient::OpenSystemFontResponse open_system_font(u64 generation, u64 face_id) override;
-    virtual Messages::WebWorkerClient::MatchSystemFontResponse match_system_font(String family, u16 weight, u16 width, u8 slope) override;
-    virtual Messages::WebWorkerClient::MatchSystemFontForCodePointResponse match_system_font_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) override;
-    virtual Messages::WebWorkerClient::ResolveGenericFontResponse resolve_generic_font(String family, u16 weight, u8 slope) override;
 
 private:
     virtual void did_misbehave(StringView message_name, StringView reason) override;
@@ -71,6 +69,7 @@ private:
 
     IsPrivate m_is_private { IsPrivate::No };
     WeakPtr<BrowsingSession> m_session;
+    RequestServerSiteBindings m_request_server_site_bindings;
 
     pid_t m_pid { -1 };
     Web::HTML::WorkerAgentId m_agent_id { 0 };

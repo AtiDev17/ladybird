@@ -8,7 +8,6 @@ use crate::painting::record::trace::Observer;
 
 use super::{PaintPhase, PaintRecorder};
 use crate::css::style::fast_hash::FastSet;
-use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::layout::node_facts;
 use crate::painting::display_list::commands::ContextRef;
@@ -17,6 +16,7 @@ use crate::painting::display_list::recorder::DisplayListRecorder;
 use crate::painting::hit_test::HitTestList;
 use crate::painting::node_painting;
 use crate::painting::paint_order_plan::PaintScope;
+use crate::painting::paint_read::{GeometryRead, PaintSource};
 use crate::painting::record::RecordingInputs;
 use crate::painting::record::assemble::{Assembler, frame_is_unchanged};
 use crate::painting::record::frame_inputs::FrameInputs;
@@ -31,30 +31,26 @@ use std::sync::Arc;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_display_list(
-    layout_arena: &LayoutNodeArena,
-    paint_state: &crate::painting::paint_state::PaintState,
+    source: &PaintSource<'_>,
     scratch: &mut RecordingScratch,
     tree: &mut PaintOrderTree,
     viewport: NodeSlotId,
-    inputs: &RecordingInputs<'_>,
-    hit_test_list_generation: u64,
-    source_frame: Option<Arc<RecordingOutput>>,
+    inputs: &RecordingInputs,
+    source_recording: Option<Arc<RecordingOutput>>,
     source_items: Option<Arc<PublishedHitTestItems>>,
     plan_from_prepared_inputs: bool,
     trace: bool,
 ) -> RecordingResult {
-    scratch.begin_recording(layout_arena.paintable_row_count());
+    scratch.begin_recording(source.frame().paintable_row_capacity());
     macro_rules! record {
         ($observer:ty) => {
             record_display_list_impl::<$observer>(
-                layout_arena,
-                paint_state,
+                source,
                 scratch,
                 tree,
                 viewport,
                 inputs,
-                hit_test_list_generation,
-                source_frame,
+                source_recording,
                 source_items,
                 plan_from_prepared_inputs,
             )
@@ -71,52 +67,50 @@ pub(crate) fn record_display_list(
 
 #[allow(clippy::too_many_arguments)]
 fn record_display_list_impl<O: Observer>(
-    layout_arena: &LayoutNodeArena,
-    paint_state: &crate::painting::paint_state::PaintState,
+    source: &PaintSource<'_>,
     scratch: &mut RecordingScratch,
     tree: &mut PaintOrderTree,
     viewport: NodeSlotId,
-    inputs: &RecordingInputs<'_>,
-    hit_test_list_generation: u64,
-    source_frame: Option<Arc<RecordingOutput>>,
+    inputs: &RecordingInputs,
+    source_recording: Option<Arc<RecordingOutput>>,
     source_items: Option<Arc<PublishedHitTestItems>>,
     plan_from_prepared_inputs: bool,
 ) -> RecordingResult {
     debug_assert!(
-        inputs.publishes_recording || source_frame.is_none(),
-        "a recording that publishes nothing has no published frame to copy from"
+        inputs.publishes_recording || source_recording.is_none(),
+        "a recording that publishes nothing has no published recording to copy from"
     );
-    let structural_epoch = paint_state.visual_context.structural_epoch();
-    let paintable_rows = layout_arena.paintable_rows();
+    let paint_state = source.frame().paint_state();
+    let structural_epoch = paint_state.structural_epoch();
     let frame_inputs = FrameInputs::from_recording_inputs(inputs, paint_state);
     let root_background_canvas_rect = root_background_canvas_rect(
-        &paintable_rows,
+        source,
         inputs.uncaptured.root_background_source.root_layout_node,
         inputs.css_viewport_rect,
     );
-    // The published frame is copied from while every input its producers read is unchanged and
+    // The published recording is copied from while every input its producers read is unchanged and
     // no push asked for everything; otherwise this frame records from scratch.
-    let source_is_usable = source_frame
+    let source_is_usable = source_recording
         .as_ref()
         .is_some_and(|frame| frame.frame_inputs == frame_inputs)
         && source_items.is_some()
-        && !layout_arena.paint_damage_covers_everything()
-        && !layout_arena.scroll_metadata_damaged_everywhere();
-    let (source_frame, source_items) = if source_is_usable {
-        (source_frame, source_items)
+        && !source.frame().damage().covers_everything()
+        && !source.frame().damage().scroll_metadata_everywhere();
+    let (source_recording, source_items) = if source_is_usable {
+        (source_recording, source_items)
     } else {
         (None, None)
     };
     let force_dark_settings = inputs.force_dark_enabled.then_some(inputs.force_dark_settings);
     let mut recorder = PaintRecorder {
-        layout_arena: &paintable_rows,
+        source,
         paint_state,
         inputs,
         recorder: DisplayListRecorder::new(force_dark_settings),
         converter: DevicePixelConverter::new(inputs.device_pixels_per_css_pixel),
         svg_resource_walk: None,
         viewport,
-        source_frame,
+        source_recording,
         source_items,
         live_producer: false,
         plan_from_prepared_inputs,
@@ -124,11 +118,7 @@ fn record_display_list_impl<O: Observer>(
         blocking_wheel_event_region_count: 0,
         observer: O::default(),
         list: HitTestList {
-            item_capacity_hint_from_previous_list: layout_arena
-                .hit_test_list
-                .borrow()
-                .as_ref()
-                .map_or(0, |list| list.items.len()),
+            item_capacity_hint_from_previous_list: paint_state.hit_test_item_capacity_hint,
             ..HitTestList::default()
         },
         scratch,
@@ -136,7 +126,7 @@ fn record_display_list_impl<O: Observer>(
     };
     recorder
         .observer
-        .observe(|log| log.damage = Some(layout_arena.paint_damage_summary()));
+        .observe(|log| log.damage = Some(source.frame().damage().summary()));
     recorder.record_canvas();
     let prologue_bytes = u32::try_from(recorder.recorder.byte_size()).expect("display list exceeds u32");
     let has_inspector_overlays = inputs.inspector_highlight.is_some()
@@ -147,11 +137,11 @@ fn record_display_list_impl<O: Observer>(
     // Nothing was pushed and nothing records every frame: the published tape and items are
     // this frame, which lets the compositor skip its update as well.
     let unchanged_frame = recorder
-        .source_frame
+        .source_recording
         .as_ref()
         .zip(recorder.source_items.as_ref())
         .filter(|(frame, _)| {
-            frame_is_unchanged(tree, layout_arena.has_paint_damage())
+            frame_is_unchanged(tree, !source.frame().damage().is_empty())
                 && !has_inspector_overlays
                 && frame.prologue_bytes == prologue_bytes
                 && recorder.recorder.bytes() == &frame.display_list.bytes[..prologue_bytes as usize]
@@ -167,7 +157,7 @@ fn record_display_list_impl<O: Observer>(
             display_list
         }
         None => {
-            let source_prologue_bytes = recorder.source_frame.as_ref().map(|frame| frame.prologue_bytes);
+            let source_prologue_bytes = recorder.source_recording.as_ref().map(|frame| frame.prologue_bytes);
             Assembler::new(&mut recorder, tree, source_prologue_bytes).assemble_root(root_scope);
             if has_inspector_overlays {
                 recorder.trace_paint(
@@ -179,7 +169,7 @@ fn record_display_list_impl<O: Observer>(
         }
     };
     let mut hit_test_list = recorder.list;
-    hit_test_list.generation = hit_test_list_generation;
+    hit_test_list.generation = paint_state.hit_test_list_generation + 1;
     let output = RecordingOutput {
         recorded_structural_epoch: structural_epoch,
         frame_inputs,
@@ -189,7 +179,7 @@ fn record_display_list_impl<O: Observer>(
         display_list,
         has_blocking_wheel_event_listeners: recorder.blocking_wheel_event_region_count > 0,
         wheel_event_listener_state_generation: inputs.wheel_event_listener_state_generation,
-        is_identical_to_published_frame: false,
+        is_identical_to_published_recording: false,
         capture_log_for_verification: recorder.observer.finish(),
     };
     RecordingResult {
@@ -221,7 +211,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
 
         // For elements with SVG filters, emit a transparent FillRect to trigger filter application.
         // This ensures content-generating filters (feFlood, feImage) work even with empty source.
-        if let Some(svg_filter_bounds) = self.layout_arena.paintable_side_data(svg_box).svg_filter_bounds.get() {
+        if let Some(svg_filter_bounds) = self.source.committed_side_data(svg_box).svg_filter_bounds {
             let device_rect = self
                 .converter
                 .enclosing_device_rect(crate::css::css_pixels::CssPixelRect::from(svg_filter_bounds));
@@ -262,9 +252,9 @@ impl<O: Observer> PaintRecorder<'_, O> {
         if phase != PaintPhase::Foreground {
             return;
         }
-        let mut next_child = crate::painting::paint_order::first_paint_child(self.layout_arena, paintable);
+        let mut next_child = crate::painting::paint_order::first_paint_child(self.source, paintable);
         while let Some(child) = next_child {
-            next_child = crate::painting::paint_order::next_paint_sibling(self.layout_arena, child);
+            next_child = crate::painting::paint_order::next_paint_sibling(self.source, child);
             // A child that establishes a stacking context is painted by that context.
             if self.has_stacking_context(child) {
                 continue;
@@ -283,8 +273,8 @@ impl<O: Observer> PaintRecorder<'_, O> {
     pub(crate) fn context_for_phase(&self, paintable: NodeSlotId, phase: PaintPhase) -> ContextRef {
         // Text fragments are content of the block container (or of a self-painting inline box).
         // They need the descendants' visual context, not the element's own visual context.
-        let foreground_paints_descendant_content = node_painting::has_lines(self.layout_arena, paintable)
-            || node_painting::is_inline(self.layout_arena, paintable);
+        let foreground_paints_descendant_content =
+            node_painting::has_lines(self.source, paintable) || node_painting::is_inline(self.source, paintable);
         if foreground_paints_descendant_content && phase == PaintPhase::Foreground {
             self.for_descendants_context(paintable)
         } else {

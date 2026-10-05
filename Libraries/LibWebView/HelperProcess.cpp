@@ -15,6 +15,7 @@
 #include <LibWebView/Application.h>
 #include <LibWebView/CompositorClient.h>
 #include <LibWebView/FontService.h>
+#include <LibWebView/FontServiceHost.h>
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/Utilities.h>
 
@@ -287,6 +288,16 @@ static ErrorOr<NonnullRefPtr<ClientType>> launch_server_process(
     VERIFY_NOT_REACHED();
 }
 
+// Gives a new process its one connection to the font service. This is the first message it gets, so that every font
+// question it asks, from any thread, can go out on that connection.
+template<typename ClientType>
+static ErrorOr<void> connect_to_font_service(ClientType& client)
+{
+    auto font_catalog = TRY(Application::font_service().clone_catalog());
+    client.async_set_font_service(TRY(Application::font_service_host().connect()), move(font_catalog.file), font_catalog.size, font_catalog.generation);
+    return {};
+}
+
 ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsPrivate is_private, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id)
 {
     auto const& browser_options = WebView::Application::browser_options();
@@ -297,10 +308,6 @@ ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsP
     if (browser_options.headless_mode.has_value())
         arguments.append("--headless"sv);
 
-    if (web_content_options.cache_path.has_value()) {
-        arguments.append("--cache-path"sv);
-        arguments.append(web_content_options.cache_path.value());
-    }
     if (web_content_options.is_test_mode == WebView::IsTestMode::Yes)
         arguments.append("--test-mode"sv);
     if (web_content_options.log_all_js_exceptions == WebView::LogAllJSExceptions::Yes)
@@ -337,6 +344,7 @@ ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsP
     }
 
     auto client = TRY(launch_server_process<WebView::WebContentClient>("WebContent"sv, move(arguments), is_private, initial_page_id, root_navigable_id));
+    TRY(connect_to_font_service(*client));
 
     // The test-only messages live on their own endpoint pair, over a transport that only exists in test mode.
     if (web_content_options.is_test_mode == WebView::IsTestMode::Yes) {
@@ -345,8 +353,6 @@ ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsP
         client->connect_test_endpoint(move(test_transport.local));
     }
 
-    auto font_catalog = TRY(WebView::Application::font_service().clone_catalog());
-    client->async_set_font_catalog(move(font_catalog.file), font_catalog.size, font_catalog.generation);
     if (auto system_font_family = WebView::Application::the().system_font_family(); system_font_family.has_value())
         client->async_set_system_font_family(system_font_family.release_value());
     return client;
@@ -426,8 +432,7 @@ ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process()
     }
 
     auto client = TRY(launch_server_process<WebView::CompositorClient>("Compositor"sv, move(arguments)));
-    auto font_catalog = TRY(WebView::Application::font_service().clone_catalog());
-    client->async_set_font_catalog(move(font_catalog.file), font_catalog.size, font_catalog.generation);
+    TRY(connect_to_font_service(*client));
     return client;
 }
 
@@ -437,11 +442,6 @@ ErrorOr<NonnullRefPtr<WebWorkerClient>> launch_web_worker_process(Web::HTML::Age
     auto const& web_content_options = WebView::Application::web_content_options();
 
     Vector<ByteString> arguments;
-
-    if (web_content_options.cache_path.has_value()) {
-        arguments.append("--cache-path"sv);
-        arguments.append(web_content_options.cache_path.value());
-    }
 
     if (browser_options.disable_sandbox == DisableSandbox::Yes)
         arguments.append("--disable-sandbox"sv);
@@ -475,8 +475,7 @@ ErrorOr<NonnullRefPtr<WebWorkerClient>> launch_web_worker_process(Web::HTML::Age
     }
 
     auto client = TRY(launch_server_process<WebWorkerClient>("WebWorker"sv, move(arguments), is_private, agent_id));
-    auto font_catalog = TRY(WebView::Application::font_service().clone_catalog());
-    client->async_set_font_catalog(move(font_catalog.file), font_catalog.size, font_catalog.generation);
+    TRY(connect_to_font_service(*client));
     if (auto system_font_family = WebView::Application::the().system_font_family(); system_font_family.has_value())
         client->async_set_system_font_family(system_font_family.release_value());
     return client;
@@ -538,13 +537,13 @@ ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_pro
     return client;
 }
 
-ErrorOr<IPC::TransportHandle> connect_new_request_server_client(BrowsingSession& session)
+ErrorOr<RequestServerClientConnection> connect_new_request_server_client(BrowsingSession& session, RequestServer::SiteBinding site_binding)
 {
-    auto response = Application::request_server_control_client().send_sync_but_allow_failure<Messages::RequestServerControl::ConnectNewClient>(session.is_private() == IsPrivate::Yes ? RequestServer::IsPrivate::Yes : RequestServer::IsPrivate::No);
+    auto response = Application::request_server_control_client().send_sync_but_allow_failure<Messages::RequestServerControl::ConnectNewClient>(session.is_private() == IsPrivate::Yes ? RequestServer::IsPrivate::Yes : RequestServer::IsPrivate::No, site_binding);
     if (!response || response->client_id() < 0)
         return Error::from_string_literal("Failed to connect to RequestServer");
-    Application::the().did_connect_request_server_client(response->client_id(), session);
-    return response->take_handle();
+    Application::the().did_connect_request_server_client(response->client_id(), session, site_binding);
+    return RequestServerClientConnection { .handle = response->take_handle(), .client_id = response->client_id() };
 }
 
 ErrorOr<IPC::TransportHandle> connect_new_image_decoder_client()
@@ -561,12 +560,8 @@ ErrorOr<IPC::TransportHandle> connect_new_image_decoder_client()
 
 ErrorOr<IPC::TransportHandle> connect_new_media_server_client(RefPtr<MediaClient::Client>& controller)
 {
-    if (!controller) {
+    if (!controller || !controller->is_open())
         controller = TRY(launch_media_server_process());
-        controller->on_death = [&controller] {
-            controller = nullptr;
-        };
-    }
 
     auto response = controller->send_sync_but_allow_failure<Messages::MediaServer::ConnectNewClient>();
     if (!response || !response->handle().has_value())

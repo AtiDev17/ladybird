@@ -9,7 +9,7 @@
 
 use super::bridge::element_adjustment_fact;
 use super::publication::drive_font_metric;
-use super::tree::StyleNodeID;
+use super::tree::{StyleNodeID, TreeScopeID};
 use super::{RetainedState, bridge};
 use crate::css::animated_overlay::AnimatedOverlay;
 use crate::css::color_resolution::{ColorResolutionInput, FfiColorResolutionInput, Rgba, to_color};
@@ -181,9 +181,9 @@ impl RetainedState {
     /// `payloads` and answers which ones it rebuilt, each of which the caller owns a reference to,
     /// or `None` where the engine holds no such record.
     ///
-    /// `font` supplies the platform font of the animated style, which only the host resolves,
-    /// where the font group is rebuilt. The overlay is adjusted already, as the sample's animated
-    /// box-type finalization leaves it.
+    /// `font` is the platform font of the animated style, which only the host resolves, and which
+    /// a rebuilt font group needs: without it, such a build answers `Err` and rebuilds nothing. The
+    /// overlay is adjusted already, as the sample's animated box-type finalization leaves it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_animation_overlay_payloads(
         &self,
@@ -194,18 +194,18 @@ impl RetainedState {
         overlay: Option<&AnimatedOverlay>,
         used_color_scheme: u8,
         display_before_box_type_transformation_raw: u32,
-        font: impl FnOnce() -> FfiFontGroupBuildInputs,
+        font: Option<&FfiFontGroupBuildInputs>,
         payloads: &mut [*const std::ffi::c_void; group_index::COUNT],
-    ) -> Option<RebuiltOverlayGroups> {
+    ) -> Option<Result<RebuiltOverlayGroups, NeedsHostFont>> {
         let view = self.computed_group_sets.style_record_view(style_record)?;
         payloads.copy_from_slice(SharedPayload::as_pointer_slice(view.base_payloads));
         // An overlay that animates nothing leaves the base as it is: publishing it releases the
         // element's overlay record.
         let Some(overlay) = overlay.filter(|overlay| !overlay.is_empty()) else {
-            return Some(RebuiltOverlayGroups {
+            return Some(Ok(RebuiltOverlayGroups {
                 groups: 0,
                 every_group: true,
-            });
+            }));
         };
         // A value no group is known to hold, or an animated `color` whose readers the engine cannot
         // name, rebuilds every group.
@@ -228,8 +228,12 @@ impl RetainedState {
         // Colors resolve against the element's font as it stood when the overlay was last
         // published, or against the animated font where the overlay rebuilds the font group.
         let record = self.record_font(style_record)?;
-        let font_inputs = (groups & (1 << STYLE_GROUP_INDEX_FONT) != 0).then(font);
-        let own_font = match &font_inputs {
+        let rebuilds_font = groups & (1 << STYLE_GROUP_INDEX_FONT) != 0;
+        if rebuilds_font && font.is_none() {
+            return Some(Err(NeedsHostFont));
+        }
+        let font_inputs = font.filter(|_| rebuilds_font);
+        let own_font = match font_inputs {
             Some(font) => FfiFontMetrics {
                 font_size: CssPixels::from_raw(font.font_size_raw).to_double(),
                 x_height: drive_font_metric(font.font_x_height),
@@ -279,7 +283,7 @@ impl RetainedState {
             used_color_scheme,
             animated_overlay: overlay,
             box_display_before_transformation_raw: display_before_box_type_transformation_raw,
-            font: font_inputs.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+            font: font_inputs.map_or(std::ptr::null(), std::ptr::from_ref),
         };
         let parents = [std::ptr::null(); group_index::COUNT];
         let mut rebuilt = [std::ptr::null(); group_index::COUNT];
@@ -300,12 +304,15 @@ impl RetainedState {
                 rebuilt_groups |= 1 << group;
             }
         }
-        Some(RebuiltOverlayGroups {
+        Some(Ok(RebuiltOverlayGroups {
             groups: rebuilt_groups,
             every_group: rebuilds_every_group,
-        })
+        }))
     }
 }
+
+/// A build of overlay payloads that rebuilds the font group, asked without the host's font.
+pub(crate) struct NeedsHostFont;
 
 /// The groups `build_animation_overlay_payloads` rebuilt over the base record.
 pub(crate) struct RebuiltOverlayGroups {
@@ -368,11 +375,14 @@ pub(super) fn effective_data<'a>(
 
 /// What resolving an element's font asks the document's resolver, as the C++ font computer would
 /// resolve it for the element's computed values over `overlay`. The font phase computes
-/// font-size, font-weight and font-width to the shapes read here.
+/// font-size, font-weight and font-width to the shapes read here. `feature_values_scope` names the
+/// tree scope whose `@font-feature-values` the element's `font-variant-alternates` reads, asked
+/// only when it has one.
 pub(super) fn font_resolution_request(
     table: &ComputedLonghandTable,
     overlay: Option<&AnimatedOverlay>,
     inputs: &bridge::FfiDocumentStyleComputationInputs,
+    feature_values_scope: impl FnOnce() -> TreeScopeID,
 ) -> bridge::FfiFontResolutionRequest {
     let value_of = |property| effective_data(table, overlay, property);
     let handle_of =
@@ -414,6 +424,14 @@ pub(super) fn font_resolution_request(
         }
         _ => 0,
     };
+    // Only `font-variant-alternates` reads `@font-feature-values`, so every other request resolves
+    // once for all scopes.
+    let names_alternates = !font_feature_values[bridge::FontResolutionFeatureInput::FontVariantAlternates as usize]
+        .as_pointer()
+        .is_null();
+    let feature_values_scope = names_alternates
+        .then(feature_values_scope)
+        .unwrap_or(TreeScopeID::DOCUMENT);
     bridge::FfiFontResolutionRequest {
         font_family: handle_of(prop::FONT_FAMILY),
         font_feature_values,
@@ -422,6 +440,7 @@ pub(super) fn font_resolution_request(
         font_weight,
         font_width,
         font_optical_sizing,
+        font_feature_values_scope: feature_values_scope.0,
         font_environment_generation: inputs.font_environment_generation,
     }
 }

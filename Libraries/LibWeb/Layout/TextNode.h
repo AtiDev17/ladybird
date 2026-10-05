@@ -22,7 +22,7 @@ class GeneratedTextNode;
 
 class TextNode : public Node {
 public:
-    TextNode(DOM::Document&, DOM::Text&, AttachToDOMNode = AttachToDOMNode::Yes);
+    TextNode(DOM::Document&, BindToPreparedArenaSlot, Compositing::RustFFI::NodeSlotId, RustFFI::NodeKind);
     virtual ~TextNode() override;
 
     DOM::Text const& dom_node() const
@@ -42,18 +42,9 @@ public:
     RustFFI::FfiTextSourceRange word_range_at(size_t dom_offset) const;
     void invalidate_text_for_rendering();
 
-    // The returned views survive until the next DOM mutation.
-    RustFFI::FfiTextSource text_source() const;
-
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList) const;
 
     bool update_produces_line_box_fragment_when_empty_flag();
-
-protected:
-    TextNode(DOM::Document&, RustFFI::NodeKind);
-
-    virtual GC::Ptr<DOM::Element const> parent_element_for_text_transform() const;
-    virtual bool is_password_input() const;
 
 private:
     virtual bool is_text_node() const final { return true; }
@@ -61,16 +52,13 @@ private:
 
 class GeneratedTextNode final : public TextNode {
 public:
-    GeneratedTextNode(DOM::Document&, Utf16String);
+    GeneratedTextNode(DOM::Document&, BindToPreparedArenaSlot, Compositing::RustFFI::NodeSlotId, RustFFI::NodeKind);
     virtual ~GeneratedTextNode() override;
 
     virtual DOM::Text const* dom_text() const override { return nullptr; }
     virtual Utf16String const& text() const override { return m_text; }
 
 private:
-    virtual GC::Ptr<DOM::Element const> parent_element_for_text_transform() const override;
-    virtual bool is_password_input() const override { return false; }
-
     Utf16String m_text;
 };
 

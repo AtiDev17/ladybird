@@ -85,13 +85,12 @@ impl RetainedState {
         &mut self,
         declarations: &[declaration_block::DeclaredProperty],
         counters: &mut Counters,
-    ) -> (Vec<DeclaredProperty>, Vec<RetainedStyleValueData>) {
+    ) -> Vec<(DeclaredProperty, RetainedStyleValueData)> {
         fn append(
             engine: &mut RetainedState,
             property: u16,
             declaration: &declaration_block::DeclaredProperty,
-            declared: &mut Vec<DeclaredProperty>,
-            written: &mut Vec<RetainedStyleValueData>,
+            declarations: &mut Vec<(DeclaredProperty, RetainedStyleValueData)>,
             counters: &mut Counters,
         ) {
             use crate::css::property_metadata::{longhands_for_shorthand, property_is_shorthand};
@@ -99,30 +98,21 @@ impl RetainedState {
             // whose children are themselves shorthands, so expand the complete property inventory.
             if property_is_shorthand(property) && !matches!(&*declaration.value, StyleValueData::Unresolved { .. }) {
                 for &longhand in longhands_for_shorthand(property) {
-                    append(engine, longhand, declaration, declared, written, counters);
+                    append(engine, longhand, declaration, declarations, counters);
                 }
             } else {
                 let mut value = engine.intern_declared_property(declaration, counters);
                 value.property = property;
-                declared.push(value);
-                written.push(unsafe {
+                declarations.push((value, unsafe {
                     RetainedStyleValueData::from_retained_pointer(Arc::into_raw(declaration.value.clone()))
-                });
+                }));
             }
         }
-        let mut declared = Vec::with_capacity(declarations.len());
-        let mut written = Vec::with_capacity(declarations.len());
+        let mut interned = Vec::with_capacity(declarations.len());
         for declaration in declarations {
-            append(
-                self,
-                declaration.property_id,
-                declaration,
-                &mut declared,
-                &mut written,
-                counters,
-            );
+            append(self, declaration.property_id, declaration, &mut interned, counters);
         }
-        (declared, written)
+        interned
     }
 
     pub(crate) fn intern_declared_property(
@@ -164,11 +154,6 @@ impl RetainedState {
             Lookup::KnownAbsent | Lookup::Missing(_) => {}
         }
         id
-    }
-
-    pub(super) unsafe fn intern_exact_specified_value(&mut self, value: *const StyleValueData) -> SpecifiedValueID {
-        debug_assert!(!value.is_null());
-        unsafe { self.specified_values.intern(value, &mut self.memory).0 }
     }
 
     /// Register an authored spelling as an alias of its context-free canonical value.
@@ -498,7 +483,6 @@ impl StyleEngineState {
         written_values: Vec<RetainedStyleValueData>,
         custom_declarations: Vec<CustomDeclaration>,
         custom_written_values: Vec<RetainedStyleValueData>,
-        complete: bool,
     ) {
         if !self.staged_rule_is_arriving(rule) {
             let program_version = self.retained.program.version();
@@ -513,14 +497,12 @@ impl StyleEngineState {
                 written_values: self.retained.program.written_values_of(rule).to_vec(),
                 custom_declarations: self.retained.program.custom_declarations_of(rule).to_vec(),
                 custom_written_values: self.retained.program.custom_written_values_of(rule).to_vec(),
-                complete: self.retained.program.declarations_are_complete_for(rule),
             },
             PendingRuleDeclarations {
                 declared,
                 written_values,
                 custom_declarations,
                 custom_written_values,
-                complete,
             },
         );
     }
@@ -548,7 +530,7 @@ impl StyleEngineState {
             .program_staging
             .rule_declarations
             .after(rule)
-            .map(|pending| pending.complete && pending.custom_declarations.is_empty())
+            .map(|pending| pending.custom_declarations.is_empty())
             .unwrap_or_else(|| self.retained.program.declarations_are_complete_for(rule))
     }
 
@@ -793,7 +775,7 @@ impl StyleEngineState {
         replacement.reused += 1;
 
         self.set_rule_conditions_hold(rule, true, counters);
-        self.stage_rule_declared_properties(rule, Vec::new(), Vec::new(), Vec::new(), Vec::new(), false);
+        self.stage_rule_declared_properties(rule, Vec::new(), Vec::new(), Vec::new(), Vec::new());
         self.stage_rule_in_a_layer(rule, false);
         self.stage_rule_gated_by_container_query(rule, false);
         let mut version = RuleVersion::new(rule, RuleKind::Style);
@@ -909,7 +891,6 @@ impl StyleEngineState {
                 pending.written_values,
                 pending.custom_declarations,
                 pending.custom_written_values,
-                pending.complete,
             );
         }
 
@@ -1152,7 +1133,6 @@ impl StyleEngineState {
         written_values: Vec<RetainedStyleValueData>,
         custom_declarations: Vec<CustomDeclaration>,
         custom_written_values: Vec<RetainedStyleValueData>,
-        declarations_are_complete: bool,
     ) {
         self.record_rule_declaration_change(rule, declared, &custom_declarations);
         self.stage_rule_declared_properties(
@@ -1161,7 +1141,6 @@ impl StyleEngineState {
             written_values,
             custom_declarations,
             custom_written_values,
-            declarations_are_complete,
         );
     }
 
@@ -1318,33 +1297,25 @@ impl StyleEngineState {
         self.settle_program();
     }
 
-    pub(super) fn discard_style_transaction_outputs(&mut self, counters: &mut Counters) {
+    /// Answers the identities the end of the transaction released, for the host to mint again.
+    pub(super) fn discard_style_transaction_outputs(&mut self, counters: &mut Counters) -> Vec<u32> {
+        if let Some(pass) = self.host.suspended_style_pass.take() {
+            self.abandon_style_pass(pass);
+        }
         self.clear_ffi_style_transaction_output();
         self.discard_engine_computed_records(counters);
         self.retain_prefix_states();
         self.discard_prepared_batch_matching_traversal();
         self.discard_published_match_answers(counters);
         // Published matching scratch is the last owner that may name a retired identity.
-        self.retained.tree.release_retired_identities(&mut self.retained.memory);
+        self.retained.tree.release_retired_identities(&mut self.retained.memory)
     }
 }
 
 impl StyleEngineState {
     /// Record already decoded cascade operators beside canonical specified values.
-    pub fn set_rule_declared_properties_with_operators(
-        &mut self,
-        rule: RuleID,
-        declared: &[DeclaredProperty],
-        declarations_are_complete: bool,
-    ) {
-        self.set_rule_declared_properties_with_written_values(
-            rule,
-            declared,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            declarations_are_complete,
-        );
+    pub fn set_rule_declared_properties_with_operators(&mut self, rule: RuleID, declared: &[DeclaredProperty]) {
+        self.set_rule_declared_properties_with_written_values(rule, declared, Vec::new(), Vec::new(), Vec::new());
     }
 
     /// Drop every rule of a sheet.
@@ -1382,12 +1353,7 @@ impl StyleEngineState {
 impl StyleEngineState {
     /// Record which longhand properties a rule declares, and which of them it marks important.
     #[cfg(test)]
-    pub(super) fn set_rule_declared_properties(
-        &mut self,
-        rule: RuleID,
-        declared: &[(u16, bool)],
-        declarations_are_complete: bool,
-    ) {
+    pub(super) fn set_rule_declared_properties(&mut self, rule: RuleID, declared: &[(u16, bool)]) {
         let block = self
             .program
             .rule_version(rule)
@@ -1403,14 +1369,7 @@ impl StyleEngineState {
             })
             .collect();
         self.record_rule_declaration_change(rule, &declared, &[]);
-        self.stage_rule_declared_properties(
-            rule,
-            declared,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            declarations_are_complete,
-        );
+        self.stage_rule_declared_properties(rule, declared, Vec::new(), Vec::new(), Vec::new());
     }
 
     /// Record the canonical specified value beside every declared longhand.
@@ -1419,7 +1378,6 @@ impl StyleEngineState {
         &mut self,
         rule: RuleID,
         declared: &[(u16, bool, SpecifiedValueID)],
-        declarations_are_complete: bool,
     ) {
         let declared: Vec<DeclaredProperty> = declared
             .iter()
@@ -1431,14 +1389,7 @@ impl StyleEngineState {
             })
             .collect();
         self.record_rule_declaration_change(rule, &declared, &[]);
-        self.stage_rule_declared_properties(
-            rule,
-            declared,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            declarations_are_complete,
-        );
+        self.stage_rule_declared_properties(rule, declared, Vec::new(), Vec::new(), Vec::new());
     }
 
     /// Take the pending transaction for the style consumer that immediately follows this call.
@@ -1460,11 +1411,16 @@ impl StyleEngineState {
             scoped: true,
         });
         let _ = self.take_style_transaction(root, |_, _, _| {}, counters);
+        // A pass the host would install in waves reports every wave, as the host's diagnostic take
+        // does.
+        while self.host.suspended_style_pass.is_some() {
+            let _ = self.take_style_transaction(root, |_, _, _| {}, counters);
+        }
         let capture = self
             .diagnostic_plan_capture
             .take()
             .expect("the diagnostic plan capture is active during the transaction");
-        self.discard_style_transaction_outputs(counters);
+        let _ = self.discard_style_transaction_outputs(counters);
         if !capture.nodes.is_empty() {
             emit(&capture.nodes);
         }

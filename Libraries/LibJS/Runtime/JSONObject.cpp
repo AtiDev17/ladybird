@@ -869,7 +869,7 @@ static void append_code_unit_offsets(Vector<size_t>& offsets, StringView bytes, 
     }
 }
 
-static ErrorOr<JSONTextBytes> json_text_bytes(Utf16View text, TrackCodeUnitOffsets track_code_unit_offsets)
+static ErrorOr<Optional<JSONTextBytes>> json_text_bytes(Utf16View text, TrackCodeUnitOffsets track_code_unit_offsets)
 {
     auto maximum_length = text.has_ascii_storage() ? text.length_in_code_units() : 3 * text.length_in_code_units();
     JSONTextBytes text_bytes { text, StringBuilder { maximum_length + simdjson::SIMDJSON_PADDING }, {} };
@@ -898,6 +898,11 @@ static ErrorOr<JSONTextBytes> json_text_bytes(Utf16View text, TrackCodeUnitOffse
             }
             if (all_valid)
                 break;
+
+            auto converted_so_far = utf8.string_view();
+            auto preceding_backslashes = converted_so_far.length() - converted_so_far.trim("\\"sv, TrimMode::Right).length();
+            if (preceding_backslashes % 2 != 0)
+                return OptionalNone {};
 
             TRY(utf8.try_appendff("\\u{:04X}", remaining.code_unit_at(valid_code_units)));
             if (track_offsets) {
@@ -950,6 +955,8 @@ static ThrowCompletionOr<Value> parse_simdjson_number(VM& vm, T& value, StringVi
 
     if (error != simdjson::NUMBER_ERROR)
         return vm.throw_completion<SyntaxError>(ErrorType::JsonMalformed);
+
+    raw_sv = raw_sv.trim(" \t\n\r"sv, TrimMode::Right);
 
     // Validate JSON number format (parse_first_number is more lenient than spec)
     // - No leading zeros (except "0" or "0.xxx")
@@ -1110,12 +1117,17 @@ static ThrowCompletionOr<Value> parse_simdjson_value(VM& vm, JSONParseState& sta
 
     // NB: raw_json_token() must be captured before the value is consumed by the get_* calls below.
     switch (type) {
-    case simdjson::ondemand::json_type::null:
+    case simdjson::ondemand::json_type::null: {
+        auto token = value.raw_json_token();
+        bool is_null_value;
+        if (value.is_null().get(is_null_value) || !is_null_value)
+            return vm.throw_completion<SyntaxError>(ErrorType::JsonMalformed);
         if (record) {
             record->value = js_null();
-            record->source = json_token_source(state.text, value.raw_json_token());
+            record->source = json_token_source(state.text, token);
         }
         return js_null();
+    }
     case simdjson::ondemand::json_type::boolean: {
         auto token = value.raw_json_token();
         bool boolean_value;
@@ -1188,6 +1200,8 @@ static ThrowCompletionOr<Value> parse_simdjson_document(VM& vm, JSONParseState& 
         bool boolean_value;
         if (document.get_bool().get(boolean_value))
             return vm.throw_completion<SyntaxError>(ErrorType::JsonMalformed);
+        if (!StringView { raw_token.data(), raw_token.size() }.starts_with(boolean_value ? "true"sv : "false"sv))
+            return vm.throw_completion<SyntaxError>(ErrorType::JsonMalformed);
         if (!document.at_end())
             return vm.throw_completion<SyntaxError>(ErrorType::JsonMalformed);
         if (record) {
@@ -1198,8 +1212,10 @@ static ThrowCompletionOr<Value> parse_simdjson_document(VM& vm, JSONParseState& 
     }
     case simdjson::ondemand::json_type::number: {
         StringView raw_sv { raw_token.data(), raw_token.size() };
-        auto trimmed = raw_sv.trim_whitespace();
-        auto parsed = TRY(parse_simdjson_number(vm, document, trimmed));
+        auto text_bytes = state.text.bytes();
+        if (raw_sv.characters_without_null_termination() + raw_sv.length() != text_bytes.characters_without_null_termination() + text_bytes.length())
+            return vm.throw_completion<SyntaxError>(ErrorType::JsonMalformed);
+        auto parsed = TRY(parse_simdjson_number(vm, document, raw_sv));
         if (record) {
             record->value = parsed;
             record->source = json_token_source(state.text, raw_token);
@@ -1236,7 +1252,10 @@ ThrowCompletionOr<Value> JSONObject::parse_json(VM& vm, Utf16View text, JSONPars
     if (text.length_in_code_units() >= 1 && text.code_unit_at(0) == 0xFEFF)
         return vm.throw_completion<SyntaxError>(ErrorType::JsonMalformed);
 
-    JSONParseState state { json_text_bytes(text, root_record ? TrackCodeUnitOffsets::Yes : TrackCodeUnitOffsets::No).release_value_but_fixme_should_propagate_errors(), {} };
+    auto json_text = json_text_bytes(text, root_record ? TrackCodeUnitOffsets::Yes : TrackCodeUnitOffsets::No).release_value_but_fixme_should_propagate_errors();
+    if (!json_text.has_value())
+        return vm.throw_completion<SyntaxError>(ErrorType::JsonMalformed);
+    JSONParseState state { json_text.release_value(), {} };
 
     simdjson::ondemand::parser parser;
     simdjson::ondemand::document document;
@@ -1346,77 +1365,50 @@ ThrowCompletionOr<Value> JSONObject::internalize_json_property(VM& vm, GC::Ref<O
     return TRY(call(vm, reviver, holder, PrimitiveString::create(vm, name.to_utf16_string()), value, context));
 }
 
-// 1.3 JSON.rawJSON ( text ), https://tc39.es/proposal-json-parse-with-source/#sec-json.rawjson
+// 25.5.3 JSON.rawJSON ( text ), https://tc39.es/ecma262/#sec-json.rawjson
 JS_DEFINE_NATIVE_FUNCTION(JSONObject::raw_json)
 {
     auto& realm = *vm.current_realm();
 
     // 1. Let jsonString be ? ToString(text).
     auto json_string = TRY(vm.argument(0).to_utf16_string(vm));
-
-    // 2. Throw a SyntaxError exception if jsonString is the empty String, or if either the first or last code unit of
-    //    jsonString is any of 0x0009 (CHARACTER TABULATION), 0x000A (LINE FEED), 0x000D (CARRIAGE RETURN), or
-    //    0x0020 (SPACE).
     auto json_string_view = json_string.utf16_view();
+
+    // 2. If jsonString is the empty String, throw a SyntaxError exception.
     if (json_string_view.is_empty())
         return vm.throw_completion<SyntaxError>(ErrorType::JsonMalformed);
 
-    static constexpr AK::Array invalid_code_points { 0x09, 0x0A, 0x0D, 0x20 };
-    auto first_char = json_string_view.code_unit_at(0);
-    auto last_char = json_string_view.code_unit_at(json_string_view.length_in_code_units() - 1);
+    // 3. If the first code unit of jsonString is not either an ASCII lowercase letter code unit (0x0061 through
+    //    0x007A, inclusive), an ASCII digit code unit (0x0030 through 0x0039, inclusive), 0x0022 (QUOTATION MARK), or
+    //    0x002D (HYPHEN-MINUS), throw a SyntaxError exception.
+    auto first_code_unit = json_string_view.code_unit_at(0);
+    if (!is_ascii_lower_alpha(first_code_unit) && !is_ascii_digit(first_code_unit) && first_code_unit != '"' && first_code_unit != '-')
+        return vm.throw_completion<SyntaxError>(first_code_unit == '{' || first_code_unit == '[' ? ErrorType::JsonRawJSONNonPrimitive : ErrorType::JsonMalformed);
 
-    if (invalid_code_points.contains_slow(first_char) || invalid_code_points.contains_slow(last_char))
+    // 4. If the last code unit of jsonString is not either an ASCII lowercase letter code unit (0x0061 through 0x007A,
+    //    inclusive), an ASCII digit code unit (0x0030 through 0x0039, inclusive), or 0x0022 (QUOTATION MARK), throw a
+    //    SyntaxError exception.
+    auto last_code_unit = json_string_view.code_unit_at(json_string_view.length_in_code_units() - 1);
+    if (!is_ascii_lower_alpha(last_code_unit) && !is_ascii_digit(last_code_unit) && last_code_unit != '"')
         return vm.throw_completion<SyntaxError>(ErrorType::JsonMalformed);
 
-    // 3. Parse StringToCodePoints(jsonString) as a JSON text as specified in ECMA-404. Throw a SyntaxError exception
-    //    if it is not a valid JSON text as defined in that specification, or if its outermost value is an object or
-    //    array as defined in that specification.
-    auto json_text = json_text_bytes(json_string_view, TrackCodeUnitOffsets::No).release_value_but_fixme_should_propagate_errors();
+    // 5. Let parseResult be ? ParseJSON(jsonString).
+    auto parse_result = TRY(parse_json(vm, json_string_view));
 
-    simdjson::ondemand::parser parser;
-    simdjson::ondemand::document doc;
-    if (parser.iterate(json_text.padded_view()).get(doc))
-        return vm.throw_completion<SyntaxError>(ErrorType::JsonMalformed);
+    // 6. Assert: parseResult.[[Value]] is either a String, a Number, a Boolean, or null.
+    VERIFY(parse_result.is_string() || parse_result.is_number() || parse_result.is_boolean() || parse_result.is_null());
 
-    simdjson::ondemand::json_type type;
-    if (doc.type().get(type) || type == simdjson::ondemand::json_type::unknown)
-        return vm.throw_completion<SyntaxError>(ErrorType::JsonMalformed);
-
-    if (type == simdjson::ondemand::json_type::object || type == simdjson::ondemand::json_type::array)
-        return vm.throw_completion<SyntaxError>(ErrorType::JsonRawJSONNonPrimitive);
-
-    // Consume the value to advance past it, then check for trailing content
-    switch (type) {
-    case simdjson::ondemand::json_type::null:
-        (void)doc.is_null();
-        break;
-    case simdjson::ondemand::json_type::boolean:
-        (void)doc.get_bool();
-        break;
-    case simdjson::ondemand::json_type::number:
-        (void)doc.get_double();
-        break;
-    case simdjson::ondemand::json_type::string:
-        (void)doc.get_string();
-        break;
-    default:
-        VERIFY_NOT_REACHED();
-    }
-
-    if (!doc.at_end())
-        return vm.throw_completion<SyntaxError>(ErrorType::JsonMalformed);
-
-    // 4. Let internalSlotsList be « [[IsRawJSON]] ».
-    // 5. Let obj be OrdinaryObjectCreate(null, internalSlotsList).
+    // 7. Let internalSlotsList be « [[IsRawJSON]] ».
+    // 8. Let obj be OrdinaryObjectCreate(null, internalSlotsList).
     auto object = RawJSONObject::create(realm, nullptr);
 
-    // 6. Perform ! CreateDataPropertyOrThrow(obj, "rawJSON", jsonString).
+    // 9. Perform ! CreateDataPropertyOrThrow(obj, "rawJSON", jsonString).
     MUST(object->create_data_property_or_throw(vm.names.rawJSON, PrimitiveString::create(vm, json_string)));
 
-    // 7. Perform ! SetIntegrityLevel(obj, frozen).
+    // 10. Perform ! SetIntegrityLevel(obj, frozen).
     MUST(object->set_integrity_level(Object::IntegrityLevel::Frozen));
 
-    // 8. Return obj.
+    // 11. Return obj.
     return object;
 }
 

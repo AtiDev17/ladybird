@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<script src="frame-in-flight.js"></script>
+<style>
+    body { margin: 0; }
+</style>
+<div id="box" style="width: 10px; height: 10px; background: green"></div>
+<script>
+    // Reads beside a frame in flight: a read of style or layout joins the style transaction of the frame, drains its
+    // reactions, and runs in step behind it. The next rendering update paints what the reads changed.
+    asyncTest(async done => {
+        const result = await whileRecordingInFlight(() => {
+            box.style.backgroundColor = "blue";
+        }, state => {
+            const color = getComputedStyle(box).backgroundColor;
+            const cleanHeight = box.offsetHeight;
+            const afterCleanReads = internals.frameSchedulerState();
+            box.style.height = "20px";
+            const dirtyHeight = box.offsetHeight;
+            return { state, color, cleanHeight, afterCleanReads, dirtyHeight, afterDirtyRead: internals.frameSchedulerState() };
+        });
+        println(`state in the next task: ${result.state}`);
+        println(`clean reads: ${result.color} ${result.cleanHeight}`);
+        println(`state after the clean reads: ${result.afterCleanReads}`);
+        println(`dirty read: ${result.dirtyHeight}`);
+        println(`state after the dirty read: ${result.afterDirtyRead}`);
+        await twoFrames();
+        println(`hit test finds the grown box: ${document.elementFromPoint(5, 15) === box}`);
+        done();
+    });
+</script>

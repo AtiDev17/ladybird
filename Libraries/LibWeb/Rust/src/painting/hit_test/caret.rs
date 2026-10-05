@@ -5,8 +5,8 @@
  */
 
 use super::*;
-use crate::layout::LayoutNodeArena;
 use crate::painting::host::{FfiCaretPositionQuery, FfiHitTestQueryCallbacks};
+use crate::painting::paint_read::PaintRead;
 use crate::painting::text_fragment::CaretMatch;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,7 +141,7 @@ impl Default for ClosestLine {
 impl HitTestList {
     pub(crate) fn caret_line_for_position(
         &self,
-        arena: &LayoutNodeArena,
+        arena: &impl PaintRead,
         query: &FfiCaretPositionQuery,
         offset: usize,
         affinity_is_downstream: bool,
@@ -167,7 +167,7 @@ impl HitTestList {
 
     fn item_position_match(
         &self,
-        arena: &LayoutNodeArena,
+        arena: &impl PaintRead,
         query: &FfiCaretPositionQuery,
         item_index: usize,
         offset: usize,
@@ -314,13 +314,13 @@ impl HitTestList {
 
     pub(crate) fn caret_item_for_line(
         &self,
-        arena: &LayoutNodeArena,
+        arena: &impl PaintRead,
         line_index: usize,
         local_point: CssPixelPoint,
         mode: CaretPositionMode,
     ) -> Option<(usize, CaretPositionType)> {
         debug_assert!(self.caret_lines_built);
-        let rows = arena.paintable_rows();
+        let rows = arena;
         let line = self.caret_lines[line_index].clone();
         let first_item = self.first_item_of_line(&line);
         let writing_mode = first_item.writing_mode;
@@ -384,7 +384,7 @@ impl HitTestList {
             let item = &self.items[item_index];
             let item_writing_mode = item.writing_mode;
             let block_distance = block_axis_distance_to_line_rect(
-                Self::caret_line_rect_for_item(&rows, item),
+                Self::caret_line_rect_for_item(rows, item),
                 local_point,
                 item_writing_mode,
             );
@@ -428,11 +428,17 @@ impl HitTestList {
             || inline_axis_end(line.rect, writing_mode) <= inline_axis_start(item.rect, writing_mode)
     }
 
-    fn line_in_scope(&self, arena: &LayoutNodeArena, callbacks: &FfiHitTestQueryCallbacks, line_index: usize) -> bool {
+    fn line_in_scope(
+        &self,
+        main_thread: &crate::stage::MainThread,
+        arena: &impl PaintRead,
+        callbacks: &FfiHitTestQueryCallbacks,
+        line_index: usize,
+    ) -> bool {
         let line = &self.caret_lines[line_index];
         for caret_item_index in line.first_caret_item_index..=line.last_caret_item_index {
-            let shell = self.item_target_shell(arena, self.caret_item_indices[caret_item_index]);
-            if !shell.is_null() && callbacks.shell_in_scope(shell) {
+            let node = self.item_target(arena, self.caret_item_indices[caret_item_index]);
+            if !node.is_none() && callbacks.node_in_scope(main_thread, node) {
                 return true;
             }
         }
@@ -442,7 +448,8 @@ impl HitTestList {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn find_closest_line(
         &self,
-        arena: &LayoutNodeArena,
+        main_thread: &crate::stage::MainThread,
+        arena: &impl PaintRead,
         visual_context_tree: &VisualContextTree,
         callbacks: &FfiHitTestQueryCallbacks,
         point: CssPixelPoint,
@@ -451,7 +458,7 @@ impl HitTestList {
         respect_clip: bool,
     ) -> ClosestLine {
         debug_assert!(self.caret_lines_built);
-        let rows = arena.paintable_rows();
+        let rows = arena;
         let mut closest_line = ClosestLine::default();
         let mut closest_line_after_point = ClosestLine::default();
         let mut closest_line_before_point = ClosestLine::default();
@@ -473,7 +480,7 @@ impl HitTestList {
         };
 
         for line_index in 0..self.caret_lines.len() {
-            if scoped && !self.line_in_scope(arena, callbacks, line_index) {
+            if scoped && !self.line_in_scope(main_thread, arena, callbacks, line_index) {
                 continue;
             }
             let line = self.caret_lines[line_index].clone();
@@ -580,7 +587,7 @@ impl HitTestList {
             let writing_mode = self.first_item_of_line(line).writing_mode;
             let block_coordinate = block_axis_coordinate(closest_line.local_point, writing_mode);
             let point_is_in_closest_line_block_container_margin =
-                super::geometry::block_container_margin_rect(&rows, closest_line.block_container)
+                super::geometry::block_container_margin_rect(rows, closest_line.block_container)
                     .is_some_and(|rect| block_coordinate < block_axis_end(rect, writing_mode));
             let lines_share_block_container = !closest_line.block_container.is_invalid()
                 && closest_line.block_container == closest_line_after_point.block_container;
@@ -596,7 +603,8 @@ impl HitTestList {
 
     pub(crate) fn adjacent_line(
         &self,
-        arena: &LayoutNodeArena,
+        main_thread: &crate::stage::MainThread,
+        arena: &impl PaintRead,
         callbacks: &FfiHitTestQueryCallbacks,
         current_line_index: usize,
         direction: CaretLineDirection,
@@ -625,7 +633,7 @@ impl HitTestList {
             let line = &self.caret_lines[line_index];
             // INTEROP: Keyboard navigation follows layout geometry across clips, effects, and transforms.
             //          Separate paint contexts inside one editing host must not isolate its editable lines.
-            if line_index == current_line_index || !self.line_in_scope(arena, callbacks, line_index) {
+            if line_index == current_line_index || !self.line_in_scope(main_thread, arena, callbacks, line_index) {
                 continue;
             }
             let candidate_block_coordinate = line_block_middle(line.rect, writing_mode);

@@ -64,6 +64,7 @@ struct StyleCache : public RefCounted<StyleCache> {
     static NonnullRefPtr<StyleCache> create();
 
     OwnPtr<StyleRuleCache> rule_cache;
+    // Unique among every rule cache built, so a scope that comes to read another cache publishes from it.
     u64 rule_cache_generation { 0 };
 };
 
@@ -121,7 +122,7 @@ public:
     void initialize_a_css_style_sheet(StyleSheetState&, DOM::Element* owner_node, Utf16View media, Utf16String title, Alternate, OriginClean, StyleSheetState* parent_style_sheet, StyleSheetImport* owner_import, StyleEngineUpdate = StyleEngineUpdate::Record);
 
     [[nodiscard]] StyleRuleCache const& rule_cache() const;
-    [[nodiscard]] bool has_valid_rule_cache() const { return m_style_cache && m_style_cache->rule_cache; }
+    [[nodiscard]] bool has_valid_rule_cache() const;
     void invalidate_style_cache();
     void publish_cascade_layer_order(StyleSheetState* pending_attachment = nullptr);
     void publish_animation_keyframes();
@@ -152,17 +153,17 @@ public:
     void for_each_active_css_style_sheet(Function<void(CSS::StyleSheetState&)> const& callback) const;
 
     void invalidate_counter_style_cache();
-    void build_counter_style_cache();
-    u64 counter_style_environment_identity() const;
-    RefPtr<CSS::CounterStyle const> get_registered_counter_style(Utf16FlyString const& name) const;
-    void publish_counter_style_lookup_chain() const;
+    void build_counter_style_cache(Layout::BegunRead const& read);
+    u64 counter_style_environment_identity(Layout::BegunRead const& read) const;
+    RefPtr<CSS::CounterStyle const> get_registered_counter_style(Layout::BegunRead const& read, Utf16FlyString const& name) const;
+    void publish_counter_style_lookup_chain(Layout::BegunRead const& read) const;
 
     struct FunctionDefinitionAndScope {
         RustCompiledFunction function;
         StyleScope const& scope;
     };
-    Optional<FunctionDefinitionAndScope> get_function_definition(Utf16FlyString const& name) const;
-    void for_each_visible_function_definition(Function<void(FunctionDefinitionAndScope const&)> const&) const;
+    Optional<FunctionDefinitionAndScope> get_function_definition(Layout::BegunRead const& read, Utf16FlyString const& name) const;
+    void for_each_visible_function_definition(Layout::BegunRead const& read, Function<void(FunctionDefinitionAndScope const&)> const&) const;
 
     template<typename T>
     Optional<T> dereference_global_tree_scoped_reference(Function<Optional<T>(StyleScope const&)> const& callback) const;
@@ -171,8 +172,6 @@ public:
 
     StyleCache& ensure_style_cache();
     StyleCache& ensure_style_cache() const;
-
-    RefPtr<StyleCache> m_style_cache;
 
     // The keyframe sets this scope last published. The style engine names them by pointer, so they stay alive after
     // the rule cache they came from is invalidated, until the scope publishes again or gives its row up.
@@ -194,6 +193,15 @@ public:
     GC::Ref<DOM::Node> m_node;
 
 private:
+    // The cache this scope reads, if it has one. A shadow scope with no stylesheets of its own keeps none: it reads
+    // the one its document's scope holds for all of them, so dropping that one drops it for every such scope.
+    [[nodiscard]] StyleCache* style_cache() const;
+
+    RefPtr<StyleCache> m_style_cache;
+    bool m_reads_document_sheetless_style_cache { false };
+    // In the document's scope: the cache its shadow-root scopes with no stylesheets of their own share.
+    RefPtr<StyleCache> m_sheetless_shadow_root_style_cache;
+
     [[nodiscard]] StyleScope* parent_counter_style_scope() const;
     void publish_counter_styles_if_changed() const;
 

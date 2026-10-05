@@ -3277,86 +3277,146 @@ impl RuleDispatch {
     }
 }
 
-/// The accumulated local facts of the document's style nodes.
-///
-/// It is built from the same feature and state deltas the journal normalizes, so a fact exists here
-/// exactly because a mutation published it. The store's [`StyleNodeFacts`] is both the input-side
-/// projection and the current-side evaluation arrangement; bounded batches are temporary views of
-/// selected rows.
-type ElementDeclaredProperties = Box<[DeclaredProperty]>;
+/// One kind of an element's own declarations: what each covers, the value it was written with,
+/// and what the drive checks of that value. They are built from one list of pairs, so every
+/// declaration has its written value.
+#[derive(Default)]
+pub struct ElementDeclarations {
+    declared: Box<[DeclaredProperty]>,
+    written: Box<[RetainedStyleValueData]>,
+    checks: Box<[super::publication::WrittenValueChecks]>,
+}
 
+impl ElementDeclarations {
+    fn new(declarations: Vec<(DeclaredProperty, RetainedStyleValueData)>) -> Self {
+        let checks = declarations
+            .iter()
+            .map(|(declared, written)| super::publication::WrittenValueChecks::prepare(declared.property, written))
+            .collect();
+        let (declared, written): (Vec<_>, Vec<_>) = declarations.into_iter().unzip();
+        Self {
+            declared: declared.into_boxed_slice(),
+            written: written.into_boxed_slice(),
+            checks,
+        }
+    }
+
+    #[must_use]
+    pub fn declared(&self) -> &[DeclaredProperty] {
+        &self.declared
+    }
+
+    /// The value the declaration at `index` of `declared` was written with.
+    #[must_use]
+    pub fn written(&self, index: usize) -> &RetainedStyleValueData {
+        &self.written[index]
+    }
+
+    pub(super) fn checks(&self, index: usize) -> super::publication::WrittenValueChecks {
+        self.checks[index]
+    }
+
+    pub fn iter(
+        &self,
+    ) -> std::iter::Zip<std::slice::Iter<'_, DeclaredProperty>, std::slice::Iter<'_, RetainedStyleValueData>> {
+        self.declared.iter().zip(self.written.iter())
+    }
+
+    /// The index of the declaration a winner names: the last one of its property, importance and
+    /// declared value.
+    #[must_use]
+    pub fn winner_index(
+        &self,
+        property: u16,
+        important: bool,
+        value: super::cascade::SpecifiedValueID,
+    ) -> Option<usize> {
+        self.declared.iter().rposition(|declared| {
+            declared.property == property && declared.important == important && declared.value == value
+        })
+    }
+
+    /// The value the declaration a winner names was written with.
+    #[must_use]
+    pub fn winner_value(
+        &self,
+        property: u16,
+        important: bool,
+        value: super::cascade::SpecifiedValueID,
+    ) -> Option<&RetainedStyleValueData> {
+        self.winner_index(property, important, value)
+            .map(|index| &self.written[index])
+    }
+
+    fn storage_bytes(&self) -> usize {
+        size_of_val(self.declared.as_ref()) + size_of_val(self.written.as_ref()) + size_of_val(self.checks.as_ref())
+    }
+}
+
+/// Declarations standing for their written values with the guaranteed-invalid one, for a test
+/// that reads no value.
+#[cfg(test)]
+pub(super) fn unwritten_declarations(declared: &[DeclaredProperty]) -> Vec<(DeclaredProperty, RetainedStyleValueData)> {
+    declared
+        .iter()
+        .map(|&declared| {
+            (
+                declared,
+                RetainedStyleValueData::from_owned(crate::css::style_value::StyleValueData::GuaranteedInvalid),
+            )
+        })
+        .collect()
+}
+
+/// The custom properties an element's inline style declares, in declaration order, each with
+/// the value it was written with.
+pub struct ElementCustomDeclarations {
+    declared: Box<[CustomDeclaration]>,
+    written: Box<[RetainedStyleValueData]>,
+}
+
+impl ElementCustomDeclarations {
+    #[must_use]
+    pub fn declared(&self) -> &[CustomDeclaration] {
+        &self.declared
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&CustomDeclaration, &RetainedStyleValueData)> {
+        self.declared.iter().zip(&self.written)
+    }
+
+    fn storage_bytes(&self) -> usize {
+        size_of_val(self.declared.as_ref()) + size_of_val(self.written.as_ref())
+    }
+}
+
+#[derive(Default)]
 struct ElementDeclarationRow {
-    by_kind: [Option<ElementDeclaredProperties>; ElementDeclarationKind::COUNT],
-    /// The value each declaration was written with, parallel to `by_kind`, when the block's
-    /// publication carried them; a consumer computing from the declarations reads the spelling.
-    written_by_kind: [Option<Box<[RetainedStyleValueData]>>; ElementDeclarationKind::COUNT],
-    written_checks_by_kind: [Box<[super::publication::WrittenValueChecks]>; ElementDeclarationKind::COUNT],
-    complete: [bool; ElementDeclarationKind::COUNT],
-    /// The custom properties the inline style declares, in declaration order. Only the `style`
-    /// attribute declares custom properties.
-    custom_declarations: Option<Box<[CustomDeclaration]>>,
-    /// The values the custom declarations were written with, parallel to them.
-    custom_written_values: Option<Box<[RetainedStyleValueData]>>,
+    by_kind: [ElementDeclarations; ElementDeclarationKind::COUNT],
+    /// Only the `style` attribute declares custom properties.
+    custom: Option<ElementCustomDeclarations>,
 }
 
 /// An element's inline declaration, taken out of its row while a private demand computes the
 /// element as though it had none.
 pub(super) struct HiddenInlineDeclarations {
-    declared: Option<ElementDeclaredProperties>,
-    written: Option<Box<[RetainedStyleValueData]>>,
-    checks: Box<[super::publication::WrittenValueChecks]>,
-    complete: bool,
-    custom: Option<Box<[CustomDeclaration]>>,
-    custom_written: Option<Box<[RetainedStyleValueData]>>,
-}
-
-impl Default for ElementDeclarationRow {
-    fn default() -> Self {
-        Self {
-            by_kind: Default::default(),
-            written_by_kind: Default::default(),
-            written_checks_by_kind: Default::default(),
-            complete: [true; ElementDeclarationKind::COUNT],
-            custom_declarations: None,
-            custom_written_values: None,
-        }
-    }
+    declarations: ElementDeclarations,
+    custom: Option<ElementCustomDeclarations>,
 }
 
 impl ElementDeclarationRow {
     fn storage_bytes(&self) -> u64 {
         (size_of::<Self>()
             + self
-                .written_checks_by_kind
-                .iter()
-                .map(|checks| size_of_val(checks.as_ref()))
-                .sum::<usize>()
-            + self
                 .by_kind
                 .iter()
-                .flatten()
-                .map(|declared| size_of_val(declared.as_ref()))
+                .map(ElementDeclarations::storage_bytes)
                 .sum::<usize>()
-            + self
-                .written_by_kind
-                .iter()
-                .flatten()
-                .map(|written| size_of_val(written.as_ref()))
-                .sum::<usize>()
-            + self
-                .custom_declarations
-                .as_ref()
-                .map_or(0, |custom| size_of_val(custom.as_ref()))
-            + self
-                .custom_written_values
-                .as_ref()
-                .map_or(0, |written| size_of_val(written.as_ref()))) as u64
+            + self.custom.as_ref().map_or(0, ElementCustomDeclarations::storage_bytes)) as u64
     }
 
     fn is_empty(&self) -> bool {
-        self.by_kind.iter().all(Option::is_none)
-            && self.complete.iter().all(|&complete| complete)
-            && self.custom_declarations.is_none()
+        self.by_kind.iter().all(|declarations| declarations.declared.is_empty()) && self.custom.is_none()
     }
 }
 
@@ -3373,112 +3433,53 @@ struct ElementDeclarationRows {
 }
 
 impl ElementDeclarationRows {
-    fn get(&self, node: StyleNodeID, kind: ElementDeclarationKind) -> (&[DeclaredProperty], bool) {
-        let Some(index) = node.element_index().map(|index| index as usize) else {
-            return (&[], true);
-        };
-        let Some(row) = self.rows.get(index).and_then(Option::as_ref) else {
-            return (&[], true);
-        };
-        (
-            row.by_kind[kind.index()].as_deref().unwrap_or(&[]),
-            row.complete[kind.index()]
-                && (kind != ElementDeclarationKind::InlineStyle || row.custom_declarations.is_none()),
-        )
+    fn row(&self, node: StyleNodeID) -> Option<&ElementDeclarationRow> {
+        let index = node.element_index()? as usize;
+        self.rows.get(index)?.as_deref()
     }
 
-    /// Whether the longhand declarations of one kind are all published, whatever custom
-    /// properties the inline style declares beside them.
-    fn complete_but_for_custom(&self, node: StyleNodeID, kind: ElementDeclarationKind) -> bool {
-        let Some(index) = node.element_index().map(|index| index as usize) else {
-            return true;
-        };
-        let Some(row) = self.rows.get(index).and_then(Option::as_ref) else {
-            return true;
-        };
-        row.complete[kind.index()]
+    fn get(&self, node: StyleNodeID, kind: ElementDeclarationKind) -> &[DeclaredProperty] {
+        self.row(node).map_or(&[], |row| &row.by_kind[kind.index()].declared)
     }
 
-    /// The values the declarations of one kind were written with, parallel to `get`, or nothing
-    /// when the publication carried none.
-    fn get_written(&self, node: StyleNodeID, kind: ElementDeclarationKind) -> &[RetainedStyleValueData] {
-        let Some(index) = node.element_index().map(|index| index as usize) else {
-            return &[];
-        };
-        let Some(row) = self.rows.get(index).and_then(Option::as_ref) else {
-            return &[];
-        };
-        row.written_by_kind[kind.index()].as_deref().unwrap_or(&[])
+    fn declarations(&self, node: StyleNodeID, kind: ElementDeclarationKind) -> Option<&ElementDeclarations> {
+        self.row(node).map(|row| &row.by_kind[kind.index()])
     }
 
     fn set(
         &mut self,
         node: StyleNodeID,
         kind: ElementDeclarationKind,
-        declared: Vec<DeclaredProperty>,
-        written_values: Vec<RetainedStyleValueData>,
-        declarations_are_complete: bool,
+        declarations: Vec<(DeclaredProperty, RetainedStyleValueData)>,
     ) {
         let index = node.element_index().expect("only elements carry element declarations") as usize;
-        if declared.is_empty() && declarations_are_complete {
+        if declarations.is_empty() {
             self.remove_kind(node, kind);
             return;
         }
         let row = self.rows.entry(index);
         let before = row.as_ref().map_or(0, |row| row.storage_bytes());
         let row = row.get_or_insert_with(Box::default);
-        row.written_checks_by_kind[kind.index()] = declared
-            .iter()
-            .zip(&written_values)
-            .map(|(declared, value)| super::publication::WrittenValueChecks::prepare(declared.property, value))
-            .collect();
-        row.written_by_kind[kind.index()] =
-            (!declared.is_empty() && written_values.len() == declared.len()).then(|| written_values.into_boxed_slice());
-        row.by_kind[kind.index()] = (!declared.is_empty()).then(|| declared.into_boxed_slice());
-        row.complete[kind.index()] = declarations_are_complete;
+        row.by_kind[kind.index()] = ElementDeclarations::new(declarations);
         let after = row.storage_bytes();
         self.payload_bytes = self.payload_bytes - before + after;
     }
 
     /// The custom properties the node's inline style declares.
-    fn get_custom(&self, node: StyleNodeID) -> &[CustomDeclaration] {
-        let Some(index) = node.element_index().map(|index| index as usize) else {
-            return &[];
-        };
-        let Some(row) = self.rows.get(index).and_then(Option::as_ref) else {
-            return &[];
-        };
-        row.custom_declarations.as_deref().unwrap_or(&[])
+    fn get_custom(&self, node: StyleNodeID) -> Option<&ElementCustomDeclarations> {
+        self.row(node)?.custom.as_ref()
     }
 
-    /// The values the node's inline custom declarations were written with, parallel to them, or
-    /// nothing when their publication carried none.
-    fn get_custom_written(&self, node: StyleNodeID) -> &[RetainedStyleValueData] {
-        let Some(index) = node.element_index().map(|index| index as usize) else {
-            return &[];
-        };
-        let Some(row) = self.rows.get(index).and_then(Option::as_ref) else {
-            return &[];
-        };
-        row.custom_written_values.as_deref().unwrap_or(&[])
-    }
-
-    fn set_custom(
-        &mut self,
-        node: StyleNodeID,
-        custom_declarations: Vec<CustomDeclaration>,
-        custom_written_values: Vec<RetainedStyleValueData>,
-    ) {
+    fn set_custom(&mut self, node: StyleNodeID, custom_declarations: Vec<(CustomDeclaration, RetainedStyleValueData)>) {
         let index = node.element_index().expect("only elements carry element declarations") as usize;
         if custom_declarations.is_empty() {
             let Some(row) = self.rows.get_mut(index).and_then(Option::as_mut) else {
                 return;
             };
             let before = row.storage_bytes();
-            if row.custom_declarations.take().is_some() {
+            if row.custom.take().is_some() {
                 self.rows_with_custom_declarations -= 1;
             }
-            row.custom_written_values = None;
             let after = match row.is_empty() {
                 true => 0,
                 false => row.storage_bytes(),
@@ -3492,13 +3493,12 @@ impl ElementDeclarationRows {
         let row = self.rows.entry(index);
         let before = row.as_ref().map_or(0, |row| row.storage_bytes());
         let row = row.get_or_insert_with(Box::default);
-        row.custom_written_values = (custom_written_values.len() == custom_declarations.len())
-            .then(|| custom_written_values.into_boxed_slice());
-        if row
-            .custom_declarations
-            .replace(custom_declarations.into_boxed_slice())
-            .is_none()
-        {
+        let (declared, written): (Vec<_>, Vec<_>) = custom_declarations.into_iter().unzip();
+        let custom = ElementCustomDeclarations {
+            declared: declared.into_boxed_slice(),
+            written: written.into_boxed_slice(),
+        };
+        if row.custom.replace(custom).is_none() {
             self.rows_with_custom_declarations += 1;
         }
         let after = row.storage_bytes();
@@ -3513,15 +3513,9 @@ impl ElementDeclarationRows {
             return;
         };
         let before = row.storage_bytes();
-        row.by_kind[kind.index()] = None;
-        row.written_by_kind[kind.index()] = None;
-        row.written_checks_by_kind[kind.index()] = Box::default();
-        row.complete[kind.index()] = true;
-        if kind == ElementDeclarationKind::InlineStyle {
-            if row.custom_declarations.take().is_some() {
-                self.rows_with_custom_declarations -= 1;
-            }
-            row.custom_written_values = None;
+        row.by_kind[kind.index()] = ElementDeclarations::default();
+        if kind == ElementDeclarationKind::InlineStyle && row.custom.take().is_some() {
+            self.rows_with_custom_declarations -= 1;
         }
         let after = match row.is_empty() {
             true => 0,
@@ -3540,7 +3534,7 @@ impl ElementDeclarationRows {
         let Some(row) = self.rows.get_mut(index).and_then(Option::take) else {
             return;
         };
-        if row.custom_declarations.is_some() {
+        if row.custom.is_some() {
             self.rows_with_custom_declarations -= 1;
         }
         self.payload_bytes -= row.storage_bytes();
@@ -3564,6 +3558,12 @@ impl super::intern_table::InternIdentity for CustomPropertyNameSetID {
     }
 }
 
+/// The accumulated local facts of the document's style nodes.
+///
+/// It is built from the same feature and state deltas the journal normalizes, so a fact exists here
+/// exactly because a mutation published it. The store's [`StyleNodeFacts`] is both the input-side
+/// projection and the current-side evaluation arrangement; bounded batches are temporary views of
+/// selected rows.
 pub struct ElementFactStore {
     /// Required primary arrangement. Element identity selects its fixed column slots directly;
     /// variable facts are append-only payloads reached through the slots' handles.
@@ -4103,7 +4103,7 @@ impl ElementFactStore {
         let mut visited = 0_u64;
         for row in self.element_declared_properties.rows.iter().flatten() {
             visited += 1;
-            for declaration in row.custom_declarations.iter().flatten() {
+            for declaration in row.custom.iter().flat_map(ElementCustomDeclarations::declared) {
                 visited += 1;
                 atoms.insert(declaration.name);
             }
@@ -4536,8 +4536,10 @@ impl ElementFactStore {
     }
 
     /// What an `attr()` can read of an element: each of its attributes in no namespace, by its
-    /// local name, with the text of its value.
-    pub fn substitution_attributes(&self, node: StyleNodeID) -> impl Iterator<Item = (&[u16], Option<&[u16]>)> {
+    /// local name, with the text of its value. The host publishes the text of every attribute
+    /// name an `attr()` may read before a style update or read takes the rules that read it, so
+    /// an attribute without its text is one no `attr()` reads.
+    pub fn substitution_attributes(&self, node: StyleNodeID) -> impl Iterator<Item = (&[u16], &[u16])> {
         self.rows
             .row_of(node)
             .map_or(&[][..], |row| self.rows.attributes_of(row))
@@ -4545,7 +4547,7 @@ impl ElementFactStore {
             .filter_map(|&attribute| {
                 Some((
                     self.attribute_substitution_name(attribute.name)?,
-                    self.rows.text_of(attribute),
+                    self.rows.text_of(attribute)?,
                 ))
             })
     }
@@ -4584,6 +4586,13 @@ impl ElementFactStore {
         self.rows
             .row_of(node)
             .map_or(StyleAtomID::NONE, |row| self.rows.language_of(row))
+    }
+
+    /// The element's resolved language tag, empty when it has none. A tag is recorded once per
+    /// language atom, so its casing is the one the first element spelling that language used.
+    #[must_use]
+    pub fn language_tag_of(&self, node: StyleNodeID) -> &[u16] {
+        self.rows.row_of(node).map_or(&[], |row| self.rows.language_tag_of(row))
     }
 
     #[must_use]
@@ -4940,31 +4949,27 @@ impl ElementFactStore {
         })
     }
 
-    /// Record which longhand properties one of an element's own declarations covers.
+    /// Record which longhand properties one of an element's own declarations covers, each with the
+    /// value it was written with.
     pub fn set_element_declared_properties(
         &mut self,
         node: StyleNodeID,
         kind: ElementDeclarationKind,
-        declared: Vec<DeclaredProperty>,
-        written_values: Vec<RetainedStyleValueData>,
-        declarations_are_complete: bool,
+        declarations: Vec<(DeclaredProperty, RetainedStyleValueData)>,
     ) {
         self.memory_dirty = true;
-        self.element_declared_properties
-            .set(node, kind, declared, written_values, declarations_are_complete);
+        self.element_declared_properties.set(node, kind, declarations);
     }
 
-    /// Record the custom properties the node's inline style declares, with the values they were
+    /// Record the custom properties the node's inline style declares, each with the value it was
     /// written with.
     pub fn set_element_custom_declarations(
         &mut self,
         node: StyleNodeID,
-        custom_declarations: Vec<CustomDeclaration>,
-        custom_written_values: Vec<RetainedStyleValueData>,
+        custom_declarations: Vec<(CustomDeclaration, RetainedStyleValueData)>,
     ) {
         self.memory_dirty = true;
-        self.element_declared_properties
-            .set_custom(node, custom_declarations, custom_written_values);
+        self.element_declared_properties.set_custom(node, custom_declarations);
     }
 
     /// Take the node's inline declaration out of its row while a private demand computes the node
@@ -4979,12 +4984,8 @@ impl ElementFactStore {
         let before = row.storage_bytes();
         let kind = ElementDeclarationKind::InlineStyle.index();
         let hidden = HiddenInlineDeclarations {
-            declared: row.by_kind[kind].take(),
-            written: row.written_by_kind[kind].take(),
-            checks: std::mem::take(&mut row.written_checks_by_kind[kind]),
-            complete: std::mem::replace(&mut row.complete[kind], true),
-            custom: row.custom_declarations.take(),
-            custom_written: row.custom_written_values.take(),
+            declarations: std::mem::take(&mut row.by_kind[kind]),
+            custom: row.custom.take(),
         };
         if hidden.custom.is_some() {
             rows.rows_with_custom_declarations -= 1;
@@ -5006,13 +5007,9 @@ impl ElementFactStore {
             .expect("a private demand keeps the element's declaration row");
         let before = row.storage_bytes();
         let kind = ElementDeclarationKind::InlineStyle.index();
-        row.by_kind[kind] = hidden.declared;
-        row.written_by_kind[kind] = hidden.written;
-        row.written_checks_by_kind[kind] = hidden.checks;
-        row.complete[kind] = hidden.complete;
-        row.custom_declarations = hidden.custom;
-        row.custom_written_values = hidden.custom_written;
-        if row.custom_declarations.is_some() {
+        row.by_kind[kind] = hidden.declarations;
+        row.custom = hidden.custom;
+        if row.custom.is_some() {
             rows.rows_with_custom_declarations += 1;
         }
         rows.payload_bytes = rows.payload_bytes - before + row.storage_bytes();
@@ -5022,14 +5019,16 @@ impl ElementFactStore {
     /// The custom properties the node's inline style declares, in declaration order.
     #[must_use]
     pub fn element_custom_declarations(&self, node: StyleNodeID) -> &[CustomDeclaration] {
-        self.element_declared_properties.get_custom(node)
+        self.element_declared_properties
+            .get_custom(node)
+            .map_or(&[], ElementCustomDeclarations::declared)
     }
 
-    /// The values the node's inline custom declarations were written with, parallel to them, or
-    /// nothing when their publication carried none.
+    /// The custom properties the node's inline style declares, with the values they were written
+    /// with.
     #[must_use]
-    pub fn element_custom_written_values(&self, node: StyleNodeID) -> &[RetainedStyleValueData] {
-        self.element_declared_properties.get_custom_written(node)
+    pub fn element_custom_declarations_written(&self, node: StyleNodeID) -> Option<&ElementCustomDeclarations> {
+        self.element_declared_properties.get_custom(node)
     }
 
     /// Whether any inline style declares a custom property.
@@ -5038,46 +5037,19 @@ impl ElementFactStore {
         self.element_declared_properties.rows_with_custom_declarations != 0
     }
 
-    /// Whether one kind of the node's element declarations is complete once the custom properties
-    /// the inline style declares are set aside.
+    /// One kind of the node's element declarations, with the values they were written with;
+    /// `None` when it has none of any kind.
     #[must_use]
-    pub fn element_declarations_are_complete_but_for_custom_properties(
+    pub fn element_declarations(
         &self,
         node: StyleNodeID,
         kind: ElementDeclarationKind,
-    ) -> bool {
-        self.element_declared_properties.complete_but_for_custom(node, kind)
-    }
-
-    pub(super) fn element_written_value_checks(
-        &self,
-        node: StyleNodeID,
-        kind: ElementDeclarationKind,
-        index: usize,
-    ) -> super::publication::WrittenValueChecks {
-        let row = self.element_declared_properties.rows[node.element_index().unwrap() as usize]
-            .as_ref()
-            .unwrap();
-        row.written_checks_by_kind[kind.index()][index]
-    }
-
-    /// The values one kind of the node's element declarations were written with, parallel to
-    /// `element_declared_properties`, or nothing when their publication carried none.
-    #[must_use]
-    pub fn element_written_declared_values(
-        &self,
-        node: StyleNodeID,
-        kind: ElementDeclarationKind,
-    ) -> &[RetainedStyleValueData] {
-        self.element_declared_properties.get_written(node, kind)
+    ) -> Option<&ElementDeclarations> {
+        self.element_declared_properties.declarations(node, kind)
     }
 
     #[must_use]
-    pub fn element_declared_properties(
-        &self,
-        node: StyleNodeID,
-        kind: ElementDeclarationKind,
-    ) -> (&[DeclaredProperty], bool) {
+    pub fn element_declared_properties(&self, node: StyleNodeID, kind: ElementDeclarationKind) -> &[DeclaredProperty] {
         self.element_declared_properties.get(node, kind)
     }
 
@@ -6073,43 +6045,39 @@ mod tests {
         facts.set_element_declared_properties(
             first,
             inline,
-            vec![declared(1, false, 10), declared(2, true, 20)],
-            Vec::new(),
-            true,
+            unwritten_declarations(&[declared(1, false, 10), declared(2, true, 20)]),
         );
-        facts.set_element_declared_properties(first, hints, vec![declared(3, false, 30)], Vec::new(), false);
-        facts.set_element_declared_properties(later, svg, vec![declared(4, false, 40)], Vec::new(), true);
-        facts.set_element_declared_properties(later, inline, Vec::new(), Vec::new(), false);
+        facts.set_element_declared_properties(first, hints, unwritten_declarations(&[declared(3, false, 30)]));
+        facts.set_element_declared_properties(later, svg, unwritten_declarations(&[declared(4, false, 40)]));
+        facts.set_element_declared_properties(later, inline, Vec::new());
         assert_eq!(
             facts.element_declared_properties.get(first, inline),
-            (&[declared(1, false, 10), declared(2, true, 20)][..], true)
+            &[declared(1, false, 10), declared(2, true, 20)][..]
         );
         assert_eq!(
             facts.element_declared_properties.get(first, hints),
-            (&[declared(3, false, 30)][..], false)
+            &[declared(3, false, 30)][..]
         );
         assert_eq!(
             facts.element_declared_properties.get(later, svg),
-            (&[declared(4, false, 40)][..], true)
+            &[declared(4, false, 40)][..]
         );
-        assert_eq!(facts.element_declared_properties.get(later, inline), (&[][..], false));
+        assert!(facts.element_declared_properties.get(later, inline).is_empty());
         assert_eq!(facts.element_declared_properties.rows.len(), 65);
-        facts.set_element_declared_properties(first, inline, Vec::new(), Vec::new(), true);
-        assert!(facts.element_declared_properties.get(first, inline).0.is_empty());
+        facts.set_element_declared_properties(first, inline, Vec::new());
+        assert!(facts.element_declared_properties.get(first, inline).is_empty());
         assert_eq!(
             facts.element_declared_properties.get(first, hints),
-            (&[declared(3, false, 30)][..], false)
+            &[declared(3, false, 30)][..]
         );
-        facts.set_element_declared_properties(later, inline, Vec::new(), Vec::new(), true);
-        assert_eq!(facts.element_declared_properties.get(later, inline), (&[][..], true));
 
         // Declaration rows can exist without a resident selector-fact row. Retirement still has to
         // clear them before the dense identity is reused.
         facts.forget(first);
-        assert!(facts.element_declared_properties.get(first, hints).0.is_empty());
+        assert!(facts.element_declared_properties.get(first, hints).is_empty());
         assert_eq!(
             facts.element_declared_properties.get(later, svg),
-            (&[declared(4, false, 40)][..], true)
+            &[declared(4, false, 40)][..]
         );
         facts.apply_staged(&mut memory);
         assert_eq!(

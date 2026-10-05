@@ -10,6 +10,7 @@
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CountersSet.h>
+#include <LibWeb/CSS/InstalledStyle.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleGroupPayloadPins.h>
 #include <LibWeb/CSS/StyleScope.h>
@@ -557,8 +558,7 @@ static void register_style_group_field_descriptors()
 Optional<StyleGroupIndex> ComputedValues::style_group_of_property(PropertyID property_id)
 {
     VERIFY(property_id >= first_longhand_property_id && property_id <= last_longhand_property_id);
-    // The bindings are filled with the descriptor registration, which the default payloads trigger.
-    style_group_default_payload(0);
+    register_style_groups();
     return style_group_by_property()[to_underlying(property_id) - to_underlying(first_longhand_property_id)];
 }
 
@@ -660,7 +660,7 @@ static_assert(to_underlying(MathShift::Compact) == 1);
 static_assert(to_underlying(MathStyle::Normal) == 0);
 static_assert(to_underlying(MathStyle::Compact) == 1);
 
-void const* style_group_default_payload(size_t group_index)
+static auto const& registered_default_payloads()
 {
     StyleComputer::ensure_style_metadata_tables_installed();
     static auto const default_payloads = [] {
@@ -675,7 +675,17 @@ void const* style_group_default_payload(size_t group_index)
         register_style_group_field_descriptors();
         return payloads;
     }();
-    return default_payloads[group_index];
+    return default_payloads;
+}
+
+void register_style_groups()
+{
+    (void)registered_default_payloads();
+}
+
+void const* style_group_default_payload(size_t group_index)
+{
+    return registered_default_payloads()[group_index];
 }
 
 bool ComputedValues::property_inheritance_is_standard() const
@@ -792,16 +802,13 @@ void ComputedValues::borrow_style_record_payloads(ReadonlySpan<void const*> payl
     VERIFY(index == payloads.size());
 }
 
-bool style_record_display_is_none(StyleEngine const& style_engine, StyleRecordID style_record)
+bool InstalledStyle::display_is_none() const
 {
-    if (!style_record)
-        return false;
-    auto view = style_engine.style_record_view(style_record);
-    if (!view.present)
+    if (!m_view.present)
         return false;
     // The record's base payloads are the ones an animation overlay was layered on top of, matching
     // what ComputedValues::base_values() exposes.
-    auto const* payloads = view.base_payloads ? view.base_payloads : view.payloads;
+    auto const* payloads = m_view.base_payloads ? m_view.base_payloads : m_view.payloads;
     if (!payloads)
         return false;
     auto const* box = static_cast<ComputedValuesFFI::BoxValues const*>(payloads[to_underlying(StyleGroupIndex::BoxValues)]);

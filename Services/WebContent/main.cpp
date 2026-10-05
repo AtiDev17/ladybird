@@ -58,12 +58,6 @@
 #    include <LibIPC/SingleServer.h>
 #endif
 
-#if defined(AK_OS_WINDOWS)
-#    include <objbase.h>
-#endif
-
-#include <SDL3/SDL_init.h>
-
 #if !defined(AK_OS_WINDOWS)
 #    include <signal.h>
 static void crash_signal_handler(int signo)
@@ -119,26 +113,12 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     install_crash_signal_handlers();
 #endif
 
-#if defined(AK_OS_WINDOWS)
-    // NOTE: We need this here otherwise SDL inits COM in the APARTMENTTHREADED model which we don't want as we need to
-    // make calls across threads which would otherwise have a high overhead. It is safe for all the objects we use.
-    HRESULT hr = CoInitializeEx(0, COINIT_MULTITHREADED);
-    VERIFY(SUCCEEDED(hr));
-    ScopeGuard uninitialize_com = []() { CoUninitialize(); };
-#endif
-    // SDL is used for the Gamepad API.
-    if (!SDL_Init(SDL_INIT_GAMEPAD)) {
-        dbgln("Failed to initialize SDL3: {}", SDL_GetError());
-        return -1;
-    }
-
     auto& event_loop = Core::EventLoop::initialize_for_current_thread();
 
     WebView::platform_init();
 
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
 
-    StringView cache_path;
     StringView mach_server_name {};
     Vector<ByteString> certificates;
     int crash_report_fd = -1;
@@ -161,7 +141,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     Core::ArgsParser args_parser;
     args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
     args_parser.add_option(connect_broker_fd, "Descriptor for the sandbox connection broker", "connect-broker-fd", 0, "fd");
-    args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
     args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
     args_parser.add_option(expose_experimental_interfaces, "Expose experimental IDL interfaces", "expose-experimental-interfaces");
     args_parser.add_option(expose_internals_object, "Expose internals object", "expose-internals-object");
@@ -242,7 +221,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 #endif
 
     if (!disable_sandbox)
-        TRY(RendererSandbox::apply_sandbox(mach_server_name, cache_path, RendererSandbox::AudioAccess::Yes));
+        TRY(RendererSandbox::apply_sandbox(mach_server_name, RendererSandbox::AudioAccess::Yes));
 
 #if defined(AK_OS_MACOS)
     auto browser_port = TRY(Core::MachPort::look_up_from_bootstrap_server(ByteString { mach_server_name }));

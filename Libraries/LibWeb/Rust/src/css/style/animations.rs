@@ -229,17 +229,21 @@ pub(crate) enum DeclarationScope {
     Shadow(TreeScopeID),
 }
 
+/// One style scope's `@keyframes`: the host's keyframe set for each name the scope defines.
+pub(crate) type KeyframesRow = HashMap<Box<[u16]>, usize>;
+
 /// The `@keyframes` every style scope of the document defines, as each scope's rule cache resolved
 /// them, with the host's keyframe set for each name.
 ///
 /// A scope publishes its row whenever its rule cache is built, and the host builds every scope's
 /// cache before a style transaction, so resolving an animation's keyframes is a lookup here rather
 /// than building a rule cache in the middle of a style computation. A keyframe set is the host's
-/// refcounted object, borrowed: the scope keeps a reference to every set its row names until the
-/// row is replaced or given up.
+/// refcounted object, borrowed: the scope keeps a reference to every set its row names until it
+/// publishes the row again or gives it up, which the engine takes in ahead of anything that
+/// resolves keyframes.
 #[derive(Default)]
 pub(crate) struct AnimationKeyframes {
-    scopes: HashMap<TreeScopeID, HashMap<Box<[u16]>, usize>>,
+    scopes: HashMap<TreeScopeID, KeyframesRow>,
     /// Which scope a shadow root's pointer identity names. The cascade attributes the winning
     /// `animation-name` declaration to a shadow root by that identity, and the scope it names is
     /// where the declaration's `@keyframes` are looked for first.
@@ -247,18 +251,25 @@ pub(crate) struct AnimationKeyframes {
 }
 
 impl AnimationKeyframes {
-    /// Replaces one scope's row. The names arrive packed into one buffer of code units with a length
-    /// each, the way an element's animation names do. An empty row gives the scope's row up.
-    pub(crate) fn set(
-        &mut self,
-        tree_scope: TreeScopeID,
-        shadow_root_identity: usize,
-        name_lengths: &[u32],
-        name_units: &[u16],
-        keyframe_sets: &[usize],
-    ) {
+    /// The row of the names, packed into one buffer of code units with a length each, the way an
+    /// element's animation names arrive, and the host's keyframe set for each.
+    pub(crate) fn row(name_lengths: &[u32], name_units: &[u16], keyframe_sets: &[usize]) -> KeyframesRow {
         debug_assert_eq!(name_lengths.len(), keyframe_sets.len());
-        if name_lengths.is_empty() {
+        let mut offset = 0;
+        name_lengths
+            .iter()
+            .zip(keyframe_sets)
+            .map(|(&length, &set)| {
+                let units = &name_units[offset..offset + length as usize];
+                offset += length as usize;
+                (Box::from(units), set)
+            })
+            .collect()
+    }
+
+    /// Replaces one scope's row. An empty row gives the scope's row up.
+    pub(crate) fn set(&mut self, tree_scope: TreeScopeID, shadow_root_identity: usize, row: KeyframesRow) {
+        if row.is_empty() {
             self.scopes.remove(&tree_scope);
             // A scope with no row answers like one that defines nothing, so its identity stops
             // naming it, unless another shadow root has since been allocated at that address and
@@ -271,27 +282,7 @@ impl AnimationKeyframes {
         if shadow_root_identity != 0 {
             self.scope_by_shadow_root.insert(shadow_root_identity, tree_scope);
         }
-        let mut offset = 0;
-        let sets = name_lengths
-            .iter()
-            .zip(keyframe_sets)
-            .map(|(&length, &set)| {
-                let units = &name_units[offset..offset + length as usize];
-                offset += length as usize;
-                (Box::from(units), set)
-            })
-            .collect();
-        self.scopes.insert(tree_scope, sets);
-    }
-
-    /// The scope of a declaration the cascade attributes to the shadow root of this pointer identity.
-    /// The document's identity, zero, names no shadow root, and a shadow root whose scope defines no
-    /// `@keyframes` has none to look in.
-    #[must_use]
-    pub(crate) fn scope_of_shadow_root(&self, shadow_root_identity: usize) -> DeclarationScope {
-        self.scope_by_shadow_root
-            .get(&shadow_root_identity)
-            .map_or(DeclarationScope::Unscoped, |&scope| DeclarationScope::Shadow(scope))
+        self.scopes.insert(tree_scope, row);
     }
 
     /// The host's keyframe set an animation of this name runs, or `None` where no scope in its chain
@@ -442,12 +433,20 @@ mod tests {
             .collect();
         let units: Vec<u16> = rows.iter().flat_map(|(name, _)| name.encode_utf16()).collect();
         let sets: Vec<usize> = rows.iter().map(|&(_, set)| set).collect();
-        keyframes.set(TreeScopeID(scope), identity, &lengths, &units, &sets);
+        keyframes.set(
+            TreeScopeID(scope),
+            identity,
+            AnimationKeyframes::row(&lengths, &units, &sets),
+        );
     }
 
     fn resolve(keyframes: &AnimationKeyframes, identity: usize, scope: u32, name: &str) -> Option<usize> {
+        let declaration_scope = keyframes
+            .scope_by_shadow_root
+            .get(&identity)
+            .map_or(DeclarationScope::Unscoped, |&scope| DeclarationScope::Shadow(scope));
         keyframes.resolve(
-            keyframes.scope_of_shadow_root(identity),
+            declaration_scope,
             TreeScopeID(scope),
             &name.encode_utf16().collect::<Vec<_>>(),
         )

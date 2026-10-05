@@ -38,21 +38,26 @@ WEB_API void flush_deferred_style_change_events_for_rule(CSSRule&);
 // the document's style node identity, which is the parent every top-level child names.
 WEB_API void record_document_tree_tracked(DOM::Document&);
 
-// Called once a subtree has been linked into a connected tree. Allocates a style node identity for
-// every element and shadow root in it that has none yet, and records the arrival of each element.
+// Called once a subtree has been linked into a connected tree. Marks it as waiting to arrive: the
+// elements, text nodes and shadow roots in it that have no style node identity yet take one, and
+// the elements record their arrival, only once something observes the style engine.
 WEB_API void record_subtree_connecting(DOM::Node& root);
 
-// Called once a node has been linked into a connected tree. Allocates the element's style node
-// identity if it does not have one yet.
+// Called once a node has been linked into a connected tree. Marks the element as waiting to arrive
+// if it has no style node identity yet and no subtree waiting to arrive covers it.
 WEB_API void record_element_connected(DOM::Element&);
 
-// Called once a text node has been linked into a connected tree that no subtree arrival covered.
-// Allocates the text node's style node identity if it does not have one yet.
+// Called once a text node has been linked into a connected tree. Marks it as waiting to arrive if it
+// has no style node identity yet and no subtree waiting to arrive covers it.
 WEB_API void record_text_connected(DOM::Text&);
 
-// Called once a text node's data has stopped being, or started being, nothing but ASCII whitespace.
-// That is the only thing about its data the mirror carries.
-WEB_API void record_text_whitespace_state_changed(DOM::Text&);
+// Gives every node waiting to arrive its style node identity and records its arrival, in tree
+// order. Whatever reads the style engine, or a connected node's identity, calls this first.
+WEB_API void take_in_pending_style_arrivals(DOM::Document&);
+
+// Called whenever a text node's data is replaced. The mirror carries the characters, which the layout tree build
+// renders, and whether they are nothing but ASCII whitespace.
+WEB_API void record_text_data_changed(DOM::Text&);
 WEB_API void publish_pending_element_features(StyleEngine&, StyleComputer&);
 WEB_API void publish_required_attribute_value_texts(StyleEngine&, StyleComputer&);
 
@@ -81,6 +86,10 @@ WEB_API void record_element_assigned_slot_changed(DOM::Element&, DOM::Element* o
 // Assignment runs inside an insertion, before the inserted subtree is named, so a slottable's
 // arrival republishes the list it is now a member of.
 WEB_API void record_slot_assignment_changed(HTML::HTMLSlotElement&);
+
+// The document's top layer, published whole whenever its list changes: the order is the order the
+// members' boxes are built in, and no per-element fact can carry it.
+WEB_API void record_top_layer_changed(DOM::Document&);
 
 // Called once every element of a shadow tree has recorded its own removal, so nothing still names
 // the root as a parent. A shadow root's identity follows its host's lifetime: keeping it across a
@@ -128,8 +137,8 @@ enum ElementStyleAdjustmentFact : u32 {
     // The element stands for an element-reference pseudo-element of its shadow host, whose style
     // it takes.
     IsShadowHostPseudoElement = 1 << 19,
-    // An HTML <body>. The first one among an HTML <html> root's children propagates its overflow to
-    // the viewport, which the style engine's damage for the element's record moves reads.
+    // An HTML <body>. The first one among an HTML <html> root's children propagates its style to the
+    // viewport, which layout and the style engine's damage for the element's record moves read.
     IsHtmlBodyElement = 1 << 20,
     // The element types layout tree construction branches on. An element's type is fixed when it is
     // created, so the store holds these rather than the tree builder asking the DOM for them.
@@ -147,10 +156,31 @@ enum ElementStyleAdjustmentFact : u32 {
     // An HTML <html>, whose first <body> child propagates its overflow to the viewport when it is
     // the root.
     IsHtmlHtmlElement = 1 << 30,
+    // An HTML <frameset>, which is the document's body in place of a <body>.
+    IsHtmlFramesetElement = 1u << 31,
 };
+// What a layout row records about the element it is built for at the moment it is allocated, published so that the
+// tree build can read it out of the mirror rather than off the DOM node. Mirrors Rust `element_construction_fact`.
+enum ElementConstructionFact : u32 {
+    IsHtmlInputElement = 1 << 0,
+    // This and ConstructedAsDocumentElement are also ElementStyleAdjustmentFacts. A row is built out of this word
+    // alone, so they are published into both rather than read across two.
+    ConstructedAsHtmlHtmlElement = 1 << 1,
+    IsInUserAgentShadowTree = 1 << 2,
+    UsesButtonLayout = 1 << 3,
+    IsEditingHost = 1 << 4,
+    IsBody = 1 << 5,
+    ConstructedAsDocumentElement = 1 << 6,
+};
+WEB_API u32 element_construction_facts(DOM::Element const&);
 WEB_API u32 element_style_adjustment_facts(DOM::Element const&);
 WEB_API u32 element_box_type_adjustment_facts(DOM::Element const&);
 WEB_API void record_element_adjustment_facts(DOM::Element&);
+WEB_API void record_element_construction_facts(DOM::Element&);
+// Called where which box an element asks for may have moved without its type or an attribute's presence moving.
+WEB_API void record_element_box_kind(DOM::Element&);
+// Called where what an element gives the natural size of its replaced content moves.
+WEB_API void record_element_replaced_content_input(DOM::Element&);
 WEB_API bool record_element_presentational_hint_properties(DOM::Element&, ReadonlySpan<StyleProperty>);
 // Publish the element's hints again, after something they are mapped from beside its own attributes moved.
 WEB_API void republish_presentational_hints(DOM::Element&);

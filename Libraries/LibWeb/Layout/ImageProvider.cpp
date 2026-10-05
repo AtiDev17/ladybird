@@ -6,10 +6,7 @@
 
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/HTML/DecodedImageData.h>
-#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/ImageProvider.h>
-#include <LibWeb/Painting/BoxViews.h>
-#include <LibWeb/Painting/PaintFacts.h>
 
 namespace Web::Layout {
 
@@ -56,16 +53,6 @@ Optional<Gfx::DecodedImageFrame> ImageProvider::default_image_frame(Optional<Gfx
     if (auto const& data = decoded_image_data())
         return data->default_frame(size.value_or(intrinsic_size().value_or({}).to_type<int>()));
     return {};
-}
-
-void ImageProvider::image_provider_contents_changed() const
-{
-    auto const* layout_node = image_provider_layout_node();
-    if (!layout_node)
-        return;
-    if (layout_node->kind() == RustFFI::NodeKind::ImageBox && &static_cast<Box const&>(*layout_node).image_provider() != this)
-        return;
-    Painting::push_replaced_image_paint_facts(*layout_node);
 }
 
 }

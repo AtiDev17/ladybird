@@ -29,6 +29,10 @@ pub enum FfiCommitMessageKind {
     /// tree build laid out under the graphics element `other_style_node` names. The resource
     /// outlives that box, so removing it has to rebuild the subtree the box sits in.
     SvgResourceReferenced,
+    /// The node is an element a bypass path reached without a style, which no style update
+    /// settled. The tree build built no box for it: the document styles it and builds its box
+    /// again.
+    UnstyledElementReached,
 }
 
 /// One thing layout has to tell the document. The node it is about is named by the style node the
@@ -64,13 +68,17 @@ impl CommitNotifications {
     ///
     /// The host must keep the document and node shells alive until these synchronous
     /// notifications return. No mutable arena borrow may be active.
-    pub(crate) unsafe fn notify_host(self, host: &FfiLayoutHostCallbacks) {
+    pub(crate) unsafe fn notify_host(
+        self,
+        main_thread: &crate::stage::MainThread,
+        read: &crate::render_state::BegunRead,
+        host: &FfiLayoutHostCallbacks,
+    ) {
         for reset in self.row_resets {
-            reset.invoke_callback();
+            reset.tell(main_thread);
         }
-        if !self.messages.is_empty() {
-            unsafe { (host.deliver_commit_messages)(host.context, self.messages.as_ptr(), self.messages.len()) };
-        }
+        // SAFETY: Guaranteed by the caller.
+        unsafe { host.deliver_commit_messages(main_thread, read, &self.messages) };
     }
 }
 

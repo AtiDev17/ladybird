@@ -81,26 +81,18 @@ struct PublishedWinnerState {
     inventory_is_complete: bool,
 }
 
-/// What a match contributes to a compaction that depends on nothing but its match list.
+/// What a match contributes to a compaction that depends on nothing but its match list. A match
+/// from the node's own tree reaches the compaction only through its priority, which names
+/// everything the tree decides about it, so alike rows of two instances of one shadow tree share
+/// a compaction.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct CompactionMatch {
     rule: RuleID,
     pseudo_element: Option<tree::PseudoElementTarget>,
     specificity: Specificity,
-    tree_scope: TreeScopeID,
     scope_proximity: u32,
-}
-
-impl CompactionMatch {
-    fn of(entry: &RuleMatch) -> Self {
-        Self {
-            rule: entry.rule,
-            pseudo_element: entry.pseudo_element,
-            specificity: entry.specificity,
-            tree_scope: entry.tree_scope,
-            scope_proximity: entry.scope_proximity,
-        }
-    }
+    /// The normal priority of a match from the node's own tree; none for a document rule's.
+    own_tree_priority: Option<CascadePriority>,
 }
 
 /// What compacting one match list decided: the states it published and, unless compaction was
@@ -127,11 +119,9 @@ struct RememberedCompactions {
 impl RememberedCompactions {
     const LIMIT: usize = 1024;
 
-    fn hash_of(all: &[RuleMatch]) -> u64 {
+    fn hash_of(matches: &[CompactionMatch]) -> u64 {
         let mut hasher = fast_hash::fast_hasher();
-        for entry in all {
-            CompactionMatch::of(entry).hash(&mut hasher);
-        }
+        matches.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -149,14 +139,9 @@ impl RememberedCompactions {
         self.nested_bytes = 0;
     }
 
-    fn get(&self, hash: u64, all: &[RuleMatch]) -> Option<&RememberedCompaction> {
+    fn get(&self, hash: u64, matches: &[CompactionMatch]) -> Option<&RememberedCompaction> {
         self.by_matches.find(hash, |remembered| {
-            remembered.hash == hash
-                && remembered
-                    .matches
-                    .iter()
-                    .copied()
-                    .eq(all.iter().map(CompactionMatch::of))
+            remembered.hash == hash && *remembered.matches == *matches
         })
     }
 
@@ -168,13 +153,19 @@ impl RememberedCompactions {
         !self.seen.insert(hash)
     }
 
-    fn remember(&mut self, hash: u64, all: &[RuleMatch], states: &[PublishedWinnerState], keep: Option<&[bool]>) {
+    fn remember(
+        &mut self,
+        hash: u64,
+        matches: &[CompactionMatch],
+        states: &[PublishedWinnerState],
+        keep: Option<&[bool]>,
+    ) {
         if self.by_matches.len() >= Self::LIMIT {
             self.clear();
         }
         let remembered = RememberedCompaction {
             hash,
-            matches: all.iter().map(CompactionMatch::of).collect(),
+            matches: matches.into(),
             states: states.into(),
             keep: keep.map(Into::into),
         };
@@ -205,6 +196,8 @@ pub(super) struct CascadeCompactionWorkspace {
     published_winners: Vec<PropertyWinner>,
     published_targets: Vec<(Option<tree::PseudoElementTarget>, std::ops::Range<usize>)>,
     published_states: SmallVec<[PublishedWinnerState; 2]>,
+    /// The match list of a compaction that depends on nothing but it, as `remembered` keys it.
+    remembered_key: Vec<CompactionMatch>,
     remembered: RememberedCompactions,
 }
 
@@ -220,6 +213,7 @@ impl Default for CascadeCompactionWorkspace {
             published_winners: Vec::new(),
             published_targets: Vec::new(),
             published_states: SmallVec::new(),
+            remembered_key: Vec::new(),
             remembered: RememberedCompactions::default(),
         }
     }
@@ -238,6 +232,7 @@ impl CascadeCompactionWorkspace {
             } else {
                 0
             }
+            + (self.remembered_key.capacity() * size_of::<CompactionMatch>()) as u64
             + self.remembered.capacity_bytes()
     }
 }
@@ -261,16 +256,17 @@ impl RetainedState {
     /// Order matches the way the cascade applies them, dropping repeats from asking more than one
     /// tree scope when that could have happened.
     pub(super) fn order_matches_in_cascade(&self, all: &mut Vec<RuleMatch>, can_have_scope_duplicates: bool) {
-        // One match per rule and target, not per scope that asked. The user-agent and user origins
-        // decide in every scope, so a node asked in two of them - a host, which is asked its own
-        // scope's rules and its shadow tree's - meets those rules twice. Their priority is the same
-        // either way, because a sheet the asking scope does not hold is weighed where it is
-        // attached.
+        // One match per rule, target and context the rule is weighed in, not per scope that asked.
+        // The user-agent and user origins decide in every scope, so a node asked in two of them - a
+        // host, which is asked its own scope's rules and its shadow tree's - meets those rules
+        // twice, and both are weighed where their sheet is attached. A sheet several scopes adopt
+        // decides in each of them, at each one's own context.
         let identity = |entry: &RuleMatch| {
             (
                 entry.node,
                 entry.rule,
                 entry.pseudo_element.map_or(u32::MAX, |target| u32::from(target.kind.0)),
+                self.cascade_context_scope(entry.rule, entry.tree_scope),
             )
         };
         if can_have_scope_duplicates {
@@ -300,6 +296,7 @@ impl RetainedState {
             } else {
                 matches.sort_by_cached_key(|entry| {
                     self.cascade_priority_of(
+                        entry.node,
                         entry.rule,
                         entry.tree_scope,
                         entry.specificity,
@@ -330,14 +327,20 @@ impl RetainedState {
         }
     }
 
-    pub(super) fn cascade_stratum_of(&self, rule: RuleID, tree_scope: TreeScopeID, important: bool) -> CascadeStratum {
+    pub(super) fn cascade_stratum_of(
+        &self,
+        node: StyleNodeID,
+        rule: RuleID,
+        tree_scope: TreeScopeID,
+        important: bool,
+    ) -> CascadeStratum {
         let sheet = self.program.rule_sheet(rule);
         let context_scope = self.cascade_context_scope(rule, tree_scope);
         let layer = self.program.rule_version(rule).layer;
         CascadeStratum::new(
             self.program.sheet_origin(sheet),
             important,
-            self.tree_scope_depth(context_scope),
+            self.encapsulation_context(node, context_scope),
             layer,
             self.program.layer_rank(context_scope, layer),
             CascadeAttachment::StyleSheet,
@@ -395,6 +398,7 @@ impl RetainedState {
                 // node's winners were published.
                 if self.published_container_verdict_holds(node, rule, pseudo_kind.is_some()) {
                     self.push_rule_cascade_candidates(
+                        node,
                         rule,
                         tree_scope,
                         specificity,
@@ -476,6 +480,7 @@ impl RetainedState {
             .filter(|entry| entry.pseudo_element == pseudo && conditions_hold(entry.rule))
         {
             self.push_rule_cascade_candidates(
+                node,
                 entry.rule,
                 entry.tree_scope,
                 entry.specificity,
@@ -504,8 +509,10 @@ impl RetainedState {
     /// Push the cascade candidates a matched rule declares for the longhands `wants` names. A
     /// shorthand written with a substitution is declared whole beside the longhands it pends; the
     /// longhands are the candidates, the shorthand names no column.
+    #[allow(clippy::too_many_arguments)]
     fn push_rule_cascade_candidates(
         &self,
+        node: StyleNodeID,
         rule: RuleID,
         tree_scope: TreeScopeID,
         specificity: Specificity,
@@ -521,8 +528,15 @@ impl RetainedState {
             let (priority, stratum) = *priority_and_stratum_by_importance[declared.important as usize]
                 .get_or_insert_with(|| {
                     (
-                        self.cascade_priority_of(rule, tree_scope, specificity, scope_proximity, declared.important),
-                        self.cascade_stratum_of(rule, tree_scope, declared.important),
+                        self.cascade_priority_of(
+                            node,
+                            rule,
+                            tree_scope,
+                            specificity,
+                            scope_proximity,
+                            declared.important,
+                        ),
+                        self.cascade_stratum_of(node, rule, tree_scope, declared.important),
                     )
                 });
             candidates.push(OrderedCascadeCandidate {
@@ -548,13 +562,7 @@ impl RetainedState {
         for kind in ElementDeclarationKind::ALL {
             // Custom properties an inline style declares beside its longhands leave those
             // longhands as complete as any; the environment they decide is computed apart.
-            let (declared_properties, _) = self.facts.element_declared_properties(node, kind);
-            if !self
-                .facts
-                .element_declarations_are_complete_but_for_custom_properties(node, kind)
-            {
-                continue;
-            }
+            let declared_properties = self.facts.element_declared_properties(node, kind);
             let mut priority_and_stratum_by_importance = [None; 2];
             for &declared in declared_properties {
                 if !wants(declared.property) || !property_is_longhand(declared.property) {
@@ -688,7 +696,6 @@ impl RetainedState {
             ElementDeclarationKind::ALL.iter().any(|&kind| {
                 self.facts
                     .element_declared_properties(node, kind)
-                    .0
                     .iter()
                     .any(|declared| {
                         matches!(
@@ -712,10 +719,28 @@ impl RetainedState {
             && !has_continuations
             && self.compaction_depends_only_on_matches(effects, node, all)
         {
+            let key = &mut workspace.remembered_key;
+            key.clear();
+            key.extend(all.iter().map(|entry| CompactionMatch {
+                rule: entry.rule,
+                pseudo_element: entry.pseudo_element,
+                specificity: entry.specificity,
+                scope_proximity: entry.scope_proximity,
+                own_tree_priority: (entry.tree_scope != TreeScopeID::DOCUMENT).then(|| {
+                    self.cascade_priority_of(
+                        entry.node,
+                        entry.rule,
+                        entry.tree_scope,
+                        entry.specificity,
+                        entry.scope_proximity,
+                        false,
+                    )
+                }),
+            }));
             let remembered = &mut workspace.remembered;
             remembered.settle(self.program.version(), self.winner_groups.generation());
-            let hash = RememberedCompactions::hash_of(all);
-            if let Some(remembered) = remembered.get(hash, all) {
+            let hash = RememberedCompactions::hash_of(key);
+            if let Some(remembered) = remembered.get(hash, key) {
                 self.publish_winner_states(effects, node, &remembered.states, counters);
                 if let Some(keep) = &remembered.keep {
                     // The key holds every match, so the remembered decisions line up with the list; were one missing,
@@ -745,13 +770,7 @@ impl RetainedState {
         // cannot decide is kept as undecided, not as failed: it leaves the node to the host.
         let mut container_verdicts = Vec::new();
         for (match_index, entry) in all.iter().enumerate() {
-            if compaction_blocked
-                && (!self.match_scope_is_complete_for(publish_winners_for, entry.tree_scope)
-                    || !self.container_gate_is_held(publish_winners_for, entry.rule)
-                    || !self
-                        .program
-                        .declarations_are_complete_but_for_custom_properties(entry.rule))
-            {
+            if compaction_blocked && !self.container_gate_is_held(publish_winners_for, entry.rule) {
                 continue;
             }
             if self.program.rule_is_gated_by_container_query(entry.rule)
@@ -778,6 +797,7 @@ impl RetainedState {
                 }
                 let priority = *priorities[declared.important as usize].get_or_insert_with(|| {
                     self.cascade_priority_of(
+                        entry.node,
                         entry.rule,
                         entry.tree_scope,
                         entry.specificity,
@@ -802,13 +822,7 @@ impl RetainedState {
         if let Some(node) = publish_winners_for {
             self.publish_container_verdicts(node, container_verdicts);
             for kind in ElementDeclarationKind::ALL {
-                let (declared_properties, _) = self.facts.element_declared_properties(node, kind);
-                if !self
-                    .facts
-                    .element_declarations_are_complete_but_for_custom_properties(node, kind)
-                {
-                    continue;
-                }
+                let declared_properties = self.facts.element_declared_properties(node, kind);
                 let mut priorities = [None; 2];
                 for &declared in declared_properties {
                     if !property_is_longhand(declared.property) {
@@ -941,7 +955,7 @@ impl RetainedState {
             if let Some(hash) = remember_as {
                 workspace
                     .remembered
-                    .remember(hash, all, &workspace.published_states, None);
+                    .remember(hash, &workspace.remembered_key, &workspace.published_states, None);
             }
             self.memory.release(MemoryCategory::BatchScratch, scratch_bytes);
             return;
@@ -1067,7 +1081,7 @@ impl RetainedState {
         if let Some(hash) = remember_as {
             workspace
                 .remembered
-                .remember(hash, all, &workspace.published_states, Some(keep));
+                .remember(hash, &workspace.remembered_key, &workspace.published_states, Some(keep));
         }
         let mut index = 0;
         all.retain(|_| {
@@ -1525,6 +1539,7 @@ impl RetainedState {
                 };
                 let priority = *priorities[declared.important as usize].get_or_insert_with(|| {
                     self.cascade_priority_of(
+                        node,
                         delta.rule,
                         matched.tree_scope,
                         entry.specificity,
@@ -1611,14 +1626,8 @@ impl RetainedState {
             .any(|entry| {
                 !self.container_gate_is_held(node, entry.rule)
                     || !self.program.declarations_are_complete_for(entry.rule)
-                    || !self.match_scope_is_complete_for(node, entry.tree_scope)
             })
-            || (pseudo.is_none()
-                && node.is_some_and(|node| {
-                    ElementDeclarationKind::ALL
-                        .iter()
-                        .any(|&kind| !self.facts.element_declared_properties(node, kind).1)
-                })))
+            || (pseudo.is_none() && node.is_some_and(|node| !self.facts.element_custom_declarations(node).is_empty())))
     }
 
     /// Whether a pseudo-element's rules declare nothing past its longhand winners but custom
@@ -1632,70 +1641,44 @@ impl RetainedState {
         !matches
             .iter()
             .filter(|entry| entry.pseudo_element == Some(pseudo))
-            .any(|entry| {
-                !self.container_gate_is_held(Some(node), entry.rule)
-                    || !self
-                        .program
-                        .declarations_are_complete_but_for_custom_properties(entry.rule)
-                    || !self.match_scope_is_complete_for(Some(node), entry.tree_scope)
-            })
-    }
-
-    /// Whether the winners the cascade publishes for a node hold a match from a rule in the given
-    /// tree scope: a document rule's do, and so does a rule's from the element's own tree scope,
-    /// for the element and its pseudo-elements alike. A rule reaching across a shadow boundary
-    /// (`:host`, `::slotted`, `::part`) decides from its own context, and the winners hold it when
-    /// that context is one the element's cascade weighs where a rule's priority places it, which
-    /// is at its encapsulation depth, the same for every element it matches.
-    pub(super) fn match_scope_is_complete_for(&self, node: Option<StyleNodeID>, scope: TreeScopeID) -> bool {
-        if scope == TreeScopeID::DOCUMENT {
-            return true;
-        }
-        let Some(node) = node else {
-            return false;
-        };
-        self.tree.tree_scope(node) == scope
-            || self
-                .author_context_index(node, scope)
-                .is_some_and(|index| index == self.tree_scope_depth(scope))
+            .any(|entry| !self.container_gate_is_held(Some(node), entry.rule))
     }
 
     /// Where a tree scope stands among the encapsulation contexts that decide for an element,
     /// outermost first, the order its cascade applies them in: the document, the shadow trees the
     /// element is in from the outermost inwards, the ones holding the slots it is assigned to along
-    /// its assignment chain, then the element's own shadow tree, for `:host`. `None` when the scope
-    /// is none of them.
+    /// its assignment chain, then the element's own shadow tree, for `:host`. That is the
+    /// shadow-including tree order of those trees. `None` when the scope is none of them.
     pub(super) fn author_context_index(&self, node: StyleNodeID, scope: TreeScopeID) -> Option<u32> {
-        let mut contexts: SmallVec<[TreeScopeID; 8]> = SmallVec::new();
-        let mut append = |scope: TreeScopeID| {
-            if !contexts.contains(&scope) {
-                contexts.push(scope);
-            }
-        };
-        append(TreeScopeID::DOCUMENT);
-        let mut chain: SmallVec<[TreeScopeID; 4]> = SmallVec::new();
-        let mut current = self.tree.tree_scope(node);
-        while current != TreeScopeID::DOCUMENT {
-            if chain.contains(&current) {
-                return None;
-            }
-            chain.push(current);
+        let tree_scope = self.tree.tree_scope(node);
+        let enclosing = std::iter::successors(Some(tree_scope), |&current| {
             let host = self.scope_root(current).and_then(|root| self.tree.host_of(root))?;
-            current = self.tree.tree_scope(host);
+            Some(self.tree.tree_scope(host))
+        });
+        let is_context = enclosing
+            .take(self.tree_scope_depth(tree_scope) as usize + 1)
+            .any(|enclosing| enclosing == scope)
+            || self.scopes_slotted_into(node).any(|slotted_into| slotted_into == scope)
+            || self.own_shadow_tree(node) == Some(scope);
+        is_context.then(|| self.encapsulation_context(node, scope))
+    }
+
+    /// Where the cascade of `node` weighs a match from `scope`, as `author_context_index` places
+    /// it. Each tree the element is in or slotted into stands at its depth, one deeper than the
+    /// last, so only the element's own shadow tree, after all of those, stands elsewhere.
+    fn encapsulation_context(&self, node: StyleNodeID, scope: TreeScopeID) -> u32 {
+        if self.own_shadow_tree(node) != Some(scope) {
+            return self.tree_scope_depth(scope);
         }
-        for &scope in chain.iter().rev() {
-            append(scope);
-        }
-        for slotted_into in self.scopes_slotted_into(node) {
-            append(slotted_into);
-        }
-        if let Some(shadow_root) = self.tree.shadow_root_of(node) {
-            append(self.tree.tree_scope(shadow_root));
-        }
-        contexts
-            .iter()
-            .position(|&context| context == scope)
-            .map(|index| index as u32)
+        let slotted_into = self.scopes_slotted_into(node).count() as u32;
+        self.tree_scope_depth(self.tree.tree_scope(node)) + slotted_into + 1
+    }
+
+    /// The tree the element's shadow root roots, where its `:host` rules decide from.
+    fn own_shadow_tree(&self, node: StyleNodeID) -> Option<TreeScopeID> {
+        self.tree
+            .shadow_root_of(node)
+            .and_then(|shadow_root| self.scope_by_root.get(shadow_root))
     }
 
     pub(super) fn cascade_winner_inventory_is_complete(
@@ -1706,14 +1689,8 @@ impl RetainedState {
         // Checking every target covers every match. Check each inventory once instead
         // of scanning the answer again for every rule matching the same pseudo target.
         !matches.iter().any(|entry| {
-            !self.container_gate_is_held(node, entry.rule)
-                || !self.program.declarations_are_complete_for(entry.rule)
-                || !self.match_scope_is_complete_for(node, entry.tree_scope)
-        }) && !node.is_some_and(|node| {
-            ElementDeclarationKind::ALL
-                .iter()
-                .any(|&kind| !self.facts.element_declared_properties(node, kind).1)
-        })
+            !self.container_gate_is_held(node, entry.rule) || !self.program.declarations_are_complete_for(entry.rule)
+        }) && !node.is_some_and(|node| !self.facts.element_custom_declarations(node).is_empty())
     }
 
     /// As `cascade_winner_inventory_is_complete`, for winners published in the transaction `effects`
@@ -1860,8 +1837,9 @@ impl RetainedState {
     }
 
     /// How deeply a tree scope is encapsulated: the document is zero, a shadow tree inside it one,
-    /// and one inside that two. It is what orders the contexts against each other, outermost first
-    /// for a normal declaration and innermost first for an important one.
+    /// and one inside that two. It is where an element's cascade weighs a tree it is in or slotted
+    /// into (`encapsulation_context`), outermost first for a normal declaration and innermost first
+    /// for an important one.
     #[must_use]
     pub(super) fn tree_scope_depth(&self, tree_scope: TreeScopeID) -> u32 {
         let mut depth = 0;
@@ -1907,7 +1885,7 @@ impl RetainedState {
         }
     }
 
-    /// Where one rule's declarations sit in the cascade for an element in `tree_scope`.
+    /// Where one rule's declarations, matched from `tree_scope`, sit in the cascade of `node`.
     ///
     /// The components that change globally - layer topology, sheet order - are read through the
     /// identities the rule references rather than copied into it, so moving a layer or a sheet
@@ -1915,8 +1893,51 @@ impl RetainedState {
     #[must_use]
     pub(super) fn cascade_priority_of(
         &self,
+        node: StyleNodeID,
         rule: RuleID,
         tree_scope: TreeScopeID,
+        specificity: Specificity,
+        scope_proximity: u32,
+        important: bool,
+    ) -> CascadePriority {
+        let context_scope = self.cascade_context_scope(rule, tree_scope);
+        self.cascade_priority_in_context(
+            rule,
+            tree_scope,
+            self.encapsulation_context(node, context_scope),
+            specificity,
+            scope_proximity,
+            important,
+        )
+    }
+
+    /// As `cascade_priority_of`, for any element of `tree_scope` itself, which weighs its own tree
+    /// and the document at their depths: a rule decides for such an element from no other context.
+    #[must_use]
+    pub(super) fn own_scope_cascade_priority_of(
+        &self,
+        rule: RuleID,
+        tree_scope: TreeScopeID,
+        specificity: Specificity,
+        scope_proximity: u32,
+        important: bool,
+    ) -> CascadePriority {
+        let context_scope = self.cascade_context_scope(rule, tree_scope);
+        self.cascade_priority_in_context(
+            rule,
+            tree_scope,
+            self.tree_scope_depth(context_scope),
+            specificity,
+            scope_proximity,
+            important,
+        )
+    }
+
+    fn cascade_priority_in_context(
+        &self,
+        rule: RuleID,
+        tree_scope: TreeScopeID,
+        context_depth: u32,
         specificity: Specificity,
         scope_proximity: u32,
         important: bool,
@@ -1931,7 +1952,7 @@ impl RetainedState {
         CascadePriority::new(PriorityInputs {
             origin: self.program.sheet_origin(sheet),
             important,
-            context_depth: self.tree_scope_depth(context_scope),
+            context_depth,
             element_attachment: ElementAttachment::Rule,
             layer_rank: self.program.layer_rank(context_scope, version.layer),
             specificity,
@@ -1969,10 +1990,10 @@ impl RetainedState {
     }
 
     pub(super) fn node_has_element_declaration_input(&self, node: StyleNodeID) -> bool {
-        ElementDeclarationKind::ALL.iter().any(|&kind| {
-            let (declared, complete) = self.facts.element_declared_properties(node, kind);
-            !declared.is_empty() || !complete
-        })
+        !self.facts.element_custom_declarations(node).is_empty()
+            || ElementDeclarationKind::ALL
+                .iter()
+                .any(|&kind| !self.facts.element_declared_properties(node, kind).is_empty())
     }
 
     /// Advance staged local facts to the transaction's final snapshot.
@@ -2168,6 +2189,7 @@ impl StyleEngineState {
 
     /// Merge one element style input into the deferred inputs, which are kept sorted by key.
     pub(crate) fn defer_element_style_input(&mut self, node: StyleNodeID, reaction: u8, inherited_style_groups: u8) {
+        self.host.deferred_element_style_inputs_moved = true;
         let key = InputKey::ElementStyleInput(node);
         match self
             .host
@@ -2249,14 +2271,16 @@ impl StyleEngineState {
     }
 
     pub(super) fn sweep_style_atoms(&mut self, counters: &mut Counters) {
-        if !self.retained.atoms.should_sweep() && self.host.replay_reclaimed_style_atoms.is_none() {
-            return;
-        }
+        let replay_reclaimed = match self.host.replay_atom_sweep.take() {
+            Some(ReplayAtomSweep::Skip) => return,
+            Some(ReplayAtomSweep::Reclaim(atoms)) => Some(atoms),
+            None if self.retained.atoms.should_sweep() && !self.host.defers_atom_sweep => None,
+            None => return,
+        };
         if self.retained.batch_matching_traversal.is_some() {
             counters.bump(Counter::AtomSweepsDeferredForActiveTraversal);
             return;
         }
-        let replay_reclaimed = self.host.replay_reclaimed_style_atoms.take();
         self.host.style_atoms_swept = true;
         self.retained.facts.sweep_auxiliary_catalogs_without_sync();
         let (mut live, visited) = self.collect_live_style_atoms();

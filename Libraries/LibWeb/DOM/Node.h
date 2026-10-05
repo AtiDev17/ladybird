@@ -84,17 +84,16 @@ enum class RootNodeComposed {
     X(HTMLCanvasElementWidthOrHeightChange)           \
     X(HTMLImageElementReactToChangesInTheEnvironment) \
     X(HTMLImageElementUpdateTheImageData)             \
+    X(HTMLObjectElementContentDocumentResized)        \
     X(HTMLVideoElementNaturalDimensionsChanged)       \
     X(HTMLVideoElementSetVideoTrack)                  \
     X(KeyframeEffect)                                 \
-    X(LanguageChangeUnderCasingTextTransform)         \
     X(LayoutTreeUpdate)                               \
     X(NavigableSetViewportSize)                       \
     X(SVGImageElementFetchTheDocument)                \
     X(SVGResourceElementAttributeChange)              \
     X(SVGViewBoxChange)                               \
-    X(StyleChange)                                    \
-    X(TableSpanAttributeChange)
+    X(StyleChange)
 
 enum class SetNeedsLayoutReason {
 #define ENUMERATE_SET_NEEDS_LAYOUT_REASON(e) e,
@@ -189,6 +188,16 @@ public:
     virtual bool is_svg_clip_path_element() const { return false; }
     virtual bool is_svg_image_element() const { return false; }
     virtual bool is_svg_text_content_element() const { return false; }
+    virtual bool is_svg_path_element() const { return false; }
+    virtual bool is_svg_rect_element() const { return false; }
+    virtual bool is_svg_circle_element() const { return false; }
+    virtual bool is_svg_ellipse_element() const { return false; }
+    virtual bool is_svg_polyline_element() const { return false; }
+    virtual bool is_svg_polygon_element() const { return false; }
+    virtual bool is_svg_line_element() const { return false; }
+    virtual bool is_svg_text_positioning_element() const { return false; }
+    virtual bool is_svg_text_element() const { return false; }
+    virtual bool is_svg_text_path_element() const { return false; }
 
     bool in_a_document_tree() const;
 
@@ -204,6 +213,8 @@ public:
     bool in_editable_subtree() const { return m_in_editable_subtree; }
     bool recompute_editable_subtree_flag();
     void recompute_editable_subtree_flags_and_repaint();
+    // Brings the editing-host and empty-text stamps of the boxes in the subtree to the nodes' editability.
+    void apply_editability_to_boxes(Badge<InvalidationJournal>, Layout::BegunRead const&);
 
     virtual bool is_dom_node() const final { return true; }
     virtual bool is_html_element() const { return false; }
@@ -356,6 +367,13 @@ public:
     u32 child_index_generation() const { return m_child_index_generation; }
     bool is_tracked_by_style_engine() const;
 
+    // Whether this subtree waits to take its place in the style engine's tree, and whether a shadow-including
+    // descendant's subtree does. See CSS::take_in_pending_style_arrivals().
+    bool style_arrival_pending() const { return m_style_arrival_pending; }
+    void set_style_arrival_pending(bool value) { m_style_arrival_pending = value; }
+    bool descendant_style_arrival_pending() const { return m_descendant_style_arrival_pending; }
+    void set_descendant_style_arrival_pending(bool value) { m_descendant_style_arrival_pending = value; }
+
     // Mirrors the slottable's assigned slot; see SlottableMixin::set_assigned_slot().
     bool has_assigned_slot() const { return m_has_assigned_slot; }
     void set_has_assigned_slot(Badge<SlottableMixin>, bool value) { m_has_assigned_slot = value; }
@@ -408,11 +426,11 @@ public:
     virtual void adopted_from(Document&) { }
     virtual WebIDL::ExceptionOr<void> cloned(Node&, bool) const { return {}; }
 
-    Layout::Node const* layout_node() const;
-    Layout::Node* layout_node();
+    Layout::Node const* layout_node(Layout::BegunRead const& read) const;
+    Layout::Node* layout_node(Layout::BegunRead const& read);
 
-    Layout::Node const* unsafe_layout_node() const;
-    Layout::Node* unsafe_layout_node() { return const_cast<Layout::Node*>(static_cast<Node const*>(this)->unsafe_layout_node()); }
+    Layout::Node const* unsafe_layout_node(Layout::BegunRead const& read) const;
+    Layout::Node* unsafe_layout_node(Layout::BegunRead const& read) { return const_cast<Layout::Node*>(static_cast<Node const*>(this)->unsafe_layout_node(read)); }
     // Whether the last layout tree build gave this node a box, and whether layout committed geometry for it. Code
     // that only needs to know whether there is a box should ask these instead of reaching for the box. The layout
     // node arena writes both as it changes the boxes they describe, so asking reads the node, not the arena.
@@ -423,21 +441,21 @@ public:
         m_has_layout_box = has_layout_box;
         m_has_committed_box = has_committed_box;
     }
-    Element const* first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor) const;
-    Element* first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor)
+    Element const* first_letter_owner_for_layout_subtree_from(Layout::BegunRead const& read, Node const& inclusive_ancestor) const;
+    Element* first_letter_owner_for_layout_subtree_from(Layout::BegunRead const& read, Node const& inclusive_ancestor)
     {
-        return const_cast<Element*>(const_cast<Node const*>(this)->first_letter_owner_for_layout_subtree_from(inclusive_ancestor));
+        return const_cast<Element*>(const_cast<Node const*>(this)->first_letter_owner_for_layout_subtree_from(read, inclusive_ancestor));
     }
 
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
-    // The facts about this node that its box paints (inertness, editability, and so on) may have changed.
-    void note_dom_paint_facts();
+    // The facts about this node that a box built for it paints (inertness, editability, and so on) may have changed.
+    void publish_dom_paint_facts();
     void set_needs_layout_update(SetNeedsLayoutReason);
     void set_needs_layout_update(SetNeedsLayoutReason, Layout::LayoutUpdatePropagation);
 
     // Whether the node's layout subtree can leave the parent's box without restructuring the
     // anonymous boxes around it, so the parent's subtree keeps its layout tree.
-    static bool can_detach_layout_subtree_in_place(Node const& node, Node const& parent, bool box_is_block_level);
+    static bool can_detach_layout_subtree_in_place(Layout::BegunRead const& read, Element const& element, Element const& parent, bool box_is_block_level);
     // Whether a list item's box appearing or disappearing changes the list-item counter value of
     // some item that stays in the list.
     static bool list_item_box_change_renumbers_list(Element const& list_item);
@@ -452,10 +470,8 @@ public:
     // the style mirror has not named holds none.
     [[nodiscard]] bool needs_layout_tree_update() const;
     void set_needs_layout_tree_update(bool, SetNeedsLayoutTreeUpdateReason);
-    // The half of a layout tree update mark that reads the layout tree: whether the node's box relays out alone, defers
-    // to the insertion, or dirties its ancestors, and whether the rebuild has to climb past anonymous parents. The
-    // invalidation journal holds it back until it drains, and hands in the box it found bound to the node.
-    void apply_layout_tree_update_mark(Layout::Node&, SetNeedsLayoutTreeUpdateReason);
+    // Which narrower rebuild a layout tree update mark made for `reason` permits.
+    static u8 layout_tree_update_reuse_reason(SetNeedsLayoutTreeUpdateReason);
 
     [[nodiscard]] bool needs_pseudo_element_layout_tree_update() const { return layout_tree_update_reuse_reasons() & PseudoElementChange; }
     [[nodiscard]] bool may_reuse_layout_node_for_child_list_insertion() const { return layout_tree_update_reuse_reasons() & ChildListInsertion; }
@@ -617,7 +633,6 @@ protected:
         virtual void visit_edges(Cell::Visitor&);
         virtual size_t external_memory_size() const;
 
-        mutable Optional<UniqueNodeID> unique_id;
         Optional<String> webdriver_node_id;
 
         // https://dom.spec.whatwg.org/#registered-observer-list
@@ -662,13 +677,18 @@ protected:
     u32 m_associated_animation_count_in_subtree { 0 };
     bool m_in_editable_subtree { false };
     bool m_is_connected { false };
-    bool m_has_assigned_slot { false };
-    bool m_inside_blocking_wheel_event_handler { false };
+    // NB: These share a byte, which keeps every node from growing.
+    bool m_has_assigned_slot : 1 { false };
+    bool m_inside_blocking_wheel_event_handler : 1 { false };
+    bool m_style_arrival_pending : 1 { false };
+    bool m_descendant_style_arrival_pending : 1 { false };
     u32 m_child_index_generation { 1 };
+    // The slot of the node directory that names the node by its unique id, or 0 before anything asked for the id.
+    mutable u32 m_node_directory_slot { 0 };
 
     void build_accessibility_tree(AccessibilityTreeNode& parent);
 
-    ErrorOr<Utf16String> name_or_description(NameOrDescription, Document const&, HashTable<UniqueNodeID>&, IsDescendant = IsDescendant::No, ShouldComputeRole = ShouldComputeRole::Yes) const;
+    ErrorOr<Utf16String> name_or_description(Layout::BegunRead const& read, NameOrDescription, Document const&, HashTable<UniqueNodeID>&, IsDescendant = IsDescendant::No, ShouldComputeRole = ShouldComputeRole::Yes) const;
 
 private:
     enum class LayoutSubtreeRemoval {
@@ -683,7 +703,7 @@ private:
     void run_node_iterator_pre_removing_steps();
     bool schedule_list_item_renumber_for_removal();
     void report_removal_to_style_engine(Node& parent);
-    void update_layout_tree_for_removal(Node& parent, LayoutSubtreeRemoval, AncestorsMayHaveFirstLetter);
+    void update_layout_tree_for_removal(Layout::BegunRead const& read, Node& parent, LayoutSubtreeRemoval, AncestorsMayHaveFirstLetter);
     void assign_slottables_after_removal(Node& parent, Node& parent_root);
     void run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine);
     void add_transient_registered_observers_for_removal(Node& parent);

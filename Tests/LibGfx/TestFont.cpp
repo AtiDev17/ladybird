@@ -58,8 +58,7 @@ private:
 
 static bool font_is_emoji(StringView path)
 {
-    auto file = MUST(Core::MappedFile::map(path));
-    auto typeface = MUST(Gfx::Typeface::try_load_from_externally_owned_memory(file->bytes()));
+    auto typeface = MUST(Gfx::Typeface::try_load_from_mapped_file(MUST(Core::MappedFile::map(path)), 0));
     // Construct the Font directly rather than via Typeface::font() — which would cache it on the
     // Typeface and form a Typeface<->Font reference cycle that leaks once both leave this scope.
     auto font = adopt_ref(*new Gfx::Font(typeface, 12, 12, {}, {}));
@@ -432,8 +431,7 @@ TEST_CASE(shaping_cache_preserves_positions_spacing_and_trailing_whitespace)
 // Only ThreadSanitizer can catch a memo race here, since every thread reaches the same verdict.
 TEST_CASE(emoji_classification_can_run_on_several_threads)
 {
-    auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/colrv1-noname.ttf"sv)));
-    auto typeface = MUST(Gfx::Typeface::try_load_from_externally_owned_memory(file->bytes()));
+    auto typeface = MUST(Gfx::Typeface::try_load_from_mapped_file(MUST(Core::MappedFile::map(TEST_INPUT("fonts/colrv1-noname.ttf"sv))), 0));
     IGNORE_USE_IN_ESCAPING_LAMBDA auto font = adopt_ref(*new Gfx::Font(typeface, 12, 12, {}, {}));
 
     IGNORE_USE_IN_ESCAPING_LAMBDA Array<bool, 8> verdicts {};
@@ -585,7 +583,7 @@ TEST_CASE(font_collection_preserves_each_face_style)
 {
     auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/styles.ttc"sv)));
     for (u32 index = 0; index < 3; ++index) {
-        auto result = Gfx::TypefaceSkia::load_from_buffer(file->bytes(), index);
+        auto result = Gfx::TypefaceSkia::try_load_from_temporary_memory(file->bytes(), index);
         EXPECT(!result.is_error());
         if (result.is_error())
             continue;
@@ -604,20 +602,21 @@ TEST_CASE(font_collection_preserves_each_face_style)
         EXPECT_EQ(font->slope(), expected_slope);
         EXPECT_NE(font->glyph_id_for_code_point('a'), 0u);
     }
-    EXPECT(Gfx::TypefaceSkia::load_from_buffer(file->bytes(), 3).is_error());
+    EXPECT(Gfx::TypefaceSkia::try_load_from_temporary_memory(file->bytes(), 3).is_error());
 }
 
 TEST_CASE(font_collection_retains_shared_backing_for_skia)
 {
     auto mapping = MUST(Core::MappedFile::map(TEST_INPUT("fonts/styles.ttc"sv)));
-    auto shared_mapping = make_ref_counted<Core::SharedMappedFile>(move(mapping));
-    auto backing = make_ref_counted<Gfx::Typeface::FontDataBacking>(shared_mapping);
+    auto backing = make_ref_counted<Gfx::Typeface::FontDataBacking>(move(mapping));
     sk_sp<SkTypeface const> skia_typeface;
     ByteBuffer expected_table;
     constexpr auto cmap_tag = SkSetFourByteTag('c', 'm', 'a', 'p');
     {
-        auto typeface = MUST(Gfx::TypefaceSkia::load_from_buffer(shared_mapping->operator->().bytes(), 1, backing));
-        EXPECT_EQ(typeface->buffer().data(), shared_mapping->operator->().bytes().data());
+        auto const& mapping = backing->storage.get<NonnullOwnPtr<Core::MappedFile>>();
+
+        auto typeface = MUST(Gfx::TypefaceSkia::load_from_buffer(mapping->bytes(), 1, backing));
+        EXPECT_EQ(typeface->buffer().data(), mapping->bytes().data());
         skia_typeface = sk_ref_sp(typeface->sk_typeface());
         expected_table = MUST(ByteBuffer::create_uninitialized(skia_typeface->getTableSize(cmap_tag)));
         EXPECT(!expected_table.is_empty());
@@ -672,4 +671,73 @@ TEST_CASE(system_fallback_fonts_can_be_matched_on_several_threads)
     bold_key.weight = 700;
     (void)Gfx::system_fallback_font(bold_key, 12);
     EXPECT_EQ(Gfx::system_fallback_font_cache_size(), 2u);
+}
+
+// A frozen cascade answers the same question as the live one, without entering the document.
+TEST_CASE(frozen_cascade_matches_the_live_lookup)
+{
+    auto local_font = load_text_font(24);
+    auto fallback_font = load_text_font(16);
+    auto cascade = Gfx::FontCascadeList::create();
+    cascade->add(local_font, { { 'a', 'a' } });
+    cascade->add(fallback_font);
+    cascade->set_last_resort_font(fallback_font);
+
+    cascade->freeze();
+    EXPECT(cascade->frozen_list());
+    for (u32 code_point : { 'a', 'b', 'z' })
+        EXPECT_EQ(&cascade->frozen_font_for_code_point(code_point), &cascade->font_for_code_point(code_point));
+}
+
+// https://drafts.csswg.org/css-fonts-4/#font-display-timeline
+// A face in its block period renders invisibly and one in its swap period renders with the
+// fallback, and the frozen cascade decides that from the period it recorded, not by resolving.
+TEST_CASE(frozen_cascade_renders_a_pending_face_without_resolving_it)
+{
+    auto font = load_text_font(16);
+    u32 resolves = 0;
+    auto build = [&](Gfx::PendingFontState state) {
+        auto cascade = Gfx::FontCascadeList::create();
+        cascade->add_pending_face(
+            { { 'a', 'a' } }, [&resolves, state] { ++resolves; return state; }, {}, [state] { return state; });
+        cascade->add(font);
+        cascade->set_last_resort_font(font);
+        cascade->freeze();
+        return cascade;
+    };
+
+    // Drop anything an earlier case left waiting, so the count below is only this case's.
+    (void)Gfx::request_wanted_pending_faces();
+
+    auto blocking = build(Gfx::PendingFontState::Invisible);
+    EXPECT(blocking->frozen_font_for_code_point('a').is_invisible());
+    EXPECT(!blocking->frozen_font_for_code_point('b').is_invisible());
+
+    auto swapping = build(Gfx::PendingFontState::Visible);
+    EXPECT_EQ(&swapping->frozen_font_for_code_point('a'), font.ptr());
+
+    // Not one of those lookups resolved a face: the periods came from the snapshot.
+    EXPECT_EQ(resolves, 0u);
+
+    // Both faces are waiting for the document to request their loads, which is what starts them.
+    EXPECT_EQ(Gfx::request_wanted_pending_faces(), 2u);
+    EXPECT_EQ(resolves, 2u);
+}
+
+// A face whose display period has already failed contributes nothing and does not block the
+// faces after it, so the frozen cascade does not carry it at all.
+TEST_CASE(frozen_cascade_leaves_out_a_failed_pending_face)
+{
+    auto local_font = load_text_font(24);
+    auto fallback_font = load_text_font(16);
+    auto cascade = Gfx::FontCascadeList::create();
+    cascade->add_pending_face(
+        { { 'a', 'a' } }, [] { return Gfx::PendingFontState::Failed; }, {}, [] { return Gfx::PendingFontState::Failed; });
+    cascade->add_pending_face(
+        { { 'a', 'a' } }, [] { return Gfx::PendingFontState::Visible; }, [local_font] { return local_font; }, [] { return Gfx::PendingFontState::Visible; });
+    cascade->add(fallback_font);
+    cascade->set_last_resort_font(fallback_font);
+    cascade->freeze();
+
+    EXPECT_EQ(&cascade->frozen_font_for_code_point('a'), local_font.ptr());
 }

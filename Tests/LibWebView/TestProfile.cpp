@@ -16,6 +16,7 @@
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
 #include <LibHTTP/HeaderList.h>
+#include <LibHTTP/NetworkIsolationKey.h>
 #include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
 #include <LibWebView/BookmarkStore.h>
@@ -202,7 +203,7 @@ TEST_CASE(profile_databases_are_isolated)
             .value = "first"_string,
             .expiry_time_from_expires_attribute = UnixDateTime::now() + AK::Duration::from_seconds(3600),
         };
-        cookie_jar->set_cookie(url, cookie, HTTP::Cookie::Source::Http);
+        cookie_jar->set_cookie(url, cookie, HTTP::Cookie::Source::Http, {});
 
         auto hsts_store = TRY_OR_FAIL(WebView::HSTSStore::create(*database));
         hsts_store->store_policy("profile-isolation.example"_string, HTTP::HSTS::ParsedHSTSPolicy { AK::Duration::from_seconds(3600), false });
@@ -268,21 +269,27 @@ TEST_CASE(profile_caches_are_isolated)
     auto url = parse_url("https://profile-isolation.example/script.js"sv);
     auto request_headers = HTTP::HeaderList::create({});
     auto bytecode = TRY_OR_FAIL(ByteBuffer::copy("first-profile-bytecode"sv.bytes()));
+    auto partition = HTTP::NetworkIsolationKey {
+        .top_level_site = "https://profile-isolation.example"_utf16,
+        .frame_site = "https://profile-isolation.example"_utf16,
+    }
+                         .disk_cache_partition()
+                         .release_value();
 
     {
         auto cache = TRY_OR_FAIL(HTTP::DiskCache::create(HTTP::DiskCache::Mode::Normal, LexicalPath { first_profile.paths().cache })).release_value();
-        EXPECT(TRY_OR_FAIL(cache.create_synthetic_entry(url, "GET"sv)));
-        EXPECT(TRY_OR_FAIL(cache.store_associated_data(url, "GET"sv, *request_headers, {}, HTTP::CacheEntryAssociatedData::JavaScriptBytecode, bytecode.bytes())));
+        EXPECT(TRY_OR_FAIL(cache.create_synthetic_entry(partition, url, "GET"sv)));
+        EXPECT(TRY_OR_FAIL(cache.store_associated_data(partition, url, "GET"sv, *request_headers, {}, HTTP::CacheEntryAssociatedData::JavaScriptBytecode, bytecode.bytes())));
     }
 
     {
         auto cache = TRY_OR_FAIL(HTTP::DiskCache::create(HTTP::DiskCache::Mode::Normal, LexicalPath { second_profile.paths().cache })).release_value();
-        EXPECT(!TRY_OR_FAIL(cache.retrieve_associated_data(url, "GET"sv, *request_headers, {}, HTTP::CacheEntryAssociatedData::JavaScriptBytecode)).has_value());
+        EXPECT(!TRY_OR_FAIL(cache.retrieve_associated_data(partition, url, "GET"sv, *request_headers, {}, HTTP::CacheEntryAssociatedData::JavaScriptBytecode)).has_value());
     }
 
     {
         auto cache = TRY_OR_FAIL(HTTP::DiskCache::create(HTTP::DiskCache::Mode::Normal, LexicalPath { first_profile.paths().cache })).release_value();
-        auto retrieved_bytecode = TRY_OR_FAIL(cache.retrieve_associated_data(url, "GET"sv, *request_headers, {}, HTTP::CacheEntryAssociatedData::JavaScriptBytecode));
+        auto retrieved_bytecode = TRY_OR_FAIL(cache.retrieve_associated_data(partition, url, "GET"sv, *request_headers, {}, HTTP::CacheEntryAssociatedData::JavaScriptBytecode));
         VERIFY(retrieved_bytecode.has_value());
         EXPECT_EQ(retrieved_bytecode->bytes(), bytecode.bytes());
     }

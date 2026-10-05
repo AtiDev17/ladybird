@@ -9,6 +9,7 @@
 #include <AK/QuickSort.h>
 #include <AK/StringBuilder.h>
 #include <AK/StringConversions.h>
+#include <AK/Utf16View.h>
 #include <LibCrypto/Hash/SHA1.h>
 #include <LibHTTP/Cache/DiskCache.h>
 #include <LibHTTP/Cache/Utilities.h>
@@ -78,6 +79,30 @@ static u64 serialize_hash(Crypto::Hash::SHA1& hasher)
     result |= static_cast<u64>(bytes[7]);
 
     return result;
+}
+
+u64 create_cache_key(Utf16View const& partition, StringView url, StringView method)
+{
+    auto hasher = Crypto::Hash::SHA1::create();
+
+    // NB: Hash the code units rather than the string's storage, so the same text always gives the same key.
+    Array<u8, 256> buffer;
+    size_t buffer_size = 0;
+    for (size_t i = 0; i < partition.length_in_code_units(); ++i) {
+        if (buffer_size == buffer.size()) {
+            hasher->update(buffer.span());
+            buffer_size = 0;
+        }
+        auto code_unit = partition.code_unit_at(i);
+        buffer[buffer_size++] = static_cast<u8>(code_unit & 0xff);
+        buffer[buffer_size++] = static_cast<u8>(code_unit >> 8);
+    }
+    hasher->update(buffer.span().trim(buffer_size));
+    hasher->update("\n"sv);
+    hasher->update(url);
+    hasher->update(method);
+
+    return serialize_hash(*hasher);
 }
 
 u64 create_cache_key(StringView url, StringView method)
@@ -573,17 +598,23 @@ CacheLifetimeStatus cache_lifetime_status(HeaderList const& request_headers, Hea
     if (!response_cache_control.has_value())
         return revalidation_status(CacheLifetimeStatus::MustRevalidate);
 
+    // https://httpwg.org/specs/rfc9111.html#cache-response-directive.must-revalidate
+    // The must-revalidate response directive indicates that once the response has become stale, a cache MUST NOT reuse
+    // that response to satisfy another request until it has been successfully validated by the origin
+    //
+    // NB: This takes precedence over stale-while-revalidate, as per
+    //     https://httpwg.org/specs/rfc9111.html#serving.stale.responses:
+    //     A cache MUST NOT generate a stale response if it is prohibited by an explicit in-protocol directive (e.g., by
+    //     a no-cache response directive, a must-revalidate response directive, or an applicable s-maxage or
+    //     proxy-revalidate response directive; see Section 5.2.2).
+    if (contains_cache_control_directive(*response_cache_control, "must-revalidate"sv))
+        return revalidation_status(CacheLifetimeStatus::MustRevalidate);
+
     // https://httpwg.org/specs/rfc5861.html#n-the-stale-while-revalidate-cache-control-extension
     // When present in an HTTP response, the stale-while-revalidate Cache-Control extension indicates that caches MAY
     // serve the response it appears in after it becomes stale, up to the indicated number of seconds.
     if (calculate_stale_while_revalidate_lifetime(response_headers, freshness_lifetime) > current_age)
         return revalidation_status(CacheLifetimeStatus::StaleWhileRevalidate);
-
-    // https://httpwg.org/specs/rfc9111.html#cache-response-directive.must-revalidate
-    // The must-revalidate response directive indicates that once the response has become stale, a cache MUST NOT reuse
-    // that response to satisfy another request until it has been successfully validated by the origin
-    if (contains_cache_control_directive(*response_cache_control, "must-revalidate"sv))
-        return revalidation_status(CacheLifetimeStatus::MustRevalidate);
 
     return CacheLifetimeStatus::Expired;
 }

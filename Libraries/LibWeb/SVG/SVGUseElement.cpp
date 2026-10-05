@@ -7,6 +7,7 @@
 
 #include <LibGC/Heap.h>
 #include <LibGC/HeapHashTable.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/DOM/ElementFactory.h>
@@ -212,7 +213,7 @@ Gfx::AffineTransform SVGUseElement::additional_element_transform() const
     if (auto* svg_svg_element = first_flat_tree_ancestor_of_type<SVGSVGElement>()) {
         if (auto view_box = svg_svg_element->active_view_box(); view_box.has_value())
             viewport_size = { CSSPixels::nearest_value_for(view_box->width), CSSPixels::nearest_value_for(view_box->height) };
-        else if (auto svg_svg_layout_node = svg_svg_element->unsafe_layout_node())
+        else if (Layout::ForcedReadScope read { document(), false }; auto svg_svg_layout_node = svg_svg_element->unsafe_layout_node(read))
             viewport_size = { svg_svg_layout_node->width().to_px(0), svg_svg_layout_node->height().to_px(0) };
     }
 
@@ -295,6 +296,9 @@ void SVGUseElement::fetch_the_document(URL::URL const& url)
     m_resource_request->add_callbacks(
         [this] {
             clone_element_tree_as_our_shadow_tree(referenced_element());
+            m_load_event_delayer.clear();
+        },
+        [this] {
             m_load_event_delayer.clear();
         },
         [this] {
@@ -395,9 +399,9 @@ GC::Ptr<SVGElement> SVGUseElement::instance_root() const
     return const_cast<DOM::ShadowRoot&>(*shadow_root()).first_child_of_type<SVGElement>();
 }
 
-Layout::Node* SVGUseElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind SVGUseElement::box_kind() const
 {
-    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGGraphicsBox);
+    return CSS::ElementBoxKind::SvgGraphics;
 }
 
 }

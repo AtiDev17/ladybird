@@ -28,7 +28,7 @@ set(TEST_SOURCES
 )
 
 if (APPLE OR LINUX)
-    list(APPEND TEST_SOURCES TestCrashReport.cpp TestCrashReportReview.cpp TestCrashReportStore.cpp TestFontService.cpp)
+    list(APPEND TEST_SOURCES TestCrashReport.cpp TestCrashReportReview.cpp TestCrashReportStore.cpp TestFontService.cpp TestRendererFontService.cpp)
 endif()
 
 if (APPLE)
@@ -42,6 +42,9 @@ foreach(source IN LISTS TEST_SOURCES)
     endif()
     if (source STREQUAL "TestFontService.cpp")
         list(APPEND test_libraries LibIPC LibGfx)
+    endif()
+    if (source STREQUAL "TestRendererFontService.cpp")
+        list(APPEND test_libraries LibCompositing LibGfx LibIPC LibThreading)
     endif()
     ladybird_test("${source}" LibWebView LIBS ${test_libraries})
 endforeach()
@@ -202,6 +205,11 @@ if (BUILD_TESTING AND NOT WIN32)
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-worker-terminated-while-starting.py $<TARGET_FILE:WebDriver>
         )
         set_tests_properties(TestWebDriverWorkerTerminatedWhileStarting PROPERTIES TIMEOUT 120)
+        add_test(
+            NAME TestWebDriverCompositorReconnect
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-compositor-reconnect.py $<TARGET_FILE:WebDriver>
+        )
+        set_tests_properties(TestWebDriverCompositorReconnect PROPERTIES TIMEOUT 120)
     endif()
 
     add_test(
@@ -235,10 +243,10 @@ if (BUILD_TESTING AND NOT WIN32)
     set_tests_properties(TestWebDriverSiteZoom PROPERTIES TIMEOUT 120)
 
     add_test(
-        NAME TestWebDriverSiteZoomWithSiteIsolation
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-site-zoom.py $<TARGET_FILE:WebDriver>
+        NAME TestWebDriverForceDark
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-force-dark.py $<TARGET_FILE:WebDriver>
     )
-    set_tests_properties(TestWebDriverSiteZoomWithSiteIsolation PROPERTIES TIMEOUT 120 ENVIRONMENT "LADYBIRD_WEBDRIVER_ENABLE_SITE_ISOLATION=1")
+    set_tests_properties(TestWebDriverForceDark PROPERTIES TIMEOUT 120)
 
     add_test(
         NAME TestWebDriverErrorKeepAlive

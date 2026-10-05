@@ -32,6 +32,7 @@
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/Fetch/Response.h>
+#include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/MimeSniff/Resource.h>
 #include <LibWeb/Platform/FontPlugin.h>
 
@@ -258,6 +259,13 @@ void FontComputer::visit_edges(Visitor& visitor)
         visitor.visit(loader);
 }
 
+static void for_each_nested_font_rule(Parser::ValueParserFFI::NativeRuleList const* rules, Function<void(RustRuleView const&)> const& callback)
+{
+    Parser::ValueParserFFI::rust_rule_list_visit_font_rules(rules, &callback, [](void const* context, Parser::ValueParserFFI::NativeRuleView const* rule) {
+        (*static_cast<Function<void(RustRuleView const&)> const*>(context))(RustRuleView { *rule });
+    });
+}
+
 static void append_font_feature_values(StyleScope const& style_scope, Utf16FlyString const& family_name, FontFeatureValues& font_feature_values)
 {
     // https://drafts.csswg.org/css-fonts/#font-feature-values-syntax
@@ -325,27 +333,45 @@ FontFeatureValues FontComputer::font_feature_values_in_scope(Utf16FlyString cons
     return font_feature_values;
 }
 
-NonnullRefPtr<FontFeatureValuesByFamily const> FontComputer::document_font_feature_values() const
+NonnullRefPtr<FontFeatureValuesByScope const> FontComputer::font_feature_values_by_scope() const
 {
-    if (m_document_font_feature_values)
-        return *m_document_font_feature_values;
+    if (m_font_feature_values_by_scope)
+        return *m_font_feature_values_by_scope;
+    auto by_scope = adopt_ref(*new FontFeatureValuesByScope);
     HashTable<Utf16FlyString> families;
-    if (m_document) {
-        m_document->style_scope().for_each_active_css_style_sheet([&](CSS::StyleSheetState const& sheet) {
-            sheet.for_each_effective_rule_data(TraversalOrder::Preorder, [&](RustRuleView const& rule, Utf16View) {
+    auto declares_any = [&](StyleScope const& style_scope) {
+        bool declares = false;
+        style_scope.for_each_active_css_style_sheet([&](CSS::StyleSheetState const& sheet) {
+            for_each_nested_font_rule(sheet.native_rules().handle(), [&](RustRuleView const& rule) {
                 if (rule.type() != RustRule::Type::FontFeatureValues)
                     return;
+                declares = true;
                 auto values = rule.font_feature_values();
                 for (size_t index = 0; index < values.family_count(); ++index)
                     families.set(Utf16FlyString::from_utf16(values.family_at(index)));
             });
         });
+        return declares;
+    };
+    if (m_document) {
+        declares_any(m_document->style_scope());
+        m_document->style_computer().for_each_shadow_root([&](DOM::ShadowRoot& shadow_root) {
+            if (declares_any(shadow_root.style_scope()))
+                by_scope->shadow_scopes.append(shadow_root.style_engine_tree_scope());
+        });
     }
-    auto by_family = adopt_ref(*new FontFeatureValuesByFamily);
-    for (auto const& family : families)
-        by_family->families.set(family, font_feature_values_for_family(family, {}));
-    m_document_font_feature_values = by_family;
-    return by_family;
+    auto add_scope = [&](TreeScopeID tree_scope) {
+        auto& scope = by_scope->scopes.ensure(tree_scope);
+        for (auto const& family : families) {
+            if (auto const& values = font_feature_values_for_family(family, tree_scope); !values.is_empty())
+                scope.set(family, values);
+        }
+    };
+    add_scope({});
+    for (auto tree_scope : by_scope->shadow_scopes)
+        add_scope(tree_scope);
+    m_font_feature_values_by_scope = by_scope;
+    return by_scope;
 }
 
 Function<FontFeatureValues const&(Utf16FlyString const&)> FontComputer::font_feature_values_provider(TreeScopeID tree_scope) const
@@ -403,6 +429,46 @@ static bool font_values_reference_any_font_family(ComputedValues::FontValues con
     return font_family && style_value_references_any_font_family(*font_family, family_names);
 }
 
+static bool element_uses_any_font_family(DOM::Element const& element, Vector<Utf16FlyString> const& family_names)
+{
+    // Check the element's own font-family.
+    if (auto const* values = element.style_group<ComputedValues::FontValues>()) {
+        if (font_values_reference_any_font_family(*values, family_names))
+            return true;
+    }
+
+    // Check pseudo-elements, which may use a different font-family than the element itself.
+    bool synthetic_pseudo_element_uses_font_family = false;
+    element.for_each_synthetic_pseudo_element([&](Web::CSS::PseudoElement pseudo_element, Web::DOM::SyntheticPseudoElement const&) {
+        if (auto const* values = element.style_group<ComputedValues::FontValues>(pseudo_element)) {
+            if (font_values_reference_any_font_family(*values, family_names)) {
+                synthetic_pseudo_element_uses_font_family = true;
+                return IterationDecision::Break;
+            }
+        }
+        return IterationDecision::Continue;
+    });
+
+    return synthetic_pseudo_element_uses_font_family;
+}
+
+static bool element_uses_any_font_list(DOM::Element const& element, HashTable<Gfx::FontCascadeList const*> const& font_lists)
+{
+    auto uses_font_list = [&](Optional<CSS::PseudoElement> pseudo_element = {}) {
+        auto const* values = element.style_group<ComputedValues::FontValues>(pseudo_element);
+        return values && font_lists.contains(&values->font_list_value());
+    };
+    bool uses_any = uses_font_list();
+    element.for_each_synthetic_pseudo_element([&](CSS::PseudoElement pseudo_element, DOM::SyntheticPseudoElement const&) {
+        if (uses_font_list(pseudo_element)) {
+            uses_any = true;
+            return IterationDecision::Break;
+        }
+        return IterationDecision::Continue;
+    });
+    return uses_any;
+}
+
 void FontComputer::clear_computed_font_cache(Utf16FlyString const& family_name)
 {
     Vector<Utf16FlyString> family_names;
@@ -412,8 +478,6 @@ void FontComputer::clear_computed_font_cache(Utf16FlyString const& family_name)
 
 static void record_font_input_change(DOM::Element& element)
 {
-    if (auto* record = element.style_input_record())
-        record->font_environment_changed = true;
     constexpr u8 font_group = 1u << ComputedValues::FontValues::style_group_index;
     // NB: A derived input, not a recorded one: the change is to the published @font-face table, which the style
     //     engine holds and versions, so the engine settles the element's record itself where it can.
@@ -427,45 +491,50 @@ void FontComputer::clear_computed_font_cache_for_families(Vector<Utf16FlyString>
     bump_environment_generation();
 
     // Only clear cache entries that reference the loaded font family.
-    m_font_cascade_memo->forget_matching([&](auto const& key, auto const&) {
+    m_font_cascade_memo->forget_matching(m_environment_generation, [&](auto const& key, auto const&) {
         return computed_font_families_reference_any_family(key.font_families, family_names);
     });
 
-    auto element_uses_font_family = [&](DOM::Element const& element) {
-        // Check the element's own font-family.
-        if (auto const* values = element.style_group<ComputedValues::FontValues>()) {
-            if (font_values_reference_any_font_family(*values, family_names))
-                return true;
-        }
+    record_font_input_changes([family_names](DOM::Element const& element) {
+        return element_uses_any_font_family(element, family_names);
+    });
+}
 
-        // Check pseudo-elements, which may use a different font-family than the element itself.
-        bool synthetic_pseudo_element_uses_font_family = false;
-        element.for_each_synthetic_pseudo_element([&](Web::CSS::PseudoElement pseudo_element, Web::DOM::SyntheticPseudoElement const&) {
-            if (auto const* values = element.style_group<ComputedValues::FontValues>(pseudo_element)) {
-                if (font_values_reference_any_font_family(*values, family_names)) {
-                    synthetic_pseudo_element_uses_font_family = true;
-                    return IterationDecision::Break;
-                }
-            }
-            return IterationDecision::Continue;
-        });
-
-        return synthetic_pseudo_element_uses_font_family;
-    };
-
-    // Walk the DOM tree (including shadow trees) and publish inputs for elements that use this font family.
+// Publishes an input change for every element whose style uses a font that resolves differently now. Beside a style
+// transaction that flew, the elements are found once its drain has installed the styles it computed.
+void FontComputer::record_font_input_changes(ElementUsesChangedFonts uses_changed_fonts)
+{
+    if (document().has_flown_style_transaction()) {
+        m_font_changes_beside_flown_transaction.append(move(uses_changed_fonts));
+        return;
+    }
+    // Walk the DOM tree (including shadow trees) and publish inputs for elements that use the changed fonts.
     document().for_each_shadow_including_inclusive_descendant([&](DOM::Node& node) {
-        auto* element = as_if<DOM::Element>(node);
-        if (!element)
-            return TraversalDecision::Continue;
-
-        if (element_uses_font_family(*element)) {
+        if (auto* element = as_if<DOM::Element>(node); element && uses_changed_fonts(*element))
             record_font_input_change(*element);
-            return TraversalDecision::Continue;
-        }
-
         return TraversalDecision::Continue;
     });
+}
+
+void FontComputer::did_end_flown_style_drain()
+{
+    // The transaction resolved fonts against the table it was sealed with, where a change beside it made that older
+    // than the memo, into cascades the memo never holds. The elements holding one that answers differently now, or
+    // waits on a face the memo would no longer find it waiting on, are found here.
+    auto resolutions = m_font_cascade_memo->take_resolutions_against_older_tables();
+    HashTable<Gfx::FontCascadeList const*> stale_font_lists;
+    for (auto const& [key, font_list] : resolutions) {
+        if (font_list->has_pending_faces() || !font_list->equals(*m_font_cascade_memo->resolve(*font_face_snapshot(), key, font_feature_values_provider(key.font_feature_values_scope))))
+            stale_font_lists.set(font_list.ptr());
+    }
+    if (!stale_font_lists.is_empty()) {
+        // The lists the walk compares addresses against stay alive with it.
+        record_font_input_changes([stale_font_lists = move(stale_font_lists), kept_alive = move(resolutions)](DOM::Element const& element) {
+            return element_uses_any_font_list(element, stale_font_lists);
+        });
+    }
+    for (auto& uses_changed_fonts : exchange(m_font_changes_beside_flown_transaction, {}))
+        record_font_input_changes(move(uses_changed_fonts));
 }
 
 // Every change to what a font resolution would answer passes through here. Nothing else may touch
@@ -489,6 +558,8 @@ NonnullRefPtr<FontFaceSnapshot const> FontComputer::font_face_snapshot() const
             snapshot_faces.unchecked_append({
                 .id = face->id(),
                 .typeface = face->typeface(),
+                .rendering_typeface = face->rendering_typeface(),
+                .rendering_state = face->rendering_state_without_requesting(),
                 .unicode_ranges = face->unicode_ranges(),
                 .has_urls = face->has_urls(),
                 .is_unusable = face->is_unusable_for_rendering(),
@@ -497,14 +568,14 @@ NonnullRefPtr<FontFaceSnapshot const> FontComputer::font_face_snapshot() const
         }
         table.set(key, move(snapshot_faces));
     }
-    m_font_face_snapshot = FontFaceSnapshot::create(m_environment_generation, move(table), document_font_feature_values());
+    m_font_face_snapshot = FontFaceSnapshot::create(m_environment_generation, move(table), font_feature_values_by_scope());
     return *m_font_face_snapshot;
 }
 
 void FontComputer::clear_font_feature_values_cache(Utf16FlyString const& family_name)
 {
     m_font_feature_values_cache.remove_all_matching([&](auto const& key, auto const&) { return key.family_name == family_name; });
-    m_document_font_feature_values = nullptr;
+    m_font_feature_values_by_scope = nullptr;
 }
 
 bool FontComputer::should_defer_initial_paint()
@@ -552,7 +623,7 @@ void FontComputer::did_load_font(FontFaceKey const& changed_face)
     Vector<NonnullRefPtr<Gfx::FontCascadeList const>> invalidated_font_lists_kept_alive_for_the_walk;
     // NB: The table is built for the first remembered cascade that names the family, if any does.
     RefPtr<FontFaceSnapshot const> snapshot;
-    m_font_cascade_memo->forget_matching([&](auto const& key, auto const& font_list) {
+    m_font_cascade_memo->forget_matching(m_environment_generation, [&](auto const& key, auto const& font_list) {
         if (!any_of(key.font_families, [&](ComputedFontFamily const& family) {
                 return family.has<ComputedFontFamilyName>()
                     && family.get<ComputedFontFamilyName>().name.equals_ignoring_ascii_case(changed_face.family_name);
@@ -567,26 +638,13 @@ void FontComputer::did_load_font(FontFaceKey const& changed_face)
         invalidated_font_lists_kept_alive_for_the_walk.append(font_list);
         return true;
     });
+    // NB: A style transaction that flew may still resolve the family against the table it was sealed with, into a
+    //     cascade the memo never holds and no list here names: did_end_flown_style_drain() finds the elements holding
+    //     one that answers differently now.
     if (!invalidated_font_lists.is_empty()) {
-        document().for_each_shadow_including_inclusive_descendant([&](DOM::Node& node) {
-            auto* element = as_if<DOM::Element>(node);
-            if (!element)
-                return TraversalDecision::Continue;
-            auto uses_invalidated_font_list = [&](Optional<CSS::PseudoElement> pseudo_element = {}) {
-                auto const* values = element->style_group<ComputedValues::FontValues>(pseudo_element);
-                return values && invalidated_font_lists.contains(&values->font_list_value());
-            };
-            bool should_recompute = uses_invalidated_font_list();
-            element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement pseudo_element, DOM::SyntheticPseudoElement const&) {
-                if (uses_invalidated_font_list(pseudo_element)) {
-                    should_recompute = true;
-                    return IterationDecision::Break;
-                }
-                return IterationDecision::Continue;
-            });
-            if (should_recompute)
-                record_font_input_change(*element);
-            return TraversalDecision::Continue;
+        // The lists the walk compares addresses against stay alive with it.
+        record_font_input_changes([invalidated_font_lists = move(invalidated_font_lists), kept_alive = move(invalidated_font_lists_kept_alive_for_the_walk)](DOM::Element const& element) {
+            return element_uses_any_font_list(element, invalidated_font_lists);
         });
     }
 
@@ -703,13 +761,6 @@ GC::Ptr<FontLoader> FontComputer::load_font_face(ParsedFontFace const& font_face
     auto loader = GC::Heap::the().allocate<FontLoader>(*this, rule_or_declaration, move(sources), move(on_load));
     m_loaders_by_source.set(move(key), loader);
     return loader;
-}
-
-static void for_each_nested_font_rule(Parser::ValueParserFFI::NativeRuleList const* rules, Function<void(RustRuleView const&)> const& callback)
-{
-    Parser::ValueParserFFI::rust_rule_list_visit_font_rules(rules, &callback, [](void const* context, Parser::ValueParserFFI::NativeRuleView const* rule) {
-        (*static_cast<Function<void(RustRuleView const&)> const*>(context))(RustRuleView { *rule });
-    });
 }
 
 void FontComputer::forget_font_feature_values_declared_by(RustRuleView const& rule)

@@ -15,6 +15,7 @@
 #include <LibWeb/CSS/RustRule.h>
 #include <LibWeb/CSS/StyleEngineBridge.h>
 #include <LibWeb/CSS/StyleSheetImport.h>
+#include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/SelectorRustFFI.h>
 #include <LibWeb/StyleValueRustFFI.h>
 #include <LibWeb/ValueParserRustFFI.h>
@@ -362,7 +363,7 @@ static RustDeclarationBlock parse_native_declaration_block(Utf16View source)
 TEST_CASE(style_engine_consumes_native_inline_declaration_blocks)
 {
     StyleEngine engine(StyleEngine::DeviceClass::ForegroundDesktop);
-    auto node = engine.allocate_style_node();
+    auto node = engine.mint_style_node();
     auto declarations = parse_native_declaration_block(u"color: rgb(20, 24, 28); margin: var(--gap); --gap: 13px"sv);
     auto shared = declarations.share();
     auto transitions = parse_native_declaration_block(u"transition-duration: 1s"sv);
@@ -386,7 +387,7 @@ TEST_CASE(style_engine_consumes_native_inline_declaration_blocks)
 TEST_CASE(style_engine_expands_presentation_hint_shorthands_in_rust)
 {
     StyleEngine engine(StyleEngine::DeviceClass::ForegroundDesktop);
-    auto node = engine.allocate_style_node();
+    auto node = engine.mint_style_node();
     auto inherited = parse_native_declaration_block(u"color: inherit"sv);
     Vector<StyleProperty> hints { StyleProperty { Important::No, PropertyID::Border, inherited.properties()[0].value } };
     engine.set_element_presentational_hint_properties(node, StyleEngineFFI::FfiElementDeclarationKind::PresentationalHint, hints);
@@ -394,10 +395,11 @@ TEST_CASE(style_engine_expands_presentation_hint_shorthands_in_rust)
     // Border expands through intermediate shorthands such as border-width. Each resulting
     // longhand after the first must reuse the same immutable keyword value. The 17 longhands
     // comprise four widths, four styles, four colors, and five border-image properties.
+    Layout::ForcedReadScope read { engine.render_document(), false };
     for (size_t index = 0;; ++index) {
         StringView name;
         u64 value = 0;
-        VERIFY(engine.counter(index, name, value));
+        VERIFY(engine.counter(read, index, name, value));
         if (name == "specifiedValuesReused"sv) {
             EXPECT_EQ(value, 16ull);
             break;

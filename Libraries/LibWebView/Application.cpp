@@ -49,11 +49,11 @@
 #include <LibWebView/AutocompleteService.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/CompositorClient.h>
-#include <LibWebView/CompositorFontServiceConnection.h>
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/CrashReportStore.h>
 #include <LibWebView/FaviconStore.h>
 #include <LibWebView/FontService.h>
+#include <LibWebView/FontServiceHost.h>
 #include <LibWebView/HSTSStore.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/HelperProcess.h>
@@ -270,8 +270,8 @@ Requests::RequestClient& Application::request_server_client(IsPrivate is_private
         return *the().m_request_server_client;
 
     if (!the().m_private_request_server_client) {
-        auto handle = connect_new_request_server_client(session_for_new_view(IsPrivate::Yes)).release_value_but_fixme_should_propagate_errors();
-        auto transport = handle.create_transport().release_value_but_fixme_should_propagate_errors();
+        auto connection = connect_new_request_server_client(session_for_new_view(IsPrivate::Yes), RequestServer::SiteBinding::Unrestricted).release_value_but_fixme_should_propagate_errors();
+        auto transport = connection.handle.create_transport().release_value_but_fixme_should_propagate_errors();
         auto request_server_client = make_ref_counted<Requests::RequestClient>(move(transport));
 
 #ifdef AK_OS_WINDOWS
@@ -662,6 +662,14 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 
     create_platform_options(m_browser_options, m_request_server_options, m_web_content_options);
 
+    if (!m_settings->first_run_complete() && !m_browser_options.headless_mode.has_value()
+        && !m_browser_options.webdriver_browser_endpoint.has_value() && m_web_content_options.is_test_mode == IsTestMode::No) {
+        if (m_browser_options.raw_urls.is_empty())
+            m_browser_options.urls = { URL::about_welcome() };
+        else if (!m_browser_options.urls.contains_slow(URL::about_welcome()))
+            m_browser_options.urls.prepend(URL::about_welcome());
+    }
+
     m_font_service = FontService::create(m_browser_options.additional_font_directories);
 
     // Test mode implies experimental interfaces and internals object are exposed and the Skia CPU backend is used.
@@ -687,6 +695,10 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 
     if (!m_event_loop)
         m_event_loop = &create_platform_event_loop();
+
+    // NB: The host's thread makes an event loop, which would install the default event loop manager if the platform
+    //     one were not installed yet.
+    m_font_service_host = FontServiceHost::create(*m_font_service);
     TRY(launch_services());
 
     if (m_web_content_options.is_test_mode == IsTestMode::No && m_browser_options.enable_content_blocker == EnableContentBlocker::Yes) {
@@ -1026,10 +1038,10 @@ void Application::open_bookmark_in_new_window(String const& bookmark_id, IsPriva
         open_url_in_new_window(bookmark->bookmark().url, is_private);
 }
 
-ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(Optional<ViewImplementation&> view, IsPrivate is_private, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(IsPrivate is_private, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
 {
     // The client's WebContentClient picks up this same session when it is created.
-    auto request_server_handle = TRY(connect_new_request_server_client(session_for_new_view(is_private)));
+    auto request_server_connection = TRY(connect_new_request_server_client(session_for_new_view(is_private), RequestServer::SiteBinding::Bound));
     auto image_decoder_handle = TRY(connect_new_image_decoder_client());
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     auto wasm_compiler_handle = TRY(connect_new_wasm_compiler_client());
@@ -1042,10 +1054,8 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
 
     auto client = TRY(WebView::launch_web_content_process(is_private, initial_page_id, root_navigable_id));
     TRY(Application::the().connect_web_content_to_compositor(*client));
-    if (view.has_value())
-        system_visibility_state = view->system_visibility_state();
 
-    // A view's first process creates its traversable from this entry. A process hosting a navigable of an existing tab
+    // A tab's first process creates its traversable from this entry. A process hosting a navigable of an existing tab
     // stands in for the canonical current entry.
     auto initial_history_entry = [&] {
         if (canonical_initial_history_entry.has_value())
@@ -1060,10 +1070,9 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
 
     if (!navigable_to_adopt.has_value())
         client->set_initial_top_level_history_entry({}, move(initial_history_entry));
-    if (view.has_value())
-        client->assign_view({}, *view);
 
-    client->async_connect_to_request_server(request_server_handle);
+    client->request_server_site_bindings().did_connect(request_server_connection.client_id);
+    client->async_connect_to_request_server(move(request_server_connection.handle));
     client->async_set_site_compatibility_data(m_site_compatibility_data);
     client->async_connect_to_image_decoder(image_decoder_handle);
 #if defined(HAVE_WASM_COMPILER_SERVICE)
@@ -1117,9 +1126,33 @@ NonnullRefPtr<BrowsingSession> Application::session_for_new_view(IsPrivate is_pr
     return session;
 }
 
-void Application::did_connect_request_server_client(int client_id, BrowsingSession& session)
+void Application::did_connect_request_server_client(int client_id, BrowsingSession& session, RequestServer::SiteBinding site_binding)
 {
     m_request_server_client_sessions.set(client_id, session.make_weak_ptr());
+    if (site_binding == RequestServer::SiteBinding::Unrestricted)
+        m_unrestricted_request_server_clients.set(client_id);
+}
+
+bool Application::request_server_client_may_use_cookies_in(int client_id, URL::URL const& url, Optional<HTTP::Cookie::PartitionContext> const& context) const
+{
+    if (m_unrestricted_request_server_clients.contains(client_id))
+        return true;
+
+    // NB: A bound client makes a request without a context for a document under a top-level document with an opaque
+    //     origin. That is a third-party context of no site, which has no cookies.
+    if (!context.has_value())
+        return false;
+
+    bool may_use_cookies = false;
+    auto check_bindings = [&](RequestServerSiteBindings& bindings) {
+        if (bindings.client_id() != client_id)
+            return IterationDecision::Continue;
+        may_use_cookies = bindings.may_use_cookies_under(context->top_level_site, url);
+        return IterationDecision::Break;
+    };
+    WebContentClient::for_each_client([&](WebContentClient& client) { return check_bindings(client.request_server_site_bindings()); });
+    WorkerProcessManager::the().for_each_request_server_site_bindings([&](RequestServerSiteBindings& bindings) { return check_bindings(bindings); });
+    return may_use_cookies;
 }
 
 Vector<int> Application::request_server_client_ids_for_testing(BrowsingSession const& session) const
@@ -1411,28 +1444,26 @@ void Application::crash_compositor_process()
     m_compositor_client->async_crash();
 }
 
-ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process(ViewImplementation& view)
+ErrorOr<NonnullRefPtr<WebContentPage>> Application::open_page_for_new_tab(IsPrivate is_private)
 {
-    if (view.is_private() == IsPrivate::Yes)
-        return create_web_content_client(view, IsPrivate::Yes, allocate_page_id());
-
-    if (m_spare_web_content_process) {
-        auto web_content_client = m_spare_web_content_process.release_nonnull();
+    RefPtr<WebContentClient> web_content_client;
+    if (is_private == IsPrivate::Yes) {
+        web_content_client = TRY(create_web_content_client(IsPrivate::Yes, allocate_page_id()));
+    } else if (m_spare_web_content_process) {
+        web_content_client = m_spare_web_content_process.release_nonnull();
         launch_spare_web_content_process();
-
-        web_content_client->assign_view({}, view);
-        return web_content_client;
+    } else {
+        launch_spare_web_content_process();
+        web_content_client = TRY(create_web_content_client(IsPrivate::No, allocate_page_id()));
     }
-
-    launch_spare_web_content_process();
-    return create_web_content_client(view, IsPrivate::No, allocate_page_id());
+    return web_content_client->open_initial_page_for_new_top_level_traversable();
 }
 
 ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process(IsPrivate is_private, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
 {
     auto page_id = allocate_page_id();
     auto initial_document_state_id = initial_history_entry.document_state.id;
-    auto client = TRY(create_web_content_client({}, is_private, page_id, root_navigable_id, initial_document_state_id, move(remote_navigables), move(initial_history_entry), system_visibility_state));
+    auto client = TRY(create_web_content_client(is_private, page_id, root_navigable_id, initial_document_state_id, move(remote_navigables), move(initial_history_entry), system_visibility_state));
     return ChildFrameWebContentProcess {
         .client = move(client),
         .page_id = page_id,
@@ -1460,7 +1491,7 @@ void Application::launch_spare_web_content_process()
     Core::deferred_invoke([this]() {
         m_has_queued_task_to_launch_spare_web_content_process = false;
 
-        auto web_content_client = create_web_content_client({}, IsPrivate::No, allocate_page_id());
+        auto web_content_client = create_web_content_client(IsPrivate::No, allocate_page_id());
         if (web_content_client.is_error()) {
             dbgln("Unable to create spare web content client: {}", web_content_client.error());
             return;
@@ -1656,13 +1687,13 @@ ErrorOr<void> Application::launch_services()
 ErrorOr<void> Application::launch_compositor_process()
 {
     VERIFY(!m_compositor_client);
-    VERIFY(!m_compositor_font_service_connection);
     m_compositor_client = TRY(WebView::launch_compositor_process());
-    m_compositor_font_service_connection = TRY(CompositorFontServiceConnection::create(*m_font_service));
-    m_compositor_client->async_set_font_service_transport(m_compositor_font_service_connection->take_transport_handle());
     m_compositor_client->on_death = [this]() {
         handle_compositor_process_death();
     };
+
+    if (!platform_reports_scroll_momentum())
+        m_compositor_client->async_set_synthesizes_scroll_momentum(true);
 
 #ifdef USE_DIRECTX
     m_reported_compositor_gpu_presentation_unavailable = false;
@@ -1685,7 +1716,6 @@ void Application::notify_compositor_gpu_presentation_unavailable()
 void Application::handle_compositor_process_death()
 {
     m_compositor_client = nullptr;
-    m_compositor_font_service_connection = nullptr;
 
     // Nothing will forward or hand back the input events the dead compositor still held.
     WebContentClient::for_each_client([](WebContentClient& client) {
@@ -1774,12 +1804,13 @@ ErrorOr<void> Application::launch_request_server()
 {
     // A new RequestServer hands out client IDs from the start again.
     m_request_server_client_sessions.clear();
+    m_unrestricted_request_server_clients.clear();
     m_request_server_control_client = TRY(launch_request_server_process());
 
     // The UI process speaks the control endpoint over the initial socket, and gets its own data connection from it,
     // exactly like every other client of RequestServer.
-    auto request_server_handle = TRY(connect_new_request_server_client(*m_default_session));
-    auto request_server_transport = TRY(request_server_handle.create_transport());
+    auto request_server_connection = TRY(connect_new_request_server_client(*m_default_session, RequestServer::SiteBinding::Unrestricted));
+    auto request_server_transport = TRY(request_server_connection.handle.create_transport());
     m_request_server_client = make_ref_counted<Requests::RequestClient>(move(request_server_transport));
 
 #ifdef AK_OS_WINDOWS
@@ -1791,29 +1822,34 @@ ErrorOr<void> Application::launch_request_server()
 
     m_request_server_control_client->on_client_disconnected = [](int client_id) {
         the().m_request_server_client_sessions.remove(client_id);
+        the().m_unrestricted_request_server_clients.remove(client_id);
     };
 
-    m_request_server_control_client->on_store_response_cookies_and_hsts_policy = [](int client_id, URL::URL const& url, Vector<HTTP::Cookie::ParsedCookie> const& cookies, Optional<HTTP::HSTS::ParsedHSTSPolicy> const& hsts_policy) {
+    m_request_server_control_client->on_store_response_cookies_and_hsts_policy = [](int client_id, URL::URL const& url, Optional<HTTP::Cookie::PartitionContext> const& partition_context, Vector<HTTP::Cookie::ParsedCookie> const& cookies, Optional<HTTP::HSTS::ParsedHSTSPolicy> const& hsts_policy) {
         auto session = the().session_for_request_server_client(client_id);
         if (!session)
             return;
 
-        for (auto const& cookie : cookies)
-            session->cookie_jar->set_cookie(url, cookie, HTTP::Cookie::Source::Http);
+        if (the().request_server_client_may_use_cookies_in(client_id, url, partition_context)) {
+            for (auto const& cookie : cookies)
+                session->cookie_jar->set_cookie(url, cookie, HTTP::Cookie::Source::Http, partition_context);
+        }
 
         if (hsts_policy.has_value() && url.host().has_value() && url.host()->is_domain())
             session->hsts_store->store_policy(url.host()->get<String>(), *hsts_policy);
     };
 
-    m_request_server_control_client->on_retrieve_http_cookie = [](int client_id, URL::URL const& url) -> String {
+    m_request_server_control_client->on_retrieve_http_cookie = [](int client_id, URL::URL const& url, Optional<HTTP::Cookie::PartitionContext> const& partition_context) -> String {
         auto session = the().session_for_request_server_client(client_id);
         if (!session)
             return {};
+        if (!the().request_server_client_may_use_cookies_in(client_id, url, partition_context))
+            return {};
         auto& cookie_jar = *session->cookie_jar;
         if constexpr (!REQUESTSERVER_WIRE_DEBUG)
-            return cookie_jar.get_cookie(url, HTTP::Cookie::Source::Http);
+            return cookie_jar.get_cookie(url, HTTP::Cookie::Source::Http, partition_context);
         auto started_at = MonotonicTime::now();
-        auto cookie = cookie_jar.get_cookie(url, HTTP::Cookie::Source::Http);
+        auto cookie = cookie_jar.get_cookie(url, HTTP::Cookie::Source::Http, partition_context);
         auto elapsed_ms = (MonotonicTime::now() - started_at).to_milliseconds();
         if (elapsed_ms > 5) {
             dbgln("UI wire-cookie: get_cookie({}) took {} ms ({} bytes returned)",
@@ -1850,7 +1886,7 @@ ErrorOr<void> Application::launch_request_server()
             if (client_count == 0)
                 return {};
 
-            auto response = m_request_server_control_client->send_sync_but_allow_failure<Messages::RequestServerControl::ConnectNewClients>(client_count, is_private);
+            auto response = m_request_server_control_client->send_sync_but_allow_failure<Messages::RequestServerControl::ConnectNewClients>(client_count, is_private, RequestServer::SiteBinding::Bound);
             if (!response || response->handles().size() != client_count || response->client_ids().size() != client_count) {
                 warnln("Failed to connect {} new clients to RequestServer", client_count);
                 VERIFY_NOT_REACHED();
@@ -1866,7 +1902,9 @@ ErrorOr<void> Application::launch_request_server()
             auto& new_clients = client.is_private() == IsPrivate::No ? normal_clients : private_clients;
             // A replacement client belongs to the session of the process it is for, which may be a private session
             // that has since been replaced by a newer one.
-            did_connect_request_server_client(new_clients.client_ids.take_last(), client.session());
+            auto client_id = new_clients.client_ids.take_last();
+            did_connect_request_server_client(client_id, client.session(), RequestServer::SiteBinding::Bound);
+            client.request_server_site_bindings().did_connect(client_id);
             client.async_connect_to_request_server(new_clients.handles.take_last());
             return IterationDecision::Continue;
         });
@@ -2122,10 +2160,7 @@ void Application::process_did_exit(Process&& process, Optional<int>)
         }
         break;
     case ProcessType::MediaServer:
-        if (auto client = process.client<MediaClient::Client>()) {
-            if (auto on_death = move(client->on_death))
-                on_death();
-        }
+        // The connection's holder launches a new MediaServer when it next connects a client.
         break;
     case ProcessType::RequestServer:
         if (auto client = process.client<Requests::RequestControlClient>()) {
@@ -2694,8 +2729,22 @@ void Application::initialize_actions()
     m_enable_scripting_action->set_checked(m_browser_options.disable_scripting == WebView::DisableScripting::No);
     m_debug_menu->add_action(*m_enable_scripting_action);
 
-    m_enable_content_blocking_action = Action::create_checkable("Enable Content Blocking"sv, ActionID::EnableContentBlocking, check(m_enable_content_blocking_action, "content-blocking"sv));
-    m_enable_content_blocking_action->set_checked(m_browser_options.enable_content_blocker == WebView::EnableContentBlocker::Yes);
+    m_enable_content_blocking_action = Action::create_checkable("Enable Content Blocking"sv, ActionID::EnableContentBlocking, [this, toggle_views = check(m_enable_content_blocking_action, "content-blocking"sv)] {
+        if (m_web_content_options.is_test_mode == IsTestMode::Yes) {
+            toggle_views();
+            return;
+        }
+        m_settings->set_content_blocker_enabled(m_enable_content_blocking_action->checked());
+        if (m_enable_content_blocking_action->checked()) {
+            for (auto const& list : m_settings->content_blocker_lists()) {
+                if (list.enabled)
+                    download_content_blocker_list_if_needed({}, list.identifier);
+            }
+        }
+    });
+    // NB: Test mode supplies its own filter lists independently of profile preferences.
+    m_enable_content_blocking_action->set_checked(m_browser_options.enable_content_blocker == WebView::EnableContentBlocker::Yes
+        && (m_web_content_options.is_test_mode == IsTestMode::Yes || m_settings->content_blocker_enabled()));
     m_debug_menu->add_action(*m_enable_content_blocking_action);
 
     m_block_pop_ups_action = Action::create_checkable("Block Pop-ups"sv, ActionID::BlockPopUps, check(m_block_pop_ups_action, "block-pop-ups"sv));
@@ -2757,6 +2806,14 @@ void Application::background_networking_settings_changed(Badge<ApplicationSettin
 
 void Application::content_blocker_settings_changed(Badge<ApplicationSettingsObserver>)
 {
+    if (m_web_content_options.is_test_mode == IsTestMode::Yes)
+        return;
+    auto enabled = m_browser_options.enable_content_blocker == EnableContentBlocker::Yes && m_settings->content_blocker_enabled();
+    m_enable_content_blocking_action->set_checked(enabled);
+    ViewImplementation::for_each_view([enabled](ViewImplementation& view) {
+        view.debug_request("content-blocking"sv, enabled ? "on"sv : "off"sv);
+        return IterationDecision::Continue;
+    });
     apply_content_blocker_settings();
 }
 
@@ -2786,7 +2843,7 @@ void Application::update_content_blocker_lists(Badge<SettingsUI>)
     start_content_blocker_list_update(ContentBlockerListUpdateTrigger::UserInitiated);
 }
 
-void Application::download_content_blocker_list_if_needed(Badge<SettingsUI>, StringView identifier)
+void Application::download_content_blocker_list_if_needed(Badge<Application, SettingsUI>, StringView identifier)
 {
     if (content_blocker_list_last_updated_at(identifier).has_value())
         return;
@@ -3076,7 +3133,7 @@ ErrorOr<void> Application::set_cookie(DevTools::TabDescription const& descriptio
 
     Optional<CookieStorageKey> old_key;
     if (old_cookie.has_value())
-        old_key = CookieStorageKey { old_cookie->name, old_cookie->domain, old_cookie->path };
+        old_key = CookieStorageKey { old_cookie->name, old_cookie->domain, old_cookie->path, old_cookie->partition_key };
 
     TRY(view->session().cookie_jar->set_cookie_from_devtools(*url, move(old_key), move(cookie)));
     return {};
@@ -3089,7 +3146,7 @@ void Application::delete_cookies(DevTools::TabDescription const& description, Ve
         return;
 
     for (auto const& cookie : cookies)
-        view->session().cookie_jar->delete_cookie({ cookie.name, cookie.domain, cookie.path });
+        view->session().cookie_jar->delete_cookie({ cookie.name, cookie.domain, cookie.path, cookie.partition_key });
 }
 
 void Application::listen_for_host_cookie_changes(DevTools::TabDescription const& description, OnHostCookieChange on_host_cookie_change) const

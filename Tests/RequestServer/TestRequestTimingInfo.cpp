@@ -130,7 +130,7 @@ public:
         auto pair = MUST(IPC::Transport::create_paired());
         m_remote_transport = MUST(pair.remote_handle.create_transport());
         m_connection = RequestServer::ConnectionFromClient::construct(
-            move(pair.local), RequestServer::IsPrivate::No,
+            move(pair.local), RequestServer::IsPrivate::No, RequestServer::SiteBinding::Unrestricted,
             m_server.connections, m_server.request_transfer_leases, Optional<HTTP::DiskCache&> {}, ByteString {});
 #ifdef AK_OS_WINDOWS
         auto pid = Core::System::getpid();
@@ -150,7 +150,7 @@ public:
         auto started_at = MonotonicTime::now();
         m_started_at.set(request_id, started_at);
 
-        auto message = make<Messages::RequestServer::StartRequest>(request_id, ByteString { "GET" }, move(url), Vector<HTTP::Header> {}, ByteBuffer {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::No, false, Optional<u32> {}, false, 0, 0);
+        auto message = make<Messages::RequestServer::StartRequest>(request_id, ByteString { "GET" }, move(url), Vector<HTTP::Header> {}, ByteBuffer {}, HTTP::CacheMode::Default, Optional<HTTP::NetworkIsolationKey> {}, HTTP::Cookie::IncludeCredentials::No, false, Optional<u32> {}, false, 0, 0);
         auto response = MUST(static_cast<RequestServerEndpoint::Stub&>(*m_connection).handle(move(message)));
         VERIFY(!response);
 

@@ -20,6 +20,7 @@
 #include <LibGfx/FontCascadeList.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Bindings/FontFace.h>
+#include <LibWeb/CSS/FontFaceSnapshot.h>
 #include <LibWeb/CSS/ParsedFontFace.h>
 #include <LibWeb/CSS/RustDescriptorBlock.h>
 #include <LibWeb/CSS/StyleValues/ComputationContext.h>
@@ -37,7 +38,7 @@ class FontFaceState final : public RefCounted<FontFaceState>
 public:
     using FontFaceSource = FlattenVariant<Variant<Utf16String>, WebIDL::BufferSourceVariant>;
 
-    [[nodiscard]] static NonnullRefPtr<FontFaceState> create_for_constructor(JS::Object&, Utf16String family, FontFaceSource source, Bindings::FontFaceDescriptors const& descriptors);
+    [[nodiscard]] static GC::Ref<FontFace> create_for_constructor(JS::Object&, Utf16String family, FontFaceSource source, Bindings::FontFaceDescriptors const& descriptors);
     [[nodiscard]] static NonnullRefPtr<FontFaceState> create_css_connected(JS::Realm&, u64 rule_identity, StyleSheetState&);
     ~FontFaceState();
     FontFace& cssom_font_face() const;
@@ -123,9 +124,9 @@ public:
     int declared_width() const { return m_cached_width; }
     bool should_be_registered_with_font_computer() const;
 
-    RefPtr<Gfx::FontCascadeList const> font_with_point_size(float point_size, Gfx::FontVariationSettings const&, Gfx::ShapeFeatures const&) const;
-    // The font this face renders with right now: its typeface while its font-display period has not failed.
-    RefPtr<Gfx::Font const> font_for_rendering(float point_size, Gfx::FontVariationSettings const&, Gfx::ShapeFeatures const&) const;
+    // What the face renders with right now, published for a cascade on any thread: its typeface while its font-display
+    // period has not failed.
+    NonnullRefPtr<FontFaceRenderingTypeface const> rendering_typeface() const { return m_rendering_typeface; }
 
     Vector<Gfx::UnicodeRange> const& unicode_ranges() const { return m_unicode_ranges; }
     bool has_urls() const { return !m_urls.is_empty(); }
@@ -135,6 +136,7 @@ public:
     bool has_pending_rendering() const;
     void set_font_display_time_for_testing(u32 milliseconds);
     Gfx::PendingFontState resolve_for_rendering();
+    Gfx::PendingFontState rendering_state_without_requesting() const;
 
     bool has_non_default_unicode_range() const
     {
@@ -155,11 +157,12 @@ public:
     void remove_from_set(FontFaceSet&);
 
 private:
-    FontFaceState(GC::Ref<HTML::EnvironmentSettingsObject>, GC::Ptr<WebIDL::Promise> font_status_promise = nullptr);
+    explicit FontFaceState(GC::Ref<HTML::EnvironmentSettingsObject>);
 
     JS::Object& task_global_object() const;
     void reject_status_promise(WebIDL::Exception);
     void did_load(RefPtr<Gfx::Typeface const>);
+    void set_parsed_font(RefPtr<Gfx::Typeface const>);
 
     Optional<FontComputer&> font_computer() const;
     void update_font_display_period();
@@ -214,6 +217,7 @@ private:
     ByteBuffer m_binary_data {};                            // [[Data]]
 
     RefPtr<Gfx::Typeface const> m_parsed_font;
+    NonnullRefPtr<FontFaceRenderingTypeface> m_rendering_typeface { FontFaceRenderingTypeface::create() };
     RefPtr<Core::Promise<NonnullRefPtr<Gfx::Typeface const>>> m_font_load_promise;
 
     Optional<u64> m_css_font_face_rule_identity;
@@ -226,9 +230,9 @@ private:
 
 bool font_format_is_supported(Utf16View name);
 
-// Record that a style update wanted a web face loaded. Loading a face changes its status, appends it to every
-// FontFaceSet it is in - under an execution context that runs author callbacks - and starts a fetch, none of which
-// may happen while a style update runs.
+// Record that a style update wanted a web face loaded, on any thread. Loading a face changes its status, appends it to
+// every FontFaceSet it is in - under an execution context that runs author callbacks - and starts a fetch, none of
+// which may happen while a style update runs, nor anywhere but the main thread.
 void note_wanted_web_face(u64 face_id);
 
 // Load every face wanted since the last call, unless a style update is running: that one drains them at its end.

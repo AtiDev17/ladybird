@@ -131,10 +131,10 @@ impl RetainedState {
 
     /// The pseudo-element winner states a node settled this flush for the kinds the engine
     /// settles pseudo-elements from, to travel with the node's winner state: ::before, ::after,
-    /// ::first-letter, ::marker, ::selection and ::backdrop. The user agent's rules for ::marker
-    /// and ::backdrop match every element, and a row for each of them on every element would cost
-    /// the memory the winner groups have, so those travel only from a node holding a record for
-    /// that pseudo-element: a list item's marker, or a backdrop in the top layer.
+    /// ::first-letter, ::marker, ::search-text, ::selection and ::backdrop. The user agent's rules
+    /// for ::marker and ::backdrop match every element, and a row for each of them on every element
+    /// would cost the memory the winner groups have, so those travel only from a node holding a
+    /// record for that pseudo-element: a list item's marker, or a backdrop in the top layer.
     fn settled_pseudo_winner_states(
         &self,
         effects: &AnswerEffects,
@@ -146,7 +146,7 @@ impl RetainedState {
             .pseudo_states(node)
             .filter(|&(pseudo, version, _, priority_current)| {
                 let travels = match pseudo.kind.0 {
-                    0 | 2 | 3 | 6 => true,
+                    0 | 2 | 3 | 6 | 7 => true,
                     kind @ (1 | 5) => self.computed_group_sets.pseudo_style_record(node, kind as u8).is_some(),
                     _ => false,
                 };
@@ -244,7 +244,6 @@ impl RetainedState {
     }
 
     pub(super) fn discard_published_match_answers(&mut self, counters: &mut Counters) {
-        self.computed_group_sets.clear_shared_style_records();
         if let Some(traversal) = self.batch_matching_traversal.as_mut() {
             let effects = std::mem::take(&mut traversal.answer_effects);
             effects.install_observations(&mut self.published_match_answers);
@@ -437,7 +436,7 @@ impl RetainedState {
             reuse_retained_match_answers: false,
             retained_answer_dispatch: None,
             ancestor_requirements,
-            prefix_caches: Rc::clone(&self.prefix_caches),
+            prefix_caches: std::sync::Arc::clone(&self.prefix_caches),
             match_workspace: MatchScratch::default(),
             match_workspace_bytes: 0,
             dispatch_workspace: DispatchCandidateWorkspace::default(),
@@ -528,7 +527,7 @@ impl RetainedState {
             reuse_retained_match_answers,
             retained_answer_dispatch,
             ancestor_requirements,
-            prefix_caches: Rc::clone(&self.prefix_caches),
+            prefix_caches: std::sync::Arc::clone(&self.prefix_caches),
             match_workspace,
             match_workspace_bytes,
             dispatch_workspace: DispatchCandidateWorkspace::default(),
@@ -628,7 +627,7 @@ impl RetainedState {
             reuse_retained_match_answers,
             retained_answer_dispatch,
             ancestor_requirements: AncestorRequirementsCache::default(),
-            prefix_caches: Rc::clone(&self.prefix_caches),
+            prefix_caches: std::sync::Arc::clone(&self.prefix_caches),
             match_workspace,
             match_workspace_bytes,
             dispatch_workspace: DispatchCandidateWorkspace::default(),
@@ -656,7 +655,7 @@ impl RetainedState {
                         None,
                         None,
                     );
-                    let prefix_caches = Rc::clone(&self.prefix_caches);
+                    let prefix_caches = std::sync::Arc::clone(&self.prefix_caches);
                     let mut caches = prefix_caches.borrow_mut();
                     caches.states.make_scratch(&mut self.memory);
                     let states = caches.states.prepare_program(scope_program);
@@ -940,7 +939,7 @@ impl RetainedState {
         } else {
             dispatch.assign_cascade_order(|candidate| {
                 let entry = &self.programs.get(candidate.program).entries()[candidate.entry as usize];
-                self.cascade_priority_of(candidate.rule, scope, entry.specificity, u32::MAX, false)
+                self.own_scope_cascade_priority_of(candidate.rule, scope, entry.specificity, u32::MAX, false)
             });
         }
         // A rule declaring custom properties beside its longhands contributes those longhands
@@ -1245,7 +1244,7 @@ impl RetainedState {
         dispatch_workspace: &mut DispatchCandidateWorkspace,
         matches: &mut RuleMatches,
         requirements: Option<&AncestorRequirements>,
-        shared_prefix_caches: Option<&Rc<RefCell<PrefixCaches>>>,
+        shared_prefix_caches: Option<&std::sync::Arc<SharedPrefixCaches>>,
         prefix_contexts: &mut PrefixTransitionContexts,
         match_workspace: Option<&mut MatchScratch>,
         mut retry: BatchMatchRetry<'_>,
@@ -2604,7 +2603,7 @@ impl RetainedState {
             scope_program,
             dispatch,
             match_workspace: MatchScratch::default(),
-            prefix_caches: Rc::clone(&self.prefix_caches),
+            prefix_caches: std::sync::Arc::clone(&self.prefix_caches),
             dispatch_workspace,
             always_emit: selection.always_emit,
             has_non_selector_inputs: selection.has_non_selector_inputs,
@@ -2762,10 +2761,7 @@ impl RetainedState {
         else {
             return false;
         };
-        if ElementDeclarationKind::ALL
-            .iter()
-            .any(|&kind| !self.facts.element_declared_properties(node, kind).1)
-        {
+        if !self.facts.element_custom_declarations(node).is_empty() {
             return false;
         }
         for retained_entry in retained {
@@ -2810,6 +2806,7 @@ impl RetainedState {
                             return false;
                         }
                         let priority = self.cascade_priority_of(
+                            node,
                             delta.rule,
                             TreeScopeID::DOCUMENT,
                             entry.specificity,
@@ -3187,7 +3184,7 @@ impl RetainedState {
         let affected_keys: &[(RuleID, SelectorProgramID)] = narrowed_keys.unwrap_or(&patch.rule_keys);
         counters.bump(Counter::SelectorTruthRepairUpqueries);
         let mut matches = RuleMatches::new();
-        let prefix_caches = Rc::clone(&patch.prefix_caches);
+        let prefix_caches = std::sync::Arc::clone(&patch.prefix_caches);
         let mut caches = prefix_caches.borrow_mut();
         let mut states = caches
             .states
@@ -3683,9 +3680,7 @@ impl RetainedState {
                     && !self.program.rule_is_gated_by_container_query(entry.rule)
                     && self.program.declarations_are_complete_for(entry.rule)
             })
-            && ElementDeclarationKind::ALL
-                .iter()
-                .all(|&kind| self.facts.element_declared_properties(node, kind).1);
+            && self.facts.element_custom_declarations(node).is_empty();
         counters.bump(Counter::RetainedMatchAnswerReuses);
         Some(PublishedMatchAnswer {
             node,
@@ -3730,10 +3725,10 @@ impl RetainedState {
     }
 
     pub(super) fn has_no_element_declarations(&self, node: StyleNodeID) -> bool {
-        ElementDeclarationKind::ALL.iter().all(|&kind| {
-            let (declarations, complete) = self.facts.element_declared_properties(node, kind);
-            complete && declarations.is_empty()
-        })
+        self.facts.element_custom_declarations(node).is_empty()
+            && ElementDeclarationKind::ALL
+                .iter()
+                .all(|&kind| self.facts.element_declared_properties(node, kind).is_empty())
     }
 
     /// Whether nodes with this exact answer can share one node's completed cascade: not when the
@@ -3878,10 +3873,7 @@ impl RetainedState {
             counters.bump(Counter::TransitionProofMissingAnswer);
             return false;
         };
-        if ElementDeclarationKind::ALL
-            .iter()
-            .any(|&kind| !self.facts.element_declared_properties(node, kind).1)
-        {
+        if !self.facts.element_custom_declarations(node).is_empty() {
             counters.bump(Counter::TransitionProofElementDeclarations);
             return false;
         }
@@ -3952,6 +3944,7 @@ impl RetainedState {
                     return false;
                 }
                 let priority = self.cascade_priority_of(
+                    node,
                     added.rule,
                     added.tree_scope,
                     entry.specificity,
@@ -4091,8 +4084,7 @@ impl RetainedState {
     }
 
     /// Publish a driven row's winners again from its retained selector answer, or from a fresh
-    /// match where that answer is gone. The row a drive reads next is no cache the memory budget
-    /// may decline, so it is admitted whatever the budget. Whether the winners are complete.
+    /// match where that answer is gone. Whether the winners are complete.
     pub(super) fn republish_driven_winners(
         &mut self,
         node: StyleNodeID,
@@ -4101,7 +4093,7 @@ impl RetainedState {
     ) -> bool {
         let matches = self.matches_to_republish(node, counters);
         debug_assert!(matches.is_some(), "a driven row without the facts to match it");
-        self.republish_demanded_winners(node, matches.unwrap_or_default(), republication, counters)
+        self.republish_winners_from_matches(node, matches.unwrap_or_default(), republication, counters)
     }
 
     /// Publish new winners from the retained selector answer, matching from published facts when
@@ -4123,7 +4115,7 @@ impl RetainedState {
     pub(super) fn republish_pseudo_winners_from_retained_answer(
         &mut self,
         node: StyleNodeID,
-        _: publication::WinnerRepublication,
+        republication: publication::WinnerRepublication,
         counters: &mut Counters,
     ) -> Option<()> {
         let identity = self.current_answer_identity(node)?;
@@ -4139,7 +4131,9 @@ impl RetainedState {
         effects
             .winners
             .preserve_equal_pseudo_states(&mut self.winner_groups, node);
+        let admitting = self.winner_groups.admit_republished_rows(republication);
         self.install_answer_effects(effects);
+        self.winner_groups.restore_admission(admitting);
         Some(())
     }
 
@@ -4152,20 +4146,7 @@ impl RetainedState {
         counters: &mut Counters,
     ) -> bool {
         let matches = self.match_element_for_cascade(node, counters).unwrap_or_default();
-        self.republish_demanded_winners(node, matches, republication, counters)
-    }
-
-    fn republish_demanded_winners(
-        &mut self,
-        node: StyleNodeID,
-        matches: Vec<RuleMatch>,
-        republication: publication::WinnerRepublication,
-        counters: &mut Counters,
-    ) -> bool {
-        let admitting = self.winner_groups.admit_demanded_rows();
-        let complete = self.republish_winners_from_matches(node, matches, republication, counters);
-        self.winner_groups.restore_admission(admitting);
-        complete
+        self.republish_winners_from_matches(node, matches, republication, counters)
     }
 
     fn matches_to_republish(&mut self, node: StyleNodeID, counters: &mut Counters) -> Option<Vec<RuleMatch>> {
@@ -4188,17 +4169,16 @@ impl RetainedState {
         &mut self,
         node: StyleNodeID,
         matches: Vec<RuleMatch>,
-        _: publication::WinnerRepublication,
+        republication: publication::WinnerRepublication,
         counters: &mut Counters,
     ) -> bool {
         // Winners published on their own decide the node's gated rules over its containers as
         // they stand, which the record loop checks again once the node's ancestors are settled.
         self.container_gates_unheld.remove(&node);
         let complete = self.cascade_winner_inventory_is_complete(&matches, Some(node));
-        let complete_but_for_custom_properties = self.element_declarations_are_complete_but_for_custom_properties(node)
-            && matches
-                .iter()
-                .all(|entry| self.match_is_complete_but_for_custom_properties(node, entry.rule, entry.tree_scope));
+        let complete_but_for_custom_properties = matches
+            .iter()
+            .all(|entry| self.match_is_complete_but_for_custom_properties(node, entry.rule));
         let mut effects = AnswerEffects::default();
         // The answer's pseudo-element inventory, and the matches its custom-property cascade runs
         // over where a record loop reads this transaction's.
@@ -4222,9 +4202,11 @@ impl RetainedState {
                 })
                 .collect::<Vec<_>>()
         });
+        let admitting = self.winner_groups.admit_republished_rows(republication);
         let compact = self.matches_for_cascade(&mut effects, matches, true, Some(node), counters);
         self.remember_cascade_input_with_effects(&mut effects, node, &compact, counters);
         self.install_answer_effects(effects);
+        self.winner_groups.restore_admission(admitting);
         // A record loop reading this transaction's answers reads the one just published instead.
         if let Some(batch) = self.batch_answers_complete_but_for_custom_properties.get_mut(&node) {
             *batch = complete_but_for_custom_properties;
@@ -4386,89 +4368,6 @@ impl RetainedState {
         Some(answer)
     }
 
-    /// Stream a published answer into its consumer. A materialized payload needs no copy; an
-    /// identity-only payload is restored in cascade order before it crosses the bridge.
-    pub(super) fn consume_published_match_answer_with(
-        &mut self,
-        node: StyleNodeID,
-        capacity: usize,
-        mut consume: impl FnMut(
-            usize,
-            StyleNodeID,
-            RuleID,
-            SemanticDeclarationID,
-            Option<tree::PseudoElementTarget>,
-            u32,
-            u32,
-        ),
-        counters: &mut Counters,
-    ) -> Option<usize> {
-        if let Some((owner, published)) = Self::published_answer_lookup(
-            &self.published_match_answers,
-            self.batch_matching_traversal.as_deref(),
-            node,
-        ) {
-            let cascade_input = published.cascade_input;
-            let materialized_len = owner.matches_for(published).map(<[RuleMatch]>::len);
-            let compact_len = cascade_input
-                .filter(|_| materialized_len.is_none())
-                .and_then(|identity| self.match_answers.answer(identity))
-                .map(|matches| matches.len());
-            if let Some(len) = materialized_len {
-                self.mark_published_answer_observed(node);
-                counters.bump(Counter::PublishedMatchAnswerConsumptions);
-                if len > capacity {
-                    return Some(len);
-                }
-                let (owner, published) = Self::published_answer_lookup(
-                    &self.published_match_answers,
-                    self.batch_matching_traversal.as_deref(),
-                    node,
-                )
-                .expect("a published answer remains live until the transaction ends");
-                let matches = owner
-                    .matches_for(published)
-                    .expect("a materialized published answer remains live until the transaction ends");
-                for (index, matched) in matches.iter().enumerate() {
-                    consume(
-                        index,
-                        node,
-                        matched.rule,
-                        self.program.ensure_semantic_declaration(matched.rule),
-                        matched.pseudo_element,
-                        self.cascade_context_host(matched.rule, matched.tree_scope),
-                        matched.scope_proximity,
-                    );
-                }
-                return Some(len);
-            }
-            if let Some(len) = compact_len
-                && len > capacity
-            {
-                self.mark_published_answer_observed(node);
-                counters.bump(Counter::PublishedMatchAnswerConsumptions);
-                return Some(len);
-            }
-        }
-
-        let matches = self.consume_published_match_answer(node, counters)?;
-        let len = matches.len();
-        if len <= capacity {
-            for (index, matched) in matches.iter().enumerate() {
-                consume(
-                    index,
-                    node,
-                    matched.rule,
-                    self.program.ensure_semantic_declaration(matched.rule),
-                    matched.pseudo_element,
-                    self.cascade_context_host(matched.rule, matched.tree_scope),
-                    matched.scope_proximity,
-                );
-            }
-        }
-        Some(len)
-    }
-
     /// Read the shareable identity of one answer from the immediately preceding style transaction.
     ///
     /// A contextual answer has no identity and must still consume its complete payload. A shared
@@ -4549,7 +4448,7 @@ impl RetainedState {
             && winner_groups
                 .pseudo_states(node)
                 .filter(|(pseudo, _, _, _)| {
-                    matches!(pseudo.kind.0, 0 | 2 | 3 | 6)
+                    matches!(pseudo.kind.0, 0 | 2 | 3 | 6 | 7)
                         || u8::try_from(pseudo.kind.0).ok().is_some_and(|kind| {
                             self.computed_group_sets
                                 .assigned_pseudo_kinds(node)
@@ -4849,7 +4748,7 @@ impl RetainedState {
             .is_some_and(|batch| batch.row_of(node).is_some());
         if prepared_batch_contains_node {
             let traversal = traversal.as_deref_mut().unwrap();
-            let prefix_caches = Rc::clone(&traversal.prefix_caches);
+            let prefix_caches = std::sync::Arc::clone(&traversal.prefix_caches);
             let facts = traversal.batch.as_ref().unwrap();
             let mut matches = RuleMatches::new();
             if compact_for_cascade && verify_selector_truth_derivation_is_enabled() {
@@ -5403,8 +5302,8 @@ impl RetainedState {
         let prefix_caches_return_to_completion_batch = traversal.is_some();
         let prefix_caches = traversal
             .as_deref()
-            .map(|traversal| Rc::clone(&traversal.prefix_caches))
-            .unwrap_or_else(|| Rc::new(RefCell::new(PrefixCaches::default())));
+            .map(|traversal| std::sync::Arc::clone(&traversal.prefix_caches))
+            .unwrap_or_default();
         let mut completion_scratch_bytes = 0;
         let mut retained_match_answer_is_exact = compact_for_cascade;
         let mut facts = StyleNodeFacts::new();

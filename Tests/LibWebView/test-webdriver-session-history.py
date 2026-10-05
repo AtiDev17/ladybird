@@ -54,6 +54,9 @@ class TestPageServer(http.server.ThreadingHTTPServer):
         self.blocked_post_result_load_requested = threading.Event()
         self.post_result_load_became_interactive = threading.Event()
         self.release_blocked_post_result_load = threading.Event()
+        self.held_load_image_requested = threading.Event()
+        self.held_load_document_became_interactive = threading.Event()
+        self.release_held_load_image = threading.Event()
         self.blocked_navigation_requested = threading.Event()
         self.release_blocked_navigation = threading.Event()
         self.blocked_navigation_response_finished = threading.Event()
@@ -516,6 +519,38 @@ document.addEventListener("DOMContentLoaded", () => {
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
                 self.wfile.write(b"timed out waiting to finish POST result load")
+                return
+
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/held-load":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Held Load</title>
+<script>addEventListener('DOMContentLoaded', () => fetch('/document-ran?held-load'));</script>
+<img src="/held-load-image">
+<p>Held Load</p>""".encode()
+            )
+            return
+
+        if self.path == "/document-ran?held-load":
+            server.held_load_document_became_interactive.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/held-load-image":
+            server.held_load_image_requested.set()
+            if not server.release_held_load_image.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to finish held load")
                 return
 
             self.send_response(204)
@@ -1463,6 +1498,25 @@ def expect_body_text(webdriver_port, session_id, label, expected_text, log):
     raise AssertionError(f"Expected {label} body text to be {expected_text}, got {actual}\n" + "\n".join(log))
 
 
+def wait_for_body_text(webdriver_port, session_id, label, expected_text, log, timeout=EVENT_TIMEOUT_SECONDS):
+    # A navigation the page started (a form submission, a link) completes no WebDriver command, so its document is
+    # read once it has finished loading, rather than as soon as the server has seen its script run.
+    deadline = time.monotonic() + timeout
+    actual = None
+    while time.monotonic() < deadline:
+        actual = execute_script(
+            webdriver_port, session_id, "return [document.body.innerText.trim(), document.readyState];"
+        )
+        if actual == [expected_text, "complete"]:
+            log.append(f"{label}: {actual[0]}")
+            return
+        time.sleep(0.05)
+
+    raise AssertionError(
+        f"Timed out waiting for {label} body text to be {expected_text}, got {actual}\n" + "\n".join(log)
+    )
+
+
 def expect_current_entry_resource(webdriver_port, session_id, label, expected_resource, log):
     snapshot = session_history(webdriver_port, session_id)
     ui_current_entry = history_current_entry(snapshot["ui"])
@@ -1489,7 +1543,7 @@ def expect_current_ui_entry_resource(webdriver_port, session_id, label, expected
     )
 
 
-def expect_frame_url(webdriver_port, session_id, label, expected_url, log, expected_title=None):
+def frame_url_matches(webdriver_port, session_id, expected_url, expected_title):
     result = execute_script(
         webdriver_port,
         session_id,
@@ -1499,16 +1553,38 @@ return [frame.contentWindow.location.href, frame.contentDocument.readyState, fra
 """,
     )
     actual_url, ready_state, actual_title = result
-    if (
+    matches = (
         actual_url == expected_url
         and ready_state == "complete"
         and (expected_title is None or actual_title == expected_title)
-    ):
+    )
+    return matches, actual_url, f"{actual_url} ({actual_title}, {ready_state})"
+
+
+def expect_frame_url(webdriver_port, session_id, label, expected_url, log, expected_title=None):
+    matches, actual_url, actual = frame_url_matches(webdriver_port, session_id, expected_url, expected_title)
+    if matches:
         log.append(f"{label}: {actual_url}")
         return
 
-    actual = f"{actual_url} ({actual_title})"
     raise AssertionError(f"Expected {label} to be {expected_url}, got {actual}\n" + "\n".join(log))
+
+
+def wait_for_frame_url(
+    webdriver_port, session_id, label, expected_url, log, expected_title=None, timeout=EVENT_TIMEOUT_SECONDS
+):
+    # A frame navigation completes no WebDriver command, so the frame's document is read once it has finished
+    # loading, rather than as soon as the server has seen its script run.
+    deadline = time.monotonic() + timeout
+    actual = None
+    while time.monotonic() < deadline:
+        matches, actual_url, actual = frame_url_matches(webdriver_port, session_id, expected_url, expected_title)
+        if matches:
+            log.append(f"{label}: {actual_url}")
+            return
+        time.sleep(0.05)
+
+    raise AssertionError(f"Timed out waiting for {label} to be {expected_url}, got {actual}\n" + "\n".join(log))
 
 
 def expect_history_entry_state(
@@ -2481,6 +2557,49 @@ def expect_post_crash_recovery_waits_for_load(webdriver_port, session_id, page_s
     expect_current_entry_resource(webdriver_port, session_id, "after POST crash recovery", "post", log)
 
 
+def expect_back_waits_for_restored_document_load(webdriver_port, session_id, page_server, url_held_load, url_away, log):
+    # Back traverses to a document whose load the server holds back: the command must not complete while the restored
+    # document is still loading, and must complete once it has loaded. Step 7 of the spec's Back has it wait for the
+    # restored document's pageshow event, which follows its load event: https://w3c.github.io/webdriver/#dfn-back
+    page_server.release_held_load_image.set()
+    request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url_held_load})
+    expect_url(webdriver_port, session_id, "after held load setup", url_held_load, log)
+    request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url_away})
+    expect_url(webdriver_port, session_id, "after leaving held load page", url_away, log)
+
+    page_server.held_load_image_requested.clear()
+    page_server.held_load_document_became_interactive.clear()
+    page_server.release_held_load_image.clear()
+    back_error = []
+
+    def request_back():
+        try:
+            request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        except Exception as error:
+            back_error.append(error)
+
+    back_thread = threading.Thread(target=request_back)
+    back_thread.start()
+    wait_for_event(page_server.held_load_image_requested, "held restored document load")
+    wait_for_event(page_server.held_load_document_became_interactive, "interactive restored document")
+    back_thread.join(timeout=0.25)
+    completed_before_load = not back_thread.is_alive()
+    page_server.release_held_load_image.set()
+    back_thread.join(timeout=EVENT_TIMEOUT_SECONDS)
+    if completed_before_load:
+        raise AssertionError(
+            "WebDriver back completed before the restored document finished loading\n" + "\n".join(log)
+        )
+    if back_thread.is_alive():
+        raise AssertionError(
+            "Timed out waiting for WebDriver back to finish loading the restored document\n" + "\n".join(log)
+        )
+    if back_error:
+        raise back_error[0]
+    expect_url(webdriver_port, session_id, "after back to held load page", url_held_load, log)
+    expect_body_text(webdriver_port, session_id, "after back to held load page", "Held Load", log)
+
+
 def run_navigation_response_process_selection_test(webdriver_port, url_a, url_b, url_d, url_redirect_to_b):
     for label, target_url, expected_url, should_swap in [
         ("same-site navigation", url_d, url_d, False),
@@ -2571,7 +2690,6 @@ def run_test(webdriver_binary):
 
     webdriver_port = unused_port()
     env = os.environ.copy()
-    env["LADYBIRD_WEBDRIVER_ENABLE_SITE_ISOLATION"] = "1"
     env["LADYBIRD_SESSION_HISTORY_DEBUG"] = "1"
 
     webdriver_stdout = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
@@ -2609,6 +2727,7 @@ def run_test(webdriver_binary):
         url_state_push = f"http://localhost:{page_port}/state?push"
         url_scroll = f"http://localhost:{page_port}/scroll"
         url_scroll_saved = f"http://localhost:{page_port}/scroll?saved"
+        url_held_load = f"http://localhost:{page_port}/held-load"
         url_reload_blocked = f"http://localhost:{page_port}/reload-blocked"
         url_process_swap_back_blocked = f"http://localhost:{page_port}/process-swap-back-blocked"
         url_forward_blocked = f"http://127.0.0.1:{page_port}/forward-blocked"
@@ -2848,7 +2967,7 @@ return [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.heigh
             url_cross_site_post_blocked_result,
             log,
         )
-        expect_body_text(
+        wait_for_body_text(
             webdriver_port, session_id, "after blocked cross-site POST form submit", "POST:name=ladybird", log
         )
         expect_current_entry_resource(
@@ -2874,7 +2993,7 @@ return [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.heigh
         perform_pointer_click(webdriver_port, session_id, post_form_submit_point[0], post_form_submit_point[1], log)
         wait_for_event(page_server.post_result_document_ran, "cross-site POST result document")
         expect_url(webdriver_port, session_id, "after cross-site POST form submit", url_cross_site_post_result, log)
-        expect_body_text(webdriver_port, session_id, "after cross-site POST form submit", "POST:name=ladybird", log)
+        wait_for_body_text(webdriver_port, session_id, "after cross-site POST form submit", "POST:name=ladybird", log)
         expect_current_entry_resource(webdriver_port, session_id, "after cross-site POST form submit", "post", log)
         expect_ui_session_history(
             webdriver_port,
@@ -3237,7 +3356,7 @@ return [Math.floor(rect.left + rect.width / 2), Math.floor(rect.top + rect.heigh
             f"document.getElementById('frame').contentWindow.location.href = '{url_frame_b_blocked}'; return null;",
         )
         wait_for_event(page_server.frame_b_blocked_document_ran, "nested frame setup document")
-        expect_frame_url(
+        wait_for_frame_url(
             webdriver_port,
             session_id,
             "after nested restore crash setup frame navigation",
@@ -3342,7 +3461,7 @@ return [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.heigh
             raise AssertionError("Timed out waiting for blocked same-site POST request to finish\n" + "\n".join(log))
         wait_for_event(page_server.same_site_post_result_document_ran, "blocked same-site POST result document")
         expect_url(webdriver_port, session_id, "after blocked same-site POST submit", url_post_blocked_result, log)
-        expect_body_text(webdriver_port, session_id, "after blocked same-site POST submit", "POST:name=ladybird", log)
+        wait_for_body_text(webdriver_port, session_id, "after blocked same-site POST submit", "POST:name=ladybird", log)
         expect_current_entry_resource(webdriver_port, session_id, "after blocked same-site POST submit", "post", log)
         request(webdriver_port, "DELETE", f"/session/{session_id}")
         session_id = None
@@ -3387,7 +3506,7 @@ return [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.heigh
             raise AssertionError("Timed out waiting for blocked same-URL POST request to finish\n" + "\n".join(log))
         wait_for_event(page_server.same_url_post_result_document_ran, "blocked same-URL POST result document")
         expect_url(webdriver_port, session_id, "after blocked same-URL POST submit", url_post_same_url_blocked, log)
-        expect_body_text(webdriver_port, session_id, "after blocked same-URL POST submit", "POST:name=ladybird", log)
+        wait_for_body_text(webdriver_port, session_id, "after blocked same-URL POST submit", "POST:name=ladybird", log)
         expect_current_entry_resource(webdriver_port, session_id, "after blocked same-URL POST submit", "post", log)
         request(webdriver_port, "DELETE", f"/session/{session_id}")
         session_id = None
@@ -3409,7 +3528,7 @@ return [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.heigh
         perform_pointer_click(webdriver_port, session_id, post_form_submit_point[0], post_form_submit_point[1], log)
         wait_for_event(page_server.post_result_document_ran, "POST result document")
         expect_url(webdriver_port, session_id, "after POST form submit", url_post_result, log)
-        expect_body_text(webdriver_port, session_id, "after POST form submit", "POST:name=ladybird", log)
+        wait_for_body_text(webdriver_port, session_id, "after POST form submit", "POST:name=ladybird", log)
         expect_current_entry_resource(webdriver_port, session_id, "after POST form submit", "post", log)
         expect_ui_session_history(
             webdriver_port,
@@ -4331,6 +4450,11 @@ return [location.href, Math.round(scrollX), Math.round(scrollY)];
 
         request(webdriver_port, "DELETE", f"/session/{session_id}")
         session_id = create_session(webdriver_port)
+        log.append(f"back waits for restored document load initial: {current_url(webdriver_port, session_id)}")
+        expect_back_waits_for_restored_document_load(webdriver_port, session_id, page_server, url_held_load, url_b, log)
+
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = create_session(webdriver_port)
         log.append(f"intercepted same-document scroll initial: {current_url(webdriver_port, session_id)}")
         request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url_scroll})
         expect_url(webdriver_port, session_id, "before intercepted scroll setup", url_scroll, log)
@@ -4440,7 +4564,7 @@ return [location.href, window.canceledTraverseCount];
             f"document.getElementById('frame').contentWindow.location.href = '{url_frame_b_blocked}'; return null;",
         )
         wait_for_event(page_server.frame_b_blocked_document_ran, "nested frame document")
-        expect_frame_url(
+        wait_for_frame_url(
             webdriver_port, session_id, "after nested frame navigation", url_frame_b_blocked, log, "Frame B Blocked"
         )
         expect_current_entry_nested_history(
@@ -4886,7 +5010,7 @@ return [Math.floor(rect.left + rect.width / 2), Math.floor(rect.top + rect.heigh
             page_server.frame_b_blocked_document_ran,
             "nested frame document after browser UI back",
         )
-        expect_frame_url(
+        wait_for_frame_url(
             webdriver_port,
             session_id,
             "after browser UI back restores nested frame navigation",

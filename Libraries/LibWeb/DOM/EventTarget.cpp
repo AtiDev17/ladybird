@@ -293,6 +293,9 @@ static void invalidate_compositor_wheel_event_listener_state(EventTarget& event_
     }
 
     if (auto* node = as_if<Node>(event_target)) {
+        // The document remembers that a blocking listener lives in it, so that a node arriving
+        // under this one later derives the state it inherits.
+        node->document().set_may_have_blocking_wheel_event_listener();
         node->update_inside_blocking_wheel_event_handler_state_for_subtree();
         node->set_needs_repaint();
         node->document().page().invalidate_compositor_wheel_event_listener_state();
@@ -353,6 +356,25 @@ static void update_needs_beforeunload_check(EventTarget& event_target, DOMEventL
         return;
 
     navigable->page().update_needs_beforeunload_check();
+}
+
+static void notify_page_that_window_listens_for_gamepad_events(EventTarget& event_target, DOMEventListener const& listener)
+{
+    if (!first_is_one_of(listener.type, Gamepad::EventNames::gamepadconnected, Gamepad::EventNames::gamepaddisconnected))
+        return;
+
+    auto* window = as_if<HTML::Window>(event_target);
+    if (!window)
+        return;
+
+    auto& document = window->associated_document();
+    if (!document.navigable())
+        return;
+
+    if (!document.is_allowed_to_use_feature(PolicyControlledFeature::Gamepad))
+        return;
+
+    window->page().client().page_did_start_using_gamepads();
 }
 
 // https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener
@@ -428,6 +450,7 @@ void EventTarget::add_an_event_listener(DOMEventListener& listener)
         wake_animation_frame_pump_for_animation_event_listener(*this, listener);
         update_needs_beforeunload_check(*this, listener);
         event_listener_list_changed();
+        notify_page_that_window_listens_for_gamepad_events(*this, listener);
     }
 
     // 6. If listener’s signal is not null, then add the following abort steps to it:

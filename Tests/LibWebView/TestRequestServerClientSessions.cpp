@@ -56,8 +56,8 @@ int client_id_of(Requests::RequestClient& client)
 
 int connect_request_server_client(WebView::BrowsingSession& session)
 {
-    auto handle = MUST(WebView::connect_new_request_server_client(session));
-    auto client = make_ref_counted<Requests::RequestClient>(MUST(handle.create_transport()));
+    auto connection = MUST(WebView::connect_new_request_server_client(session, RequestServer::SiteBinding::Bound));
+    auto client = make_ref_counted<Requests::RequestClient>(MUST(connection.handle.create_transport()));
     auto client_id = client->send_sync<Messages::RequestServer::GetClientId>()->client_id();
     s_clients.append(move(client));
     return client_id;
@@ -113,17 +113,17 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     auto theme = TRY(Gfx::load_system_theme(LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv).string()));
     app->reset_private_browsing_session();
     auto old_private_view = WebView::HeadlessWebView::create(theme, { 800, 600 }, WebView::IsPrivate::Yes);
-    auto& old_private_session = old_private_view->client().session();
+    auto& old_private_session = old_private_view->page().client().session();
     app->reset_private_browsing_session();
     auto new_private_view = WebView::HeadlessWebView::create(theme, { 800, 600 }, WebView::IsPrivate::Yes);
-    auto& new_private_session = new_private_view->client().session();
+    auto& new_private_session = new_private_view->page().client().session();
     VERIFY(&old_private_session != &new_private_session);
 
     // Pages that a private view opens are private too, whether they share its process or get their own.
     Vector<bool> popups_are_private;
     auto open_popup = move(new_private_view->on_new_web_view);
-    new_private_view->on_new_web_view = [&](auto activate_tab, auto hints, WebView::WebContentClient& page_process, Optional<Web::PageId> page_index) {
-        auto handle = open_popup(activate_tab, hints, page_process, page_index);
+    new_private_view->on_new_web_view = [&](auto activate_tab, auto hints, WebView::CanonicalTraversable& traversable) {
+        auto handle = open_popup(activate_tab, hints, traversable);
         popups_are_private.append(WebView::ViewImplementation::find_view_by_handle(handle)->is_private() == WebView::IsPrivate::Yes);
         return handle;
     };

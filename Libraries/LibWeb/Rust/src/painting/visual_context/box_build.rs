@@ -8,7 +8,6 @@ use super::reconcile::BoxNodeWriter;
 use super::scroll_state::NO_SCROLL_STATE_SLOT;
 use super::*;
 use crate::layout::node_data::{NodeFlag, NodeSlotId};
-use crate::painting::host::FfiVisualContextHostCallbacks;
 use crate::painting::paintable_data::*;
 use crate::painting::paintable_geometry;
 use crate::painting::paintable_rows::{PaintableRowsRead, PaintableRowsWrite};
@@ -16,7 +15,6 @@ use libgfx_rust::FloatPoint;
 
 pub(crate) struct BoxBuildEnvironment<'a, Arena> {
     pub layout_arena: &'a Arena,
-    pub callbacks: &'a FfiVisualContextHostCallbacks,
     pub pixel_ratio: f64,
 }
 
@@ -36,6 +34,7 @@ pub(crate) struct PaintableVisualContextAssignment {
     pub accumulated_visual_context_for_descendants: ContextRef,
     pub has_non_invertible_css_transform: bool,
     pub record: PaintableVisualContextRecord,
+    pub node_handles: BoxVisualContextNodeHandles,
 }
 
 impl PaintableVisualContextAssignment {
@@ -50,6 +49,7 @@ impl PaintableVisualContextAssignment {
             accumulated_visual_context_for_descendants: data.accumulated_visual_context_for_descendants,
             has_non_invertible_css_transform: data.has_flag(PaintableFlag::HasNonInvertibleCssTransform),
             record,
+            node_handles: BoxVisualContextNodeHandles::default(),
         }
     }
 
@@ -72,7 +72,7 @@ impl PaintableVisualContextAssignment {
             None => (false, false),
         };
         {
-            let data = layout_arena.paintable_data_mut(self.slot);
+            let mut data = layout_arena.paintable_data_mut(self.slot);
             data.establishes_stacking_context = self.record.stacking_context.establishes_stacking_context;
             data.enclosing_scroll_node_index = self.enclosing_scroll_node_index;
             data.own_scroll_node_index = self.own_scroll_node_index;
@@ -85,7 +85,7 @@ impl PaintableVisualContextAssignment {
                 self.has_non_invertible_css_transform,
             );
         }
-        layout_arena.set_paintable_visual_context_record(self.slot, self.record);
+        layout_arena.set_paintable_visual_context_record(self.slot, self.record, self.node_handles);
         if scroll_nodes_changed {
             layout_arena.push_paint_damage(self.slot, PaintDamage::ALL_PRODUCERS);
             layout_arena.push_paint_damage_to_paint_subtree(self.slot, PaintDamage::SCROLL_METADATA);
@@ -256,7 +256,6 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         PaintableVisualContextRecord {
             inherited_input: inherited,
             output_for_descendants: inherited,
-            node_handles: BoxVisualContextNodeHandles::default(),
             has_mask_nodes: false,
             may_be_root_element,
             owns_geometry_dependent_nodes: false,
@@ -553,7 +552,7 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         );
         let scroll_node_index = state_for_descendants.spatial;
         assignment.own_scroll_node_index = scroll_node_index;
-        assignment.node_identity = env.callbacks.node_identity(layout_arena.shell_if_live(slot));
+        assignment.node_identity = layout_arena.unique_node_ids().id(slot);
         nearest_scroll_nodes_for_descendants = NearestScrollNodeIndices {
             stopping_at_fixed_position_ancestors: scroll_node_index,
             continuing_through_fixed_position_ancestors: scroll_node_index,
@@ -566,7 +565,7 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
             .node_style_if_live(slot)
             .is_some_and(|style| style.has_scroll_snap_alignment())
     {
-        assignment.node_identity = env.callbacks.node_identity(layout_arena.shell_if_live(slot));
+        assignment.node_identity = layout_arena.unique_node_ids().id(slot);
     }
 
     // Positioned descendants that escape into a viewport-establishing containing block lay

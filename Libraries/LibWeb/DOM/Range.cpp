@@ -15,16 +15,20 @@
 #include <LibWeb/DOM/DocumentType.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
+#include <LibWeb/DOM/InvalidationJournal.h>
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/DOM/ProcessingInstruction.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/SelectionchangeEventDispatching.h>
+#include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/DOM/Slottable.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/Geometry/DOMRectList.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
+#include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/TextNode.h>
@@ -105,10 +109,7 @@ void Range::set_associated_selection(Badge<Selection::Selection>, GC::Ptr<Select
     } else if (had_selection) {
         // The range this selection painted through is no longer its range; take the highlight back.
         auto& document = m_start_container->document();
-        if (document.has_committed_viewport_box()) {
-            document.paint_state().reset_selection_states(document);
-            Painting::set_needs_repaint(*document.unsafe_layout_node(), InvalidateDisplayList::PaintCommands);
-        }
+        document.invalidation_journal().note_selection_changed();
 
         // https://w3c.github.io/selection-api/#selectionchange-event
         // When the selection is dissociated with its range, the user agent must schedule a selectionchange event on
@@ -126,11 +127,9 @@ void Range::update_associated_selection()
 
     auto& document = m_start_container->document();
 
-    // NB: Called during selection update after range change.
-    if (document.has_committed_viewport_box()) {
-        document.paint_state().recompute_selection_states(document, *this);
-        Painting::set_needs_repaint(*document.unsafe_layout_node(), InvalidateDisplayList::PaintCommands);
-    }
+    // The boxes the selection paints through are found by the invalidation journal as it drains: the range may change
+    // beside a frame in flight, which holds the boxes.
+    document.invalidation_journal().note_selection_changed();
 
     document.reset_cursor_blink_cycle();
     document.set_cursor_position_needs_repaint();
@@ -203,6 +202,85 @@ RelativeBoundaryPointPosition position_of_boundary_point_relative_to_other_bound
 
     // 5. Return before.
     return RelativeBoundaryPointPosition::Before;
+}
+
+static bool children_are_outside_flat_tree(Node const& node)
+{
+    if (auto const* element = as_if<Element>(node); element && element->is_shadow_host())
+        return true;
+    auto const* slot = as_if<HTML::HTMLSlotElement>(node);
+    return slot && !slot->assigned_nodes_internal().is_empty();
+}
+
+static size_t flat_tree_child_count_of_host_or_slot(Node const& node)
+{
+    if (auto const* slot = as_if<HTML::HTMLSlotElement>(node))
+        return slot->assigned_nodes_internal().size();
+    return as<Element>(node).shadow_root()->child_count();
+}
+
+static Optional<size_t> index_in_flat_tree(Node& node)
+{
+    if (auto slot = assigned_slot_for_node(node)) {
+        auto assigned_nodes = slot->assigned_nodes_internal();
+        auto index = find_index(assigned_nodes.begin(), assigned_nodes.end(), node.as_slottable());
+        if (index == assigned_nodes.size())
+            return {};
+        return index;
+    }
+    if (auto const* parent = node.parent(); parent && children_are_outside_flat_tree(*parent))
+        return {};
+    return node.index();
+}
+
+struct FlatTreePosition {
+    GC::Ref<Node> root;
+    Vector<size_t, 32> indices;
+};
+
+static Optional<FlatTreePosition> flat_tree_position(BoundaryPoint point)
+{
+    Vector<size_t, 32> indices;
+    auto node = point.node;
+    if (!children_are_outside_flat_tree(*node)) {
+        indices.append(point.offset);
+    } else if (point.offset == 0) {
+        indices.append(0);
+    } else if (auto* child = node->child_at_index(point.offset); child && index_in_flat_tree(*child).has_value()) {
+        node = *child;
+    } else {
+        indices.append(flat_tree_child_count_of_host_or_slot(*node));
+    }
+
+    while (auto* parent = node->flat_tree_parent()) {
+        if (!is<ShadowRoot>(*node)) {
+            auto index = index_in_flat_tree(*node);
+            if (!index.has_value())
+                return {};
+            indices.append(*index);
+        }
+        node = *parent;
+    }
+    indices.reverse();
+    return FlatTreePosition { node, move(indices) };
+}
+
+Optional<RelativeBoundaryPointPosition> position_of_boundary_point_relative_to_other_boundary_point_in_flat_tree(BoundaryPoint a, BoundaryPoint b)
+{
+    auto a_position = flat_tree_position(a);
+    auto b_position = flat_tree_position(b);
+    if (!a_position.has_value() || !b_position.has_value() || a_position->root != b_position->root)
+        return {};
+
+    auto const& a_indices = a_position->indices;
+    auto const& b_indices = b_position->indices;
+    for (size_t i = 0; i < min(a_indices.size(), b_indices.size()); ++i) {
+        if (a_indices[i] != b_indices[i])
+            return a_indices[i] < b_indices[i] ? RelativeBoundaryPointPosition::Before : RelativeBoundaryPointPosition::After;
+    }
+    if (a_indices.size() == b_indices.size())
+        return RelativeBoundaryPointPosition::Equal;
+    return a_indices.size() < b_indices.size() ? RelativeBoundaryPointPosition::Before : RelativeBoundaryPointPosition::After;
 }
 
 // https://dom.spec.whatwg.org/#concept-range-bp-set
@@ -1222,6 +1300,7 @@ GC::Ref<Geometry::DOMRectList> Range::get_client_rects()
         return Geometry::DOMRectList::create({});
 
     auto& document = start_container()->document();
+    Layout::ForcedReadScope read { document, true };
     document.update_layout(DOM::UpdateLayoutReason::RangeGetClientRects);
 
     Vector<GC::Root<Geometry::DOMRect>> rects;
@@ -1296,7 +1375,7 @@ GC::Ref<Geometry::DOMRectList> Range::get_client_rects()
             if (selection_state == Painting::SelectionState::None)
                 continue;
 
-            auto const* layout_node = text.layout_node();
+            auto const* layout_node = text.layout_node(read);
             if (!layout_node) {
                 dbgln("FIXME: Failed to get client rects for node {}", node->debug_description());
                 continue;
@@ -1327,8 +1406,8 @@ GC::Ref<Geometry::DOMRectList> Range::get_client_rects()
                 VERIFY_NOT_REACHED();
             }
 
-            Layout::RustFFI::layout_arena_text_range_rects(
-                layout_node->arena_handle(), Layout::Node::slot_id(layout_node),
+            Layout::RustFFI::layout_script_text_range_rects(
+                layout_node->document_host(), Layout::Node::slot_id(layout_node),
                 to_underlying(selection_state), start_offset(), end_offset(), filter_dom_start, filter_dom_end,
                 rect_to_viewport_transform, &rects, [](void* context, CSSPixelRect rect) {
                     static_cast<Vector<GC::Root<Geometry::DOMRect>>*>(context)->append(Geometry::DOMRect::create(rect.to_type<float>()));

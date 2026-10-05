@@ -17,10 +17,20 @@ class SVGTextElement : public SVGTextPositioningElement {
     GC_DECLARE_ALLOCATOR(SVGTextElement);
 
 public:
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
 protected:
     SVGTextElement(DOM::Document&, DOM::QualifiedName);
+
+private:
+    virtual bool is_svg_text_element() const final { return true; }
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<SVG::SVGTextElement>() const { return is_svg_text_element(); }
 
 }

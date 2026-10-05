@@ -1702,7 +1702,9 @@ GC::Ref<CSS::CSSStyleProperties> Window::get_computed_style(DOM::Element& elemen
         auto type = parse_pseudo_element_selector(CSS::Parser::ParsingParams(associated_document()), pseudo_element.value());
 
         // 2. If type is failure, or is a ::slotted() or ::part() pseudo-element, let obj be null.
-        if (!type.has_value() || first_is_one_of(type.value().type(), CSS::PseudoElement::Slotted, CSS::PseudoElement::Part)) {
+        // NB: A ::-webkit- pseudo-element parses so that selectors naming it stay valid, but it is no pseudo-element
+        //     we support, so it is a failure here.
+        if (!type.has_value() || first_is_one_of(type.value().type(), CSS::PseudoElement::Slotted, CSS::PseudoElement::Part, CSS::PseudoElement::UnknownWebKit)) {
             object = {};
         }
         // 3. Otherwise let obj be the given pseudo-element of elt.
@@ -1923,9 +1925,10 @@ void Window::scroll(ScrollToOptions const& options, GC::Ptr<WebIDL::Promise> pro
     //               This also means we don't need to update layout in that case.
     if (x != 0 || y != 0) {
         // NB: Make sure layout is up-to-date before looking at scrollable overflow metrics.
+        Layout::ForcedReadScope read { *document, true };
         document->update_layout(DOM::UpdateLayoutReason::WindowScroll);
 
-        auto const* layout_node = document->layout_node();
+        auto const* layout_node = document->layout_node(read);
         VERIFY(layout_node && Painting::has_committed_box(*layout_node));
         auto scrolling_area = Painting::scrollable_overflow_rect(*layout_node).value().to_type<float>();
         auto overflow_directions = Painting::rust_physical_overflow_directions(*layout_node);
@@ -2422,25 +2425,30 @@ Window::NamedObjects Window::named_objects(Utf16View name)
 
 bool Window::find(Utf16View string)
 {
-    if (string.is_empty())
+    auto& document = associated_document();
+    if (string.is_empty() || !document.is_fully_active())
         return false;
 
-    auto& page = this->page();
-    Optional<Page::FindInPageResult> result;
-    if (auto last_query = page.last_find_in_page_query(); last_query.has_value() && last_query->string == string) {
-        result = page.find_in_page_next_match();
-    } else {
-        Page::FindInPageQuery query {
-            Utf16String::from_utf16(string),
-            CaseSensitivity::CaseInsensitive,
-            Page::WrapAround::No,
-            Page::ClearSelectionOnNoMatch::No,
-        };
+    auto selection = document.get_selection();
+    if (!selection)
+        return false;
 
-        result = page.find_in_page(query);
-    }
+    auto current_range = selection->range();
+    auto matches = document.find_matching_text(string, CaseSensitivity::CaseInsensitive);
+    auto match = matches.first_matching([&](auto const& match) {
+        if (!current_range)
+            return true;
+        auto position = DOM::position_of_boundary_point_relative_to_other_boundary_point_in_flat_tree(match->start(), current_range->end());
+        return !position.has_value() || *position != DOM::RelativeBoundaryPointPosition::Before;
+    });
+    if (!match.has_value())
+        return false;
 
-    return result.has_value() && result->total_match_count.has_value() && *result->total_match_count > 0;
+    auto start = (*match)->start();
+    auto end = (*match)->end();
+    MUST(selection->set_base_and_extent(start.node, start.offset, end.node, end.offset));
+    selection->scroll_focus_into_view();
+    return true;
 }
 
 }

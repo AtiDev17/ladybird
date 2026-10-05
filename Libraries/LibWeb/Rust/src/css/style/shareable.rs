@@ -28,17 +28,19 @@ fn assert_member_is_sync<T: Sync + ?Sized>(_member: &T) {}
 /// below. That is what keeps `assert_sync::<RetainedState>()` -- which this becomes, unchanged in
 /// meaning, once the exemptions are gone -- from being a list somebody forgets to update.
 ///
-/// Both exemptions are one thing: the prefix caches, which a single `Rc<RefCell<PrefixCaches>>`
+/// Both exemptions are one thing: the prefix caches, which a single `Arc<SharedPrefixCaches>`
 /// shares between the engine and every matching traversal that borrows it -- so
-/// `batch_matching_traversal` fails the bound for exactly the reason `prefix_caches` does.
-/// Giving a walk prefix caches of its own is what removes both. A lock here would not: the
-/// borrows nest, so it would only turn a loud re-entrant panic into a silent deadlock.
+/// `batch_matching_traversal` is exempt for exactly the reason `prefix_caches` is. Both are
+/// `Sync` by type: their borrows are checked atomically, so the engine can move to the thread its
+/// stages run on. That is not shareable in the sense meant here: two workers borrowing the caches
+/// at once would panic, and a lock that waited instead would deadlock, since the borrows nest.
+/// Giving a walk prefix caches of its own is what removes both.
 #[expect(dead_code, reason = "a compile-time witness, never called")]
 fn every_retained_member_is_shareable(state: &RetainedState) {
     let RetainedState {
         memory,
         admission,
-        deferred_pseudo_element,
+        deferred_pseudo_elements,
         tree,
         program,
         native_rules,
@@ -56,6 +58,7 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
         document_resource_contexts,
         document_media,
         document_functions,
+        custom_property_registry,
         font_resolution,
         monospace_font_family,
         layer_topology_version,
@@ -68,18 +71,20 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
         custom_declaration_reads,
         nodes_with_tree_counting_records,
         nodes_with_rolled_back_records,
+        nodes_with_element_relative_substitutions,
         element_custom_property_data,
         pseudo_element_custom_property_data,
         environment_move_recompute_nodes,
         container_effects_for_host,
         published_container_verdicts,
         container_gates_unheld,
-        container_input_nodes,
+        row_inputs_moved,
         container_query_inputs,
         layout_style_snapshots,
         size_container_queries,
         counter_style_environment_identities,
         held_style_records,
+        backing_elements,
         children_explicitly_inherit_marks,
         host_var_reads,
         css_defined_animations,
@@ -87,14 +92,13 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
         animation_effect_descriptions,
         held_root_font_inputs,
         random_base_values,
+        replaced_content_inputs,
+        style_groups,
         transition_baselines,
         custom_property_registrations_changed,
-        pending_element_style_computation_selections,
-        pending_pseudo_style_computation_selections,
         engine_computed_records_pending,
         demand_records,
         flush_stamp,
-        parent_inputs_moved_nodes,
         engine_pseudo_record_cache,
         batch_answers_complete_but_for_custom_properties,
         batch_custom_property_matches,
@@ -152,7 +156,7 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
     } = state;
     assert_member_is_sync(memory);
     assert_member_is_sync(admission);
-    assert_member_is_sync(deferred_pseudo_element);
+    assert_member_is_sync(deferred_pseudo_elements);
     assert_member_is_sync(tree);
     assert_member_is_sync(program);
     assert_member_is_sync(native_rules);
@@ -170,6 +174,7 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
     assert_member_is_sync(document_resource_contexts);
     assert_member_is_sync(document_media);
     assert_member_is_sync(document_functions);
+    assert_member_is_sync(custom_property_registry);
     assert_member_is_sync(layer_topology_version);
     assert_member_is_sync(sheet_order_version);
     assert_member_is_sync(monospace_font_family);
@@ -179,18 +184,20 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
     assert_member_is_sync(custom_declaration_reads);
     assert_member_is_sync(nodes_with_tree_counting_records);
     assert_member_is_sync(nodes_with_rolled_back_records);
+    assert_member_is_sync(nodes_with_element_relative_substitutions);
     assert_member_is_sync(element_custom_property_data);
     assert_member_is_sync(pseudo_element_custom_property_data);
     assert_member_is_sync(environment_move_recompute_nodes);
     assert_member_is_sync(container_effects_for_host);
     assert_member_is_sync(published_container_verdicts);
     assert_member_is_sync(container_gates_unheld);
-    assert_member_is_sync(container_input_nodes);
+    assert_member_is_sync(row_inputs_moved);
     assert_member_is_sync(container_query_inputs);
     assert_member_is_sync(layout_style_snapshots);
     assert_member_is_sync(size_container_queries);
     assert_member_is_sync(counter_style_environment_identities);
     assert_member_is_sync(held_style_records);
+    assert_member_is_sync(backing_elements);
     assert_member_is_sync(children_explicitly_inherit_marks);
     assert_member_is_sync(host_var_reads);
     assert_member_is_sync(css_defined_animations);
@@ -198,14 +205,13 @@ fn every_retained_member_is_shareable(state: &RetainedState) {
     assert_member_is_sync(animation_effect_descriptions);
     assert_member_is_sync(held_root_font_inputs);
     assert_member_is_sync(random_base_values);
+    assert_member_is_sync(replaced_content_inputs);
+    assert_member_is_sync(style_groups);
     assert_member_is_sync(transition_baselines);
     assert_member_is_sync(custom_property_registrations_changed);
-    assert_member_is_sync(pending_element_style_computation_selections);
-    assert_member_is_sync(pending_pseudo_style_computation_selections);
     assert_member_is_sync(engine_computed_records_pending);
     assert_member_is_sync(demand_records);
     assert_member_is_sync(flush_stamp);
-    assert_member_is_sync(parent_inputs_moved_nodes);
     assert_member_is_sync(engine_pseudo_record_cache);
     assert_member_is_sync(batch_answers_complete_but_for_custom_properties);
     assert_member_is_sync(batch_custom_property_matches);

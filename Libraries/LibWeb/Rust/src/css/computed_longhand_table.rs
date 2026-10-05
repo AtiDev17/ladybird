@@ -39,6 +39,10 @@ use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
 
 pub(crate) const LONGHAND_COUNT: usize = (LAST_LONGHAND_PROPERTY_ID - FIRST_LONGHAND_PROPERTY_ID + 1) as usize;
 
+fn is_current_color_keyword(value: &StyleValueData) -> bool {
+    matches!(value, StyleValueData::Keyword { keyword } if *keyword == crate::css::style_compute::keyword::CURRENTCOLOR)
+}
+
 pub(crate) const LONGHAND_BITMAP_BYTES: usize = LONGHAND_COUNT.div_ceil(8);
 
 /// Mixes one slot's value content hash with the slot index, so that a sum over the slots is
@@ -568,6 +572,8 @@ pub(crate) const DEPENDS_ON_VIEWPORT_METRICS: u8 = 1;
 /// The dependency-flag bit of a record whose font metrics read the viewport, as a `vw` font size
 /// does: what `em` and the other font-relative units resolve against moves with the viewport.
 pub(crate) const FONT_METRICS_DEPEND_ON_VIEWPORT_METRICS: u8 = 1 << 1;
+/// The dependency-flag bit of a record whose element is `display: none` or inherits from one that is.
+pub(crate) const IN_DISPLAY_NONE_SUBTREE: u8 = 1 << 2;
 /// The dependency-flag bit of a highlight pseudo-element record whose `color` or `background-color`
 /// comes from the author origin, on itself or up its highlight chain, so the paired default colors
 /// do not apply. Bits 0 to 4 are the viewport, font-metric, display-none, swap-eligibility and image
@@ -815,7 +821,11 @@ impl ComputedLonghandTable {
     }
 
     pub(crate) fn publication_dependency_flags(&self) -> u8 {
-        self.metadata.dependency_flags | (u8::from(self.metadata.in_display_none_subtree) << 2)
+        if self.metadata.in_display_none_subtree {
+            self.metadata.dependency_flags | IN_DISPLAY_NONE_SUBTREE
+        } else {
+            self.metadata.dependency_flags
+        }
     }
 
     pub(crate) fn pseudo_element_styles(&self) -> u64 {
@@ -944,15 +954,6 @@ impl ComputedLonghandTable {
 
     pub(crate) fn effective_color_scheme(&self) -> i16 {
         self.metadata.effective_color_scheme
-    }
-
-    /// Only the values and their hash sum carry over from `source`; flags, provenance, metadata and
-    /// the inheritance-dependent records start fresh, as for a drive from an empty table.
-    pub(crate) fn seeded_with_values_from(source: &ComputedLonghandTable) -> Self {
-        ffi_stats::bump(FfiOp::LonghandTableClone);
-        let table = Self::with_storage(SlotStorage::seeded(&source.storage, false));
-        table.slot_hash_sum.set(source.slot_hash_sum.get());
-        table
     }
 
     pub(crate) fn copied_for_drive(source: &ComputedLonghandTable) -> Self {
@@ -1172,6 +1173,44 @@ impl ComputedLonghandTable {
             .iter()
             .find(|(property, _)| *property == property_id)
             .map(|(_, value)| value)
+    }
+
+    /// Whether the longhand was specified as the `currentcolor` keyword itself.
+    pub(crate) fn specified_value_is_current_color(&self, property_id: u16) -> bool {
+        self.specified_value(property_id)
+            .is_some_and(|value| is_current_color_keyword(value.data()))
+    }
+
+    /// Whether each layer of the specified `text-shadow` has the `currentcolor` keyword as its
+    /// color, or no color, in the order the computed layers have; empty for `none`.
+    pub(crate) fn text_shadow_layer_colors_are_current_color(&self) -> Vec<bool> {
+        let Some(StyleValueData::ValueList { values, .. }) = self
+            .specified_value(property_id::TEXT_SHADOW)
+            .map(RetainedStyleValueData::data)
+        else {
+            return Vec::new();
+        };
+        values
+            .as_slice()
+            .iter()
+            .map(|layer| match layer.optional_data() {
+                Some(StyleValueData::Shadow { color, .. }) => {
+                    color.optional_data().is_none_or(is_current_color_keyword)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// The longhand's value as specified: an unevaluated longhand's recorded specified value, else
+    /// the table slot's.
+    fn specified_value(&self, property_id: u16) -> Option<&RetainedStyleValueData> {
+        if !self.is_evaluated(property_id)
+            && let Some(value) = self.inheritance_dependent_value(property_id)
+        {
+            return Some(value);
+        }
+        self.get(property_id)
     }
 
     pub(crate) fn is_important(&self, property_id: u16) -> bool {
@@ -1524,22 +1563,6 @@ pub unsafe extern "C" fn rust_computed_longhand_table_set_raw_cascaded_font_size
     unsafe { &mut *table }.set_raw_cascaded_font_size(value);
 }
 
-/// Returns the longhand's recorded cascade source slot, or -1 when its value
-/// did not come from a declaration carrying style sheet context.
-///
-/// # Safety
-/// `table` must be a valid table.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_computed_longhand_table_source_slot(
-    table: *const ComputedLonghandTable,
-    property_id: u16,
-) -> i64 {
-    match unsafe { &*table }.source_slot(property_id) {
-        Some(slot) => i64::from(slot),
-        None => -1,
-    }
-}
-
 /// Marks a longhand's stored value `!important` (or not).
 ///
 /// # Safety
@@ -1751,25 +1774,6 @@ mod tests {
     }
 
     #[test]
-    fn seeding_a_delta_preserves_independence_without_a_base_chain() {
-        let mut original = ComputedLonghandTable::new();
-        original.set(property_id::OPACITY, retained_number(0.5), 3);
-        original.freeze();
-        let mut first = ComputedLonghandTable::copied_for_partial_drive(&original);
-        first.set(property_id::Z_INDEX, retained_number(1.0), 4);
-        let mut second = ComputedLonghandTable::seeded_with_values_from(&first);
-        first.set(property_id::Z_INDEX, retained_number(2.0), 5);
-        assert_eq!(second.source_slot(property_id::Z_INDEX), None);
-        assert!(second.get(property_id::Z_INDEX).unwrap().data() == &StyleValueData::Number { value: 1.0 });
-        drop(first);
-        drop(original);
-        assert!(second.get(property_id::OPACITY).unwrap().data() == &StyleValueData::Number { value: 0.5 });
-        second.freeze();
-        assert!(matches!(second.storage, SlotStorage::Dense(_)));
-        assert_eq!(second.slot_hash_sum(), second.recomputed_slot_hash_sum());
-    }
-
-    #[test]
     fn set_retains_and_release_drops() {
         let value = Arc::new(StyleValueData::Number { value: 42.0 });
         let weak_value = Arc::downgrade(&value);
@@ -1970,22 +1974,6 @@ mod tests {
             Some(&[property_id::OPACITY][..])
         );
         assert_eq!(resolutions, 1);
-    }
-
-    #[test]
-    fn seeded_table_carries_only_the_source_values() {
-        let mut source = ComputedLonghandTable::new();
-        source.set(property_id::OPACITY, retained_number(0.5), 7);
-        source.set_important(property_id::OPACITY, true);
-        let seeded = ComputedLonghandTable::seeded_with_values_from(&source);
-        assert_eq!(
-            seeded.get(property_id::OPACITY).unwrap().pointer(),
-            source.get(property_id::OPACITY).unwrap().pointer()
-        );
-        assert_eq!(seeded.slot_hash_sum(), source.slot_hash_sum());
-        assert_eq!(seeded.source_slot(property_id::OPACITY), None);
-        assert!(!seeded.is_important(property_id::OPACITY));
-        assert!(seeded.evaluated_bits().iter().all(|&bits| bits == 0));
     }
 }
 

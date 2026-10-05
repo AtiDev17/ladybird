@@ -13,10 +13,12 @@ namespace Web::Painting {
 
 class DocumentPaintState;
 class HitTestDisplayList;
+class HitTestQuery;
 enum class CaretLineDirection : u8;
 enum class CaretLineEdge : u8;
 enum class CaretPositionMode : u8;
 struct CaretPosition;
+struct DisplayListRecording;
 struct HitTestResult;
 
 }

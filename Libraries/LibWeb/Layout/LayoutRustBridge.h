@@ -33,12 +33,25 @@ namespace Web::Layout {
 // Registers the document-side answers every layout pass needs on the arena, once per document.
 WEB_API void register_layout_host(NodeArena&, DOM::Document&);
 
-// Publishes what an SVG element's attributes parse to, under its style node, and retires that
-// publication. An element's attributes are layout input that no pass can change, so the document publishes them as
+// Publishes what an SVG element's attributes parse to, under its style node. The publication leaves with the
+// identity. An element's attributes are layout input that no pass can change, so the document publishes them as
 // they are written rather than answering for them while a pass runs.
 void publish_svg_attribute_facts(DOM::Element&);
 void publish_svg_style_references(DOM::Element&);
-void clear_svg_attribute_facts(DOM::Document&, CSS::StyleNodeID);
+
+// Publishes whether a row built for the node sits in the user agent shadow tree of the focused text control, which is
+// what a caret is painted inside. The overflow pass reserves a pixel for the caret, so it reads the published answer
+// rather than asking the document who has focus.
+void publish_is_in_focused_text_control(DOM::Node const&);
+
+// Publishes what the element has scrolled to, under its identity. The element's box is replaced whenever its subtree is
+// rebuilt, so the offset is held against the identity that outlives it, and every row built for the element reads it
+// there.
+void publish_element_scroll_offset(DOM::Element const&);
+
+// Publishes the spans a table cell's or table column's attributes give it, under its identity, which table fixup reads
+// before the build that stamps the element's row is over. Every other element spans one of each and publishes nothing.
+void publish_table_spans(DOM::Element const&);
 
 inline RustFFI::FfiSvgNumberPercentage to_ffi_number_percentage(SVG::NumberPercentage value)
 {
@@ -57,3 +70,6 @@ extern "C" WEB_API bool ladybird_layout_code_point_has_emoji_property(u32);
 extern "C" WEB_API Web::Layout::RustFFI::FfiCodePointCategoryFacts ladybird_layout_code_point_category_facts(u32);
 
 extern "C" WEB_API void ladybird_layout_node_shell_destroy(void*);
+extern "C" WEB_API void ladybird_layout_owned_image_provider_destroy(void*);
+extern "C" WEB_API void ladybird_layout_image_observers_destroy(void*);
+extern "C" WEB_API void ladybird_layout_owned_image_provider_notify_detach(void*);

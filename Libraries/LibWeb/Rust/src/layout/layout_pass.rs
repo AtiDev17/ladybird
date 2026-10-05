@@ -6,12 +6,59 @@
 
 use super::*;
 
-/// Arena and host inputs borrowed while computing a layout result. The pass ends before
-/// commit takes a mutable arena borrow, so its text and style views cannot survive commit.
+/// The one question a layout pass still asks the document while it runs: what the container-relative
+/// lengths on an element resolve against. Answering it notes in the document that the element depends
+/// on its query container's size, so the answer cannot be published ahead of the pass. A pass holds
+/// this and no other part of the host. Every other host call takes the main thread token, which a
+/// pass is not handed, so a pass has no way to make any other call into the document.
+#[derive(Clone, Copy)]
+pub(crate) struct ContainerLengthBasesQuery {
+    context: *mut c_void,
+    /// The query, or none for a pass that runs beside the host and cannot ask it.
+    query: Option<unsafe extern "C" fn(*mut c_void, u32) -> svg_formatting_context::FfiContainerLengthBases>,
+}
+
+// SAFETY: A layout job calls the query while the host waits for the job's answer, so the document the C++ side reads
+// changes under neither of them.
+unsafe impl Send for ContainerLengthBasesQuery {}
+
+impl ContainerLengthBasesQuery {
+    /// Only the layout host makes one, for a caller holding the main thread token.
+    pub(super) fn new(
+        context: *mut c_void,
+        query: unsafe extern "C" fn(*mut c_void, u32) -> svg_formatting_context::FfiContainerLengthBases,
+    ) -> Self {
+        Self {
+            context,
+            query: Some(query),
+        }
+    }
+
+    /// The query for a pass that runs beside the host, which answers nothing.
+    pub(crate) fn sealed(self) -> Self {
+        Self {
+            context: std::ptr::null_mut(),
+            query: None,
+        }
+    }
+
+    /// What `cqw` and `cqh` are 100 of for `element`, where the pass can ask the host.
+    pub(crate) fn bases(
+        self,
+        element: crate::css::style::tree::StyleNodeID,
+    ) -> Option<svg_formatting_context::FfiContainerLengthBases> {
+        // SAFETY: The document registered the query with the arena and outlives the pass, which the host waits for.
+        self.query.map(|query| unsafe { query(self.context, element.raw()) })
+    }
+}
+
+/// Arena inputs borrowed while computing a layout result. The pass ends before commit takes a
+/// mutable arena borrow, so its text and style views cannot survive commit.
 #[derive(Clone, Copy)]
 pub(crate) struct LayoutPass<'arena> {
     arena: &'arena LayoutNodeArena,
-    pub(crate) host: &'arena FfiLayoutHostCallbacks,
+    scratch: &'arena super::run_records::LayoutScratch,
+    pub(crate) container_length_bases: ContainerLengthBasesQuery,
     pub(crate) initial_containing_block_inline_size: CssPixels,
     pub(crate) initial_containing_block_block_size: CssPixels,
     pub(crate) document_in_quirks_mode: bool,
@@ -20,14 +67,16 @@ pub(crate) struct LayoutPass<'arena> {
 impl<'arena> LayoutPass<'arena> {
     pub(crate) fn new(
         arena: &'arena LayoutNodeArena,
-        host: &'arena FfiLayoutHostCallbacks,
+        scratch: &'arena super::run_records::LayoutScratch,
+        container_length_bases: ContainerLengthBasesQuery,
         initial_containing_block_inline_size: CssPixels,
         initial_containing_block_block_size: CssPixels,
         document_in_quirks_mode: bool,
     ) -> Self {
         Self {
             arena,
-            host,
+            scratch,
+            container_length_bases,
             initial_containing_block_inline_size,
             initial_containing_block_block_size,
             document_in_quirks_mode,
@@ -36,6 +85,22 @@ impl<'arena> LayoutPass<'arena> {
 
     pub(crate) fn arena(&self) -> &'arena LayoutNodeArena {
         self.arena
+    }
+
+    /// The layout stage's own scratch, which the pass's runs keep their records in.
+    pub(crate) fn scratch(&self) -> &'arena super::run_records::LayoutScratch {
+        self.scratch
+    }
+
+    /// The intrinsic sizes passes measured, kept for the passes after them.
+    pub(crate) fn intrinsic_size_caches(&self) -> &'arena super::layout_node_arena::IntrinsicSizeCaches {
+        &self.scratch.intrinsic_size_caches
+    }
+
+    /// What an intrinsic size cache entry measured for `node` now is valid for.
+    pub(crate) fn intrinsic_size_cache_stamp(&self, node: Node) -> super::layout_node_arena::IntrinsicSizeCacheStamp {
+        self.arena.assert_layout_read_is_in_scope(node);
+        self.arena.intrinsic_size_cache_stamp(node)
     }
 
     pub(crate) fn node_data(&self, node: Node) -> &'arena NodeData {
@@ -86,13 +151,6 @@ impl<'arena> LayoutPass<'arena> {
             child = data.next_sibling.get();
         }
         true
-    }
-
-    pub(crate) fn shell(&self, node: Node) -> *mut c_void {
-        self.arena.assert_layout_read_is_in_scope(node);
-        let shell = self.arena().node_shell(node);
-        assert!(!shell.is_null());
-        shell
     }
 
     pub(crate) fn is_before(&self, node: Node, other: Node) -> bool {

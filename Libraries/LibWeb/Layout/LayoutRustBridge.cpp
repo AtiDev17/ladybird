@@ -24,16 +24,21 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Node.h>
+#include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/HTML/AttributeNames.h>
-#include <LibWeb/HTML/HTMLBodyElement.h>
+#include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLElement.h>
+#include <LibWeb/HTML/HTMLTableCellElement.h>
+#include <LibWeb/HTML/HTMLTableColElement.h>
 #include <LibWeb/Layout/Box.h>
+#include <LibWeb/Layout/ImageProvider.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/PaintableTypes.h>
+#include <LibWeb/Painting/ScrollSnap.h>
 #include <LibWeb/SVG/FragmentIdentifier.h>
 #include <LibWeb/SVG/SVGCircleElement.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
@@ -255,6 +260,22 @@ static RustFFI::FfiSvgAttributeFacts build_svg_attribute_facts(DOM::Element& dom
     // republication of their own.
     auto style_references = svg_style_reference_atoms(dom_node);
 
+    // What an <svg>'s natural size is negotiated from: its width and height where they are a <length>, which layout
+    // resolves against the box's style, and the aspect ratio its active SVG view or viewBox gives it.
+    RustFFI::FfiSvgLengthValue natural_width { .value = 0, .kind = RustFFI::SVG_LENGTH_KIND_NONE, .unit = 0 };
+    RustFFI::FfiSvgLengthValue natural_height { .value = 0, .kind = RustFFI::SVG_LENGTH_KIND_NONE, .unit = 0 };
+    Optional<CSSPixelFraction> view_box_aspect_ratio;
+    if (auto const* svg_element = as_if<SVG::SVGSVGElement>(dom_node)) {
+        auto to_ffi_length = [](Optional<CSS::Length> const& length) -> RustFFI::FfiSvgLengthValue {
+            if (!length.has_value())
+                return { .value = 0, .kind = RustFFI::SVG_LENGTH_KIND_NONE, .unit = 0 };
+            return { .value = length->raw_value(), .kind = RustFFI::SVG_LENGTH_KIND_LENGTH, .unit = static_cast<u8>(to_underlying(length->unit())) };
+        };
+        natural_width = to_ffi_length(svg_element->width_attribute_length());
+        natural_height = to_ffi_length(svg_element->height_attribute_length());
+        view_box_aspect_ratio = SVG::SVGSVGElement::view_box_natural_aspect_ratio(*svg_element);
+    }
+
     return {
         .is_graphics_element = is<SVG::SVGGraphicsElement>(dom_node),
         .is_use_element = is<SVG::SVGUseElement>(dom_node),
@@ -290,7 +311,66 @@ static RustFFI::FfiSvgAttributeFacts build_svg_attribute_facts(DOM::Element& dom
         .fill_reference_atom = style_references[2].value(),
         .stroke_reference_atom = style_references[3].value(),
         .text_path_start_offset = to_ffi_number_percentage(start_offset),
+        .natural_width = natural_width,
+        .natural_height = natural_height,
+        .has_view_box_aspect_ratio = view_box_aspect_ratio.has_value(),
+        .view_box_aspect_ratio_numerator = view_box_aspect_ratio.has_value() ? view_box_aspect_ratio->numerator() : 0,
+        .view_box_aspect_ratio_denominator = view_box_aspect_ratio.has_value() ? view_box_aspect_ratio->denominator() : 0,
     };
+}
+
+// The answer moves only when the focused area does, or when a node arrives in the focused control's shadow tree, and a
+// node in no user agent shadow tree never holds it, so the published set holds one control's shadow tree at a time.
+void publish_is_in_focused_text_control(DOM::Node const& node)
+{
+    auto identity = Node::style_node_of(&node);
+    if (identity.value() == 0)
+        return;
+    auto shadow_root = node.containing_shadow_root();
+    auto value = shadow_root
+        && shadow_root->is_user_agent_internal()
+        && is<HTML::FormAssociatedTextControlElement>(shadow_root->host())
+        && shadow_root->host()->is_focused();
+    auto* arena = const_cast<DOM::Document&>(node.document()).layout_node_arena_if_created();
+    if (!arena) {
+        if (!value)
+            return;
+        arena = &const_cast<DOM::Document&>(node.document()).layout_node_arena();
+    }
+    RustFFI::render_state_set_identity_in_focused_text_control(arena->host(), identity.value(), value);
+}
+
+void publish_element_scroll_offset(DOM::Element const& element)
+{
+    if (element.style_node_id().value() == 0)
+        return;
+    auto& document = const_cast<DOM::Document&>(element.document());
+    auto offset = element.scroll_offset({});
+    // Nothing has scrolled anything before a layout tree exists, so there is no offset to forget.
+    if (!document.layout_node_arena_if_created() && offset.is_zero())
+        return;
+    RustFFI::render_state_set_element_scroll_offset(document.layout_node_arena().host(), element.style_node_id().value(), offset);
+}
+
+void publish_table_spans(DOM::Element const& element)
+{
+    if (element.style_node_id().value() == 0)
+        return;
+    u16 column_span = 1;
+    u16 row_span = 1;
+    u32 raw_column_span = 1;
+    if (auto const* cell = as_if<HTML::HTMLTableCellElement>(element)) {
+        column_span = static_cast<u16>(cell->col_span());
+        row_span = static_cast<u16>(cell->row_span());
+    } else if (auto const* column = as_if<HTML::HTMLTableColElement>(element)) {
+        column_span = static_cast<u16>(column->span());
+        // The raw span keeps the unclamped attribute value; its only consumer is the table formatting context's column
+        // handling, so other elements' span attributes stay out of the mirror.
+        raw_column_span = column->get_attribute_value(HTML::AttributeNames::span).to_number<u32>().value_or(1);
+    } else {
+        return;
+    }
+    const_cast<DOM::Document&>(element.document()).style_computer().style_engine().set_element_table_spans(element.style_node_id(), column_span, row_span, raw_column_span);
 }
 
 // The publication is keyed by the element's style node rather than by a row, because an element that draws nothing
@@ -304,8 +384,8 @@ void publish_svg_attribute_facts(DOM::Element& element)
     else if (auto const* polyline = as_if<SVG::SVGPolylineElement>(element))
         points = polyline->points();
     static_assert(sizeof(Gfx::FloatPoint) == sizeof(RustFFI::FfiFloatPoint));
-    RustFFI::layout_arena_set_style_node_svg_attribute_facts(
-        element.document().layout_node_arena().handle(),
+    RustFFI::render_state_set_svg_attribute_facts(
+        element.document().layout_node_arena().host(),
         element.style_node_id().value(),
         build_svg_attribute_facts(element),
         reinterpret_cast<RustFFI::FfiFloatPoint const*>(points.data()),
@@ -319,75 +399,13 @@ void publish_svg_style_references(DOM::Element& element)
 {
     VERIFY(element.style_node_id() != 0);
     auto references = svg_style_reference_atoms(element);
-    RustFFI::layout_arena_set_style_node_svg_style_references(
-        element.document().layout_node_arena().handle(),
+    RustFFI::render_state_set_svg_style_references(
+        element.document().layout_node_arena().host(),
         element.style_node_id().value(),
         references[0].value(),
         references[1].value(),
         references[2].value(),
         references[3].value());
-}
-
-void clear_svg_attribute_facts(DOM::Document& document, CSS::StyleNodeID style_node)
-{
-    if (auto* arena = document.layout_node_arena_if_created())
-        RustFFI::layout_arena_clear_style_node_svg_attribute_facts(arena->handle(), style_node.value());
-}
-
-static bool style_has_any_containment(CSS::ComputedValues::BoxValues const& values)
-{
-    return values.size_containment || values.inline_size_containment || values.layout_containment || values.style_containment || values.paint_containment;
-}
-
-// The inputs of the principal writing mode and viewport overflow propagation. They are read from
-// the elements' own style records: the previous pass already rewrote their boxes' values, and a
-// display:none body has style but no box.
-static RustFFI::FfiViewportPropagationFacts viewport_propagation_facts(DOM::Document& document)
-{
-    static_assert(to_underlying(CSS::Overflow::Auto) == 0);
-    static_assert(to_underlying(CSS::Overflow::Clip) == 1);
-    static_assert(to_underlying(CSS::Overflow::Hidden) == 2);
-    static_assert(to_underlying(CSS::Overflow::Visible) == 4);
-    RustFFI::FfiViewportPropagationFacts facts {};
-    facts.root_layout_node = Compositing::RustFFI::NodeSlotId_INVALID;
-    facts.body_layout_node = Compositing::RustFFI::NodeSlotId_INVALID;
-    auto* root_element = document.document_element();
-    if (!root_element || !root_element->unsafe_layout_node())
-        return facts;
-    auto const* root_box_values = root_element->style_group<CSS::ComputedValues::BoxValues>();
-    auto const* root_inherited_box_values = root_element->style_group<CSS::ComputedValues::InheritedBoxValues>();
-    VERIFY(root_box_values && root_inherited_box_values);
-    facts.root_layout_node = Node::slot_id(root_element->unsafe_layout_node());
-    facts.root_is_html_html_element = root_element->is_html_html_element();
-    facts.root_overflow_x = root_box_values->overflow_x;
-    facts.root_overflow_y = root_box_values->overflow_y;
-    facts.root_writing_mode = root_inherited_box_values->writing_mode;
-    facts.root_direction = root_inherited_box_values->direction;
-    facts.root_has_containment = style_has_any_containment(*root_box_values);
-
-    auto* body_element = root_element->first_child_of_type<HTML::HTMLBodyElement>();
-    auto const* body_box_values = body_element ? body_element->style_group<CSS::ComputedValues::BoxValues>() : nullptr;
-    auto const* body_inherited_box_values = body_element ? body_element->style_group<CSS::ComputedValues::InheritedBoxValues>() : nullptr;
-    if (!body_box_values || !body_inherited_box_values)
-        return facts;
-    facts.has_styled_body = true;
-    facts.body_layout_node = Node::slot_id(body_element->unsafe_layout_node());
-    facts.body_display_is_none = CSS::display_from_ffi_display(body_box_values->display).is_none();
-    facts.body_overflow_x = body_box_values->overflow_x;
-    facts.body_overflow_y = body_box_values->overflow_y;
-    facts.body_writing_mode = body_inherited_box_values->writing_mode;
-    facts.body_direction = body_inherited_box_values->direction;
-    facts.body_has_containment = style_has_any_containment(*body_box_values);
-    return facts;
-}
-
-static Optional<DOM::AbstractElement> abstract_element_for_abspos_box(Box const& box)
-{
-    if (box.is_generated_for_pseudo_element())
-        return DOM::AbstractElement { *box.pseudo_element_generator(), box.generated_for_pseudo_element() };
-    if (auto const* element = as_if<DOM::Element>(box.dom_node()))
-        return DOM::AbstractElement { *element };
-    return {};
 }
 
 void register_layout_host(NodeArena& arena, DOM::Document& document)
@@ -408,64 +426,28 @@ void register_layout_host(NodeArena& arena, DOM::Document& document)
     static_assert(to_underlying(SVG::SVGUnits::UserSpaceOnUse) == 1);
     RustFFI::FfiLayoutHostCallbacks callbacks {
         .context = &document,
-        .anchor_lookup = [](void*, void* node, size_t anchor_name, void* const* eligible_anchor_boxes, size_t eligible_anchor_box_count) {
-            auto const& box = *static_cast<Box const*>(node);
-            auto abstract_element = abstract_element_for_abspos_box(box);
-            if (!abstract_element.has_value())
-                return Compositing::RustFFI::NodeSlotId_INVALID;
-            auto const* containing_block = box.containing_block();
-            if (!containing_block)
-                return Compositing::RustFFI::NodeSlotId_INVALID;
-            Function<bool(DOM::Element&)> is_acceptable_anchor_element = [&](DOM::Element& candidate) {
-                auto const* anchor_box = as_if<Box>(candidate.unsafe_layout_node());
-                if (!anchor_box || anchor_box == &box)
-                    return false;
-                bool has_used_values = false;
-                for (size_t index = 0; index < eligible_anchor_box_count; ++index) {
-                    if (eligible_anchor_boxes[index] == anchor_box) {
-                        has_used_values = true;
-                        break;
-                    }
-                }
-                if (!has_used_values)
-                    return false;
-                for (auto const* ancestor = anchor_box->containing_block(); ancestor; ancestor = ancestor->containing_block()) {
-                    if (ancestor == containing_block)
-                        return true;
-                }
-                return false;
-            };
-            auto anchor_element = abstract_element->element().document().element_by_anchor_name(
-                Utf16FlyString::from_raw(anchor_name),
-                abstract_element->element(),
-                is_acceptable_anchor_element);
-            if (!anchor_element)
-                return Compositing::RustFFI::NodeSlotId_INVALID;
-            auto const* anchor_box = as_if<Box>(anchor_element->unsafe_layout_node());
-            if (!anchor_box)
-                return Compositing::RustFFI::NodeSlotId_INVALID;
-            return Node::slot_id(anchor_box); },
-        .deliver_commit_messages = [](void* context, RustFFI::FfiCommitMessage const* messages, size_t count) {
+        .deliver_commit_messages = [](void* context, BegunRead const* read, RustFFI::FfiCommitMessage const* messages, size_t count) {
             auto& commit_messages = static_cast<DOM::Document*>(context)->commit_messages();
             for (size_t index = 0; index < count; ++index)
-                commit_messages.append(messages[index]);
+                commit_messages.append(*read, messages[index]);
             // The pass that produced them reads back what they change before it ends.
-            commit_messages.apply(); },
-        .build_replaced_content_facts = [](void*, void* node_shell, RustFFI::FfiReplacedContentFacts* facts) {
-            auto const& node = *static_cast<Node const*>(node_shell);
-            if (auto const* box = as_if<Box>(node))
-                *facts = box->build_replaced_content_facts_for_arena(); },
-        .viewport_propagation_facts = [](void* context) { return viewport_propagation_facts(*static_cast<DOM::Document*>(context)); },
-        .container_length_bases = [](void*, void* node_shell) -> RustFFI::FfiContainerLengthBases {
-            auto const& element = as<DOM::Element>(*static_cast<Node const*>(node_shell)->dom_node());
-            auto context = CSS::Length::ResolutionContext::for_element(DOM::AbstractElement { element });
+            commit_messages.apply(*read); },
+        .container_length_bases = [](void* document_pointer, u32 style_node) -> RustFFI::FfiContainerLengthBases {
+            auto& document = *static_cast<DOM::Document*>(document_pointer);
+            auto element = document.style_computer().element_for_style_node(style_node);
+            VERIFY(element);
+            auto context = CSS::Length::ResolutionContext::for_element(DOM::AbstractElement { *element });
             return {
                 .width = CSS::Length(100, CSS::LengthUnit::Cqw).to_px_without_rounding(context),
                 .height = CSS::Length(100, CSS::LengthUnit::Cqh).to_px_without_rounding(context),
             }; },
+        .take_built_scroll_containers = [](void* context, BegunRead const* read, RustFFI::FfiBuiltScrollContainer const* built, size_t count) {
+            auto& document = *static_cast<DOM::Document*>(context);
+            for (auto const& scroll_container : ReadonlySpan<RustFFI::FfiBuiltScrollContainer> { built, count })
+                Painting::take_built_scroll_container(*read, document, scroll_container.slot, scroll_container.is_scroll_snap_container); },
     };
-    RustFFI::layout_arena_set_layout_host_callbacks(arena.handle(), callbacks);
-    RustFFI::layout_arena_set_document_is_decoded_svg(arena.handle(), document.is_decoded_svg());
+    RustFFI::document_host_set_layout_host_callbacks(arena.host(), callbacks);
+    RustFFI::render_state_set_document_is_decoded_svg(arena.host(), document.is_decoded_svg());
 }
 
 }
@@ -521,4 +503,19 @@ extern "C" WEB_API Web::Layout::RustFFI::FfiCodePointCategoryFacts ladybird_layo
 extern "C" WEB_API void ladybird_layout_node_shell_destroy(void* shell)
 {
     Web::Layout::Node::delete_arena_owned_shell(*static_cast<Web::Layout::Node*>(shell));
+}
+
+extern "C" WEB_API void ladybird_layout_owned_image_provider_destroy(void* image_provider)
+{
+    delete static_cast<Web::Layout::ImageProvider*>(image_provider);
+}
+
+extern "C" WEB_API void ladybird_layout_owned_image_provider_notify_detach(void* image_provider)
+{
+    static_cast<Web::Layout::ImageProvider*>(image_provider)->layout_node_was_detached();
+}
+
+extern "C" WEB_API void ladybird_layout_image_observers_destroy(void* image_observers)
+{
+    delete static_cast<Web::Layout::NodeWithStyle::ImageObserverSlots*>(image_observers);
 }

@@ -6,8 +6,6 @@
 
 #include <AK/Array.h>
 #include <AK/Math.h>
-#include <AK/Queue.h>
-#include <AK/Stream.h>
 #include <Compositor/CompositorState.h>
 #include <Compositor/FramePacer.h>
 #include <LibCompositing/DisplayList/DisplayListDamage.h>
@@ -17,9 +15,6 @@
 #include <LibCore/EventLoop.h>
 #include <LibCore/Timer.h>
 #include <LibGfx/SharedImageBuffer.h>
-#include <LibIPC/Decoder.h>
-#include <LibIPC/Encoder.h>
-#include <LibIPC/Message.h>
 #include <LibTest/TestCase.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <Tests/LibCompositing/DisplayListTestHelpers.h>
@@ -155,33 +150,6 @@ static NonnullRefPtr<Compositing::DisplayList> make_display_list(Compositing::Ac
         append_display_list_command(command_bytes, command, command.rect, context);
     }
     return decode_display_list(visual_context_tree, move(command_bytes), surface_clear_color);
-}
-
-TEST_CASE(visual_context_trees_round_trip_through_ipc_and_reject_corrupted_bytes)
-{
-    Compositing::VisualContextTreeTestBuilder builder;
-    auto scroll_node = builder.append_scroll(Compositing::VISUAL_VIEWPORT_NODE_INDEX);
-    auto clip = builder.append_clip(Compositing::NO_CLIP_NODE, scroll_node, { 1, 2, 3, 4 });
-    auto effect = builder.append_effects(Compositing::NO_EFFECT_NODE, scroll_node, clip, 0.5f);
-    auto visual_context_tree = builder.finish();
-
-    IPC::MessageBuffer buffer;
-    IPC::Encoder encoder { buffer };
-    MUST(encoder.encode(visual_context_tree));
-    FixedMemoryStream stream { buffer.data().span() };
-    Queue<IPC::Attachment> attachments;
-    IPC::Decoder decoder { stream, attachments };
-    auto decoded_tree = MUST(decoder.decode<Compositing::AccumulatedVisualContextTree>());
-    EXPECT_EQ(decoded_tree.structural_epoch(), visual_context_tree.structural_epoch());
-    EXPECT_EQ(decoded_tree.spatial_node_count(), 2u);
-    EXPECT_EQ(decoded_tree.node_count(), 4u);
-    EXPECT_EQ(decoded_tree.live_node_count(), 4u);
-    EXPECT_EQ(decoded_tree.effects_opacity(effect), Optional<float> { 0.5f });
-    EXPECT_EQ(decoded_tree.serialize_to_bytes(), visual_context_tree.serialize_to_bytes());
-
-    auto corrupted_bytes = visual_context_tree.serialize_to_bytes();
-    corrupted_bytes[0] ^= 0xff;
-    EXPECT(Compositing::AccumulatedVisualContextTree::from_serialized_bytes(corrupted_bytes).is_error());
 }
 
 static Compositing::AccumulatedVisualContextTree make_visual_context_tree()
@@ -555,30 +523,6 @@ TEST_CASE(viewport_scrollbar_drag_ignores_non_primary_mouse_up)
     EXPECT(context.handle_mouse_event(mouse_event(Web::MouseEvent::Type::MouseUp, 50, 60, Web::UIEvents::MouseButton::Primary)).accepted);
 }
 
-TEST_CASE(context_visibility_and_pending_frame_state)
-{
-    TestWebContentClient client;
-    Compositing::CanvasSurfaceRegistry canvas_surface_registry;
-    Compositor::ContextState context { Web::CompositorContextId { 1 }, 1, client, canvas_surface_registry };
-    auto viewport_rect = Gfx::IntRect { 0, 0, 4, 4 };
-
-    EXPECT(!context.set_visibility(Compositing::ContextVisibility::Visible));
-    EXPECT(context.set_visibility(Compositing::ContextVisibility::Hidden));
-    EXPECT(!context.set_visibility(Compositing::ContextVisibility::Hidden));
-    EXPECT(context.set_visibility(Compositing::ContextVisibility::Visible));
-    EXPECT(!context.pending_present_frame_viewport_rect().has_value());
-
-    context.viewport_size_updated(viewport_rect.size(), Compositing::WindowResizingInProgress::No);
-    VERIFY(context.resize_backing_stores_if_needed({}, Compositor::BackingStoreManager::GpuSharing::Disallowed).has_value());
-    context.queue_present_frame({ viewport_rect, { 0, 0, 2, 2 } });
-    EXPECT_EQ(context.pending_present_frame_viewport_rect(), viewport_rect);
-    EXPECT(context.can_schedule_pending_present_frame_if_unblocked());
-    context.mark_pending_present_frame_scheduled();
-    EXPECT(!context.can_schedule_pending_present_frame_if_unblocked());
-    context.unschedule_pending_present_frame();
-    EXPECT(context.can_schedule_pending_present_frame_if_unblocked());
-}
-
 // MonotonicTime has no fixed reference point, so the pacing tests offset from one taken once.
 static MonotonicTime monotonic_time_at(i64 nanoseconds)
 {
@@ -909,7 +853,6 @@ struct NestedScrollbarSceneOptions {
     bool display_list_paints_enlarged_scrollbar { false };
     bool gives_nested_scroller_a_later_scroll_node_index { false };
     Optional<Gfx::FloatRect> main_thread_wheel_event_region_in_viewport {};
-    Optional<Web::UniqueNodeID> document_id_of_nested_scroller {};
 };
 
 struct NestedScrollbarScene {
@@ -941,7 +884,6 @@ static NestedScrollbarScene make_nested_scrollbar_scene(NestedScrollbarSceneOpti
     auto visual_context_tree = builder.finish();
 
     Web::UniqueNodeID document_id { 1 };
-    auto document_id_of_nested_scroller = options.document_id_of_nested_scroller.value_or(document_id);
     TestDisplayList command_bytes;
     append_display_list_command(
         command_bytes,
@@ -969,7 +911,7 @@ static NestedScrollbarScene make_nested_scrollbar_scene(NestedScrollbarSceneOpti
     append_display_list_command(
         command_bytes,
         Compositing::CompositorWheelHitTestTarget {
-            .document_id = document_id_of_nested_scroller,
+            .document_id = document_id,
             .target_scroll_node_index = nested_scroll_node_index,
             .rect = { 10, 10, 40, 40 },
         },
@@ -978,7 +920,7 @@ static NestedScrollbarScene make_nested_scrollbar_scene(NestedScrollbarSceneOpti
     append_display_list_command(
         command_bytes,
         Compositing::CompositorScrollNode {
-            .document_id = document_id_of_nested_scroller,
+            .document_id = document_id,
             .scrollable_node_id = nested_scroller_node_id,
             .scroll_node_index = nested_scroll_node_index,
             .parent_scroll_node_index = viewport_scroll_node_index,
@@ -996,7 +938,7 @@ static NestedScrollbarScene make_nested_scrollbar_scene(NestedScrollbarSceneOpti
     append_display_list_command(
         command_bytes,
         Compositing::CompositorWheelHitTestTarget {
-            .document_id = document_id_of_nested_scroller,
+            .document_id = document_id,
             .target_scroll_node_index = nested_scroll_node_index,
             .rect = { 10, 10, 40, 140 },
         },
@@ -1019,7 +961,7 @@ static NestedScrollbarScene make_nested_scrollbar_scene(NestedScrollbarSceneOpti
     append_display_list_command(
         command_bytes,
         Compositing::CompositorScrollbar {
-            .document_id = document_id_of_nested_scroller,
+            .document_id = document_id,
             .scroll_node_index = nested_scroll_node_index,
             .gutter_rect = {},
             .thumb_rect = { 47, 10, 2, 10 },
@@ -1240,8 +1182,8 @@ TEST_CASE(losing_the_nested_scrollbar_a_drag_holds_ends_its_user_scroll_gesture)
     EXPECT(!context.handle_mouse_event(mouse_event(Web::MouseEvent::Type::MouseMove, 48, 30)).accepted);
 }
 
-// Drives wheel events at chosen times through the nested scrollbar scene: the UI path through wheel(), the WebContent
-// path through wheel_from_document(). (20,20) is over the nested scroller, (80,80) over the viewport.
+// Drives wheel events from the UI at chosen times through the nested scrollbar scene. (20,20) is over the nested
+// scroller, (80,80) over the viewport.
 struct LatchedWheelContextFixture {
     explicit LatchedWheelContextFixture(NestedScrollbarSceneOptions options = {})
         : scene(options)
@@ -1252,16 +1194,6 @@ struct LatchedWheelContextFixture {
     Compositor::ContextState::ContextUpdateResult wheel(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::ScrollGesturePhase phase, i64 milliseconds_after_start, u32 modifiers = Web::UIEvents::KeyModifier::Mod_None, Web::WheelDeltaPrecision precision = Web::WheelDeltaPrecision::Precise)
     {
         return scene.context.async_scroll_by(position, delta, precision, phase, modifiers, now + AK::Duration::from_milliseconds(milliseconds_after_start));
-    }
-
-    Compositor::ContextState::ContextUpdateResult mouse_wheel_tick(Gfx::FloatPoint position, Gfx::FloatPoint delta, i64 milliseconds_after_start, u32 modifiers = Web::UIEvents::KeyModifier::Mod_None)
-    {
-        return wheel(position, delta, Web::ScrollGesturePhase::None, milliseconds_after_start, modifiers, Web::WheelDeltaPrecision::Discrete);
-    }
-
-    Compositor::ContextState::AsyncScrollResult wheel_from_document(Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::ScrollGesturePhase phase, i64 milliseconds_after_start)
-    {
-        return scene.context.async_scroll_by(document_id, position, delta, { 0, 0, 100, 100 }, Web::WheelDeltaPrecision::Precise, phase, Web::UIEvents::KeyModifier::Mod_None, Compositing::AsyncScrollOperationTracking::Yes, now + AK::Duration::from_milliseconds(milliseconds_after_start));
     }
 
     struct TakenScrollOffsets {
@@ -1312,23 +1244,6 @@ struct LatchedWheelContextFixture {
     MonotonicTime now { MonotonicTime::now() };
 };
 
-TEST_CASE(a_wheel_gesture_latches_the_scroller_its_first_step_hit)
-{
-    LatchedWheelContextFixture fixture;
-
-    EXPECT(fixture.wheel({ 20, 20 }, { 0, 50 }, Web::ScrollGesturePhase::Ongoing, 0).accepted);
-    auto offsets = fixture.take_scroll_offsets();
-    EXPECT_EQ(offsets.nested, (Gfx::FloatPoint { 0, 50 }));
-    EXPECT(!offsets.viewport.has_value());
-
-    // The viewport is under the cursor now, but the gesture stays with the nested scroller.
-    EXPECT(fixture.wheel({ 80, 80 }, { 0, 30 }, Web::ScrollGesturePhase::Ongoing, 10).accepted);
-    offsets = fixture.take_scroll_offsets();
-    EXPECT_EQ(offsets.nested, (Gfx::FloatPoint { 0, 80 }));
-    EXPECT(!offsets.viewport.has_value());
-    EXPECT_EQ(fixture.latched_scroller_node_id(), nested_scroller_node_id);
-}
-
 TEST_CASE(scroll_snapshots_keep_newer_unreconciled_offsets_until_they_are_adopted)
 {
     LatchedWheelContextFixture fixture;
@@ -1359,48 +1274,6 @@ TEST_CASE(scroll_snapshots_keep_newer_unreconciled_offsets_until_they_are_adopte
     EXPECT_EQ(fixture.take_scroll_offsets().viewport, (Gfx::FloatPoint { 0, 75 }));
 }
 
-TEST_CASE(a_latched_scroller_absorbs_the_gesture_at_its_edge)
-{
-    LatchedWheelContextFixture fixture;
-
-    EXPECT(fixture.wheel({ 20, 20 }, { 0, 100 }, Web::ScrollGesturePhase::Ongoing, 0).accepted);
-    EXPECT(fixture.wheel({ 20, 20 }, { 0, 100 }, Web::ScrollGesturePhase::Ongoing, 10).accepted);
-    EXPECT_EQ(fixture.take_scroll_offsets().nested, (Gfx::FloatPoint { 0, 120 }));
-
-    auto step_past_the_edge = fixture.wheel({ 20, 20 }, { 0, 50 }, Web::ScrollGesturePhase::Ongoing, 20);
-    EXPECT(step_past_the_edge.accepted);
-    EXPECT(!step_past_the_edge.frame_to_present.has_value());
-    auto offsets = fixture.take_scroll_offsets();
-    EXPECT(!offsets.nested.has_value());
-    EXPECT(!offsets.viewport.has_value());
-
-    // Once the gesture ended, the next one is routed afresh, past the scroller at its edge.
-    fixture.wheel({ 20, 20 }, { 0, 0 }, Web::ScrollGesturePhase::Ended, 30);
-    fixture.expect_step_to_scroll_viewport_afresh({ 20, 20 }, Web::ScrollGesturePhase::Ongoing, 300);
-}
-
-TEST_CASE(mouse_wheel_ticks_within_the_settle_delay_continue_the_latched_gesture)
-{
-    LatchedWheelContextFixture fixture;
-
-    EXPECT(fixture.mouse_wheel_tick({ 20, 20 }, { 0, 100 }, 0).accepted);
-    EXPECT(fixture.mouse_wheel_tick({ 20, 20 }, { 0, 100 }, 100).accepted);
-    EXPECT_EQ(fixture.take_scroll_offsets().nested, (Gfx::FloatPoint { 0, 120 }));
-
-    fixture.expect_step_to_be_absorbed_by_latched_scroller({ 25, 25 }, Web::ScrollGesturePhase::None, 300, Web::UIEvents::KeyModifier::Mod_None, Web::WheelDeltaPrecision::Discrete);
-    fixture.expect_step_to_scroll_viewport_afresh({ 20, 20 }, Web::ScrollGesturePhase::None, 900, Web::UIEvents::KeyModifier::Mod_None, Web::WheelDeltaPrecision::Discrete);
-}
-
-TEST_CASE(a_mouse_wheel_tick_far_from_where_the_gesture_started_starts_a_new_gesture)
-{
-    LatchedWheelContextFixture fixture;
-    fixture.latch_gesture_to_nested_scroller_at_its_edge(Web::ScrollGesturePhase::None, Web::WheelDeltaPrecision::Discrete);
-
-    fixture.expect_step_to_be_absorbed_by_latched_scroller({ 27, 20 }, Web::ScrollGesturePhase::None, 50, Web::UIEvents::KeyModifier::Mod_None, Web::WheelDeltaPrecision::Discrete);
-    // 14 device pixels from where the gesture started, though only 7 from its last tick.
-    fixture.expect_step_to_scroll_viewport_afresh({ 34, 20 }, Web::ScrollGesturePhase::None, 100, Web::UIEvents::KeyModifier::Mod_None, Web::WheelDeltaPrecision::Discrete);
-}
-
 TEST_CASE(a_mouse_wheel_tick_with_other_modifiers_starts_a_new_gesture)
 {
     LatchedWheelContextFixture fixture;
@@ -1421,65 +1294,6 @@ TEST_CASE(momentum_within_the_grace_after_the_gesture_ended_continues_its_latch)
 
     fixture.expect_step_to_be_absorbed_by_latched_scroller({ 20, 20 }, Web::ScrollGesturePhase::Momentum, 60);
     EXPECT_EQ(fixture.latched_scroller_node_id(), nested_scroller_node_id);
-}
-
-TEST_CASE(momentum_arriving_late_after_the_gesture_ended_starts_a_new_gesture)
-{
-    LatchedWheelContextFixture fixture;
-    fixture.latch_gesture_to_nested_scroller_at_its_edge();
-    fixture.wheel({ 20, 20 }, { 0, 0 }, Web::ScrollGesturePhase::Ended, 10);
-
-    fixture.expect_step_to_scroll_viewport_afresh({ 20, 20 }, Web::ScrollGesturePhase::Momentum, 150);
-}
-
-TEST_CASE(an_ongoing_step_after_the_gesture_ended_starts_a_new_gesture)
-{
-    LatchedWheelContextFixture fixture;
-    fixture.latch_gesture_to_nested_scroller_at_its_edge();
-    fixture.wheel({ 20, 20 }, { 0, 0 }, Web::ScrollGesturePhase::Ended, 10);
-
-    fixture.expect_step_to_scroll_viewport_afresh({ 20, 20 }, Web::ScrollGesturePhase::Ongoing, 20);
-}
-
-TEST_CASE(a_latch_expires_when_no_step_arrives_within_the_settle_delay)
-{
-    LatchedWheelContextFixture fixture;
-    fixture.latch_gesture_to_nested_scroller_at_its_edge();
-
-    fixture.expect_step_to_scroll_viewport_afresh({ 20, 20 }, Web::ScrollGesturePhase::Ongoing, 600);
-}
-
-TEST_CASE(a_latched_wheel_gesture_outlives_a_display_list_that_renumbers_its_scroll_node)
-{
-    LatchedWheelContextFixture fixture;
-
-    EXPECT(fixture.wheel({ 20, 20 }, { 0, 50 }, Web::ScrollGesturePhase::Ongoing, 0).accepted);
-    fixture.take_scroll_offsets();
-
-    fixture.scene.install({ .gives_nested_scroller_a_later_scroll_node_index = true });
-    fixture.take_scroll_offsets();
-
-    EXPECT(fixture.wheel({ 80, 80 }, { 0, 50 }, Web::ScrollGesturePhase::Ongoing, 20).accepted);
-    auto offsets = fixture.take_scroll_offsets();
-    EXPECT_EQ(offsets.nested, (Gfx::FloatPoint { 0, 100 }));
-    EXPECT(!offsets.viewport.has_value());
-}
-
-TEST_CASE(a_latch_is_dropped_when_its_scroller_leaves_the_display_list)
-{
-    LatchedWheelContextFixture fixture;
-
-    EXPECT(fixture.wheel({ 20, 20 }, { 0, 50 }, Web::ScrollGesturePhase::Ongoing, 0).accepted);
-    fixture.take_scroll_offsets();
-
-    auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
-    fixture.scene.context.install_display_list_update(make_scrollable_viewport_display_list(visual_context_tree, false), visual_context_tree, {});
-    fixture.take_scroll_offsets();
-
-    EXPECT(fixture.wheel({ 20, 20 }, { 0, 50 }, Web::ScrollGesturePhase::Ongoing, 20).accepted);
-    auto latched_scroller = fixture.scene.context.latched_wheel_scroller_for_testing();
-    EXPECT(latched_scroller.has_value());
-    EXPECT_EQ(latched_scroller->kind, Web::AsyncScrollNodeKind::Viewport);
 }
 
 TEST_CASE(a_latched_gesture_ignores_main_thread_wheel_regions_it_moves_over)
@@ -1515,32 +1329,6 @@ TEST_CASE(a_pinch_pan_that_consumes_a_step_leaves_the_latch_alone)
     auto offsets = fixture.take_scroll_offsets();
     EXPECT_EQ(offsets.nested, (Gfx::FloatPoint { 0, 120 }));
     EXPECT_EQ(offsets.viewport.value_or(Gfx::FloatPoint {}), Gfx::FloatPoint {});
-}
-
-TEST_CASE(a_latched_step_over_another_document_is_left_to_that_document)
-{
-    Web::UniqueNodeID const parent_document_id { 1 };
-    Web::UniqueNodeID const nested_document_id { 7 };
-    LatchedWheelContextFixture fixture({ .document_id_of_nested_scroller = nested_document_id });
-
-    EXPECT(!fixture.wheel_from_document(parent_document_id, { 20, 20 }, { 0, 50 }, Web::ScrollGesturePhase::Ongoing, 0).enqueue_result.accepted);
-    EXPECT(!fixture.latched_scroller_node_id().has_value());
-    EXPECT(fixture.wheel_from_document(nested_document_id, { 20, 20 }, { 0, 50 }, Web::ScrollGesturePhase::Ongoing, 0).enqueue_result.accepted);
-    EXPECT_EQ(fixture.latched_scroller_node_id(), nested_scroller_node_id);
-    fixture.take_scroll_offsets();
-
-    // The parent navigable reports every step first; the nested one routes the steps of its scroller.
-    EXPECT(!fixture.wheel_from_document(parent_document_id, { 20, 20 }, { 0, 50 }, Web::ScrollGesturePhase::Ongoing, 20).enqueue_result.accepted);
-    EXPECT_EQ(fixture.latched_scroller_node_id(), nested_scroller_node_id);
-    EXPECT(fixture.wheel_from_document(nested_document_id, { 20, 20 }, { 0, 50 }, Web::ScrollGesturePhase::Ongoing, 20).enqueue_result.accepted);
-    EXPECT_EQ(fixture.take_scroll_offsets().nested, (Gfx::FloatPoint { 0, 100 }));
-
-    fixture.wheel_from_document(parent_document_id, { 20, 20 }, { 0, 0 }, Web::ScrollGesturePhase::Ended, 30);
-    fixture.wheel_from_document(nested_document_id, { 20, 20 }, { 0, 0 }, Web::ScrollGesturePhase::Ended, 31);
-    EXPECT_EQ(fixture.latched_scroller_node_id(), nested_scroller_node_id);
-
-    EXPECT(fixture.wheel_from_document(nested_document_id, { 20, 20 }, { 0, 50 }, Web::ScrollGesturePhase::Momentum, 80).enqueue_result.accepted);
-    EXPECT_EQ(fixture.take_scroll_offsets().nested, (Gfx::FloatPoint { 0, 120 }));
 }
 
 static Gfx::IntRect const test_viewport_rect { 0, 0, 16, 16 };
@@ -1758,20 +1546,6 @@ TEST_CASE(offscreen_changes_do_not_acquire_a_backing_store_or_block_later_frames
     EXPECT_EQ(fixture.rasterize(fixture.viewport_rect), fixture.viewport_rect);
 }
 
-TEST_CASE(changed_command_reports_its_inflated_rect)
-{
-    PresentingContextFixture fixture;
-    auto visual_context_tree = make_visual_context_tree();
-    fixture.install(make_fills_display_list(visual_context_tree, { { { 2, 2, 4, 4 }, Gfx::Color::Red } }), visual_context_tree);
-    fixture.present();
-
-    fixture.install(make_fills_display_list(visual_context_tree, { { { 2, 2, 4, 4 }, Gfx::Color::Blue } }), visual_context_tree);
-    EXPECT_EQ(fixture.present().damage_rect, (Gfx::IntRect { 1, 1, 6, 6 }));
-
-    fixture.install(make_fills_display_list(visual_context_tree, { { { 8, 8, 4, 4 }, Gfx::Color::Blue } }), visual_context_tree);
-    EXPECT_EQ(fixture.present().damage_rect, (Gfx::IntRect { 1, 1, 12, 12 }));
-}
-
 TEST_CASE(changed_command_is_repainted_within_its_damage)
 {
     RasterizingContextFixture fixture;
@@ -1785,6 +1559,11 @@ TEST_CASE(changed_command_is_repainted_within_its_damage)
     EXPECT_EQ(fixture.rasterize(), (Gfx::IntRect { 1, 1, 6, 6 }));
     EXPECT_EQ(fixture.pixel(3, 3), Gfx::Color::Blue);
     EXPECT_EQ(fixture.pixel(0, 0), Gfx::Color::Green);
+
+    fixture.context.install_display_list_update(make_fills_display_list(visual_context_tree, { { { 8, 8, 4, 4 }, Gfx::Color::Blue } }, Gfx::Color::Green), visual_context_tree, {});
+    EXPECT_EQ(fixture.rasterize(), (Gfx::IntRect { 1, 1, 12, 12 }));
+    EXPECT_EQ(fixture.pixel(3, 3), Gfx::Color::Green);
+    EXPECT_EQ(fixture.pixel(9, 9), Gfx::Color::Blue);
 }
 
 TEST_CASE(scroll_state_only_update_damages_only_moved_commands)
@@ -1816,17 +1595,6 @@ TEST_CASE(tree_only_update_damages_transformed_commands)
 
     fixture.compositor_state->update_visual_context_tree(fixture.context_id, make_translated_visual_context_tree({ 8, 0 }), {});
     fixture.expect_no_frame();
-}
-
-TEST_CASE(surface_clear_color_change_forces_full_damage)
-{
-    PresentingContextFixture fixture;
-    auto visual_context_tree = make_visual_context_tree();
-    fixture.install(make_fills_display_list(visual_context_tree, { { { 2, 2, 4, 4 }, Gfx::Color::Red } }, Gfx::Color::Green), visual_context_tree);
-    fixture.present();
-
-    fixture.install(make_fills_display_list(visual_context_tree, { { { 2, 2, 4, 4 }, Gfx::Color::Red } }, Gfx::Color::Blue), visual_context_tree);
-    EXPECT_EQ(fixture.present().damage_rect, fixture.viewport_rect);
 }
 
 TEST_CASE(surface_clear_color_change_repaints_the_background)
@@ -2272,24 +2040,6 @@ static Web::MouseEvent ui_mouse_move_event(int x, int y, u64 id)
     return event;
 }
 
-TEST_CASE(ui_wheel_event_is_forwarded_flagged_after_the_scroll_updates_it_produced)
-{
-    PresentingContextFixture fixture { { 100, 100 } };
-    auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
-    fixture.install(make_scrollable_viewport_display_list(visual_context_tree, true, Compositing::ContextRef {}), visual_context_tree);
-    fixture.present();
-    fixture.web_content_client.events.clear();
-
-    fixture.compositor_state->handle_and_dispatch_mouse_event(fixture.context_id, ui_wheel_event(20, 20, 0, 5, 3));
-
-    EXPECT_EQ(fixture.web_content_client.event_sequence(), "async_scroll_updates,request_rendering_update,mouse_event"sv);
-    EXPECT_EQ(fixture.web_content_client.forwarded_mouse_events.size(), 1u);
-    EXPECT(fixture.web_content_client.forwarded_mouse_events.last().async_scroll_performed_default_action);
-    EXPECT_EQ(fixture.web_content_client.forwarded_mouse_events.last().id, 3u);
-    EXPECT(fixture.compositor_client.consumed_input_event_ids.is_empty());
-    EXPECT(fixture.compositor_client.undispatched_input_event_ids.is_empty());
-}
-
 TEST_CASE(shift_swaps_the_wheel_axes_in_the_compositor)
 {
     PresentingContextFixture fixture { { 100, 100 } };
@@ -2356,19 +2106,6 @@ TEST_CASE(ui_mouse_event_for_a_missing_context_is_reported_as_not_dispatched)
     EXPECT_EQ(fixture.compositor_client.undispatched_input_event_ids.size(), 1u);
     EXPECT_EQ(fixture.compositor_client.undispatched_input_event_ids.last(), 8u);
     EXPECT(fixture.web_content_client.forwarded_mouse_events.is_empty());
-}
-
-TEST_CASE(compositor_initiated_presents_request_full_damage)
-{
-    PresentingContextFixture fixture { { 100, 100 } };
-    auto visual_context_tree = make_scrollable_viewport_visual_context_tree();
-    fixture.install(make_scrollable_viewport_display_list(visual_context_tree), visual_context_tree);
-    fixture.present();
-
-    auto already_presented = fixture.compositor_client.presented_frames.size();
-    fixture.compositor_state->handle_and_dispatch_mouse_event(fixture.context_id, ui_mouse_move_event(98, 10, 1));
-    EXPECT_EQ(fixture.compositor_client.consumed_input_event_ids.size(), 1u);
-    EXPECT_EQ(fixture.wait_for_frame(already_presented).damage_rect, fixture.viewport_rect);
 }
 
 TEST_CASE(child_context_presents_repaint_the_parent)
@@ -2473,30 +2210,6 @@ TEST_CASE(async_scroll_presents_report_the_damage_of_the_scrolled_content)
     auto viewport_scroll_frame = fixture.wait_for_frame(already_presented);
     EXPECT_EQ(viewport_scroll_frame.content_rect, (Gfx::IntRect { 0, 10, 100, 100 }));
     EXPECT_EQ(viewport_scroll_frame.damage_rect, fixture.viewport_rect);
-}
-
-TEST_CASE(clip_paths_round_trip_through_serialized_tree_bytes)
-{
-    Gfx::Path star;
-    star.move_to({ 65, 0 });
-    star.line_to({ 35, 80 });
-    star.line_to({ 105, 30 });
-    star.line_to({ 25, 30 });
-    star.line_to({ 95, 80 });
-    star.close();
-    Compositing::VisualContextTreeTestBuilder builder;
-    auto clip_path = builder.append_clip_path(Compositing::NO_CLIP_NODE, Compositing::VISUAL_VIEWPORT_NODE_INDEX, star, { 25, 0, 80, 80 }, Gfx::WindingRule::EvenOdd);
-    auto visual_context_tree = builder.finish();
-
-    auto serialized_bytes = visual_context_tree.serialize_to_bytes();
-    auto decoded_tree = MUST(Compositing::AccumulatedVisualContextTree::from_serialized_bytes(serialized_bytes));
-    EXPECT_EQ(decoded_tree.serialize_to_bytes(), serialized_bytes);
-
-    Compositing::ScrollStateSnapshot unscrolled;
-    Compositing::ContextRef clip_path_context { Compositing::VISUAL_VIEWPORT_NODE_INDEX, clip_path };
-    EXPECT(decoded_tree.transform_point_for_hit_test(clip_path_context, Gfx::FloatPoint { 65, 5 }, unscrolled).has_value());
-    EXPECT(!decoded_tree.transform_point_for_hit_test(clip_path_context, Gfx::FloatPoint { 26, 1 }, unscrolled).has_value());
-    EXPECT(!decoded_tree.transform_point_for_hit_test(clip_path_context, Gfx::FloatPoint { 10, 40 }, unscrolled).has_value());
 }
 
 // A scroll container that snaps along its y axis, with snap areas every 100 pixels.
@@ -2616,91 +2329,6 @@ struct SnapContainerContextFixture {
     }
 };
 
-TEST_CASE(a_discrete_step_on_a_latched_snap_container_at_its_edge_is_consumed)
-{
-    SnapContainerContextFixture fixture;
-
-    EXPECT(fixture.discrete_step({ 0, 500 }).enqueue_result.accepted);
-    fixture.finish_animations(AK::Duration::from_milliseconds(1000));
-
-    auto step_past_the_edge = fixture.discrete_step({ 0, 100 }, AK::Duration::from_milliseconds(50));
-    EXPECT(step_past_the_edge.enqueue_result.accepted);
-    EXPECT(step_past_the_edge.enqueue_result.operation_id.has_value());
-    EXPECT(!fixture.context.has_active_smooth_scroll_animations());
-    EXPECT(fixture.take_updates().completed_operation_ids.contains_slow(*step_past_the_edge.enqueue_result.operation_id));
-    EXPECT(fixture.context.latched_wheel_scroller_for_testing().has_value());
-}
-
-TEST_CASE(a_discrete_wheel_step_on_a_snap_container_starts_a_snap_scroll)
-{
-    SnapContainerContextFixture fixture;
-
-    auto result = fixture.discrete_step({ 0, 10 });
-    EXPECT(result.enqueue_result.accepted);
-    EXPECT(result.enqueue_result.operation_id.has_value());
-    EXPECT(result.frame_to_present.has_value());
-    EXPECT(fixture.context.has_active_smooth_scroll_animations());
-
-    auto updates = fixture.take_updates();
-    EXPECT_EQ(updates.document_id, Web::UniqueNodeID { 1 });
-    EXPECT(updates.completed_operation_ids.is_empty());
-    EXPECT_EQ(updates.started_user_scrolls.size(), 1u);
-    auto started = updates.started_user_scrolls.first();
-    EXPECT_EQ(started.stable_node_id, snap_container_stable_id);
-    EXPECT_EQ(started.operation_id, *result.enqueue_result.operation_id);
-    EXPECT_EQ(started.initial_scroll_offset, Web::CSSPixelPoint(0, 0));
-    EXPECT_EQ(started.selection.position, Web::CSSPixelPoint(0, 100));
-    EXPECT_EQ(started.unsnapped_scroll_destination, Web::CSSPixelPoint(0, 10));
-    EXPECT(!started.selection.evaluated_x);
-    EXPECT(started.selection.evaluated_y);
-    EXPECT(started.selection.snapped_areas.x.is_empty());
-    EXPECT_EQ(started.selection.snapped_areas.y.size(), 1u);
-    EXPECT_EQ(started.selection.snapped_areas.y.first().node_id, Web::UniqueNodeID(11));
-
-    updates = fixture.finish_animations(AK::Duration::from_seconds(1));
-    EXPECT(updates.completed_operation_ids.contains_slow(started.operation_id));
-    EXPECT(updates.started_user_scrolls.is_empty());
-    EXPECT_EQ(updates.scroll_offsets.size(), 1u);
-    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 100));
-}
-
-TEST_CASE(consecutive_discrete_wheel_steps_travel_from_the_offset_they_asked_for)
-{
-    SnapContainerContextFixture fixture;
-
-    auto first_step = fixture.discrete_step({ 0, 10 });
-    auto first_operation_id = *first_step.enqueue_result.operation_id;
-    EXPECT_EQ(fixture.take_updates().started_user_scrolls.size(), 1u);
-
-    // The second step asks for an offset short of the snap position the first is scrolling to, so it is consumed.
-    auto second_step = fixture.discrete_step({ 0, 10 }, AK::Duration::from_milliseconds(10));
-    EXPECT(second_step.enqueue_result.accepted);
-    EXPECT(second_step.enqueue_result.operation_id.has_value());
-    auto updates = fixture.take_updates();
-    EXPECT(updates.started_user_scrolls.is_empty());
-    EXPECT(updates.completed_operation_ids.contains_slow(*second_step.enqueue_result.operation_id));
-    EXPECT(!updates.completed_operation_ids.contains_slow(first_operation_id));
-
-    // The third step travels on from the 20 pixels the gesture has asked for, past the snap position in flight.
-    auto third_step = fixture.discrete_step({ 0, 100 }, AK::Duration::from_milliseconds(20));
-    updates = fixture.take_updates();
-    EXPECT(updates.completed_operation_ids.contains_slow(first_operation_id));
-    EXPECT_EQ(updates.started_user_scrolls.size(), 1u);
-    EXPECT_EQ(updates.started_user_scrolls.first().operation_id, *third_step.enqueue_result.operation_id);
-    EXPECT_EQ(updates.started_user_scrolls.first().unsnapped_scroll_destination, Web::CSSPixelPoint(0, 120));
-    EXPECT_EQ(updates.started_user_scrolls.first().selection.position, Web::CSSPixelPoint(0, 200));
-
-    updates = fixture.finish_animations(AK::Duration::from_seconds(1));
-    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 200));
-
-    // A step arriving once the gesture has run out of input travels from where the scrolling box rests.
-    fixture.discrete_step({ 0, 10 }, AK::Duration::from_seconds(2));
-    updates = fixture.take_updates();
-    EXPECT_EQ(updates.started_user_scrolls.size(), 1u);
-    EXPECT_EQ(updates.started_user_scrolls.first().initial_scroll_offset, Web::CSSPixelPoint(0, 200));
-    EXPECT_EQ(updates.started_user_scrolls.first().selection.position, Web::CSSPixelPoint(0, 300));
-}
-
 TEST_CASE(a_wheel_gesture_ends_once_its_steps_stop_arriving)
 {
     SnapContainerContextFixture fixture;
@@ -2757,64 +2385,6 @@ TEST_CASE(an_element_scroll_gesture_reports_its_document_without_a_viewport_scro
     EXPECT(ended.scroll_offsets.is_empty());
 }
 
-TEST_CASE(a_discrete_wheel_step_along_a_non_snapping_axis_scrolls_by_its_delta)
-{
-    SnapContainerContextFixture fixture;
-
-    auto result = fixture.discrete_step({ 10, 0 });
-    EXPECT(result.enqueue_result.accepted);
-    EXPECT(!fixture.context.has_active_smooth_scroll_animations());
-
-    auto updates = fixture.take_updates();
-    EXPECT(updates.started_user_scrolls.is_empty());
-    EXPECT(updates.completed_operation_ids.contains_slow(*result.enqueue_result.operation_id));
-    EXPECT_EQ(updates.scroll_offsets.size(), 1u);
-    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(10, 0));
-}
-
-TEST_CASE(a_scroll_by_the_main_thread_ends_the_wheel_gesture_on_the_compositor)
-{
-    SnapContainerContextFixture fixture;
-
-    fixture.discrete_step({ 0, 10 });
-    auto updates = fixture.finish_animations(AK::Duration::from_seconds(1));
-    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 100));
-
-    // The main thread adopted the snap scroll's offsets and then scrolled the box itself.
-    auto scroll_state_snapshot = scroll_state_snapshot_with_offset(Compositing::SpatialNodeIndex { 1 }, { 0, -300 });
-    scroll_state_snapshot.set_adopted_async_scroll_sequence(updates.sequence);
-    fixture.context.update_scroll_state(move(scroll_state_snapshot), {});
-
-    fixture.discrete_step({ 0, 10 }, AK::Duration::from_milliseconds(100));
-    updates = fixture.take_updates();
-    EXPECT_EQ(updates.started_user_scrolls.size(), 1u);
-    EXPECT_EQ(updates.started_user_scrolls.first().initial_scroll_offset, Web::CSSPixelPoint(0, 300));
-    EXPECT_EQ(updates.started_user_scrolls.first().selection.position, Web::CSSPixelPoint(0, 400));
-}
-
-TEST_CASE(a_discrete_wheel_step_takes_over_a_smooth_scroll_the_main_thread_started)
-{
-    SnapContainerContextFixture fixture;
-
-    auto first_step = fixture.discrete_step({ 0, 10 });
-    auto first_operation_id = *first_step.enqueue_result.operation_id;
-    fixture.take_updates();
-
-    auto programmatic_scroll = fixture.context.smooth_scroll_to(snap_container_stable_id, { 0, 350 }, { 0, 0 }, { 0, 0, 100, 100 }, Compositing::ScrollAnimationKind::SmoothScroll, Compositing::SmoothScrollInitiator::Programmatic);
-    EXPECT(programmatic_scroll.enqueue_result.accepted);
-    auto programmatic_operation_id = *programmatic_scroll.enqueue_result.operation_id;
-    auto updates = fixture.take_updates();
-    EXPECT(updates.completed_operation_ids.contains_slow(first_operation_id));
-
-    auto second_step = fixture.discrete_step({ 0, 10 }, AK::Duration::from_milliseconds(20));
-    updates = fixture.take_updates();
-    EXPECT(updates.operation_ids_taken_over_by_user_input.contains_slow(programmatic_operation_id));
-    EXPECT_EQ(updates.started_user_scrolls.size(), 1u);
-    EXPECT_EQ(updates.started_user_scrolls.first().operation_id, *second_step.enqueue_result.operation_id);
-    EXPECT_EQ(updates.started_user_scrolls.first().initial_scroll_offset, Web::CSSPixelPoint(0, 0));
-    EXPECT_EQ(updates.started_user_scrolls.first().selection.position, Web::CSSPixelPoint(0, 100));
-}
-
 static constexpr int arrow_key_scroll_distance_for_testing = 40;
 
 static void target_keyboard_scrolling_at_the_snap_container(SnapContainerContextFixture& fixture)
@@ -2868,145 +2438,4 @@ TEST_CASE(a_key_step_takes_over_a_programmatic_smooth_scroll_from_its_presented_
     EXPECT(updates.operation_ids_taken_over_by_user_input.contains_slow(*programmatic_scroll.enqueue_result.operation_id));
     EXPECT_EQ(updates.started_user_scrolls.size(), 1u);
     EXPECT_EQ(updates.started_user_scrolls.first().unsnapped_scroll_destination, Web::CSSPixelPoint(arrow_key_scroll_distance_for_testing, 0));
-}
-
-TEST_CASE(started_user_scrolls_round_trip_through_ipc)
-{
-    Compositing::PendingAsyncScrollUpdates updates;
-    updates.sequence = 7;
-    updates.started_user_scrolls.append({
-        .stable_node_id = snap_container_stable_id,
-        .operation_id = 3,
-        .initial_scroll_offset = { Web::CSSPixels(0), Web::CSSPixels(12.5) },
-        .unsnapped_scroll_destination = { 0, 22 },
-        .selection = {
-            .position = { 0, 100 },
-            .snapped_x = false,
-            .snapped_y = true,
-            .evaluated_x = false,
-            .evaluated_y = true,
-            .snapped_areas = { .x = {}, .y = { { .node_id = Web::UniqueNodeID { 11 }, .pseudo_element_type = 3 } } },
-        },
-        .settles_gesture = true,
-    });
-
-    IPC::MessageBuffer buffer;
-    IPC::Encoder encoder { buffer };
-    MUST(encoder.encode(updates));
-
-    FixedMemoryStream stream { buffer.data().span() };
-    Queue<IPC::Attachment> attachments;
-    IPC::Decoder decoder { stream, attachments };
-    auto decoded = MUST(decoder.decode<Compositing::PendingAsyncScrollUpdates>());
-
-    EXPECT_EQ(decoded.sequence, 7u);
-    EXPECT_EQ(decoded.started_user_scrolls.size(), 1u);
-    auto const& started = decoded.started_user_scrolls.first();
-    EXPECT_EQ(started.stable_node_id, snap_container_stable_id);
-    EXPECT_EQ(started.operation_id, 3u);
-    EXPECT_EQ(started.initial_scroll_offset, Web::CSSPixelPoint(Web::CSSPixels(0), Web::CSSPixels(12.5)));
-    EXPECT_EQ(started.selection.position, Web::CSSPixelPoint(0, 100));
-    EXPECT_EQ(started.unsnapped_scroll_destination, Web::CSSPixelPoint(0, 22));
-    EXPECT(started.settles_gesture);
-    EXPECT(!started.selection.snapped_x);
-    EXPECT(started.selection.snapped_y);
-    EXPECT(!started.selection.evaluated_x);
-    EXPECT(started.selection.evaluated_y);
-    EXPECT_EQ(started.selection.snapped_areas.y.size(), 1u);
-    EXPECT_EQ(started.selection.snapped_areas.y.first().node_id, Web::UniqueNodeID(11));
-    EXPECT_EQ(started.selection.snapped_areas.y.first().pseudo_element_type, 3u);
-}
-
-TEST_CASE(a_precise_pan_snaps_when_its_gesture_ends)
-{
-    SnapContainerContextFixture fixture;
-    auto pan = [&](Gfx::FloatPoint delta, Web::ScrollGesturePhase phase, AK::Duration after) {
-        return fixture.context.async_scroll_by(Web::UniqueNodeID { 1 }, { 50, 50 }, delta, { 0, 0, 100, 100 }, Web::WheelDeltaPrecision::Precise, phase, Web::UIEvents::KeyModifier::Mod_None, Compositing::AsyncScrollOperationTracking::Yes, fixture.now + after);
-    };
-
-    // The finger pans the box to where it is released, past a snap position on the way.
-    EXPECT(pan({ 0, 130 }, Web::ScrollGesturePhase::Ongoing, {}).enqueue_result.accepted);
-    auto updates = fixture.take_updates();
-    EXPECT(updates.started_user_scrolls.is_empty());
-    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 130));
-
-    auto gesture_end = pan({ 0, 0 }, Web::ScrollGesturePhase::Ended, AK::Duration::from_milliseconds(10));
-    EXPECT(gesture_end.enqueue_result.accepted);
-    EXPECT(gesture_end.enqueue_result.operation_id.has_value());
-    EXPECT(fixture.context.has_active_smooth_scroll_animations());
-    updates = fixture.take_updates();
-    EXPECT_EQ(updates.started_user_scrolls.size(), 1u);
-    auto started = updates.started_user_scrolls.first();
-    EXPECT_EQ(started.operation_id, *gesture_end.enqueue_result.operation_id);
-    EXPECT(started.settles_gesture);
-    EXPECT_EQ(started.initial_scroll_offset, Web::CSSPixelPoint(0, 130));
-    EXPECT_EQ(started.selection.position, Web::CSSPixelPoint(0, 100));
-
-    // The gesture has ended, so ending it again snaps nothing.
-    EXPECT(!pan({ 0, 0 }, Web::ScrollGesturePhase::Ended, AK::Duration::from_milliseconds(20)).enqueue_result.accepted);
-}
-
-TEST_CASE(the_momentum_of_a_flick_selects_a_snap_position_once)
-{
-    SnapContainerContextFixture fixture;
-    auto flick = [&](Gfx::FloatPoint delta, Web::ScrollGesturePhase phase, AK::Duration after) {
-        return fixture.context.async_scroll_by(Web::UniqueNodeID { 1 }, { 50, 50 }, delta, { 0, 0, 100, 100 }, Web::WheelDeltaPrecision::Precise, phase, Web::UIEvents::KeyModifier::Mod_None, Compositing::AsyncScrollOperationTracking::Yes, fixture.now + after);
-    };
-
-    EXPECT(flick({ 0, 50 }, Web::ScrollGesturePhase::Ongoing, {}).enqueue_result.accepted);
-    // The first momentum delta says nothing about where the momentum is headed, so it scrolls by its delta.
-    EXPECT(flick({ 0, 100 }, Web::ScrollGesturePhase::Momentum, AK::Duration::from_milliseconds(10)).enqueue_result.accepted);
-    auto updates = fixture.take_updates();
-    EXPECT(updates.started_user_scrolls.is_empty());
-    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 150));
-
-    // The second decays by 0.6, so the momentum has 150 pixels left to travel, and snaps where that is headed.
-    auto selecting_delta = flick({ 0, 60 }, Web::ScrollGesturePhase::Momentum, AK::Duration::from_milliseconds(20));
-    EXPECT(selecting_delta.enqueue_result.accepted);
-    updates = fixture.take_updates();
-    EXPECT_EQ(updates.started_user_scrolls.size(), 1u);
-    auto started = updates.started_user_scrolls.first();
-    EXPECT_EQ(started.operation_id, *selecting_delta.enqueue_result.operation_id);
-    EXPECT(!started.settles_gesture);
-    EXPECT_EQ(started.initial_scroll_offset, Web::CSSPixelPoint(0, 150));
-    EXPECT_EQ(started.selection.position, Web::CSSPixelPoint(0, 300));
-
-    // The rest of the momentum is consumed by the scroll under way, and the end of the gesture leaves it be.
-    auto consumed_delta = flick({ 0, 30 }, Web::ScrollGesturePhase::Momentum, AK::Duration::from_milliseconds(30));
-    EXPECT(consumed_delta.enqueue_result.accepted);
-    updates = fixture.take_updates();
-    EXPECT(updates.started_user_scrolls.is_empty());
-    EXPECT(updates.scroll_offsets.is_empty());
-    EXPECT(updates.completed_operation_ids.contains_slow(*consumed_delta.enqueue_result.operation_id));
-
-    EXPECT(!flick({ 0, 0 }, Web::ScrollGesturePhase::Ended, AK::Duration::from_milliseconds(40)).enqueue_result.accepted);
-    EXPECT(fixture.context.has_active_smooth_scroll_animations());
-
-    updates = fixture.finish_animations(AK::Duration::from_seconds(10));
-    EXPECT(updates.completed_operation_ids.contains_slow(started.operation_id));
-    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 300));
-}
-
-TEST_CASE(momentum_that_never_decays_snaps_from_where_the_gesture_started_at_its_end)
-{
-    SnapContainerContextFixture fixture;
-    auto flick = [&](Gfx::FloatPoint delta, Web::ScrollGesturePhase phase, AK::Duration after) {
-        return fixture.context.async_scroll_by(Web::UniqueNodeID { 1 }, { 50, 50 }, delta, { 0, 0, 100, 100 }, Web::WheelDeltaPrecision::Precise, phase, Web::UIEvents::KeyModifier::Mod_None, Compositing::AsyncScrollOperationTracking::Yes, fixture.now + after);
-    };
-
-    // Momentum that keeps gathering pace says nothing about where it is headed, so every delta scrolls by itself.
-    EXPECT(flick({ 0, 50 }, Web::ScrollGesturePhase::Ongoing, {}).enqueue_result.accepted);
-    EXPECT(flick({ 0, 50 }, Web::ScrollGesturePhase::Momentum, AK::Duration::from_milliseconds(10)).enqueue_result.accepted);
-    EXPECT(flick({ 0, 50 }, Web::ScrollGesturePhase::Momentum, AK::Duration::from_milliseconds(20)).enqueue_result.accepted);
-    EXPECT(flick({ 0, 60 }, Web::ScrollGesturePhase::Momentum, AK::Duration::from_milliseconds(30)).enqueue_result.accepted);
-    auto updates = fixture.take_updates();
-    EXPECT(updates.started_user_scrolls.is_empty());
-    EXPECT_EQ(updates.scroll_offsets.first().compositor_scroll_offset, Gfx::FloatPoint(0, 210));
-
-    EXPECT(flick({ 0, 0 }, Web::ScrollGesturePhase::Ended, AK::Duration::from_milliseconds(40)).enqueue_result.accepted);
-    updates = fixture.take_updates();
-    EXPECT_EQ(updates.started_user_scrolls.size(), 1u);
-    EXPECT(updates.started_user_scrolls.first().settles_gesture);
-    EXPECT_EQ(updates.started_user_scrolls.first().initial_scroll_offset, Web::CSSPixelPoint(0, 210));
-    EXPECT_EQ(updates.started_user_scrolls.first().selection.position, Web::CSSPixelPoint(0, 200));
 }

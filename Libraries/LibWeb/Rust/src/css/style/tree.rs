@@ -607,6 +607,24 @@ impl Iterator for FlatTreeChildren<'_> {
     }
 }
 
+/// The spans a table cell or table column takes from its attributes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableSpans {
+    pub column_span: u16,
+    pub row_span: u16,
+    pub raw_column_span: u32,
+}
+
+impl Default for TableSpans {
+    fn default() -> Self {
+        Self {
+            column_span: 1,
+            row_span: 1,
+            raw_column_span: 1,
+        }
+    }
+}
+
 /// The Rust-owned projection of the tree relations selectors navigate.
 ///
 /// Element columns are indexed by element index, with slot 0 unused so that a `StyleNodeID` indexes
@@ -631,7 +649,9 @@ pub struct StyleNodeTree {
     /// Identities retired in the current epoch. They cannot be reused until the epoch that could
     /// still observe them has retired.
     pending_reuse: Vec<u32>,
-    free_element_indexes: Vec<u32>,
+    /// The identities a test mints from, standing in for the host's.
+    #[cfg(test)]
+    test_identities: super::identities::StyleNodeIdAllocator,
 
     /// Allocated only once a shadow tree exists.
     shadow: Option<Box<ShadowRelations>>,
@@ -648,6 +668,26 @@ pub struct StyleNodeTree {
     next_sibling: Vec<Option<StyleNodeID>>,
     previous_sibling: Vec<Option<StyleNodeID>>,
     text: TextRows,
+
+    /// What a row built for the node is painted and hit-tested with: whether the node is inert,
+    /// editable or an editing host, inside a blocking wheel event handler, or a navigable container
+    /// holding a navigable. Nearly every node holds none of them, which is the absence of an entry.
+    /// Element, text and document identities publish here, as each gets a row.
+    dom_paint_facts: HashMap<StyleNodeID, u8>,
+    /// The unique node id the document names the element by, published where the identity arrives
+    /// and constant for as long as the element holds it. A box built for the element answers by
+    /// it, and so does a box built for one of the element's pseudo-elements, which is why the
+    /// render side needs it for an element that has no box of its own. The document's identity
+    /// carries the document's.
+    unique_node_ids: Vec<i64>,
+    /// The spans a table cell's or table column's attributes give it: the effective column and row
+    /// span, and the column span attribute's unclamped value, which only the table formatting
+    /// context's column handling reads. Every other element spans one of each, which is what the
+    /// absence of an entry means.
+    table_spans: HashMap<StyleNodeID, TableSpans>,
+    /// The document's top layer, in the order its members were added. The order is the order their
+    /// boxes are built in and belongs to the document, so no per-element fact can carry it.
+    top_layer: Vec<StyleNodeID>,
 
     capacity_bytes: u64,
 
@@ -686,13 +726,18 @@ impl StyleNodeTree {
             relation_only: BitColumn::default(),
             connected_element_count: 0,
             pending_reuse: Vec::new(),
-            free_element_indexes: Vec::new(),
+            #[cfg(test)]
+            test_identities: Default::default(),
             shadow: None,
             ids: None,
             first_child: Vec::new(),
             next_sibling: Vec::new(),
             previous_sibling: Vec::new(),
             text: TextRows::default(),
+            dom_paint_facts: HashMap::default(),
+            unique_node_ids: Vec::new(),
+            table_spans: HashMap::default(),
+            top_layer: Vec::new(),
             capacity_bytes: 0,
             #[cfg(test)]
             depth_recompute_visits: 0,
@@ -709,6 +754,7 @@ impl StyleNodeTree {
         tree.text.parent.push(None);
         tree.text.next_sibling.push(None);
         tree.text.previous_sibling.push(None);
+        tree.text.data.push(ak::Utf16String::default());
         tree.capacity_bytes = tree.recompute_capacity_bytes();
         memory.reserve_required(MemoryCategory::RelationColumns, tree.capacity_bytes);
         tree
@@ -760,40 +806,46 @@ impl StyleNodeTree {
 
     // -- Identity lifecycle ------------------------------------------------------------------
 
-    /// Allocate an element identity. Reuses a slot only once the epoch that could still observe its
-    /// previous occupant has retired.
-    pub fn allocate_element(&mut self, memory: &mut MemoryController) -> StyleNodeID {
-        let (index, capacity_before_growth) = match self.free_element_indexes.pop() {
-            Some(index) => {
-                self.parent[index as usize] = None;
-                self.first_element_child[index as usize] = None;
-                self.next_element_sibling[index as usize] = None;
-                self.previous_element_sibling[index as usize] = None;
-                self.depth[index as usize] = 0;
-                self.first_child[index as usize] = None;
-                self.next_sibling[index as usize] = None;
-                self.previous_sibling[index as usize] = None;
-                if let Some(column) = self.tree_scope.as_mut() {
-                    column[index as usize] = TreeScopeID::DOCUMENT;
-                }
-                (index, None)
+    /// Make the element identity `node`, which the host minted, live. The host mints past every
+    /// identity it minted before, or one this tree released, which no reader can still name.
+    pub fn mint_element(&mut self, node: StyleNodeID, memory: &mut MemoryController) {
+        let index = node.element_index().expect("mint_element requires an element identity");
+        let capacity_before_growth = if (index as usize) < self.parent.len() {
+            assert!(
+                !self.live.contains(index as usize),
+                "minting an element identity that is live"
+            );
+            self.parent[index as usize] = None;
+            self.first_element_child[index as usize] = None;
+            self.next_element_sibling[index as usize] = None;
+            self.previous_element_sibling[index as usize] = None;
+            self.depth[index as usize] = 0;
+            self.first_child[index as usize] = None;
+            self.next_sibling[index as usize] = None;
+            self.previous_sibling[index as usize] = None;
+            if let Some(column) = self.tree_scope.as_mut() {
+                column[index as usize] = TreeScopeID::DOCUMENT;
             }
-            None => {
-                let capacity_before_growth = self.identity_capacity_bytes();
-                let index = u32::try_from(self.parent.len()).expect("element index space exhausted");
-                self.parent.push(None);
-                self.first_element_child.push(None);
-                self.next_element_sibling.push(None);
-                self.previous_element_sibling.push(None);
-                self.depth.push(0);
-                self.first_child.push(None);
-                self.next_sibling.push(None);
-                self.previous_sibling.push(None);
-                if let Some(column) = self.tree_scope.as_mut() {
-                    column.push(TreeScopeID::DOCUMENT);
-                }
-                (index, Some(capacity_before_growth))
+            None
+        } else {
+            assert_eq!(
+                index as usize,
+                self.parent.len(),
+                "the host mints new element identities in order"
+            );
+            let capacity_before_growth = self.identity_capacity_bytes();
+            self.parent.push(None);
+            self.first_element_child.push(None);
+            self.next_element_sibling.push(None);
+            self.previous_element_sibling.push(None);
+            self.depth.push(0);
+            self.first_child.push(None);
+            self.next_sibling.push(None);
+            self.previous_sibling.push(None);
+            if let Some(column) = self.tree_scope.as_mut() {
+                column.push(TreeScopeID::DOCUMENT);
             }
+            Some(capacity_before_growth)
         };
         self.live.set(index as usize, true);
         if let Some(capacity_before_growth) = capacity_before_growth {
@@ -801,7 +853,24 @@ impl StyleNodeTree {
             self.record_capacity_change(memory, capacity_before_growth, current);
         }
         self.connected_element_count += 1;
-        StyleNodeID::element(index)
+    }
+
+    /// Mint an identity from the tree's own space, which stands in for the host's in a test.
+    #[cfg(test)]
+    pub fn mint_test_identity(&mut self, text: bool) -> StyleNodeID {
+        if text {
+            self.test_identities.mint_text()
+        } else {
+            self.test_identities.mint_element()
+        }
+    }
+
+    /// Mint an element identity from the tree's own space, for a test.
+    #[cfg(test)]
+    pub fn allocate_element(&mut self, memory: &mut MemoryController) -> StyleNodeID {
+        let node = self.mint_test_identity(false);
+        self.mint_element(node, memory);
+        node
     }
 
     /// Retire an element identity. The slot stays reserved until [`Self::release_retired_identities`]
@@ -828,6 +897,12 @@ impl StyleNodeTree {
                 ids.set(node, StyleAtomID::NONE);
             }
             self.live.set(index as usize, false);
+            self.dom_paint_facts.remove(&node);
+            if let Some(unique_node_id) = self.unique_node_ids.get_mut(index as usize) {
+                *unique_node_id = 0;
+            }
+            self.table_spans.remove(&node);
+            self.top_layer.retain(|&member| member != node);
             if !self.relation_only.set(index as usize, false).0 {
                 self.connected_element_count -= 1;
             }
@@ -845,13 +920,27 @@ impl StyleNodeTree {
         self.record_capacity_change(memory, before, current);
     }
 
-    /// Called once the read epoch that could still name the retired identities has retired.
-    pub fn release_retired_identities(&mut self, memory: &mut MemoryController) {
+    /// Called once the read epoch that could still name the retired identities has retired. Answers
+    /// the identities it releases, elements then text nodes, each in the order they retired, for the
+    /// host to mint again.
+    pub fn release_retired_identities(&mut self, memory: &mut MemoryController) -> Vec<u32> {
         let before = self.reuse_capacity_bytes() + self.text.capacity_bytes();
-        self.free_element_indexes.append(&mut self.pending_reuse);
-        self.text.free_indexes.append(&mut self.text.pending_reuse);
+        let released: Vec<u32> = self
+            .pending_reuse
+            .drain(..)
+            .map(|index| StyleNodeID::element(index).raw())
+            .chain(
+                self.text
+                    .pending_reuse
+                    .drain(..)
+                    .map(|index| StyleNodeID::text(index).raw()),
+            )
+            .collect();
         let current = self.reuse_capacity_bytes() + self.text.capacity_bytes();
         self.record_capacity_change(memory, before, current);
+        #[cfg(test)]
+        self.test_identities.release(&released);
+        released
     }
 
     #[must_use]
@@ -860,21 +949,38 @@ impl StyleNodeTree {
         self.pending_reuse.len()
     }
 
-    /// Allocate a text identity. Like an element's, it is reused only once the epoch that could
-    /// still observe its previous occupant has retired.
-    pub fn allocate_text(&mut self, memory: &mut MemoryController) -> StyleNodeID {
+    /// Make the text identity `node`, which the host minted, live. Like an element's, it is new or
+    /// one this tree released.
+    pub fn mint_text(&mut self, node: StyleNodeID, memory: &mut MemoryController) {
+        let index = node.text_index().expect("mint_text requires a text identity");
         let before = self.text.capacity_bytes();
-        let index = self.text.free_indexes.pop().unwrap_or_else(|| {
-            let index = u32::try_from(self.text.parent.len()).expect("text index space exhausted");
+        if (index as usize) < self.text.parent.len() {
+            assert!(
+                !self.text.live.contains(index as usize),
+                "minting a text identity that is live"
+            );
+        } else {
+            assert_eq!(
+                index as usize,
+                self.text.parent.len(),
+                "the host mints new text identities in order"
+            );
             self.text.parent.push(None);
             self.text.next_sibling.push(None);
             self.text.previous_sibling.push(None);
-            index
-        });
+            self.text.data.push(ak::Utf16String::default());
+        }
         self.text.live.set(index as usize, true);
         let current = self.text.capacity_bytes();
         self.record_capacity_change(memory, before, current);
-        StyleNodeID::text(index)
+    }
+
+    /// Mint a text identity from the tree's own space, for a test.
+    #[cfg(test)]
+    pub fn allocate_text(&mut self, memory: &mut MemoryController) -> StyleNodeID {
+        let node = self.mint_test_identity(true);
+        self.mint_text(node, memory);
+        node
     }
 
     /// Retire text identities as their nodes disconnect. Nothing selects or styles a text node, so
@@ -882,15 +988,33 @@ impl StyleNodeTree {
     /// like an element's.
     pub fn retire_texts(&mut self, nodes: impl IntoIterator<Item = StyleNodeID>, memory: &mut MemoryController) {
         let before = self.text.capacity_bytes() + self.shadow_capacity_bytes();
+        // Every column is named, so a new one cannot leave a retired identity's value behind for
+        // the next text node issued the index.
+        let TextRows {
+            parent,
+            next_sibling,
+            previous_sibling,
+            live,
+            is_ascii_whitespace,
+            is_in_user_agent_shadow_tree,
+            is_password_input,
+            data,
+            pending_reuse,
+        } = &mut self.text;
         for node in nodes {
             let index = node.text_index().expect("retire_texts requires a text identity");
-            let (was_live, _) = self.text.live.set(index as usize, false);
+            let (was_live, _) = live.set(index as usize, false);
             assert!(was_live, "retiring a text identity that is not live");
-            self.text.is_ascii_whitespace.set(index as usize, false);
-            self.text.parent[index as usize] = None;
-            self.text.next_sibling[index as usize] = None;
-            self.text.previous_sibling[index as usize] = None;
-            self.text.pending_reuse.push(index);
+            is_ascii_whitespace.set(index as usize, false);
+            is_in_user_agent_shadow_tree.set(index as usize, false);
+            is_password_input.set(index as usize, false);
+            self.dom_paint_facts.remove(&node);
+            // Lets go of the reference the mirror held to the document's string.
+            data[index as usize] = ak::Utf16String::default();
+            parent[index as usize] = None;
+            next_sibling[index as usize] = None;
+            previous_sibling[index as usize] = None;
+            pending_reuse.push(index);
             if let Some(shadow) = self.shadow.as_mut() {
                 shadow.retire_text(node);
             }
@@ -916,6 +1040,140 @@ impl StyleNodeTree {
         self.text.is_ascii_whitespace.set(index as usize, value);
         let current = self.text.capacity_bytes();
         self.record_capacity_change(memory, before, current);
+    }
+
+    /// Whether the text node sits in a user agent shadow tree. Only a text node is asked; an
+    /// element records the fact among its construction facts.
+    #[must_use]
+    pub fn text_is_in_user_agent_shadow_tree(&self, node: StyleNodeID) -> bool {
+        node.text_index()
+            .is_some_and(|index| self.text.is_in_user_agent_shadow_tree.contains(index as usize))
+    }
+
+    /// Record which kind of tree the text node arrived in.
+    pub fn set_text_is_in_user_agent_shadow_tree(
+        &mut self,
+        node: StyleNodeID,
+        value: bool,
+        memory: &mut MemoryController,
+    ) {
+        let Some(index) = node.text_index() else {
+            return;
+        };
+        let before = self.text.capacity_bytes();
+        self.text.is_in_user_agent_shadow_tree.set(index as usize, value);
+        let current = self.text.capacity_bytes();
+        self.record_capacity_change(memory, before, current);
+    }
+
+    /// Whether the text node holds the value of a password input. Only a text node is asked; every
+    /// other identity answers no.
+    #[must_use]
+    pub fn text_is_password_input(&self, node: StyleNodeID) -> bool {
+        node.text_index()
+            .is_some_and(|index| self.text.is_password_input.contains(index as usize))
+    }
+
+    /// Record whether the text node holds the value of a password input.
+    pub fn set_text_is_password_input(&mut self, node: StyleNodeID, value: bool, memory: &mut MemoryController) {
+        let Some(index) = node.text_index() else {
+            return;
+        };
+        let before = self.text.capacity_bytes();
+        self.text.is_password_input.set(index as usize, value);
+        let current = self.text.capacity_bytes();
+        self.record_capacity_change(memory, before, current);
+    }
+
+    /// Record the unique node id the document names the element by. Only an element identity, the
+    /// document's included, holds one.
+    pub fn set_unique_node_id(&mut self, node: StyleNodeID, unique_node_id: i64, memory: &mut MemoryController) {
+        let Some(index) = node.element_index() else {
+            return;
+        };
+        let index = index as usize;
+        let before = self.identity_capacity_bytes();
+        if self.unique_node_ids.len() <= index {
+            self.unique_node_ids.resize(index + 1, 0);
+        }
+        self.unique_node_ids[index] = unique_node_id;
+        let current = self.identity_capacity_bytes();
+        self.record_capacity_change(memory, before, current);
+    }
+
+    /// The unique node id the document names the element by, or zero for anything else.
+    #[must_use]
+    pub fn unique_node_id(&self, node: StyleNodeID) -> i64 {
+        node.element_index()
+            .and_then(|index| self.unique_node_ids.get(index as usize).copied())
+            .unwrap_or(0)
+    }
+
+    /// The spans a row built for the element takes from its attributes.
+    #[must_use]
+    pub fn table_spans(&self, node: StyleNodeID) -> TableSpans {
+        self.table_spans.get(&node).copied().unwrap_or_default()
+    }
+
+    /// Record the spans a row built for the element takes from its attributes. Spanning one of
+    /// each is the absence of an entry.
+    pub fn set_table_spans(&mut self, node: StyleNodeID, spans: TableSpans, memory: &mut MemoryController) {
+        let before = self.identity_capacity_bytes();
+        if spans == TableSpans::default() {
+            self.table_spans.remove(&node);
+        } else {
+            self.table_spans.insert(node, spans);
+        }
+        let current = self.identity_capacity_bytes();
+        self.record_capacity_change(memory, before, current);
+    }
+
+    /// What a row built for the node is painted and hit-tested with. An identity with nothing
+    /// published holds none of the facts.
+    #[must_use]
+    pub fn dom_paint_facts(&self, node: StyleNodeID) -> u8 {
+        self.dom_paint_facts.get(&node).copied().unwrap_or(0)
+    }
+
+    /// Record what a row built for the node is painted and hit-tested with. Holding none of the
+    /// facts is the absence of an entry.
+    pub fn set_dom_paint_facts(&mut self, node: StyleNodeID, facts: u8, memory: &mut MemoryController) {
+        let before = self.identity_capacity_bytes();
+        if facts == 0 {
+            self.dom_paint_facts.remove(&node);
+        } else {
+            self.dom_paint_facts.insert(node, facts);
+        }
+        let current = self.identity_capacity_bytes();
+        self.record_capacity_change(memory, before, current);
+    }
+
+    /// The document's top layer, in the order its members were added.
+    #[must_use]
+    pub fn top_layer(&self) -> &[StyleNodeID] {
+        &self.top_layer
+    }
+
+    /// Replace the document's top layer.
+    pub fn set_top_layer(&mut self, members: &[StyleNodeID], memory: &mut MemoryController) {
+        let before = self.identity_capacity_bytes();
+        members.clone_into(&mut self.top_layer);
+        let current = self.identity_capacity_bytes();
+        self.record_capacity_change(memory, before, current);
+    }
+
+    /// The characters the text node holds, or none for any other identity.
+    #[must_use]
+    pub fn text_data(&self, node: StyleNodeID) -> Option<&ak::Utf16String> {
+        self.text.data.get(node.text_index()? as usize)
+    }
+
+    /// Record the characters the text node now holds. The string is the document's, shared rather
+    /// than copied.
+    pub fn set_text_data(&mut self, node: StyleNodeID, data: ak::Utf16String) {
+        if let Some(index) = node.text_index() {
+            self.text.data[index as usize] = data;
+        }
     }
 
     // -- DOM child sequence ------------------------------------------------------------------
@@ -1721,6 +1979,10 @@ impl StyleNodeTree {
                 self.first_child,
                 self.next_sibling,
                 self.previous_sibling,
+                self.dom_paint_facts,
+                self.unique_node_ids,
+                self.table_spans,
+                self.top_layer,
             ];
             cached [];
             nested [
@@ -1735,7 +1997,7 @@ impl StyleNodeTree {
     }
 
     fn reuse_capacity_bytes(&self) -> u64 {
-        ((self.pending_reuse.capacity() + self.free_element_indexes.capacity()) * size_of::<u32>()) as u64
+        (self.pending_reuse.capacity() * size_of::<u32>()) as u64
     }
 
     fn shadow_capacity_bytes(&self) -> u64 {
@@ -1806,16 +2068,35 @@ struct TextRows {
     /// Whether the node's data is nothing but ASCII whitespace, which is what decides whether the
     /// layout tree build can collapse it away rather than give it a box of its own.
     is_ascii_whitespace: BitColumn,
+    /// Whether the node sits in a user agent shadow tree. An element records the same fact among
+    /// its construction facts; a text node has no element columns, so it records it here.
+    is_in_user_agent_shadow_tree: BitColumn,
+    /// Whether the node is the text of a password input, which renders as replacement characters.
+    is_password_input: BitColumn,
+    /// The characters the node holds, sharing the document's string rather than copying it. The
+    /// layout tree build reads them to render a text box, so they are published where the node
+    /// arrives and wherever its data is replaced.
+    data: Vec<ak::Utf16String>,
     pending_reuse: Vec<u32>,
-    free_indexes: Vec<u32>,
 }
 
 impl TextRows {
     fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
-            shallow [self.parent, self.next_sibling, self.previous_sibling, self.pending_reuse, self.free_indexes];
+            shallow [
+                self.parent,
+                self.next_sibling,
+                self.previous_sibling,
+                self.data,
+                self.pending_reuse,
+            ];
             cached [];
-            nested [self.live.capacity_bytes(), self.is_ascii_whitespace.capacity_bytes()];
+            nested [
+                self.live.capacity_bytes(),
+                self.is_ascii_whitespace.capacity_bytes(),
+                self.is_in_user_agent_shadow_tree.capacity_bytes(),
+                self.is_password_input.capacity_bytes(),
+            ];
             skip [];
         }
     }
@@ -2237,6 +2518,66 @@ mod tests {
         assert_eq!(reused, first);
         assert!(fixture.tree.is_live(reused));
         assert_eq!(fixture.tree.live_nodes().collect::<Vec<_>>(), vec![element]);
+    }
+
+    #[test]
+    fn a_retired_identity_holds_no_table_spans_when_it_is_reused() {
+        let mut fixture = TreeFixture::new();
+        let element = fixture.element();
+        let spans = TableSpans {
+            column_span: 2,
+            row_span: 3,
+            raw_column_span: 2,
+        };
+        fixture.tree.set_table_spans(element, spans, &mut fixture.memory);
+        assert_eq!(fixture.tree.table_spans(element), spans);
+
+        fixture.tree.retire_element(element, &mut fixture.memory);
+        fixture.tree.release_retired_identities(&mut fixture.memory);
+        assert_eq!(fixture.tree.allocate_element(&mut fixture.memory), element);
+        assert_eq!(fixture.tree.table_spans(element), TableSpans::default());
+    }
+
+    #[test]
+    fn a_retired_identity_leaves_the_top_layer_in_order() {
+        let mut fixture = TreeFixture::new();
+        let first = fixture.element();
+        let second = fixture.element();
+        let third = fixture.element();
+        fixture.tree.set_top_layer(&[third, first, second], &mut fixture.memory);
+        assert_eq!(fixture.tree.top_layer(), [third, first, second]);
+
+        fixture.tree.retire_element(first, &mut fixture.memory);
+        assert_eq!(fixture.tree.top_layer(), [third, second]);
+        fixture.tree.release_retired_identities(&mut fixture.memory);
+        assert_eq!(fixture.tree.allocate_element(&mut fixture.memory), first);
+        assert_eq!(fixture.tree.top_layer(), [third, second]);
+        assert_eq!(
+            fixture.memory.bytes_in_category(MemoryCategory::RelationColumns),
+            fixture.tree.capacity_bytes()
+        );
+    }
+
+    #[test]
+    fn a_retired_identity_holds_no_paint_facts_when_it_is_reused() {
+        let mut fixture = TreeFixture::new();
+        let element = fixture.element();
+        let text = fixture.tree.allocate_text(&mut fixture.memory);
+        fixture.tree.set_dom_paint_facts(element, 3, &mut fixture.memory);
+        fixture.tree.set_dom_paint_facts(text, 4, &mut fixture.memory);
+        assert_eq!(fixture.tree.dom_paint_facts(element), 3);
+        assert_eq!(fixture.tree.dom_paint_facts(text), 4);
+        fixture.tree.set_dom_paint_facts(element, 0, &mut fixture.memory);
+        assert_eq!(fixture.tree.dom_paint_facts(element), 0);
+        fixture.tree.set_dom_paint_facts(element, 1, &mut fixture.memory);
+
+        fixture.tree.retire_element(element, &mut fixture.memory);
+        fixture.tree.retire_texts([text], &mut fixture.memory);
+        fixture.tree.release_retired_identities(&mut fixture.memory);
+        assert_eq!(fixture.tree.allocate_element(&mut fixture.memory), element);
+        assert_eq!(fixture.tree.allocate_text(&mut fixture.memory), text);
+        assert_eq!(fixture.tree.dom_paint_facts(element), 0);
+        assert_eq!(fixture.tree.dom_paint_facts(text), 0);
     }
 
     #[test]

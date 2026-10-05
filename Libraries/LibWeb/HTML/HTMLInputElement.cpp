@@ -22,6 +22,7 @@
 #include <LibURL/Parser.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
 #include <LibWeb/CSS/Parser/Parser.h>
@@ -92,11 +93,6 @@ namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(HTMLInputElement);
 
-Layout::Node const* HTMLInputElement::image_provider_layout_node() const
-{
-    return unsafe_layout_node();
-}
-
 static GC::Ref<DOM::Event> create_event_for_element(HTMLElement& element, Utf16FlyString const& event_name, DOM::EventInit const& event_init = {})
 {
     return DOM::Event::create(
@@ -162,49 +158,32 @@ void HTMLInputElement::set_being_activated(bool activated)
     }
 }
 
-Layout::Node* HTMLInputElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind HTMLInputElement::box_kind() const
 {
-    if (type_state() == TypeAttributeState::Hidden)
-        return nullptr;
-
-    // NOTE: Image inputs are `appearance: none` per the default UA style,
-    //       but we still need to create an ImageBox for them, or no image will get loaded.
-    if (type_state() == TypeAttributeState::ImageButton) {
-        if (renders_as_alt_text() && !get_attribute_value(HTML::AttributeNames::alt).is_empty()) {
-            auto computed_style = this->computed_style();
-            VERIFY(computed_style);
-            return Element::create_layout_node_for_display_type(document(), computed_style->display(), style, this);
-        }
-        return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::ImageBox);
-    }
-
-    // https://drafts.csswg.org/css-ui/#appearance-switching
-    // This specification introduces the appearance property to provide some control over this behavior.
-    // In particular, using appearance: none allows authors to suppress the native appearance of widgets,
-    // giving them a primitive appearance where CSS can be used to restyle them.
-    auto computed_style = this->computed_style();
-    VERIFY(computed_style);
-    if (computed_style->appearance() == CSS::Appearance::None) {
-        return Element::create_layout_node_for_display_type(document(), computed_style->display(), style, this);
-    }
-
     switch (type_state()) {
-
+    case TypeAttributeState::Hidden:
+        return CSS::ElementBoxKind::NoBox;
+    // NOTE: Image inputs are `appearance: none` per the default UA style, but they still need an image box, or no
+    //       image will get loaded.
+    case TypeAttributeState::ImageButton:
+        if (renders_as_alt_text() && !get_attribute_value(HTML::AttributeNames::alt).is_empty())
+            return CSS::ElementBoxKind::FromDisplay;
+        return CSS::ElementBoxKind::Image;
     case TypeAttributeState::SubmitButton:
     case TypeAttributeState::Button:
     case TypeAttributeState::ResetButton:
-        return &Layout::allocate_layout_node<Layout::Box>(document(), this, style, Layout::RustFFI::NodeKind::BlockContainer);
+        return CSS::ElementBoxKind::InputButton;
     case TypeAttributeState::Checkbox:
-        return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::CheckBox);
+        return CSS::ElementBoxKind::InputCheckBox;
     case TypeAttributeState::RadioButton:
-        return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::RadioButton);
+        return CSS::ElementBoxKind::InputRadioButton;
     case TypeAttributeState::Range:
-        return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::RangeInputBox);
+        return CSS::ElementBoxKind::InputRange;
     case TypeAttributeState::Color:
     case TypeAttributeState::FileUpload:
-        return Element::create_layout_node_for_display_type(document(), computed_style->display(), style, this);
+        return CSS::ElementBoxKind::FromDisplay;
     default:
-        return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::TextInputBox);
+        return CSS::ElementBoxKind::InputText;
     }
 }
 
@@ -1189,6 +1168,9 @@ void HTMLInputElement::remove_image_button_alt_text_shadow_tree()
 
 void HTMLInputElement::update_image_button_alt_text_shadow_tree()
 {
+    // Whether an image button renders as its alternative text decides which box it asks for.
+    CSS::record_element_box_kind(*this);
+
     if (!shadow_root() && !has_style())
         return;
 
@@ -1281,8 +1263,12 @@ void HTMLInputElement::create_text_input_shadow_tree()
     MUST(m_placeholder_element->append_child(*m_placeholder_text_node));
 
     if (type_state() == TypeAttributeState::Number) {
+        // NB: The buttons start out with the style they have when shown, so that the style application that follows
+        //     only rewrites their declarations when appearance hides them.
+
         // Up button
         m_up_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
+        set_own_inline_style(*m_up_button_element, stepper_button_style_when_visible());
 
         auto up_button_svg = MUST(DOM::create_element(document(), SVG::TagNames::svg, Namespace::SVG));
         up_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 1em; height: 1em;"_utf16);
@@ -1322,6 +1308,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
 
         // Down button
         m_down_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
+        set_own_inline_style(*m_down_button_element, stepper_button_style_when_visible());
 
         auto down_button_svg = MUST(DOM::create_element(document(), SVG::TagNames::svg, Namespace::SVG));
         down_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 1em; height: 1em;"_utf16);
@@ -1864,9 +1851,15 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
     request->set_use_url_credentials(true);
 
     // 4. Fetch request, with processResponseEndOfBody set to the following steps given response response:
+    // NB: Fetching the image must delay the load event of the element's node document until the task that is queued by
+    //     the networking task source once the resource has been fetched (defined below) has been run.
+    m_load_event_delayer.emplace(document());
+
     m_resource_request = SharedResourceRequest::get_or_create(document(), request->url());
+    CSS::record_element_replaced_content_input(*this);
     m_resource_request->add_callbacks(
         [this]() {
+            CSS::record_element_replaced_content_input(*this);
             // 1. If the download was successful and the image is available, queue an element task on the user interaction
             //    task source given the input element to fire an event named load at the input element.
             queue_an_element_task(HTML::Task::Source::UserInteraction, [this]() {
@@ -1888,21 +1881,21 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
             });
 
             m_load_event_delayer.clear();
+            CSS::record_element_replaced_content_input(*this);
 
             // NB: The element may have been rendering as blank space while the load was pending;
             //     now that the load failed it renders its alt text instead.
             update_image_button_alt_text_shadow_tree();
             set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementSrcAttribute);
+        },
+        [this]() {
+            m_load_event_delayer.clear();
         });
 
     if (m_resource_request->needs_fetching()) {
         m_resource_request->fetch_resource(request);
     }
     update_image_button_alt_text_shadow_tree();
-
-    // Fetching the image must delay the load event of the element's node document until the task that is queued by the
-    // networking task source once the resource has been fetched (defined below) has been run.
-    m_load_event_delayer.emplace(document());
 
     return {};
 }
@@ -2552,6 +2545,7 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_size(WebIDL::UnsignedLong value)
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-height
 WebIDL::UnsignedLong HTMLInputElement::height() const
 {
+    Layout::ForcedReadScope read { document(), true };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLInputElementHeight);
 
     // When the input element's type attribute is not in the Image Button state, then no image is available.
@@ -2559,7 +2553,7 @@ WebIDL::UnsignedLong HTMLInputElement::height() const
         return 0;
 
     // Return the rendered height of the image, in CSS pixels, if the image is being rendered.
-    if (auto const* layout_node = this->layout_node(); layout_node && Painting::has_committed_box(*layout_node))
+    if (auto const* layout_node = this->layout_node(read); layout_node && Painting::has_committed_box(*layout_node))
         return Painting::content_height(*layout_node).to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
@@ -2587,6 +2581,7 @@ void HTMLInputElement::set_height(WebIDL::UnsignedLong value)
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-width
 WebIDL::UnsignedLong HTMLInputElement::width() const
 {
+    Layout::ForcedReadScope read { document(), true };
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLInputElementWidth);
 
     // When the input element's type attribute is not in the Image Button state, then no image is available.
@@ -2594,7 +2589,7 @@ WebIDL::UnsignedLong HTMLInputElement::width() const
         return 0;
 
     // Return the rendered width of the image, in CSS pixels, if the image is being rendered.
-    if (auto const* layout_node = this->layout_node(); layout_node && Painting::has_committed_box(*layout_node))
+    if (auto const* layout_node = this->layout_node(read); layout_node && Painting::has_committed_box(*layout_node))
         return Painting::content_width(*layout_node).to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.

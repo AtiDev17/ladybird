@@ -91,7 +91,9 @@ ChromeWidget::ChromeWidget(Layout::NodeArena& arena, Compositing::RustFFI::NodeS
 
 Layout::Node* ChromeWidget::layout_node() const
 {
-    return layout_node_for_committed_slot(*m_arena, m_slot);
+    // The caller's own read of the render state.
+    Layout::ForcedReadScope read { m_arena->render_document(), false };
+    return layout_node_for_committed_slot(read, *m_arena, m_slot);
 }
 
 void ChromeWidget::detach(Badge<ChromeWidgetRegistry>)
@@ -102,7 +104,7 @@ void ChromeWidget::detach(Badge<ChromeWidgetRegistry>)
 
 PhysicalResizeAxes physical_resize_axes(Layout::Node const& node)
 {
-    auto axes = Layout::RustFFI::layout_arena_paintable_physical_resize_axes(node.arena_handle(), committed_row_slot(node));
+    auto axes = Layout::RustFFI::layout_row_paintable_physical_resize_axes(node.document_host(), committed_row_slot(node));
     return { axes.horizontal, axes.vertical };
 }
 
@@ -117,8 +119,8 @@ Optional<ScrollbarData> compute_scrollbar_data(Layout::Node const& node, ScrollD
         auto own_offset = scroll_state_snapshot->device_offset_for_index(own_scroll_node_index(node));
         device_scroll_offset = direction == ScrollDirection::Horizontal ? -own_offset.x() : -own_offset.y();
     }
-    auto result = Layout::RustFFI::layout_arena_paintable_compute_scrollbar_data(
-        node.arena_handle(), committed_row_slot(node), static_cast<Layout::RustFFI::ScrollDirection>(direction),
+    auto result = Layout::RustFFI::layout_row_paintable_compute_scrollbar_data(
+        node.document_host(), committed_row_slot(node), static_cast<Layout::RustFFI::ScrollDirection>(direction),
         metrics, to_underlying(overflow_x), to_underlying(overflow_y), scrollbar_sizing == ScrollbarSizing::Enlarged,
         scroll_state_snapshot, device_scroll_offset, document.page().client().device_pixels_per_css_pixel());
     if (!result.has_value)

@@ -13,12 +13,12 @@ use crate::css::css_pixels::{CssPixelRect, CssPixelSize};
 use crate::css::style_value::StyleValueData;
 use crate::layout::node_data::{NodeFlag, NodeSlotId};
 use crate::painting::border_radii::BorderRadii;
-use crate::painting::host::{FfiLayerImageList, FfiRootBackgroundSource};
+use crate::painting::host::{FfiLayerImageList, RootBackgroundSource};
+use crate::painting::paint_read::PaintRead;
 use crate::painting::paintable_geometry::{
     absolute_border_box_rect, absolute_padding_box_rect, committed_border_box_edges, committed_padding,
     committed_uses_collapsing_borders_model,
 };
-use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::record::PaintRecorder;
 use crate::painting::record::paint::background::{BackgroundBox, background_box_for};
 use crate::painting::record::paint::replaced::{SizeWithAspectRatio, run_default_sizing_algorithm};
@@ -114,17 +114,17 @@ pub(crate) fn operator_erases_destination_outside_the_drawn_geometry(operator: C
 }
 
 pub(crate) fn body_background_is_propagated_to_root(
-    layout_arena: &impl PaintableRowsRead,
+    layout_arena: &impl PaintRead,
     slot: NodeSlotId,
-    root_background_source: FfiRootBackgroundSource,
+    root_background_source: RootBackgroundSource,
 ) -> bool {
     root_background_source.use_body_background_properties
         && layout_arena.node_flags_if_live(slot) & NodeFlag::IsBody as u32 != 0
 }
 
 fn background_layers_style(
-    layout_arena: &impl PaintableRowsRead,
-    root_background_source: FfiRootBackgroundSource,
+    layout_arena: &impl PaintRead,
+    root_background_source: RootBackgroundSource,
     node: NodeSlotId,
 ) -> Option<ComputedValuesView<'_>> {
     if body_background_is_propagated_to_root(layout_arena, node, root_background_source) {
@@ -165,8 +165,8 @@ fn any_background_layer_has_a_fixed_attachment_image(style: ComputedValuesView<'
 }
 
 pub(crate) fn background_depends_on_live_scroll_offset(
-    layout_arena: &impl PaintableRowsRead,
-    root_background_source: crate::painting::host::FfiRootBackgroundSource,
+    layout_arena: &impl PaintRead,
+    root_background_source: crate::painting::host::RootBackgroundSource,
     node: NodeSlotId,
 ) -> bool {
     let Some(background_style) = background_layers_style(layout_arena, root_background_source, node) else {
@@ -176,8 +176,8 @@ pub(crate) fn background_depends_on_live_scroll_offset(
 }
 
 pub(crate) fn background_has_fixed_attachment(
-    layout_arena: &impl PaintableRowsRead,
-    root_background_source: crate::painting::host::FfiRootBackgroundSource,
+    layout_arena: &impl PaintRead,
+    root_background_source: crate::painting::host::RootBackgroundSource,
     node: NodeSlotId,
 ) -> bool {
     let is_root_element = style_queries::node_is_root_element(layout_arena, node);
@@ -221,9 +221,9 @@ pub(crate) struct BackgroundPaintSource<'a> {
 }
 
 pub(crate) fn background_paint_source_from_style_and_geometry(
-    layout_arena: &impl PaintableRowsRead,
+    layout_arena: &impl PaintRead,
     slot: NodeSlotId,
-    root_background_source: FfiRootBackgroundSource,
+    root_background_source: RootBackgroundSource,
 ) -> Option<BackgroundPaintSource<'_>> {
     let style = layout_arena.node_style_if_live(slot)?;
     if body_background_is_propagated_to_root(layout_arena, slot, root_background_source) {
@@ -396,9 +396,9 @@ fn computed_background_layers(style: ComputedValuesView<'_>, facts_owner: NodeSl
 }
 
 pub(crate) fn background_color_can_be_compositor_animated(
-    layout_arena: &impl PaintableRowsRead,
+    layout_arena: &impl PaintRead,
     slot: NodeSlotId,
-    root_background_source: FfiRootBackgroundSource,
+    root_background_source: RootBackgroundSource,
 ) -> bool {
     if style_queries::node_is_root_element(layout_arena, slot)
         || body_background_is_propagated_to_root(layout_arena, slot, root_background_source)
@@ -489,10 +489,10 @@ fn resolve_layers<'a, O: Observer>(
         rect: border_rect,
         radii: border_radii,
     };
-    let padding = committed_padding(recorder.layout_arena, paintable);
+    let padding = committed_padding(recorder.source, paintable);
     // The padding box and content box are inset from the border box by the border widths that the border box
     // includes: half of each collapsed border in the collapsing borders model.
-    let border = committed_border_box_edges(recorder.layout_arena, paintable);
+    let border = committed_border_box_edges(recorder.source, paintable);
     let color_box = background_box_for(background_color_clip, border_box, padding, border);
     let layer_may_be_painted =
         |layer: &ComputedLayer<'_>| matches!(layer_type, LayerType::Mask) || layer.image.is_some();
@@ -544,7 +544,7 @@ fn resolve_layers<'a, O: Observer>(
         // the background positioning area is the initial containing block.
         if layer.attachment == background_attachment::FIXED
             && background_has_fixed_attachment(
-                recorder.layout_arena,
+                recorder.source,
                 recorder.inputs.uncaptured.root_background_source,
                 paintable,
             )
@@ -720,7 +720,7 @@ pub(crate) fn committed_layer_image_paint_facts<O: Observer>(
     image: &LayerImageSource<'_>,
 ) -> crate::painting::layer_image_paint_facts::LayerImagePaintFacts {
     recorder
-        .layout_arena
+        .source
         .layer_image_paint_facts(image.facts_owner, image.list, image.computed_index)
         .unwrap_or_default()
 }
@@ -803,9 +803,9 @@ pub(crate) fn resolve_mask_layers<'a, O: Observer>(
 }
 
 pub(crate) fn has_background_to_paint(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     paintable: NodeSlotId,
-    root_background_source: FfiRootBackgroundSource,
+    root_background_source: RootBackgroundSource,
 ) -> bool {
     if body_background_is_propagated_to_root(arena, paintable, root_background_source) {
         return false;
@@ -826,7 +826,7 @@ pub(crate) fn has_background_to_paint(
 /// The root background covers the viewport and the root's scrollable overflow. Moving the
 /// viewport inside that area does not change the recorded background; growing it does.
 pub(crate) fn root_background_canvas_rect(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     root: NodeSlotId,
     viewport_rect: CssPixelRect,
 ) -> CssPixelRect {
@@ -842,14 +842,14 @@ pub(crate) fn resolve_background_for_paint<'a, O: Observer>(
     paintable: NodeSlotId,
 ) -> Option<BackgroundPaintInputs<'a>> {
     if !has_background_to_paint(
-        recorder.layout_arena,
+        recorder.source,
         paintable,
         recorder.inputs.uncaptured.root_background_source,
     ) {
         return None;
     }
     let source = background_paint_source_from_style_and_geometry(
-        recorder.layout_arena,
+        recorder.source,
         paintable,
         recorder.inputs.uncaptured.root_background_source,
     )?;
@@ -877,8 +877,7 @@ pub(crate) fn resolve_background_for_paint<'a, O: Observer>(
         },
     };
     if source.is_root_element {
-        let canvas_rect =
-            root_background_canvas_rect(recorder.layout_arena, paintable, recorder.inputs.css_viewport_rect);
+        let canvas_rect = root_background_canvas_rect(recorder.source, paintable, recorder.inputs.css_viewport_rect);
         resolved.background_rect.unite(canvas_rect);
         resolved.color_box.rect.unite(canvas_rect);
     }

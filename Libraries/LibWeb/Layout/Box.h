@@ -9,7 +9,6 @@
 #include <AK/NumericLimits.h>
 #include <AK/OwnPtr.h>
 #include <LibJS/Heap/Cell.h>
-#include <LibWeb/CSS/Sizing.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Layout/Node.h>
 
@@ -22,39 +21,25 @@ public:
     // when layout is invalidated somewhere inside its subtree.
     bool is_partial_relayout_boundary() const;
 
-    // https://www.w3.org/TR/css-images-3/#natural-dimensions
-    CSS::SizeWithAspectRatio natural_size() const;
-
-    // When computed width/height is auto, auto_content_box_size gives the fallback content-box size for
-    // elements whose used size is determined by natural dimensions, attributes, or defaults other than
-    // the generic UA fallback (300x150). Any returned aspect ratio comes from natural dimensions (when
-    // available) or may be computed from fallback sizing. Don't confuse this with the CSS preferred
-    // aspect ratio.
-    CSS::SizeWithAspectRatio auto_content_box_size() const;
-
-    RustFFI::FfiReplacedContentFacts build_replaced_content_facts_for_arena() const;
-
     ImageProvider const& image_provider() const;
     ImageProvider& image_provider()
     {
         return const_cast<ImageProvider&>(const_cast<Box const&>(*this).image_provider());
     }
+    // The provider a box owns belongs to the layout arena's host tables, which delete it with the
+    // box's row.
     void set_owned_image_provider(NonnullOwnPtr<ImageProvider>);
-    void notify_owned_image_provider_of_detach();
 
     void set_replaced_box_can_have_children(bool value) { set_flag(RustFFI::NodeFlag::ReplacedBoxCanHaveChildren, value); }
 
     virtual ~Box() override;
 
-    Box(DOM::Document&, GC::Ptr<DOM::Node>, CSS::LayoutStyle, RustFFI::NodeKind = RustFFI::NodeKind::Box);
     Box(DOM::Document&, BindToPreparedArenaSlot, Compositing::RustFFI::NodeSlotId, RustFFI::NodeKind);
 
 private:
-    CSS::SizeWithAspectRatio compute_auto_content_box_size() const;
-
     virtual bool is_box() const final { return true; }
 
-    OwnPtr<ImageProvider> m_owned_image_provider;
+    ImageProvider* owned_image_provider() const;
 };
 
 template<>

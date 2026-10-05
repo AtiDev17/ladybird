@@ -9,7 +9,7 @@
 
 use super::layout_node_arena::LayoutNodeArena;
 use super::node_data::{
-    GENERATED_FOR_AFTER, GENERATED_FOR_BACKDROP, GENERATED_FOR_BEFORE, GENERATED_FOR_MARKER, NodeSlotId,
+    GENERATED_FOR_AFTER, GENERATED_FOR_BACKDROP, GENERATED_FOR_BEFORE, GENERATED_FOR_MARKER, NodeSlotId, pseudo_kind_of,
 };
 use crate::css::computed_value_views::ComputedValuesView;
 use crate::css::css_string::CssString;
@@ -170,19 +170,19 @@ impl CountersSets {
             value: Some(0),
         });
     }
+}
 
-    /// Whether the innermost `list-item` counter in the element's set counts forward and was created
-    /// by the element itself.
-    pub(crate) fn innermost_list_item_counter_is_own_forward_counter(&self, element: StyleNodeID) -> bool {
-        let owner = CounterOwner::element(element);
-        let Some(set) = self.sets.get(&owner) else {
-            return false;
-        };
-        set.iter()
+/// Whether an element with `style` has an innermost `list-item` counter of its own that counts forward: the last one its
+/// `counter-reset` instantiates, which [`resolve_counters`] pushes after every counter the element inherits, unless the
+/// element generates no box.
+pub(crate) fn style_resets_forward_list_item_counter(style: ComputedValuesView<'_>) -> bool {
+    !style.display().is_none()
+        && style
+            .counter_reset()
+            .iter()
             .rev()
-            .find(|counter| is_list_item_counter_name(counter.name.units()))
-            .is_some_and(|counter| !counter.reversed && counter.originating_element == owner)
-    }
+            .find(|counter| is_list_item_counter_name(counter.name().units()))
+            .is_some_and(|counter| !counter.is_reversed())
 }
 
 /// The published style `owner` resolves its counters from. The style store settles no record for
@@ -203,7 +203,7 @@ pub(crate) fn style_of<'a>(
                 .style_payloads(row)
                 .map(|payloads| ComputedValuesView::new(&payloads.groups))
         }
-        generated_for => engine.published_style_view(owner.element, Some(generated_for - 1)),
+        generated_for => engine.published_style_view(owner.element, Some(pseudo_kind_of(generated_for))),
     }
 }
 

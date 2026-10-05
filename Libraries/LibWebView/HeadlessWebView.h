@@ -22,7 +22,7 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     static NonnullOwnPtr<HeadlessWebView> create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size, IsPrivate = IsPrivate::No);
-    static NonnullOwnPtr<HeadlessWebView> create_child(HeadlessWebView&, WebContentClient& page_process, Web::PageId page_index);
+    static NonnullOwnPtr<HeadlessWebView> create_child(HeadlessWebView&, CanonicalTraversable&);
 
     void reset_viewport_size(Web::DevicePixelSize);
 
@@ -31,7 +31,7 @@ public:
         for (auto& child : m_child_web_views) {
             child->close_child_web_views();
             // Children sharing a crashed WebContent process are discarded by their pending crash callbacks.
-            if (!child->handle().is_empty() && child->client().is_open()) {
+            if (!child->handle().is_empty() && child->page().is_open()) {
                 child->request_close();
                 child->schedule_forced_close();
             }

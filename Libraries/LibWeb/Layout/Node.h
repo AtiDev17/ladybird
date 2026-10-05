@@ -26,7 +26,14 @@
 #include <LibWeb/Forward.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TreeBuilderRustFFI.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/TreeTraversal.h>
+
+namespace Web::CSS {
+
+class InstalledStyle;
+
+}
 
 namespace Web::Layout {
 
@@ -56,10 +63,13 @@ public:
     static Compositing::RustFFI::NodeSlotId slot_id(Node const*);
     RustFFI::NodeKind kind() const { return m_kind; }
     u32 arena_slot_index() const { return m_slot.index; }
-    void* arena_handle() const;
     NodeArena& node_arena() const { return *m_arena; }
+    RustFFI::DocumentHost* document_host() const;
+    // The read this node was reached in, which it lends the calls the host makes about its document: a layout node is
+    // reached only through an entry that takes a read, which took the document's frame in.
+    BegunRead const& held_read() const { return *RustFFI::layout_row_read_of_held_node(document_host()); }
 
-    Compositing::RustFFI::NodeSlotId linked_slot(RustFFI::FfiNodeLink link) const { return RustFFI::layout_arena_node_link_slot(m_arena->handle(), m_slot, link); }
+    Compositing::RustFFI::NodeSlotId linked_slot(RustFFI::FfiNodeLink link) const { return RustFFI::layout_row_link_slot(document_host(), m_slot, link); }
     bool has_parent() const { return linked_slot(RustFFI::FfiNodeLink::Parent).index != Compositing::RustFFI::INVALID_NODE_SLOT_INDEX; }
     Node* parent_ptr() { return linked_node(RustFFI::FfiNodeLink::Parent); }
     Node const* parent_ptr() const { return linked_node(RustFFI::FfiNodeLink::Parent); }
@@ -185,8 +195,8 @@ public:
         return false;
     }
 
-    bool is_anonymous() const { return has_flag(RustFFI::NodeFlag::Anonymous); }
-    bool is_document_element() const { return has_flag(RustFFI::NodeFlag::IsDocumentElement); }
+    bool is_anonymous() const { return has_identity_flag<RustFFI::NodeFlag::Anonymous>(); }
+    bool is_document_element() const { return has_identity_flag<RustFFI::NodeFlag::IsDocumentElement>(); }
     bool insets_use_anchor_functions() const { return has_flag(RustFFI::NodeFlag::InsetsUseAnchorFunctions); }
     DOM::Node const* dom_node() const;
     DOM::Node* dom_node();
@@ -206,18 +216,12 @@ public:
     bool needs_compositor_background_color_frame() const { return has_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind::BackgroundColor); }
     void set_needs_compositor_background_color_frame(bool value) { set_needs_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind::BackgroundColor, value); }
 
-    // The arena measures a box that holds a scroll offset eagerly after a full commit, so the box carries that fact
-    // as a flag: it is set when a box becomes an element's or a pseudo-element's box, and again whenever the stored
-    // offset changes, each time re-derived from the one place the offset is stored.
-    void update_has_scroll_offset_flag();
-    void verify_has_scroll_offset_flag() const;
-
     // Any invalidation below a node must reach every ancestor's epoch: cached runs capture
     // subtree structure, and unlike intrinsic-size invalidation there is no absolutely-positioned
     // or SVG boundary — those descendants' fragments live in ancestor run trees. The arena runs
     // the same walk for every structural change; this serves content changes that never
     // restructure the tree.
-    void bump_fragment_cache_epoch_of_self_and_ancestors();
+    void reset_cached_intrinsic_sizes_of_self_and_ancestors();
 
     // Set when a style change altered geometry-determining properties of this node itself, so
     // a partial relayout must re-resolve its own size and position instead of reusing them.
@@ -237,7 +241,6 @@ public:
     bool is_generated_for_before_pseudo_element() const { return generated_for() == encode_generated_for(CSS::PseudoElement::Before); }
     bool is_generated_for_after_pseudo_element() const { return generated_for() == encode_generated_for(CSS::PseudoElement::After); }
     bool is_generated_for_backdrop_pseudo_element() const { return generated_for() == encode_generated_for(CSS::PseudoElement::Backdrop); }
-    void set_generated_for(CSS::PseudoElement type, DOM::Element&);
     static constexpr u8 encode_generated_for(CSS::PseudoElement pseudo_element)
     {
         static_assert(static_cast<u8>(CSS::PseudoElement::UnknownWebKit) < 0xff);
@@ -251,7 +254,6 @@ public:
     static CSS::StyleNodeID style_node_of(DOM::Node const*);
     static void dom_node_style_node_changed(DOM::Node&, CSS::StyleNodeID old_style_node);
 
-    void clear_committed_box();
     void prepare_for_detach_from_layout_tree();
     void prepare_subtree_for_detach_from_layout_tree();
     void pin_style_record_for_detachment();
@@ -321,35 +323,36 @@ public:
     // https://drafts.csswg.org/css-ui/#propdef-user-select
     CSS::UserSelect user_select_used_value() const;
 
-    enum class AttachToDOMNode {
-        No,
-        Yes,
-    };
-
 protected:
-    Node(DOM::Document&, GC::Ptr<DOM::Node>, RustFFI::NodeKind, AttachToDOMNode = AttachToDOMNode::Yes);
     Node(DOM::Document&, BindToPreparedArenaSlot, Compositing::RustFFI::NodeSlotId, RustFFI::NodeKind);
 
     bool has_flag(RustFFI::NodeFlag flag) const
     {
-        return (RustFFI::layout_arena_node_flags(m_arena->handle(), m_slot) & static_cast<u32>(flag)) != 0;
+        return (RustFFI::layout_row_flags(document_host(), m_slot) & static_cast<u32>(flag)) != 0;
     }
 
-    bool dom_target_stores_scroll_offset() const;
+    // A flag that says what node the row stands for, which installing a style never changes, so reading it waits for
+    // no rows to be published again after one.
+    template<RustFFI::NodeFlag flag>
+    bool has_identity_flag() const
+    {
+        static_assert(flag == RustFFI::NodeFlag::Anonymous || flag == RustFFI::NodeFlag::IsBody || flag == RustFFI::NodeFlag::IsDocumentElement);
+        return (RustFFI::layout_row_identity_flags(document_host(), m_slot) & static_cast<u32>(flag)) != 0;
+    }
 
     bool has_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind kind) const
     {
-        return RustFFI::layout_arena_node_has_compositor_animation_frame(m_arena->handle(), m_slot, kind);
+        return RustFFI::layout_row_has_compositor_animation_frame(document_host(), m_slot, kind);
     }
 
     void set_needs_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind kind, bool value)
     {
-        RustFFI::layout_arena_set_node_needs_compositor_animation_frame(m_arena->handle(), m_slot, kind, value);
+        RustFFI::render_state_set_node_needs_compositor_animation_frame(m_arena->host(), m_slot, kind, value);
     }
 
     void set_flag(RustFFI::NodeFlag flag, bool value)
     {
-        RustFFI::layout_arena_set_node_flag(m_arena->handle(), m_slot, flag, value);
+        RustFFI::render_state_set_node_flag(document_host(), m_slot, flag, value);
     }
 
 private:
@@ -357,15 +360,15 @@ private:
 
     Node* linked_node(RustFFI::FfiNodeLink link) const
     {
-        return static_cast<Node*>(RustFFI::layout_arena_node_link_shell(m_arena->handle(), m_slot, link));
+        return static_cast<Node*>(RustFFI::layout_row_link_shell(document_host(), m_slot, link));
     }
 
     Node* containing_block_node_if_live() const
     {
-        return static_cast<Node*>(RustFFI::layout_arena_node_containing_block_shell_if_live(m_arena->handle(), m_slot));
+        return static_cast<Node*>(RustFFI::layout_row_containing_block_shell_if_live(document_host(), m_slot));
     }
 
-    u8 generated_for() const { return RustFFI::layout_arena_node_generated_for(m_arena->handle(), m_slot); }
+    u8 generated_for() const { return RustFFI::layout_row_generated_for(document_host(), m_slot); }
 
     NonnullRefPtr<NodeArena> m_arena;
     Compositing::RustFFI::NodeSlotId m_slot;
@@ -381,7 +384,6 @@ T& allocate_layout_node(Args&&... args)
 
 class WEB_API NodeWithStyle : public Node {
 public:
-    NodeWithStyle(DOM::Document&, GC::Ptr<DOM::Node>, CSS::LayoutStyle, RustFFI::NodeKind = RustFFI::NodeKind::NodeWithStyle);
     NodeWithStyle(DOM::Document&, BindToPreparedArenaSlot, Compositing::RustFFI::NodeSlotId, RustFFI::NodeKind);
 
     virtual ~NodeWithStyle() override;
@@ -400,10 +402,23 @@ public:
         NonnullRefPtr<CSS::ImageStyleValue const> m_image;
     };
 
+    // The image resources a node's style asks for, which the layout arena's host tables hold by the
+    // node's slot, and delete with its row if the node did not drop them before.
+    struct ImageObserverSlots {
+        AK_ALLOC_WITH_KMALLOC;
+
+        Vector<RefPtr<CSS::CursorStyleValue const>> cursor_style_values;
+        Vector<OwnPtr<ImageObserver>> background_layers;
+        Vector<OwnPtr<ImageObserver>> mask_layers;
+        Vector<OwnPtr<ImageObserver>> cursors;
+        OwnPtr<ImageObserver> border_image_source;
+        OwnPtr<ImageObserver> list_style_image;
+    };
+
     ImageObserver const* background_image_observer(size_t layer_index) const;
     ImageObserver const* mask_image_observer(size_t layer_index) const;
     ImageObserver const* cursor_image_observer(size_t cursor_index) const;
-    ImageObserver const* border_image_source_observer() const { return m_image_observers.border_image_source.ptr(); }
+    ImageObserver const* border_image_source_observer() const;
 
     NonnullRefPtr<CSS::ComputedValues const> copy_computed_values() const;
     CSS::StyleRecordID style_record_identity() const { return m_style_record_identity; }
@@ -457,21 +472,6 @@ public:
             return {};
         return values.z_index;
     }
-    // https://drafts.csswg.org/css-sizing-4/#intrinsic-size-override
-    Optional<CSSPixels> explicit_intrinsic_inner_width() const
-    {
-        auto const& value = style_group<CSS::ComputedValues::BoxValues>().contain_intrinsic_width;
-        if (!value.has_length)
-            return {};
-        return CSSPixels::nearest_value_for(value.length_px);
-    }
-    Optional<CSSPixels> explicit_intrinsic_inner_height() const
-    {
-        auto const& value = style_group<CSS::ComputedValues::BoxValues>().contain_intrinsic_height;
-        if (!value.has_length)
-            return {};
-        return CSSPixels::nearest_value_for(value.length_px);
-    }
     CSS::Containment contain() const
     {
         auto const& values = style_group<CSS::ComputedValues::BoxValues>();
@@ -519,7 +519,7 @@ public:
     ReadonlySpan<Utf16FlyString> color_schemes() const { return style_group<CSS::ComputedValues::InheritedUIValues>().color_schemes_span(); }
     bool color_scheme_only() const { return style_group<CSS::ComputedValues::InheritedUIValues>().color_scheme_only; }
     ReadonlySpan<CSS::ComputedValuesFFI::ComputedCursor> cursor() const { return style_group<CSS::ComputedValues::InheritedUIValues>().cursor_span(); }
-    ReadonlySpan<RefPtr<CSS::CursorStyleValue const>> cursor_style_values() const { return m_cursor_style_values; }
+    ReadonlySpan<RefPtr<CSS::CursorStyleValue const>> cursor_style_values() const;
     CSS::PointerEvents pointer_events() const { return style_group<CSS::ComputedValues::InheritedUIValues>().pointer_events_value(); }
     CSS::Appearance appearance() const { return static_cast<CSS::Appearance>(style_group<CSS::ComputedValues::MiscResetValues>().appearance); }
     CSS::WillChange will_change() const { return style_group<CSS::ComputedValues::MiscResetValues>().will_change_value(); }
@@ -656,28 +656,32 @@ public:
     bool establishes_an_absolute_positioning_containing_block() const;
     bool establishes_a_fixed_positioning_containing_block() const;
 
-    // https://drafts.csswg.org/css-contain-2/#containment-types
-    bool has_size_containment() const;
-
     [[nodiscard]] bool has_css_transform() const;
 
     void clear_image_observers();
     void apply_style(CSS::StyleRecordID);
     void attach_style_resources();
-    bool synchronize_table_span_data();
+    // Like attach_style_resources(), where the style engine answered whether `style_record` holds image values.
+    void attach_style_resources(CSS::StyleRecordID style_record, Painting::StyleHoldsImageValues);
+    // Gives the row the spans its element published again; where they moved, the row lays out again.
+    void synchronize_table_span_data();
 
     Gfx::Font const& first_available_font() const;
     CSS::StyleScope const& style_scope() const;
 
-    bool is_body() const { return has_flag(RustFFI::NodeFlag::IsBody); }
+    bool is_body() const { return has_identity_flag<RustFFI::NodeFlag::IsBody>(); }
     bool is_scroll_container() const;
 
-    void set_computed_values(NonnullRefPtr<CSS::ComputedValues const>);
-    void set_style_record_identity(CSS::StyleRecordID);
-    void refresh_style_from_arena(CSS::StyleRecordID, void const* payloads, bool should_attach_resources);
+    void set_computed_values(Layout::BegunRead const& read, NonnullRefPtr<CSS::ComputedValues const>);
+    // Takes the record its DOM target installed, `installed`, where it followed the target's record. `held_before` is
+    // the record the target held before and still holds, or none.
+    void set_style_record_identity(CSS::InstalledStyle const& installed, CSS::InstalledStyle const& held_before);
+    void refresh_style_from_arena(CSS::StyleRecordID, void const* payloads, bool derived, bool should_attach_resources);
+    // The pin lives on the node's arena row and is released with it, so
+    // Document::tear_down_layout_tree() must free the layout root before the document's style
+    // engine goes away. Every document destruction path goes through that teardown.
     void pin_style_record_for_cxx_consumers();
     void release_pinned_style_record();
-    void bind_generated_style_record(CSS::StyleRecordID);
 
     void set_display(CSS::Display);
 
@@ -686,27 +690,18 @@ private:
 
     virtual bool is_node_with_style() const final { return true; }
 
-    void initialize_from_style_record();
     void publish_style_record_to_node_data();
     void did_update_style_record();
 
-    void rebuild_image_observers();
+    void rebuild_image_observers(Vector<RefPtr<CSS::CursorStyleValue const>>);
+    ImageObserverSlots const* image_observers() const;
     void const* m_style_payloads { nullptr };
-    bool has_layout_derived_style() const;
+    // Whether the row holds a pin of its style record for C++'s readers, which only this layout node takes and drops.
+    bool m_style_record_pinned_for_cxx_consumers { false };
+    // Whether the arena derived the row's style record. Only this layout node publishes a record of its node to the row
+    // or has the arena adopt one it derived, and a job that derives one tells the layout node.
+    bool m_has_layout_derived_style { false };
     CSS::StyleRecordID m_style_record_identity;
-    // The pin is released through the arena's document, so Document::tear_down_layout_tree()
-    // must free the layout root before the document's style computer goes away. Every document
-    // destruction path goes through that teardown.
-    bool m_style_record_pinned { false };
-    struct ImageObserverSlots {
-        Vector<OwnPtr<ImageObserver>> background_layers;
-        Vector<OwnPtr<ImageObserver>> mask_layers;
-        Vector<OwnPtr<ImageObserver>> cursors;
-        OwnPtr<ImageObserver> border_image_source;
-        OwnPtr<ImageObserver> list_style_image;
-    };
-    ImageObserverSlots m_image_observers;
-    Vector<RefPtr<CSS::CursorStyleValue const>> m_cursor_style_values;
     mutable Optional<Vector<CSS::BackgroundLayerData>> m_background_layers;
     mutable Optional<Vector<CSS::BackgroundLayerData>> m_mask_layers;
     mutable Optional<CSS::BorderImageData> m_border_image;

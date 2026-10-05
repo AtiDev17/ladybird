@@ -17,8 +17,9 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use super::fast_hash::FastMap as HashMap;
+use super::fast_hash::FastSet as HashSet;
 use super::index::StyleAtomID;
-use crate::css::custom_properties::CustomPropertyStore;
+use crate::css::custom_properties::{CustomPropertyRegistry, CustomPropertyStore};
 use crate::css::retained_fly_string::RetainedUtf16FlyString;
 use crate::css::style_value::RetainedStyleValueData;
 
@@ -70,7 +71,7 @@ struct MemoizedSubstitution {
 }
 
 /// One strong reference to a custom-property store, released with the handle.
-pub(super) struct RetainedCustomPropertyStore(*const c_void);
+pub(crate) struct RetainedCustomPropertyStore(*const c_void);
 
 // SAFETY: The pointer is a raw `Arc<CustomPropertyStore>`, so the reference count this handle
 // owns is atomic, and `CustomPropertyStore` is itself `Send + Sync` (see the safety note on its
@@ -84,7 +85,7 @@ unsafe impl Sync for RetainedCustomPropertyStore where CustomPropertyStore: Send
 impl RetainedCustomPropertyStore {
     /// # Safety
     /// `store` must be a live raw `Arc` pointer to a `CustomPropertyStore`.
-    unsafe fn from_borrowed(store: *const c_void) -> Self {
+    pub(super) unsafe fn from_borrowed(store: *const c_void) -> Self {
         unsafe { Arc::increment_strong_count(store.cast::<CustomPropertyStore>()) };
         Self(store)
     }
@@ -95,7 +96,7 @@ impl RetainedCustomPropertyStore {
         Self(store)
     }
 
-    fn pointer(&self) -> *const c_void {
+    pub(super) fn pointer(&self) -> *const c_void {
         self.0
     }
 }
@@ -140,9 +141,20 @@ pub(super) struct CustomPropertyEnvironments {
     stores: HashMap<u64, RetainedCustomPropertyStore>,
     names: HashMap<StyleAtomID, CustomPropertyName>,
     engine: HashMap<u64, EngineEnvironment>,
+    /// The environment a child inherits from one holding custom properties a registration keeps
+    /// from inheriting, for each such environment; any other environment hands itself down.
+    inheritable: HashMap<u64, u64>,
+    /// The environments `inheritable` hands down, gathered by `retain_only`, which keeps the set to
+    /// reuse its allocation.
+    handed_down: HashSet<u64>,
+    /// The environments holding a registered value resolved against the viewport.
+    reads_viewport: HashSet<u64>,
     /// What inputs resolved to which environment, so an element alike in its inputs takes the
     /// environment an earlier one got.
     memo: HashMap<EnvironmentInputs, MemoizedEnvironment>,
+    /// The environment an animation overlay's values laid over another base make, by the overlay
+    /// and that base.
+    overlays_moved: HashMap<(u64, u64), u64>,
     minted: u64,
     /// What a written value substitutes to for a property under an environment, by the written
     /// value's identity: the same declaration under the same environment substitutes alike.
@@ -216,6 +228,64 @@ impl CustomPropertyEnvironments {
             })
     }
 
+    /// Keep the environment a child inherits from `identity`, which C++ made without the custom
+    /// properties a registration keeps from inheriting.
+    ///
+    /// # Safety
+    /// `store` must be null or a live raw `Arc` pointer to a `CustomPropertyStore`.
+    pub(super) unsafe fn note_inheritable(&mut self, identity: u64, inheritable: u64, store: *const c_void) {
+        if identity == 0 {
+            return;
+        }
+        // An environment that hands itself down may have handed down a filtered one before.
+        if identity == inheritable {
+            self.inheritable.remove(&identity);
+            return;
+        }
+        unsafe { self.retain(inheritable, store) };
+        self.inheritable.insert(identity, inheritable);
+    }
+
+    /// The values `overlay`, an element's animation overlay, sampled over another environment, laid
+    /// over `base`, which the element's declarations resolve to now.
+    pub(super) fn overlay_moved_over(&mut self, overlay: u64, base: u64) -> u64 {
+        if let Some(&identity) = self.overlays_moved.get(&(overlay, base)) {
+            return identity;
+        }
+        let overlay_store = self.store(overlay);
+        debug_assert!(overlay_store.is_some(), "an element's overlay was noted with its store");
+        let Some(overlay_store) = overlay_store else {
+            return base;
+        };
+        // SAFETY: The stores are live while the identities naming them are.
+        let store = unsafe {
+            CustomPropertyStore::animated_values_over(
+                &*overlay_store.cast::<CustomPropertyStore>(),
+                self.store(base).map(|store| &*store.cast::<CustomPropertyStore>()),
+            )
+        };
+        let identity = self.mint(Arc::into_raw(Arc::new(store)).cast(), base);
+        self.overlays_moved.insert((overlay, base), identity);
+        identity
+    }
+
+    /// The environment a child inherits from `identity`.
+    pub(super) fn inheritable(&self, identity: u64) -> u64 {
+        self.inheritable.get(&identity).copied().unwrap_or(identity)
+    }
+
+    /// Note that an environment holds a registered value resolved against the viewport.
+    pub(super) fn note_reads_viewport(&mut self, identity: u64) {
+        if identity != 0 {
+            self.reads_viewport.insert(identity);
+        }
+    }
+
+    /// Whether an environment holds a registered value resolved against the viewport.
+    pub(super) fn reads_viewport(&self, identity: u64) -> bool {
+        self.reads_viewport.contains(&identity)
+    }
+
     /// An engine-resolved environment's store and the environment it was resolved over.
     pub(super) fn engine_environment(&self, identity: u64) -> Option<(*const c_void, u64)> {
         self.engine
@@ -251,16 +321,45 @@ impl CustomPropertyEnvironments {
         }
     }
 
-    /// Take over a store the engine resolved and give it an identity of the engine's own.
+    /// Take over a store the engine resolved over `parent`, an environment children inherit, and
+    /// give it an identity of the engine's own. What its children inherit is the store without
+    /// the custom properties `registry` keeps from inheriting: `parent` again when nothing else
+    /// is left that `parent` does not hold.
     ///
     /// # Safety
-    /// `store` must be a live raw `Arc` pointer whose one strong reference is transferred here.
-    pub(super) unsafe fn adopt_engine_environment(&mut self, store: *const c_void, parent: u64) -> u64 {
+    /// `store` must be a live raw `Arc` pointer whose one strong reference is transferred here,
+    /// and `parent_store` null or a live one.
+    pub(super) unsafe fn adopt_engine_environment(
+        &mut self,
+        store: *const c_void,
+        parent: u64,
+        parent_store: *const c_void,
+        registry: &CustomPropertyRegistry,
+    ) -> u64 {
+        let identity = self.mint(store, parent);
+        let resolved = unsafe { &*store.cast::<CustomPropertyStore>() };
+        if let Some(inheritable) = resolved.inheritable(registry) {
+            let parent_holds_every_value = inheritable.own_values.iter().all(|(&name, entry)| {
+                unsafe { parent_store.cast::<CustomPropertyStore>().as_ref() }
+                    .is_some_and(|parent| parent.value_is_identical(name, entry.value.pointer().cast()))
+            });
+            let inheritable = if parent_holds_every_value {
+                parent
+            } else {
+                self.mint(Arc::into_raw(inheritable).cast(), parent)
+            };
+            self.inheritable.insert(identity, inheritable);
+        }
+        identity
+    }
+
+    fn mint(&mut self, store: *const c_void, parent: u64) -> u64 {
         self.minted += 1;
         let identity = ENGINE_ENVIRONMENT_IDENTITY_BIT | self.minted;
         self.engine.insert(
             identity,
             EngineEnvironment {
+                // SAFETY: The caller transfers the store's one strong reference.
                 store: unsafe { RetainedCustomPropertyStore::from_transferred(store) },
                 parent,
             },
@@ -282,10 +381,13 @@ impl CustomPropertyEnvironments {
             })
     }
 
-    /// Drop every memoized substitution: what a written value substitutes to under an environment
-    /// depends on the registrations as well, which changed.
-    pub(super) fn forget_substitutions(&mut self) {
+    /// The registrations changed. What a written value substitutes to under an environment depends
+    /// on them, and so does what an environment C++ published hands down, which C++ names again
+    /// as it hands the environment over: forget both.
+    pub(super) fn registrations_changed(&mut self) {
         self.substitutions.clear();
+        self.inheritable
+            .retain(|&identity, _| identity & ENGINE_ENVIRONMENT_IDENTITY_BIT != 0);
     }
 
     pub(super) fn remember_substitution(
@@ -309,9 +411,16 @@ impl CustomPropertyEnvironments {
 
     /// Release the stores of environments no record names any more, and forget what resolved to
     /// them and what substituted under them.
+    /// What a live environment hands its children stays as long as it does.
     pub(super) fn retain_only(&mut self, is_live: impl Fn(u64) -> bool) {
+        self.inheritable.retain(|&identity, _| is_live(identity));
+        let mut handed_down = std::mem::take(&mut self.handed_down);
+        handed_down.clear();
+        handed_down.extend(self.inheritable.values());
+        let is_live = |identity| is_live(identity) || handed_down.contains(&identity);
         self.stores.retain(|&identity, _| is_live(identity));
         self.engine.retain(|&identity, _| is_live(identity));
+        self.reads_viewport.retain(|&identity| is_live(identity));
         self.memo.retain(|inputs, environment| {
             let retain = is_live(environment.identity) && (inputs.parent == 0 || is_live(inputs.parent));
             if !retain {
@@ -322,12 +431,19 @@ impl CustomPropertyEnvironments {
         });
         self.substitutions
             .retain(|&(_, _, environment), _| environment == 0 || is_live(environment));
+        self.overlays_moved
+            .retain(|&(overlay, base), &mut moved| is_live(overlay) && (base == 0 || is_live(base)) && is_live(moved));
+        self.handed_down = handed_down;
     }
 
     pub(super) fn capacity_bytes(&self) -> u64 {
         (self.stores.capacity() * (size_of::<u64>() + size_of::<RetainedCustomPropertyStore>())
             + self.engine.capacity() * (size_of::<u64>() + size_of::<EngineEnvironment>())
+            + self.inheritable.capacity() * 2 * size_of::<u64>()
+            + self.handed_down.capacity() * size_of::<u64>()
+            + self.reads_viewport.capacity() * size_of::<u64>()
             + self.memo.capacity() * (size_of::<EnvironmentInputs>() + size_of::<MemoizedEnvironment>())
+            + self.overlays_moved.capacity() * 3 * size_of::<u64>()
             + self.substitutions.capacity() * (size_of::<(usize, u16, u64)>() + size_of::<MemoizedSubstitution>())
             + self.names.capacity() * (size_of::<StyleAtomID>() + size_of::<CustomPropertyName>())) as u64
             + self.nested_capacity_bytes

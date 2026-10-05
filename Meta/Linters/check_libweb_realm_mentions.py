@@ -42,7 +42,7 @@ ALLOWED_REALM_MENTIONS = {
     "Compression": (4, 8, "compression streams still use realms for stream/chunk conversion plumbing"),
     "ContentSecurityPolicy": (4, 14, "CSP violation/report objects and callbacks still materialize JS-facing values"),
     "CookieStore": (2, 19, "cookie-store async callbacks and promise/value materialization still thread realms"),
-    "Crypto": (10, 428, "WebCrypto algorithms still use realms for buffer/key/promise materialization"),
+    "Crypto": (8, 385, "WebCrypto algorithms still use realms for buffer/key/promise materialization"),
     "DOM": (10, 33, "DOM abort plumbing and node helpers still have callback/materialization realm use"),
     "DOMURL": (2, 8, "URLSearchParams iterator objects still materialize JS iterator results in selected realms"),
     "Fetch": (
@@ -78,8 +78,8 @@ ALLOWED_REALM_MENTIONS = {
     "TrustedTypes": (2, 9, "Trusted Types policy factory operations still use selected realms"),
     "WebAssembly": (
         12,
-        106,
-        "WebAssembly constructors/exports instantiate JS objects/functions in spec-selected realms; asynchronous compilation retains the origin realm for module installation and promise settlement",
+        104,
+        "WebAssembly constructors/exports instantiate JS objects/functions in spec-selected realms",
     ),
     "WebAudio": (
         8,

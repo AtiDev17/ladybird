@@ -20,7 +20,7 @@ class SVGTextPathElement
     GC_DECLARE_ALLOCATOR(SVGTextPathElement);
 
 public:
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     // The `href`/`xlink:href` this element names a shape with, and the parsed `startOffset`, as the element publishes
     // them to layout.
@@ -36,7 +36,16 @@ protected:
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
 private:
+    virtual bool is_svg_text_path_element() const final { return true; }
+
     Optional<NumberPercentage> m_start_offset;
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<SVG::SVGTextPathElement>() const { return is_svg_text_path_element(); }
 
 }

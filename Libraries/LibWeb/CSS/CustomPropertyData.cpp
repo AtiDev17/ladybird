@@ -7,6 +7,7 @@
 #include <AK/Atomic.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/CustomPropertyRegistration.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 #include <LibWeb/ComputedValuesRustFFI.h>
 #include <LibWeb/DOM/AbstractElement.h>
@@ -170,7 +171,7 @@ bool CustomPropertyData::declares_same_names(CustomPropertyData const& other) co
     return true;
 }
 
-RefPtr<CustomPropertyData const> CustomPropertyData::inheritable(DOM::Document const& document) const
+RefPtr<CustomPropertyData const> CustomPropertyData::inheritable(Layout::BegunRead const& read, DOM::Document const& document) const
 {
     auto document_identity = reinterpret_cast<FlatPtr>(&document);
     auto generation = document.custom_property_registration_generation();
@@ -182,29 +183,43 @@ RefPtr<CustomPropertyData const> CustomPropertyData::inheritable(DOM::Document c
 
     RefPtr<CustomPropertyData const> inheritable_parent;
     if (m_parent)
-        inheritable_parent = m_parent->inheritable(document);
+        inheritable_parent = m_parent->inheritable(read, document);
 
-    auto inheritable = inheritable_impl(
-        inheritable_parent,
-        [&](Utf16FlyString const& name) { return document.get_registered_custom_property(name); });
+    // NB: What an environment the style engine resolved hands down is the engine's to name, under the registrations
+    //     as they are now: the environments its records resolve over the element's are built over that one.
+    RefPtr<CustomPropertyData const> inheritable;
+    if (StyleEngine::is_engine_custom_property_environment(m_identity)) {
+        auto const& style_computer = document.style_computer();
+        auto inheritable_identity = style_computer.style_engine().inheritable_custom_property_environment(read, m_identity);
+        if (inheritable_identity == m_identity)
+            inheritable = this;
+        else if (inheritable_identity == (inheritable_parent ? inheritable_parent->identity() : 0))
+            inheritable = inheritable_parent;
+        else
+            inheritable = style_computer.engine_custom_property_environment(read, inheritable_identity, inheritable_parent);
+    }
+    if (!inheritable) {
+        inheritable = inheritable_impl(
+            inheritable_parent,
+            [&](Utf16FlyString const& name) { return document.get_registered_custom_property(name); });
+    }
 
+    set_inheritable(document, inheritable);
+    return inheritable;
+}
+
+void CustomPropertyData::set_inheritable(DOM::Document const& document, RefPtr<CustomPropertyData const> inheritable) const
+{
     // Registration generations are local to each document, so the cache has to include the destination document
     // identity as well. Otherwise a subtree adopted into another document can incorrectly reuse a filtered result
     // that was computed under a different registration set.
-    m_cached_inheritable_document_identity = document_identity;
-    m_cached_inheritable_generation = generation;
+    m_cached_inheritable_document_identity = reinterpret_cast<FlatPtr>(&document);
+    m_cached_inheritable_generation = document.custom_property_registration_generation();
 
     // We can't store a RefPtr to `this` in m_cached_inheritable_data since it would create a reference cycle so we store
     // that case as a special boolean flag instead.
-    if (inheritable.ptr() == this) {
-        m_cached_inheritable_data = nullptr;
-        m_cached_inheritable_is_self = true;
-    } else {
-        m_cached_inheritable_is_self = false;
-        m_cached_inheritable_data = inheritable;
-    }
-
-    return inheritable;
+    m_cached_inheritable_is_self = inheritable.ptr() == this;
+    m_cached_inheritable_data = m_cached_inheritable_is_self ? nullptr : move(inheritable);
 }
 
 void CustomPropertyData::for_each_property(Function<void(Utf16FlyString const&, StyleProperty const&)> callback) const

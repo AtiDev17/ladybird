@@ -14,7 +14,7 @@ use std::ffi::c_void;
 use std::rc::Rc;
 
 mod publication;
-use publication::{NativeCompilationResult, NativeStylePublication, SelectorInputs};
+use publication::{NativeCompilationResult, NativeStylePublication, Publisher, SelectorInputs};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -63,7 +63,7 @@ pub struct NativeCompilationCallbacks {
 struct CompilationContext {
     selectors: SelectorInputs,
     purpose: NativeCompilationPurpose,
-    layer_name: Vec<u16>,
+    layer_name: std::sync::Arc<[u16]>,
     scopes: Vec<NativeCompilationScope>,
     containers: Vec<*const ContainerConditionsData>,
     conditions_hold: bool,
@@ -76,7 +76,7 @@ impl Default for CompilationContext {
         Self {
             selectors: SelectorInputs::default(),
             purpose: NativeCompilationPurpose::Rules,
-            layer_name: Vec::new(),
+            layer_name: std::sync::Arc::default(),
             scopes: Vec::new(),
             containers: Vec::new(),
             conditions_hold: true,
@@ -110,18 +110,21 @@ impl CompilationContext {
         source: *const c_void,
         environment: MediaEnvironment<'_>,
         callbacks: &NativeCompilationCallbacks,
-        publication: Option<&NativeStylePublication>,
-        matching: Option<Rc<crate::css::selector_parser::RustParsedSelectorList>>,
+        publication: Option<&Publisher<'_>>,
+        matching: Option<std::sync::Arc<crate::css::selector_parser::RustParsedSelectorList>>,
     ) -> Self {
         let mut context = self.clone();
         if self.purpose == NativeCompilationPurpose::Rules {
             context.conditions_hold = self.conditions_hold && rule.condition_holds(environment);
         }
         if let Some(name) = rule.internal_layer_name() {
-            if !context.layer_name.is_empty() {
-                context.layer_name.push(u16::from(b'.'));
+            let mut layer_name = Vec::with_capacity(self.layer_name.len() + 1 + name.len());
+            layer_name.extend_from_slice(&self.layer_name);
+            if !layer_name.is_empty() {
+                layer_name.push(u16::from(b'.'));
             }
-            context.layer_name.extend_from_slice(&name);
+            layer_name.extend_from_slice(&name);
+            context.layer_name = layer_name.into();
             context.in_a_layer = true;
         }
         let mut implicit_root = 0;
@@ -164,17 +167,11 @@ unsafe fn visit_rule(
     context: &CompilationContext,
     environment: MediaEnvironment<'_>,
     callbacks: &NativeCompilationCallbacks,
-    publication: Option<&NativeStylePublication>,
+    publication: Option<&Publisher<'_>>,
 ) {
     let selectors = publication.and_then(|_| unsafe { context.selectors.matching_selectors(rule) });
-    if context.purpose == NativeCompilationPurpose::Selectors
-        && let Some(publication) = publication
-    {
-        unsafe { publication.replace_selectors(rule, sheet, context, selectors.as_deref().unwrap()) };
-        return;
-    }
-    let result = publication.map_or_else(NativeCompilationResult::default, |publication| unsafe {
-        publication.compile(rule, sheet, context, selectors.as_deref())
+    let result = publication.map_or_else(NativeCompilationResult::default, |publication| {
+        publication.compile(rule, sheet, context, selectors.as_ref())
     });
     if !unsafe {
         (callbacks.visit_rule)(
@@ -223,7 +220,7 @@ unsafe fn visit_list(
     context: &CompilationContext,
     environment: MediaEnvironment<'_>,
     callbacks: &NativeCompilationCallbacks,
-    publication: Option<&NativeStylePublication>,
+    publication: Option<&Publisher<'_>>,
 ) {
     let _ = list.visit_rules(&mut |rule| {
         unsafe {
@@ -306,7 +303,8 @@ pub unsafe extern "C" fn rust_style_sheet_visit_compilation(
 ///
 /// # Safety
 /// The graph and callback requirements of rust_style_sheet_visit_compilation apply. Publication
-/// must name a live main-thread engine and sheet. No engine borrow may span a host callback.
+/// must name a live document host, on its document's thread, and a sheet of its style engine. No
+/// engine borrow may span a host callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_sheet_compile(
     sheet: &NativeStyleSheet,
@@ -316,6 +314,8 @@ pub unsafe extern "C" fn rust_style_sheet_compile(
     callbacks: &NativeCompilationCallbacks,
     publication: &NativeStylePublication,
 ) {
+    // SAFETY: Guaranteed by the caller.
+    let publisher = unsafe { Publisher::new(publication) };
     unsafe {
         visit_compilation(
             sheet,
@@ -324,9 +324,10 @@ pub unsafe extern "C" fn rust_style_sheet_compile(
             source,
             environment.borrow(),
             callbacks,
-            Some(publication),
+            Some(&publisher),
         );
     };
+    publisher.finish();
 }
 
 /// Update the selectors of a style rule and its native descendants without materializing CSSOM.
@@ -342,8 +343,9 @@ pub unsafe extern "C" fn rust_style_sheet_replace_selectors(
     callbacks: &NativeCompilationCallbacks,
     publication: &NativeStylePublication,
 ) {
-    use crate::css::style::StyleEngine;
     let environment = unsafe { environment.borrow() };
+    // SAFETY: Guaranteed by the caller.
+    let publisher = unsafe { Publisher::new(publication) };
     let mut path = Vec::new();
     if !find_rule_path(sheet.rules(), sheet, rule_identity, &mut path) {
         return;
@@ -362,7 +364,7 @@ pub unsafe extern "C" fn rust_style_sheet_replace_selectors(
                 target_source,
                 environment,
                 callbacks,
-                Some(publication),
+                Some(&publisher),
                 None,
             )
         };
@@ -386,7 +388,7 @@ pub unsafe extern "C" fn rust_style_sheet_replace_selectors(
                     target_source,
                     environment,
                     callbacks,
-                    Some(publication),
+                    Some(&publisher),
                     selectors.clone(),
                 )
             };
@@ -405,20 +407,15 @@ pub unsafe extern "C" fn rust_style_sheet_replace_selectors(
             affected.push((rule, context, selectors.unwrap()));
         }
     }
+    let published = publisher.host().published_rules();
     for (rule, context, selectors) in affected {
-        let id = unsafe { &*publication.engine.cast::<StyleEngine>() }.native_rule_id(rule.identity);
-        if id.is_some() {
-            unsafe { publication.replace_selectors(RuleRef::Materialized(&rule), target_sheet, &context, &selectors) };
+        if published.contains(publisher.sheet(), rule.identity) {
+            publisher.replace_selectors(RuleRef::Materialized(&rule), target_sheet, &context, selectors);
             continue;
         }
         // A previously empty selector list may become matchable. Publish that newly active
         // subtree with its current conditions and source-order position.
-        let mut publication = *publication;
-        publication.before_rule = crate::css::rule::mutation::successor(sheet, rule.identity, |identity| {
-            unsafe { &*publication.engine.cast::<StyleEngine>() }
-                .native_rule_id(identity)
-                .map_or(0, |id| id.0 + 1)
-        });
+        let subtree = publisher.before(published.successor(publisher.sheet(), sheet, rule.identity));
         unsafe {
             visit_compilation(
                 sheet,
@@ -427,9 +424,10 @@ pub unsafe extern "C" fn rust_style_sheet_replace_selectors(
                 source,
                 environment,
                 callbacks,
-                Some(&publication),
+                Some(&subtree),
             );
         }
+        subtree.finish();
     }
 }
 
@@ -440,7 +438,7 @@ unsafe fn visit_compilation(
     source: *const c_void,
     environment: MediaEnvironment<'_>,
     callbacks: &NativeCompilationCallbacks,
-    publication: Option<&NativeStylePublication>,
+    publication: Option<&Publisher<'_>>,
 ) {
     let context = CompilationContext {
         purpose,
@@ -472,7 +470,7 @@ unsafe fn visit_compilation(
         context: &CompilationContext,
         environment: MediaEnvironment<'_>,
         callbacks: &NativeCompilationCallbacks,
-        publication: Option<&NativeStylePublication>,
+        publication: Option<&Publisher<'_>>,
     ) -> std::ops::ControlFlow<()> {
         if rule.identity() == identity {
             unsafe {
@@ -1193,9 +1191,6 @@ mod tests {
     fn compilation_publishes_shared_rules_without_allocating_mutable_owners() {
         use crate::css::declaration_block::DECLARATION_OWNER_ALLOCATIONS;
         use crate::css::rule::RULE_OWNER_ALLOCATIONS;
-        use crate::css::style::StyleEngine;
-        use crate::css::style::memory::DeviceClass;
-        use crate::css::style::program::{CascadeOrigin, StyleSheetObjectID};
         fn downloaded_sheet(source: &str) -> Rc<NativeStyleSheet> {
             let units: Vec<_> = source.encode_utf16().collect();
             let parsed = std::thread::spawn(move || {
@@ -1229,7 +1224,7 @@ mod tests {
             _: &NativeCompilationContext,
             result: NativeCompilationResult,
         ) -> bool {
-            if result.rule_id != 0 {
+            if result.published {
                 unsafe { &*context.cast::<std::cell::Cell<usize>>() }.update(|count| count + 1);
             }
             true
@@ -1277,8 +1272,15 @@ mod tests {
         });
         drop(parsed_child);
         let child = loaded_child.unwrap();
-        let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
-        let compiled_sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
+        let host = crate::render_state::TestHost::new();
+        let add_sheet = |host: &crate::render_state::TestHost| unsafe {
+            crate::css::style::rule_writes::style_engine_add_sheet(
+                host.host(),
+                1,
+                crate::css::style::bridge::FfiCascadeOrigin::Author,
+            )
+        };
+        let compiled_sheet = add_sheet(&host);
         let compiled = std::cell::Cell::new(0_usize);
         let callbacks = NativeCompilationCallbacks {
             context: (&raw const compiled).cast(),
@@ -1287,9 +1289,9 @@ mod tests {
             visit_rule: visit,
         };
         let publication = NativeStylePublication {
-            engine: (&raw mut engine).cast(),
-            sheet: compiled_sheet.0 + 1,
-            before_rule: 0,
+            host: host.host(),
+            sheet: compiled_sheet,
+            before: 0,
         };
         let environment = FfiMediaEnvironment {
             values: std::ptr::null(),
@@ -1334,30 +1336,33 @@ mod tests {
             );
         }
         assert_eq!(compiled.get(), 9);
-        source.publish_conditions(&mut engine, borrowed_environment);
+        unsafe { crate::css::style_sheet::rust_style_sheet_publish_conditions(&source, host.host(), environment) };
         unsafe extern "C" fn prepare(_: *mut c_void) {}
         let sheets = [Rc::as_ptr(&source)];
         assert!(unsafe {
             crate::css::style_sheet::rust_style_sheet_publish_layer_order(
                 sheets.as_ptr(),
                 sheets.len(),
-                (&raw mut engine).cast(),
+                host.host(),
                 0,
                 false,
                 std::ptr::null_mut(),
                 prepare,
             )
         });
-        let next = crate::css::rule::mutation::successor(&source, import_identity, |identity| unsafe {
-            crate::css::style::bridge::style_engine_native_rule_id((&raw const engine).cast(), identity)
-        });
-        assert_eq!(next, 2);
-        let mut imported_engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
-        let imported_sheet = imported_engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
+        // SAFETY: The test host lives until the end of the test.
+        let next = unsafe { &*host.host() }
+            .published_rules()
+            .successor(compiled_sheet, &source, import_identity);
+        // SAFETY: The test reaches the engine only between the host's calls.
+        let engine = unsafe { host.engine().get() };
+        assert_eq!(engine.native_rule_id(next), Some(crate::css::style::program::RuleID(1)));
+        let imported_host = crate::render_state::TestHost::new();
+        let imported_sheet = add_sheet(&imported_host);
         compiled.set(0);
         let imported_publication = NativeStylePublication {
-            engine: (&raw mut imported_engine).cast(),
-            sheet: imported_sheet.0 + 1,
+            host: imported_host.host(),
+            sheet: imported_sheet,
             ..publication
         };
         unsafe {
@@ -1372,9 +1377,7 @@ mod tests {
         }
         assert_eq!(compiled.get(), 1);
         use crate::css::rule::FfiRuleTraversalOrder;
-        use crate::css::rule::function::{
-            CompiledFunction, rust_compiled_function_visit_declarations, rust_rule_view_compile_function,
-        };
+        use crate::css::rule::function::{CompiledFunction, rust_rule_view_compile_function};
         use crate::css::rule::read::{
             NativeRuleView, rust_rule_view_keyframes, rust_rule_view_property, rust_rule_view_type,
         };
@@ -1470,18 +1473,6 @@ mod tests {
         });
         assert!(source.rules().rules.borrow().is_none());
         assert!(child.rules().rules.borrow().is_none());
-        unsafe extern "C" fn matches(_: *mut c_void, _: *const *const ContainerConditionsData, _: usize) -> bool {
-            unreachable!()
-        }
-        unsafe extern "C" fn declaration(context: *mut c_void, name: FfiUtf16View, _: *const c_void) {
-            assert_eq!(
-                unsafe { std::slice::from_raw_parts(name.utf16, name.length) },
-                "result".encode_utf16().collect::<Vec<_>>()
-            );
-            unsafe {
-                *context.cast::<usize>() += 1;
-            }
-        }
         assert_eq!(RULE_OWNER_ALLOCATIONS.get(), rule_owners);
         assert_eq!(DECLARATION_OWNER_ALLOCATIONS.get(), declaration_owners);
         assert_eq!(
@@ -1497,11 +1488,11 @@ mod tests {
         assert!(source.rules().rules.borrow().is_none());
         assert!(layer.children.as_ref().unwrap().rules.borrow().is_none());
         assert!(style.children.as_ref().unwrap().rules.borrow().is_none());
-        let mut exposed_engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
-        let exposed_sheet = exposed_engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
+        let exposed_host = crate::render_state::TestHost::new();
+        let exposed_sheet = add_sheet(&exposed_host);
         let exposed_publication = NativeStylePublication {
-            engine: (&raw mut exposed_engine).cast(),
-            sheet: exposed_sheet.0 + 1,
+            host: exposed_host.host(),
+            sheet: exposed_sheet,
             ..publication
         };
         compiled.set(0);
@@ -1526,16 +1517,6 @@ mod tests {
         drop(layer);
         drop(source);
         drop(child);
-        let mut declarations = 0_usize;
-        unsafe {
-            rust_compiled_function_visit_declarations(
-                &definitions.functions.borrow()[0],
-                (&raw mut declarations).cast(),
-                matches,
-                declaration,
-            );
-        }
-        assert_eq!(declarations, 1);
         assert_eq!(RULE_OWNER_ALLOCATIONS.get(), rule_owners + 2);
         assert_eq!(DECLARATION_OWNER_ALLOCATIONS.get(), declaration_owners);
         assert_eq!(
@@ -1548,7 +1529,7 @@ mod tests {
     fn traversal_binds_selectors_without_native_parents_or_caches() {
         use crate::css::selector_parser::RustParsedSelectorList;
 
-        fn visit(rule: &NativeRule, inputs: &SelectorInputs, bound: &mut Vec<Rc<RustParsedSelectorList>>) {
+        fn visit(rule: &NativeRule, inputs: &SelectorInputs, bound: &mut Vec<std::sync::Arc<RustParsedSelectorList>>) {
             // The traversal must supply nesting even when no parent owner can be consulted.
             *rule.parent.borrow_mut() = Default::default();
             let selectors = unsafe { inputs.matching_selectors(RuleRef::Materialized(rule)) };

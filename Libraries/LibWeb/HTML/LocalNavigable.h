@@ -18,9 +18,11 @@
 #include <LibCompositing/Scrolling/ScrollState.h>
 #include <LibCompositing/Scrolling/SmoothScrollAnimation.h>
 #include <LibCore/Forward.h>
+#include <LibGC/RootVector.h>
 #include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/Bindings/Navigation.h>
 #include <LibWeb/Compositor/CompositorHost.h>
+#include <LibWeb/Compositor/NavigablePresenter.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
@@ -81,6 +83,9 @@ public:
 
     Vector<GC::Root<LocalNavigable>> child_navigables() const;
     Vector<GC::Root<LocalNavigable>> hosted_inclusive_descendant_navigables();
+    // For a dump that descends into the documents navigable containers show: brings the layout of the active
+    // document of this navigable and of every navigable it hosts up to date.
+    void update_layout_of_hosted_inclusive_descendant_documents(DOM::UpdateLayoutReason);
 
     bool is_local_root() const;
     GC::Ref<LocalNavigable> local_root();
@@ -102,6 +107,7 @@ public:
     void stop_loading();
 
     void set_delaying_load_events(bool value);
+    void stop_delaying_load_events_for_navigation(Utf16String const& navigation_id);
     bool is_delaying_load_events() const { return m_is_delaying_load_events; }
 
     void set_navigation_load_event_guard(DOM::Document& parent_doc);
@@ -140,7 +146,7 @@ public:
     virtual OpenerPolicy const& active_document_opener_policy() const override;
     virtual Optional<u64> browsing_context_group_id() const override;
     virtual bool active_browsing_context_is_auxiliary() const override;
-    virtual GC::Ptr<WindowProxy> active_browsing_context_opener_window_proxy() const override;
+    virtual GC::Ptr<Navigable> active_browsing_context_opener_navigable() const override;
     virtual ReplicatedContainerState container_state() const override;
     ReplicatedNavigableState replicated_state() const;
     HostedNavigableState hosted_state() const;
@@ -292,11 +298,30 @@ public:
     void prepare_to_populate_reconstructed_history_entry(Utf16String navigation_api_key);
 
     bool record_display_list_and_scroll_state(PaintConfig);
-    void paint_next_frame();
-    bool paint_next_frame_if_needed(DOM::UpdateLayoutReason);
+    // Records what brings the compositor context up to date: a new display list, or what changed for the one it has.
+    // A recording that `blocker` does not block flies beside the event loop instead, which finishes its frame once it
+    // takes the recording in.
+    Optional<Compositor::CompositorFrame> record_compositor_frame(PaintConfig, Layout::RustFFI::FfiFlightBlocker = Layout::RustFFI::FfiFlightBlocker::NotInRenderingUpdate);
+    void paint_next_frame(Layout::RustFFI::FfiFlightBlocker = Layout::RustFFI::FfiFlightBlocker::NotInRenderingUpdate);
+    // Paints the next frame if it needs one, with its recording kept in step where `blocker` is not none.
+    bool paint_next_frame_if_needed(DOM::UpdateLayoutReason, Layout::RustFFI::FfiFlightBlocker blocker = Layout::RustFFI::FfiFlightBlocker::None);
+
+    enum class TakeIn {
+        // Between two tasks: only a recording that has finished.
+        IfFinished,
+        // Where the recording is needed now: waits for it to finish.
+        Wait,
+    };
+    // Takes the recording in flight in, and hands the presentation queue its frame where it still stands. Answers
+    // whether no recording is in flight any more.
+    bool take_recording_in_flight_in(TakeIn);
+    bool has_recording_in_flight() const { return m_recording_in_flight; }
+    void hold_recording_in_flight_for_testing();
+    void release_recording_in_flight_for_testing();
+
     void render_screenshot(Gfx::PaintingSurface&, PaintConfig, Function<void()>&& callback);
-    Compositing::DisplayListResourceStorage& display_list_resource_storage() { return m_display_list_resource_storage; }
-    Compositing::DisplayListResourceStorage const& display_list_resource_storage() const { return m_display_list_resource_storage; }
+    Compositing::DisplayListResourceStorage& display_list_resource_storage() { return m_presenter.display_list_resource_storage(); }
+    Compositing::DisplayListResourceStorage const& display_list_resource_storage() const { return m_presenter.display_list_resource_storage(); }
 
     bool needs_repaint() const { return m_needs_repaint; }
     void set_needs_repaint() { m_needs_repaint = true; }
@@ -375,12 +400,12 @@ public:
     bool perform_a_scroll_step_for_key_input(Layout::Node&, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type);
     bool perform_a_snapped_momentum_scroll(Layout::Node&, CSSPixelPoint momentum_delta);
     Layout::Node* layout_node_for_async_scroll_node_stable_id(Web::AsyncScrollNodeStableID);
-    void re_snap_scroll_containers_after_layout_change();
+    void re_snap_scroll_containers_after_layout_change(Layout::BegunRead const& read);
     void abort_in_flight_smooth_scrolls(Web::AsyncScrollNodeStableID, SmoothScrollAbortCause);
     void abort_in_flight_smooth_scrolls_taken_over_by_user_input(Web::AsyncScrollNodeStableID, CSSPixelPoint scroll_offset_at_gesture_start);
     void queue_scrollend_event_after_user_scroll(GC::Ref<DOM::EventTarget>, Optional<Web::AsyncScrollNodeStableID>, Optional<CSSPixelPoint> scroll_offset_before_scroll = {}, SnapPositionSelection = SnapPositionSelection::AtGestureEnd);
     void note_user_scroll_input_intent(Compositing::SnapSelectionStrategy::Type);
-    RefPtr<Painting::Scrollbar> scrollbar_dragged_by_compositor(Web::ScrollbarDraggedByCompositor const&);
+    RefPtr<Painting::Scrollbar> scrollbar_dragged_by_compositor(Layout::BegunRead const& read, Web::ScrollbarDraggedByCompositor const&);
     void note_user_scroll_gesture_phase(Web::ScrollGesturePhase);
     void defer_user_scroll_settlement();
     void snap_user_scroll_gestures_that_awaited_layout();
@@ -403,6 +428,15 @@ protected:
     Variant<Empty, Traversal, Utf16String> m_ongoing_navigation;
 
 private:
+    // A rendering update's recording that flies beside the event loop, with what its frame is finished with.
+    struct RecordingInFlight;
+
+    Layout::RustFFI::FfiFlightBlocker recording_flight_blocker(DOM::UpdateLayoutReason);
+    Optional<Compositor::CompositorFrame> finish_compositor_frame(DOM::Document&, PaintConfig const&, RefPtr<Compositing::DisplayList>);
+    Optional<Compositor::CompositorFrame> finish_recording_in_flight(RecordingInFlight&, bool landed_standing);
+    void submit_painted_frame(Compositor::CompositorFrame);
+    Gfx::IntRect present_viewport_rect() const;
+
     enum class PendingNavigationBehavior {
         Append,
         Replace
@@ -450,7 +484,7 @@ private:
     void queue_scrollend_event(Web::AsyncScrollNodeStableID, ScrollTrigger, Optional<CSSPixelPoint> scroll_offset_before_scroll = {});
     void queue_scrollend_event(DOM::Document&, GC::Ref<DOM::EventTarget>, Optional<Web::AsyncScrollNodeStableID>, ScrollTrigger, Optional<CSSPixelPoint> scroll_offset_before_scroll = {});
     void queue_scrollend_event_for_finished_scroll(Web::AsyncScrollNodeStableID, ScrollTrigger, Optional<CSSPixelPoint> scroll_offset_before_scroll);
-    void queue_scrollend_event_and_promise_resolution_for_finished_scroll(Optional<Web::AsyncScrollNodeStableID>, ScrollTrigger, Optional<CSSPixelPoint> scroll_offset_before_scroll, ScrollPromises const&);
+    void queue_scrollend_event_and_promise_resolution_for_finished_scroll(Optional<Web::AsyncScrollNodeStableID>, ScrollTrigger, Optional<CSSPixelPoint> scroll_offset_before_scroll, ReadonlySpan<GC::Ref<WebIDL::Promise>>);
     ScrollPromises* promises_of_smooth_scroll_in_flight_toward(Web::AsyncScrollNodeStableID, CSSPixelPoint position, ScrollTrigger);
     // The scroll a new input to a scrolling box would interact with; a scroll driven by user input is reported over
     // any programmatic scroll also in flight.
@@ -555,18 +589,17 @@ private:
     bool m_is_svg_page { false };
     bool m_needs_repaint { true };
     bool m_needs_to_record_display_list { true };
+
+    OwnPtr<RecordingInFlight> m_recording_in_flight;
+    bool m_last_recording_in_flight_stood { true };
+
     bool m_pending_set_browser_zoom_request { false };
     bool m_should_show_line_box_borders { false };
     bool m_force_dark_enabled { false };
     i32 m_force_dark_foreground_threshold { default_force_dark_foreground_threshold };
     i32 m_force_dark_background_threshold { default_force_dark_background_threshold };
     bool m_should_show_caret_hit_test_debug_overlay { false };
-    Optional<PaintConfig> m_compositor_display_list_paint_config;
-    RefPtr<Compositing::DisplayList> m_compositor_display_list;
-    u64 m_compositor_display_list_visual_context_tree_structural_epoch { 0 };
-    Compositing::DisplayListResourceStorage m_display_list_resource_storage;
-    Compositing::DisplayListResourceSet m_compositor_display_list_resources;
-    Compositing::DisplayListResourceSet m_compositor_display_list_command_resources;
+    Compositor::NavigablePresenter m_presenter;
     OwnPtr<Compositor::CompositorContextHandle> m_compositor_context;
     RefPtr<Core::Timer> m_async_scroll_hover_update_timer;
     Vector<PendingUserScrollendTarget> m_pending_user_scrollend_targets;
@@ -615,6 +648,17 @@ private:
         ScrollTrigger trigger { ScrollTrigger::Programmatic };
     };
     Vector<MainThreadSmoothScroll> m_main_thread_smooth_scrolls;
+
+    // A scroll taken out of the lists of scrolls in progress, which visit_edges() traces, to be reported. Reporting a
+    // scroll allocates, so its promises stay rooted until it is reported.
+    struct FinishedScroll {
+        Optional<Web::AsyncScrollNodeStableID> stable_node_id;
+        Optional<CSSPixelPoint> initial_scroll_offset;
+        GC::RootVector<GC::Ref<WebIDL::Promise>> promises;
+        ScrollTrigger trigger { ScrollTrigger::Programmatic };
+    };
+    static FinishedScroll finished_scroll(PendingAsyncScrollOperation const&);
+    static FinishedScroll finished_scroll(MainThreadSmoothScroll const&);
 };
 
 class WEB_API UserScrollGestureHold {

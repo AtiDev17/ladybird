@@ -19,18 +19,11 @@
 
 namespace Web::Layout {
 
-TextNode::TextNode(DOM::Document& document, DOM::Text& text, AttachToDOMNode attach_to_dom_node)
-    : Node(document, &text, RustFFI::NodeKind::TextNode, attach_to_dom_node)
+// The tree build stamped the row with whether an empty text produces a line box fragment and enrolled it for content
+// sync. A layout node is made whenever something first asks for it, so it does nothing but bind.
+TextNode::TextNode(DOM::Document& document, BindToPreparedArenaSlot bind, Compositing::RustFFI::NodeSlotId slot, RustFFI::NodeKind kind)
+    : Node(document, bind, slot, kind)
 {
-    invalidate_text_for_rendering();
-    update_produces_line_box_fragment_when_empty_flag();
-    Painting::push_selection_pseudo_style_of_parent(*this);
-}
-
-TextNode::TextNode(DOM::Document& document, RustFFI::NodeKind kind)
-    : Node(document, nullptr, kind)
-{
-    invalidate_text_for_rendering();
 }
 
 bool TextNode::update_produces_line_box_fragment_when_empty_flag()
@@ -57,37 +50,19 @@ bool TextNode::update_produces_line_box_fragment_when_empty_flag()
 
 TextNode::~TextNode() = default;
 
-GC::Ptr<DOM::Element const> TextNode::parent_element_for_text_transform() const
-{
-    return dom_node().parent_element();
-}
-
-bool TextNode::is_password_input() const
-{
-    return dom_node().is_password_input();
-}
-
-GeneratedTextNode::GeneratedTextNode(DOM::Document& document, Utf16String text)
-    : TextNode(document, RustFFI::NodeKind::GeneratedTextNode)
-    , m_text(move(text))
+// The build stamped the row with its characters, which this layout node shares.
+GeneratedTextNode::GeneratedTextNode(DOM::Document& document, BindToPreparedArenaSlot bind, Compositing::RustFFI::NodeSlotId slot, RustFFI::NodeKind kind)
+    : TextNode(document, bind, slot, kind)
+    , m_text(Utf16String::adopt_raw(RustFFI::layout_row_generated_text(document_host(), slot)))
 {
 }
 
 GeneratedTextNode::~GeneratedTextNode() = default;
 
-GC::Ptr<DOM::Element const> GeneratedTextNode::parent_element_for_text_transform() const
-{
-    if (is_generated_for_pseudo_element())
-        return pseudo_element_generator();
-    if (auto const* parent = this->parent(); parent && parent->is_generated_for_pseudo_element())
-        return parent->pseudo_element_generator();
-    return nullptr;
-}
-
 Utf16String TextNode::rendered_text_for_dom(bool collapse_whitespace) const
 {
     Utf16String text;
-    RustFFI::layout_arena_collect_rendered_text(arena_handle(), slot_id(this), collapse_whitespace, &text,
+    RustFFI::layout_script_rendered_text(document_host(), slot_id(this), collapse_whitespace, &text,
         [](void* context, RustFFI::FfiRenderedTextView view) {
             *static_cast<Utf16String*>(context) = Utf16String::from_utf16({ reinterpret_cast<char16_t const*>(view.text), view.length_in_code_units });
         });
@@ -96,38 +71,18 @@ Utf16String TextNode::rendered_text_for_dom(bool collapse_whitespace) const
 
 RustFFI::FfiTextSourceRange TextNode::word_range_at(size_t dom_offset) const
 {
-    return RustFFI::layout_arena_text_word_range(arena_handle(), slot_id(this), dom_offset);
+    return RustFFI::layout_text_word_range(document_host(), slot_id(this), dom_offset);
 }
 
 void TextNode::invalidate_text_for_rendering()
 {
-    RustFFI::layout_arena_invalidate_text_content(arena_handle(), slot_id(this));
+    RustFFI::render_state_invalidate_text_content(document_host(), slot_id(this));
 }
 
 Utf16View TextNode::text_for_rendering() const
 {
-    auto view = RustFFI::layout_arena_text_for_rendering(arena_handle(), slot_id(this));
+    auto view = RustFFI::render_state_text_for_rendering(document_host(), slot_id(this));
     return Utf16View { reinterpret_cast<char16_t const*>(view.text), view.length_in_code_units };
-}
-
-RustFFI::FfiTextSource TextNode::text_source() const
-{
-    Optional<Utf16View> lang;
-    if (auto element = parent_element_for_text_transform())
-        lang = element->lang_view();
-    auto view_for = [](Utf16View view) -> RustFFI::FfiUtf16View {
-        return {
-            .ascii = view.has_ascii_storage() ? reinterpret_cast<u8 const*>(view.ascii_span().data()) : nullptr,
-            .utf16 = view.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(view.utf16_span().data()),
-            .length = view.length_in_code_units(),
-        };
-    };
-    return {
-        .text = view_for(text()),
-        .locale = lang.has_value() ? view_for(*lang) : RustFFI::FfiUtf16View {},
-        .has_locale = lang.has_value(),
-        .is_password_input = is_password_input(),
-    };
 }
 
 Gfx::GlyphRun::TextType text_type_for_code_point(u32 code_point)

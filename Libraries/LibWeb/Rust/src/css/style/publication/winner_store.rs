@@ -121,6 +121,24 @@ impl WinnerStore {
             .any(|declaration| view.dependencies(declaration).uses_tree_counting_function)
     }
 
+    /// The proof that no value the store holds resolves a `url()`, or `None` when one may.
+    pub(super) fn reads_no_resource_contexts(&self, engine: &RetainedState) -> Option<ReadsNoResourceContexts> {
+        let view = self.view(engine);
+        (!self
+            .declarations
+            .iter()
+            .any(|declaration| view.dependencies(declaration).may_need_style_sheet_resource_context))
+        .then_some(ReadsNoResourceContexts(()))
+    }
+
+    /// What a record computed from the store reads beside its winners.
+    pub(super) fn record_reads(&self, engine: &RetainedState) -> StateRecordReads {
+        StateRecordReads {
+            sibling_position: self.uses_tree_counting_function(engine),
+            no_resource_contexts: self.reads_no_resource_contexts(engine),
+        }
+    }
+
     /// Whether a value the store holds resolves a container-relative length, which the drive
     /// resolves against the element's query containers.
     pub(super) fn reads_container_units(&self, engine: &RetainedState) -> bool {
@@ -173,7 +191,12 @@ impl WinnerView<'_> {
             WinnerValue::Substituted { value, .. } => return value.data(),
             WinnerValue::Written { node, source, index } => match source {
                 WinnerSource::Rule(rule) => &self.engine.program.written_values_of(*rule)[*index],
-                WinnerSource::Element(kind) => &self.engine.facts.element_written_declared_values(*node, *kind)[*index],
+                WinnerSource::Element(kind) => self
+                    .engine
+                    .facts
+                    .element_declarations(*node, *kind)
+                    .expect("a written winner's declarations are held")
+                    .written(*index),
                 WinnerSource::ExactCascade => unreachable!("a winner recipe requires original spelling"),
             },
         };
@@ -193,14 +216,10 @@ impl WinnerStore {
         &self,
         engine: &RetainedState,
     ) -> Vec<crate::css::style_compute::FfiStyleSheetResourceContext> {
-        let view = self.view(engine);
-        if !self
-            .declarations
-            .iter()
-            .any(|declaration| view.dependencies(declaration).may_need_style_sheet_resource_context)
-        {
+        if self.reads_no_resource_contexts(engine).is_some() {
             return Vec::new();
         }
+        let view = self.view(engine);
         self.declarations
             .iter()
             .map(|declaration| {
@@ -355,9 +374,8 @@ mod tests {
                     // NB: The identity does not supply the written value to the drive.
                     value: SpecifiedValueID(1),
                 })
+                .zip(written)
                 .collect(),
-            written.into(),
-            true,
         );
         let owners = Arc::strong_count(&observer);
         let store = WinnerStore::new(

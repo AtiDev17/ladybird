@@ -63,7 +63,7 @@ pub(crate) enum EnvironmentMoveAction {
 #[derive(Default)]
 pub(super) struct ChangedCustomPropertyNames {
     /// By the addresses of the two stores, the raw names whose values differ, sorted.
-    by_stores: HashMap<(usize, usize), Rc<[usize]>>,
+    by_stores: HashMap<(usize, usize), Arc<[usize]>>,
     /// The stores the addresses name, kept alive so that no other store takes an address.
     stores: Vec<Arc<CustomPropertyStore>>,
 }
@@ -78,13 +78,13 @@ impl ChangedCustomPropertyNames {
         &mut self,
         old: Option<&Arc<CustomPropertyStore>>,
         new: Option<&Arc<CustomPropertyStore>>,
-    ) -> Rc<[usize]> {
+    ) -> Arc<[usize]> {
         let key = (
             old.map_or(0, |store| Arc::as_ptr(store) as usize),
             new.map_or(0, |store| Arc::as_ptr(store) as usize),
         );
         if key.0 == key.1 {
-            return Rc::from([]);
+            return Arc::from([]);
         }
         if let Some(names) = self.by_stores.get(&key) {
             return names.clone();
@@ -102,7 +102,7 @@ impl ChangedCustomPropertyNames {
             .filter(|&name| seen.insert(name) && custom_property_value_moved(name, old, new))
             .collect();
         names.sort_unstable();
-        let names: Rc<[usize]> = names.into();
+        let names: Arc<[usize]> = names.into();
         self.stores.extend(old.cloned());
         self.stores.extend(new.cloned());
         self.by_stores.insert(key, names.clone());
@@ -247,7 +247,7 @@ impl StyleEngineState {
             .element_custom_property_data
             .get(&element)
             .map_or((0, false, false), |held| {
-                (held.identity, held.is_animation_overlay, held.declares)
+                (held.identity, held.sampled_over.is_some(), held.declares)
             });
         // An animation overlay samples over what the element's style resolves to, which a
         // computation moves.
@@ -292,7 +292,7 @@ impl StyleEngineState {
         let held = |declares| {
             (!moved.new_inheritable_data.is_null()).then(|| HeldCustomPropertyEnvironment {
                 identity: new_inheritable,
-                is_animation_overlay: false,
+                sampled_over: None,
                 declares,
                 // SAFETY: The host's object is live for the move, which takes a reference of its own.
                 data: unsafe { RetainedCustomPropertyData::retain(moved.new_inheritable_data) },
@@ -401,8 +401,9 @@ mod tests {
     use super::*;
     use crate::css::style::tests::{discard_transaction, linear_document};
 
-    fn data(address: usize) -> *const c_void {
-        address as *const c_void
+    fn data(address: usize) -> crate::css::style::inputs::RetainedCustomPropertyData {
+        // SAFETY: A test's custom-property data is never reached through its address.
+        unsafe { crate::css::style::inputs::RetainedCustomPropertyData::retain(address as *const c_void) }
     }
 
     fn moved(old_inheritable: u64, new_inheritable: u64) -> EnvironmentMove {
@@ -418,14 +419,21 @@ mod tests {
                 identity: new_inheritable,
                 store: std::ptr::null(),
             },
-            new_inheritable_data: data(0x2000),
+            new_inheritable_data: 0x2000 as *const c_void,
             new_inheritable_declares: true,
         }
     }
 
     /// A record for `node` to hold, published as one of no style groups.
     fn held_record(engine: &mut StyleEngine, node: StyleNodeID) -> u64 {
-        let record = engine
+        let record = assigned_record(engine, node, 0);
+        engine.set_held_style_record(node, record);
+        record
+    }
+
+    /// A record of no style groups assigned to `node`, told apart by its dependency flags.
+    fn assigned_record(engine: &mut StyleEngine, node: StyleNodeID, dependency_flags: u8) -> u64 {
+        engine
             .publish_computed_groups(
                 computed::ComputedStyleTarget::new(node, u8::MAX),
                 &[],
@@ -433,7 +441,7 @@ mod tests {
                 0,
                 computed::ComputedMetadataInput {
                     pseudo_element_styles: 0,
-                    dependency_flags: 0,
+                    dependency_flags,
                     counter_style_environment_identity: 0,
                     animation_overlay_identity: 0,
                     animated_overlay: crate::css::host_shared::HostShared::null(),
@@ -442,9 +450,7 @@ mod tests {
                 },
             )
             .style_record_identity
-            .raw();
-        engine.set_held_style_record(node, record);
-        record
+            .raw()
     }
 
     /// The republished records a walk answered, by node and the environment they replaced, after
@@ -485,7 +491,7 @@ mod tests {
         for &node in &nodes[1..] {
             held_record(&mut engine, node);
             engine.set_element_var_reads(node, true, true, &[]);
-            unsafe { engine.set_element_custom_property_data(node, data(0x1000), 1, false, true) };
+            engine.set_element_custom_property_data(node, Some(data(0x1000)), 1, None, true);
         }
         let actions = walk(&mut engine, nodes[0], &moved(1, 2));
         assert_eq!(
@@ -504,13 +510,13 @@ mod tests {
         // An element declaring its own over another environment is rebuilt over the moved one.
         held_record(&mut engine, nodes[1]);
         engine.set_element_var_reads(nodes[1], true, true, &[]);
-        unsafe { engine.set_element_custom_property_data(nodes[1], data(0x1000), 3, false, true) };
+        engine.set_element_custom_property_data(nodes[1], Some(data(0x1000)), 3, None, true);
         // An element whose style reads the environment through if() computes again.
         held_record(&mut engine, nodes[2]);
         engine.set_element_recomputes_on_environment_move(nodes[2], true);
-        unsafe { engine.set_element_custom_property_data(nodes[2], data(0x1000), 1, false, false) };
+        engine.set_element_custom_property_data(nodes[2], Some(data(0x1000)), 1, None, false);
         // An unstyled element is left to the computation that gives it style.
-        unsafe { engine.set_element_custom_property_data(nodes[3], data(0x1000), 1, false, false) };
+        engine.set_element_custom_property_data(nodes[3], Some(data(0x1000)), 1, None, false);
         let actions = walk(&mut engine, nodes[0], &moved(1, 2));
         assert_eq!(
             actions,
@@ -521,7 +527,7 @@ mod tests {
         );
 
         engine.set_element_recomputes_on_environment_move(nodes[2], false);
-        unsafe { engine.set_element_custom_property_data(nodes[2], data(0x1001), 4, true, false) };
+        engine.set_element_custom_property_data(nodes[2], Some(data(0x1001)), 4, Some(1), false);
         // A C++ computation that reads more than its names say computes again too.
         engine.set_element_var_reads(nodes[1], true, false, &[]);
         let actions = walk(&mut engine, nodes[0], &moved(1, 2));
@@ -535,12 +541,34 @@ mod tests {
     }
 
     #[test]
+    fn a_move_republishes_the_record_the_host_holds_beneath_a_newer_assignment() {
+        let (mut engine, nodes) = linear_document();
+        discard_transaction(&mut engine);
+        held_record(&mut engine, nodes[1]);
+        engine.set_element_var_reads(nodes[1], true, true, &[]);
+        engine.set_element_custom_property_data(nodes[1], Some(data(0x1000)), 1, None, false);
+        // A row the host has yet to apply installs the newer assignment, which moves more than the environment.
+        let assigned = assigned_record(&mut engine, nodes[1], 1);
+        let actions = walk(&mut engine, nodes[0], &moved(1, 2));
+        assert_eq!(republished(&engine, &actions, 2), [(nodes[1], 1)]);
+        let records = &engine.computed_group_sets;
+        assert!(matches!(
+            actions[..],
+            [EnvironmentMoveAction::Republish { style_record, .. }] if records.style_record_dependency_flags(style_record) == Some(0)
+        ));
+        assert_eq!(
+            records.assigned_style_record(nodes[1]).map(|record| record.raw()),
+            Some(assigned)
+        );
+    }
+
+    #[test]
     fn a_move_reads_no_changed_names_for_an_element_reading_none() {
         let (mut engine, nodes) = linear_document();
         discard_transaction(&mut engine);
         held_record(&mut engine, nodes[1]);
         engine.set_element_var_reads(nodes[1], true, true, &[]);
-        unsafe { engine.set_element_custom_property_data(nodes[1], data(0x1000), 1, false, false) };
+        engine.set_element_custom_property_data(nodes[1], Some(data(0x1000)), 1, None, false);
         let actions = walk(&mut engine, nodes[0], &moved(1, 2));
         assert_eq!(republished(&engine, &actions, 2), [(nodes[1], 1)]);
         assert!(engine.host.environment_move_changed_names.by_stores.is_empty());

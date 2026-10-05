@@ -498,6 +498,10 @@ pub struct FontValues {
     pub font_zero_advance: f32,
     pub first_available_font: *const std::ffi::c_void,
     pub font_cascade_list: libgfx_rust::font::FontCascadeListHandle,
+    /// The same cascade, frozen at publication: what the render pipeline reads. The live
+    /// list beside it is the document's, and only the document thread may look a code point
+    /// up in it.
+    pub frozen_font_list: libgfx_rust::font::FrozenFontListRef,
     pub font_weight: f64,
     pub font_width: f64,
     pub math_shift: u8,
@@ -698,6 +702,11 @@ pub struct RetainedComputedResolvedTransformList {
     pub pointer: *mut ComputedResolvedTransform,
     pub length: usize,
 }
+
+// SAFETY: The list owns its array, which is written once as the style group is built and only read after, like the
+// style values its transforms name.
+unsafe impl Send for RetainedComputedResolvedTransformList where ComputedResolvedTransform: Send {}
+unsafe impl Sync for RetainedComputedResolvedTransformList where ComputedResolvedTransform: Sync {}
 
 /// Layout of the computed transform properties.
 #[repr(C)]

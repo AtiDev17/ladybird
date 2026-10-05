@@ -42,11 +42,25 @@ CanonicalDocument::CanonicalDocument(URL::URL creation_url, URL::Origin origin, 
 
 CanonicalDocument::~CanonicalDocument() = default;
 
+Optional<URL::Origin> CanonicalDocument::top_level_origin() const
+{
+    auto& top_level_browsing_context = m_browsing_context->top_level_browsing_context();
+
+    // NB: A top-level document is not yet its browsing context's active document when it is placed in a process.
+    if (&top_level_browsing_context == m_browsing_context.ptr())
+        return m_origin;
+    if (top_level_browsing_context.has_been_discarded())
+        return {};
+    return top_level_browsing_context.active_document()->origin();
+}
+
 void CanonicalDocument::set_host(RefPtr<WebContentPage> host)
 {
     m_host = move(host);
-    if (m_host)
+    if (m_host) {
         m_relevant_global_object->agent().set_hosting_process_if_unset(m_host->client());
+        m_host->client().request_server_site_bindings().bind_sites_of(*this);
+    }
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#make-active

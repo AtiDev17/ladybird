@@ -27,20 +27,6 @@ static_assert(to_underlying(CSS::ScrollSnapStrictness::None) == to_underlying(Co
 static_assert(to_underlying(CSS::ScrollSnapStrictness::Proximity) == to_underlying(Compositing::SnapStrictness::Proximity));
 static_assert(to_underlying(CSS::ScrollSnapStrictness::Mandatory) == to_underlying(Compositing::SnapStrictness::Mandatory));
 
-// NB: The element the recorder identifies a snap area by is resolved when the visual context tree is built, which a
-//     re-snap right after layout runs ahead of, so it is resolved from the area's layout node here.
-static UniqueNodeID element_id_of_snap_area(Layout::Node const& snap_area)
-{
-    if (snap_area.is_generated_for_pseudo_element()) {
-        if (auto generator = snap_area.pseudo_element_generator())
-            return generator->unique_id();
-        return {};
-    }
-    if (auto const* element = as_if<DOM::Element>(snap_area.dom_node()))
-        return element->unique_id();
-    return {};
-}
-
 // The element a snap area's box belongs to, which is the generating element of a pseudo-element's box.
 static DOM::Element const* element_of_snap_area(Compositing::SnapAreaIdentity const& area)
 {
@@ -52,7 +38,7 @@ static DOM::Element const* element_of_snap_area(Compositing::SnapAreaIdentity co
 // https://drafts.csswg.org/css-scroll-snap-1/#snap-axis
 Compositing::SnapAxes snap_axes_of_scroll_container(Layout::Node const& snap_container)
 {
-    auto axes = Layout::RustFFI::layout_arena_scroll_snap_axes(snap_container.arena_handle(), Layout::Node::slot_id(&snap_container));
+    auto axes = Layout::RustFFI::layout_row_scroll_snap_axes(snap_container.document_host(), Layout::Node::slot_id(&snap_container));
     return { .x = axes.x, .y = axes.y };
 }
 
@@ -62,7 +48,7 @@ Optional<Compositing::SnapContainerGeometry> snap_container_geometry(Layout::Nod
         return {};
 
     Layout::RustFFI::FfiSnapContainerGeometry geometry {};
-    if (!Layout::RustFFI::layout_arena_snap_container_geometry(snap_container.arena_handle(), committed_row_slot(snap_container), &geometry))
+    if (!Layout::RustFFI::layout_row_snap_container_geometry(snap_container.document_host(), committed_row_slot(snap_container), &geometry))
         return {};
 
     return Compositing::SnapContainerGeometry {
@@ -81,10 +67,10 @@ Vector<Compositing::SnapAreaGeometry> collect_snap_areas(Layout::Node const& sna
     if (!has_committed_box(snap_container))
         return areas;
 
-    Layout::RustFFI::layout_arena_for_each_snap_area(
-        snap_container.arena_handle(), committed_row_slot(snap_container), &areas, [](void* context, Layout::RustFFI::FfiSnapAreaGeometry const* area, void* layout_node_shell) {
+    Layout::RustFFI::render_state_for_each_snap_area(
+        snap_container.document_host(), committed_row_slot(snap_container), &areas, [](void* context, Layout::RustFFI::FfiSnapAreaGeometry const* area) {
             static_cast<Vector<Compositing::SnapAreaGeometry>*>(context)->append({
-                .identity = { element_id_of_snap_area(*static_cast<Layout::Node const*>(layout_node_shell)), area->pseudo_element_type },
+                .identity = { UniqueNodeID { area->node_id }, area->pseudo_element_type },
                 .rect = area->rect,
                 .align_x = static_cast<Compositing::SnapAlign>(area->align_x),
                 .align_y = static_cast<Compositing::SnapAlign>(area->align_y),
@@ -100,7 +86,25 @@ bool is_scroll_snap_container(Layout::Node const& node)
     auto const* node_with_style = as_if<Layout::NodeWithStyle>(node);
     if (!node_with_style || !node_with_style->is_scroll_container())
         return false;
+    // Only the viewport takes its snap type from another box's style, so any other box without one snaps nothing.
+    if (!node.is_viewport() && node_with_style->scroll_snap_type().strictness == CSS::ScrollSnapStrictness::None)
+        return false;
     return !snap_axes_of_scroll_container(node).is_empty();
+}
+
+void take_built_scroll_container(Layout::BegunRead const& read, DOM::Document& document, Compositing::RustFFI::NodeSlotId slot, bool is_scroll_snap_container)
+{
+    auto const* scroll_container = document.layout_node_arena().node_if_live(read, slot);
+    if (!scroll_container)
+        return;
+    if (is_scroll_snap_container) {
+        document.set_may_have_scroll_snap_areas();
+        document.register_scroll_snap_container(*scroll_container);
+        return;
+    }
+    // A box that does not snap is snapped to no snap areas, so that a scroll it is given while it does not snap is not
+    // undone by a re-snap once it snaps again.
+    document.forget_snapped_areas_of_scroll_container(*scroll_container);
 }
 
 // https://drafts.csswg.org/css-scroll-snap-1/#choosing

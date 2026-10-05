@@ -31,6 +31,8 @@
 #include <LibWebCommon/CSS/PreferredContrast.h>
 #include <LibWebCommon/CSS/PreferredMotion.h>
 #include <LibWebCommon/Forward.h>
+#include <LibWebCommon/Gamepad/GamepadSnapshot.h>
+#include <LibWebCommon/Gamepad/GamepadStateBuffer.h>
 #include <LibWebCommon/HTML/AutoplayPolicy.h>
 #include <LibWebCommon/HTML/WorkerAgentTypes.h>
 #include <LibWebCommon/Page/EventResult.h>
@@ -46,12 +48,6 @@
 #include <WebContent/WebContentClientEndpoint.h>
 #include <WebContent/WebContentConsoleClient.h>
 #include <WebContent/WebContentServerEndpoint.h>
-
-namespace Gfx {
-
-class SharedFontProvider;
-
-}
 
 namespace WebContent {
 
@@ -88,6 +84,9 @@ public:
     Queue<Web::QueuedInputEvent>& input_event_queue() { return m_input_event_queue; }
     void update_input_method_state(Web::PageId page_id);
 
+    void notify_started_using_gamepads();
+    void pump_and_dispatch_gamepad_events();
+
 private:
     ConnectionFromClient(NonnullOwnPtr<IPC::Transport>, bool enable_test_mode);
 
@@ -95,7 +94,7 @@ private:
     Optional<PageClient const&> page(Web::PageId index, SourceLocation = SourceLocation::current()) const;
 
     virtual Messages::WebContentServer::InitTransportResponse init_transport(int peer_pid) override;
-    virtual void set_font_catalog(IPC::File, u64 size, u64 generation) override;
+    virtual void set_font_service(IPC::TransportHandle, IPC::File catalog, u64 catalog_size, u64 generation) override;
     virtual void initialize(Web::PageId initial_page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator cross_process_id_allocator, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state) override;
     virtual void create_representing_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables) override;
     virtual void create_embedded_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state) override;
@@ -294,6 +293,7 @@ private:
     virtual void find_in_page(Web::PageId page_id, Utf16String query, CaseSensitivity) override;
     virtual void find_in_page_next_match(Web::PageId page_id) override;
     virtual void find_in_page_previous_match(Web::PageId page_id) override;
+    virtual void find_in_page_end(Web::PageId page_id) override;
 
     virtual void paste(Web::PageId page_id, Utf16String text) override;
     virtual void paste_from_clipboard(Web::PageId page_id) override;
@@ -303,6 +303,13 @@ private:
 
     virtual void system_time_zone_changed() override;
     virtual void set_system_font_family(String family) override;
+
+    virtual void set_gamepad_state_buffer(Web::Gamepad::GamepadStateBuffer gamepad_state_buffer) override;
+    virtual void gamepad_connected(Web::Gamepad::GamepadDescription description) override;
+    virtual void gamepad_disconnected(Web::Gamepad::GamepadHandle handle) override;
+    virtual void gamepad_states_changed() override;
+    void dispatch_gamepad_change_event(Web::Gamepad::GamepadChangeEvent const&);
+    void dispatch_changed_gamepad_states();
 
     virtual void set_document_cookie_version_buffer(Web::PageId page_id, Core::AnonymousBuffer document_cookie_version_buffer) override;
     virtual void set_document_cookie_version_index(Web::PageId page_id, i64 document_id, Core::SharedVersionIndex document_index) override;
@@ -323,6 +330,8 @@ private:
     NonnullOwnPtr<PageHost> m_page_host;
     OwnPtr<DevToolsDebugger> m_devtools_debugger;
 
+    bool m_did_notify_started_using_gamepads { false };
+
     HashMap<int, Web::FileRequest> m_requested_files {};
     int last_id { 0 };
 
@@ -330,7 +339,6 @@ private:
     void enqueue_mouse_event(Web::PageId page_id, Optional<Web::HTML::CrossProcessId> navigable_id, Web::MouseEvent);
 
     Queue<Web::QueuedInputEvent> m_input_event_queue;
-    Gfx::SharedFontProvider* m_font_provider { nullptr };
     bool m_enable_test_mode { false };
 };
 

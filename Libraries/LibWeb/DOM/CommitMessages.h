@@ -33,14 +33,10 @@ public:
     void visit_edges(GC::Cell::Visitor&);
 
     // A message a finished layout pass or tree build left for this document.
-    void append(Layout::RustFFI::FfiCommitMessage const&);
-
-    // The node a rebuild escalates to, because the node that asked for it sits under an anonymous parent and only
-    // layout knows where the escalation stops.
-    void note_needs_layout_tree_update(NodeIdentity, SetNeedsLayoutTreeUpdateReason);
+    void append(Layout::BegunRead const& read, Layout::RustFFI::FfiCommitMessage const&);
 
     // Applies every message in order and empties the list.
-    void apply();
+    void apply(Layout::BegunRead const&);
 
 private:
     enum class Kind : u8 {
@@ -51,6 +47,7 @@ private:
         TopLayerZoneRebuildNeeded,
         ListItemCounterValueRendered,
         SvgResourceReferenced,
+        UnstyledElementReached,
     };
 
     struct Message {
@@ -62,8 +59,8 @@ private:
         SetNeedsLayoutTreeUpdateReason layout_tree_update_reason { SetNeedsLayoutTreeUpdateReason::None };
     };
 
-    void apply(Message const&);
-    Layout::Node* bound_layout_node(NodeIdentity) const;
+    void apply(Layout::BegunRead const& read, Message const&);
+    Layout::Node* bound_layout_node(Layout::BegunRead const& read, NodeIdentity) const;
 
     GC::Ref<Document> m_document;
     Vector<Message> m_messages;

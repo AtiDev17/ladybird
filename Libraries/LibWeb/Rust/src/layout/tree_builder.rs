@@ -8,20 +8,23 @@ use super::*;
 
 use crate::abort_on_panic;
 use crate::css::css_enums::{content_visibility, float, positioning, white_space_collapse};
+use crate::css::style::RecordDemand;
 use crate::css::style::StyleEngine;
-use crate::css::style::bridge::element_adjustment_fact;
-use crate::css::style::layout_style::{AnonymousStyleKind, AnonymousStyleOverrides};
+use crate::css::style::bridge::{
+    ElementBoxKind, FfiDemandedPseudoElement, FfiPseudoElementRecordDemand, answer_record_demand,
+    element_adjustment_fact,
+};
+use crate::css::style::layout_style::{AnonymousStyleKind, AnonymousStyleOverrides, DerivedStyleRecord, LayoutStyle};
 use crate::css::style::tree::StyleNodeID;
-use crate::layout::layout_node_arena::{LayoutNodeArena, StaleWalkFacts};
+use crate::layout::layout_node_arena::{LayoutNodeArena, OwedImageResources, StaleWalkFacts};
 use crate::layout::node_data::{
     GENERATED_FOR_AFTER, GENERATED_FOR_BACKDROP, GENERATED_FOR_BEFORE, GENERATED_FOR_FIRST_LETTER,
-    GENERATED_FOR_MARKER, NodeData, NodeFlag, NodeKind, NodeSlotId,
+    GENERATED_FOR_MARKER, NodeData, NodeFlag, NodeKind, NodeSlotId, pseudo_kind_of,
 };
 use crate::layout::text_chunker::{GraphemeSegmenter, code_point_at, code_unit_length_for_code_point};
-use crate::layout::tree_mutation::{UnplacedLayoutNode, free_subtree_and_destroy_shells};
+use crate::layout::tree_mutation::{HostCalls, OwedHostWork, UnplacedLayoutNode};
 use crate::layout::tree_update_marks::layout_tree_update_reuse_reason;
 use crate::layout::{ComputedValuesView, FfiDisplay};
-use std::ffi::c_void;
 
 type LayoutNode = NodeSlotId;
 
@@ -39,9 +42,18 @@ pub(crate) struct TreeBuilderState {
     /// The elements a finished build asks the document to rebuild. `None` asks for the whole tree:
     /// the container the box escaped into stands for no element.
     layout_tree_rebuild_requests: Vec<Option<StyleNodeID>>,
+    /// Whether the build reached an element no style update settled, which it built no box for.
+    reached_unstyled_element: bool,
     /// What the build found out that the document has to be told, in the order it found it out.
     /// Delivered when the walk ends: nothing inside the build reads any of it back.
     reports: Vec<crate::layout::commit::FfiCommitMessage>,
+    /// Every style record a box is built from, held until the build ends, so that a restyle later
+    /// in the same build cannot take it away from a box that names it. Letting go of one the build
+    /// has stopped looking at buys nothing before it ends.
+    pinned_style_records: Vec<u64>,
+    /// The document's style, which the build is handed before it starts when it may build the
+    /// viewport, held until the viewport's row takes it or the build ends without one.
+    pub(super) document_style: Option<DerivedStyleRecord>,
 }
 
 impl Default for TreeBuilderState {
@@ -56,8 +68,32 @@ impl Default for TreeBuilderState {
             layout_tree_update_escaped_rebuild_roots: false,
             new_subtree_root: NodeSlotId::INVALID,
             layout_tree_rebuild_requests: Vec::new(),
+            reached_unstyled_element: false,
             reports: Vec::new(),
+            pinned_style_records: Vec::new(),
+            document_style: None,
         }
+    }
+}
+
+impl TreeBuilderState {
+    /// Holds `record` until the build ends.
+    fn pin_style_record_for_build(&mut self, arena: &LayoutNodeArena, record: u64) {
+        arena.with_style_engine(|engine| engine.pin_layout_style_record(record));
+        self.pinned_style_records.push(record);
+    }
+
+    /// Lets go of every record the build held, once the build is over.
+    pub(super) fn release_pinned_style_records(&mut self, arena: &LayoutNodeArena) {
+        let unused_document_style = self.document_style.take().map(|document_style| document_style.record);
+        if self.pinned_style_records.is_empty() && unused_document_style.is_none() {
+            return;
+        }
+        arena.with_style_engine(|engine| {
+            for record in self.pinned_style_records.drain(..).chain(unused_document_style) {
+                engine.unpin_layout_style_record(record);
+            }
+        });
     }
 }
 
@@ -90,36 +126,6 @@ enum StaleSubtreeClearScope {
     DescendantsBoundedToRoot,
 }
 
-#[repr(C)]
-pub struct FfiDomTreeBuilderCallbacks {
-    pub builder: *mut c_void,
-    /// Clears one node's stale layout box, answering whether its subtree must survive with it.
-    /// The second identity is the root of the subtree being cleared, or 0 when the clear is not
-    /// bounded to one; only an SVG resource box reads it.
-    pub clear_stale_layout_node: unsafe extern "C" fn(*mut c_void, u32, u32) -> bool,
-    pub create_first_letter_nodes: unsafe extern "C" fn(*mut c_void, u32, FfiFirstLetterTarget) -> FfiFirstLetterNodes,
-    pub top_layer_element_count: unsafe extern "C" fn(*mut c_void) -> usize,
-    pub copy_top_layer_elements: unsafe extern "C" fn(*mut c_void, *mut FfiIdentifiedDomNode, usize),
-    pub prepare_principal_element: unsafe extern "C" fn(*mut c_void, u32, bool),
-    pub create_principal_element_layout: unsafe extern "C" fn(*mut c_void, u32, FfiElementLayoutKind) -> NodeSlotId,
-    pub create_principal_document_layout: unsafe extern "C" fn(*mut c_void) -> NodeSlotId,
-    pub create_principal_text_layout: unsafe extern "C" fn(*mut c_void, u32) -> NodeSlotId,
-    /// Attaches the image observers a box's style asks for. Principal and pseudo-element boxes
-    /// both go through this; nothing about it depends on which the box is.
-    pub attach_style_resources: unsafe extern "C" fn(*mut c_void, NodeSlotId),
-    pub layout: FfiTreeBuilderCallbacks,
-    pub pseudo: FfiPseudoTreeBuilderCallbacks,
-}
-
-/// A DOM node the tree builder reasons about by identity as well as by pointer: the identity names
-/// the node's rows in the arena, so Rust finds them without asking C++ for the answer.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiIdentifiedDomNode {
-    pub node: *mut c_void,
-    pub style_node: u32,
-}
-
 /// What the build knows about a node when it enters it: what its marks ask for, and what layout
 /// node it already has. Every field is read out of the arena by identity.
 #[derive(Clone, Copy)]
@@ -141,6 +147,7 @@ pub enum FfiElementLayoutKind {
 }
 
 fn apply_replaced_display_adjustment(
+    host_calls: HostCalls<'_>,
     arena: &LayoutNodeArena,
     node: NodeSlotId,
     adjustment: FfiReplacedElementDisplayAdjustment,
@@ -151,9 +158,93 @@ fn apply_replaced_display_adjustment(
         FfiReplacedElementDisplayAdjustment::Inline => display_outside::INLINE,
         FfiReplacedElementDisplayAdjustment::None => return,
     };
-    arena.update_layout_style(node, |style| {
+    arena.update_layout_style(host_calls, node, |style| {
         style.set_display(FfiDisplay::outside_and_inside(outside, display_inside::FLOW, false));
     });
+}
+
+/// The kind of box a computed display asks for, or none for a display that generates no box.
+fn node_kind_for_display(display: FfiDisplay) -> Option<NodeKind> {
+    if display.is_none() || display.is_contents() {
+        return None;
+    }
+    if display.is_table_inside()
+        || display.is_table_row_group()
+        || display.is_table_header_group()
+        || display.is_table_footer_group()
+        || display.is_table_row()
+    {
+        return Some(NodeKind::Box);
+    }
+    if display.is_list_item() {
+        return Some(NodeKind::ListItemBox);
+    }
+    if display.is_table_cell() {
+        return Some(NodeKind::BlockContainer);
+    }
+    if display.is_table_column() || display.is_table_column_group() || display.is_table_caption() {
+        // FIXME: This is just an incorrect placeholder until we improve table layout support.
+        return Some(NodeKind::BlockContainer);
+    }
+    if display.is_math_inside() {
+        // https://w3c.github.io/mathml-core/#new-display-math-value
+        // MathML elements with a computed display value equal to block math or inline math control box generation
+        // and layout according to their tag name, as described in the relevant sections.
+        // FIXME: Figure out what kind of node we should make for them. For now, we'll stick with a generic Box.
+        return Some(NodeKind::BlockContainer);
+    }
+    if display.is_inline_outside() {
+        if display.is_flow_root_inside() {
+            return Some(NodeKind::BlockContainer);
+        }
+        if display.is_flex_inside() || display.is_grid_inside() {
+            return Some(NodeKind::Box);
+        }
+        return Some(NodeKind::InlineNode);
+    }
+    if display.is_flex_inside() || display.is_grid_inside() {
+        return Some(NodeKind::Box);
+    }
+    // FIXME: We don't actually support `display: block ruby`, this treats it as a block.
+    if display.is_flow_inside() || display.is_flow_root_inside() || display.is_ruby_inside() {
+        return Some(NodeKind::BlockContainer);
+    }
+    Some(NodeKind::InlineNode)
+}
+
+/// The kind of principal box an element asks for. The element's own type and state decided its
+/// box kind at style time; its computed display decides the box for the kinds that leave the
+/// choice to it, and `appearance: none` suppresses an input's native widget.
+/// https://drafts.csswg.org/css-ui/#appearance-switching
+fn node_kind_for_element_box_kind(box_kind: ElementBoxKind, display: FfiDisplay, appearance: u8) -> Option<NodeKind> {
+    if appearance == crate::css::css_enums::appearance::NONE && box_kind.is_suppressed_by_appearance_none() {
+        return node_kind_for_display(display);
+    }
+    Some(match box_kind {
+        ElementBoxKind::NoBox => return None,
+        ElementBoxKind::FromDisplay => return node_kind_for_display(display),
+        ElementBoxKind::Break => NodeKind::BreakNode,
+        ElementBoxKind::FieldSet => NodeKind::FieldSetBox,
+        ElementBoxKind::Legend => NodeKind::LegendBox,
+        ElementBoxKind::Audio => NodeKind::AudioBox,
+        ElementBoxKind::Video => NodeKind::VideoBox,
+        ElementBoxKind::Canvas => NodeKind::CanvasBox,
+        ElementBoxKind::NavigableContainerViewport => NodeKind::NavigableContainerViewport,
+        ElementBoxKind::TextArea => NodeKind::TextAreaBox,
+        ElementBoxKind::Image => NodeKind::ImageBox,
+        ElementBoxKind::SvgGraphics => NodeKind::SVGGraphicsBox,
+        ElementBoxKind::SvgSvg => NodeKind::SVGSVGBox,
+        ElementBoxKind::SvgText => NodeKind::SVGTextBox,
+        ElementBoxKind::SvgTextPath => NodeKind::SVGTextPathBox,
+        ElementBoxKind::SvgForeignObject => NodeKind::SVGForeignObjectBox,
+        ElementBoxKind::SvgImage => NodeKind::SVGImageBox,
+        ElementBoxKind::SvgGeometry => NodeKind::SVGGeometryBox,
+        ElementBoxKind::InputButton => NodeKind::BlockContainer,
+        ElementBoxKind::InputCheckBox => NodeKind::CheckBox,
+        ElementBoxKind::InputRadioButton => NodeKind::RadioButton,
+        ElementBoxKind::InputRange => NodeKind::RangeInputBox,
+        ElementBoxKind::InputText => NodeKind::TextInputBox,
+    })
 }
 
 pub(crate) fn element_layout_kind(
@@ -273,33 +364,22 @@ pub(crate) fn display_contents_text_needs_style_wrapper(
     })
 }
 
-/// Returns whether an SVG resource layout node must survive cleanup of a DOM subtree.
+/// Whether an SVG resource box survives the clearing of a DOM subtree.
 ///
 /// SVGPatternBox, SVGMaskBox and SVGClipBox are created on behalf of a referencing element and
 /// attached to that element's layout subtree, so they survive cleanup of their DOM ancestor unless
 /// their layout attachment is inside the subtree being cleared too. The ancestors are arena rows,
 /// and the style mirror answers whether each one's node lies in the cleared subtree. An anonymous
 /// row stands for no node; the viewport stands for the document, which only a cleared document
-/// contains.
-///
-/// # Safety
-///
-/// `arena` must be a live handle used on the document thread, and `layout_node` must name a live
-/// row. `cleared_subtree_root` is the identity of the root being cleared, or 0 when the clear is
-/// not bounded to one.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_should_preserve_svg_resource_layout_node(
-    arena: *mut c_void,
+/// contains. A clear that is not bounded to a root keeps every resource box.
+fn svg_resource_box_survives(
+    arena: &LayoutNodeArena,
     layout_node: NodeSlotId,
-    cleared_subtree_root: u32,
+    cleared_subtree_root: Option<StyleNodeID>,
 ) -> bool {
-    assert!(!arena.is_null());
-    assert!(!layout_node.is_invalid());
-    let Some(cleared_subtree_root) = StyleNodeID::from_raw(cleared_subtree_root) else {
+    let Some(cleared_subtree_root) = cleared_subtree_root else {
         return true;
     };
-    // SAFETY: Guaranteed by the entry point's contract.
-    let arena = unsafe { LayoutNodeArena::from_handle(arena) };
     arena.with_style_store(|engine| {
         let tree = engine.tree();
         // The document holds every node a row stands for.
@@ -325,15 +405,6 @@ pub unsafe extern "C" fn rust_should_preserve_svg_resource_layout_node(
     })
 }
 
-#[repr(C)]
-pub struct FfiTopLayerDetachCallbacks {
-    /// What `clear_stale_layout_node` is called with, which is the only thing the stale-subtree
-    /// walk asks of the host.
-    pub context: *mut c_void,
-    pub prepare_subtree_for_detach: unsafe extern "C" fn(*mut c_void),
-    pub clear_stale_layout_node: unsafe extern "C" fn(*mut c_void, u32, u32) -> bool,
-}
-
 /// Finds the box to detach for a top-layer element: the element's own box, or the outermost
 /// anonymous wrapper around it that is a direct viewport child. Leaving an empty anonymous
 /// table-fixup wrapper as a viewport child would violate layout invariants.
@@ -356,54 +427,6 @@ fn topmost_layout_node_of_top_layer_placement(arena: *mut LayoutNodeArena, layou
         }
         direct_viewport_child_candidate = parent;
     }
-}
-
-/// Detaches a top-layer element's layout placement and clears every stale projected subtree.
-///
-/// # Safety
-///
-/// The callback table, arena, and element must remain valid for the duration of the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_detach_top_layer_element_layout_subtree(
-    callbacks: *const FfiTopLayerDetachCallbacks,
-    arena: *mut c_void,
-    element: u32,
-) {
-    assert!(!callbacks.is_null());
-    assert!(!arena.is_null());
-    // SAFETY: Guaranteed by the entry point's contract.
-    let callbacks = unsafe { &*callbacks };
-    let arena = arena.cast::<LayoutNodeArena>();
-    let host = StaleSubtreeHost {
-        arena,
-        context: callbacks.context,
-        clear_stale_layout_node: callbacks.clear_stale_layout_node,
-    };
-    // A top layer member the style engine no longer tracks has left the DOM. Nothing of it is in the
-    // mirror, and nothing of it is bound to a row, so there is nothing to detach or clear.
-    let Some(element) = StyleNodeID::from_raw(element) else {
-        return;
-    };
-    // NB: Called at DOM mutation processing time, outside layout tree construction.
-    let element_layout_node = host.arena().bound_row(element);
-    if !element_layout_node.is_invalid() {
-        let topmost = topmost_layout_node_of_top_layer_placement(arena, element_layout_node);
-        let layout_node_to_detach = if topmost.is_invalid() {
-            element_layout_node
-        } else {
-            topmost
-        };
-        let shell = unsafe { &*arena }.node_shell(layout_node_to_detach);
-        // SAFETY: The C++ detach preparation walks the still-linked subtree; the shared arena
-        // borrow ends before the subtree is freed.
-        unsafe { (callbacks.prepare_subtree_for_detach)(shell) };
-        if unsafe { &*arena }.detach_from_parent(layout_node_to_detach) {
-            free_subtree_and_destroy_shells(arena, layout_node_to_detach);
-        }
-    }
-
-    clear_stale_subtree(host, element, StaleSubtreeClearScope::InclusiveBoundedToRoot);
-    clear_stale_assigned_slottables(host, element);
 }
 
 #[derive(Clone, Copy)]
@@ -610,7 +633,7 @@ fn may_update_pseudo_elements_in_place(
             }
         }
 
-        let pseudo_kind = generated_for - 1;
+        let pseudo_kind = pseudo_kind_of(generated_for);
         let Some(content) = engine.pseudo_published_content_facts(element, pseudo_kind) else {
             continue;
         };
@@ -788,7 +811,7 @@ impl ChildListInsertionReuse<'_, '_> {
 
             let pseudo_display = self
                 .engine
-                .pseudo_published_box_facts(self.element, generated_for - 1)
+                .pseudo_published_box_facts(self.element, pseudo_kind_of(generated_for))
                 .map(|facts| facts.display);
             let parent_display = self.layout.display(self.layout_node);
             let pseudo_belongs_to_inline_run = pseudo_display
@@ -1169,14 +1192,17 @@ pub(crate) fn principal_node_entry_decision(
     })
 }
 
+/// The tree build walk's view of the document: the arena it builds rows in, and the host work it
+/// owes for what it changes. It holds no main thread token, so it cannot call the host for that
+/// work itself.
 struct DomTreeBuilderHost<'a> {
-    callbacks: &'a FfiDomTreeBuilderCallbacks,
     arena: *mut LayoutNodeArena,
+    work: &'a OwedHostWork,
 }
 
 impl DomTreeBuilderHost<'_> {
     fn arena(&self) -> &LayoutNodeArena {
-        // SAFETY: Entry points guarantee that the arena remains live for the duration of the build.
+        // SAFETY: The host borrows the state that holds the arena for as long as it lives.
         unsafe { &*self.arena }
     }
 
@@ -1228,18 +1254,21 @@ impl DomTreeBuilderHost<'_> {
 
     fn layout(&self) -> TreeBuilderHost<'_> {
         TreeBuilderHost {
-            callbacks: &self.callbacks.layout,
             arena: self.arena,
+            work: self.work,
         }
     }
 
     /// The build's own view of the stale-subtree walk.
-    fn stale(&self) -> StaleSubtreeHost {
+    fn stale(&self) -> StaleSubtreeHost<'_> {
         StaleSubtreeHost {
             arena: self.arena,
-            context: self.callbacks.builder,
-            clear_stale_layout_node: self.callbacks.clear_stale_layout_node,
+            host_calls: self.host_calls(),
         }
+    }
+
+    fn host_calls(&self) -> HostCalls<'_> {
+        HostCalls(self.work)
     }
 }
 
@@ -1274,16 +1303,167 @@ fn dom_child_layout_plan(host: &DomTreeBuilderHost<'_>, node: StyleNodeID) -> (b
     )
 }
 
-unsafe fn dom_tree_builder_host<'a>(
-    callbacks: *const FfiDomTreeBuilderCallbacks,
-    arena: *mut c_void,
-) -> DomTreeBuilderHost<'a> {
-    assert!(!callbacks.is_null());
-    assert!(!arena.is_null());
-    // SAFETY: Each exported entry point requires the callback table to remain live for the duration of its call.
+/// A document's layout tree build, which the host sends its render state: builds or updates the
+/// tree from the document's style node, and answers what the build owes the host.
+pub(crate) struct TreeBuildJob {
+    document_style_node: StyleNodeID,
+    /// The document's style, which the host makes rather than publishes, so a build that may build
+    /// the viewport is handed it before it starts.
+    document_style_record: Option<u64>,
+}
+
+/// What a tree build owes the host once it is over, besides the host calls its walk queued, in the
+/// order the host pays it.
+pub(crate) struct TreeBuildAnswer {
+    pub(crate) outcome: FfiLayoutTreeBuildOutcome,
+    /// What the build found out that the document has to be told, in the order it found it out.
+    pub(crate) reports: Vec<crate::layout::commit::FfiCommitMessage>,
+    /// The scroll containers the build gave a style.
+    pub(crate) built_scroll_containers: Vec<super::formatting_context::FfiBuiltScrollContainer>,
+}
+
+impl TreeBuildJob {
+    pub(crate) fn new(document_style_node: StyleNodeID, document_style_record: Option<u64>) -> Self {
+        Self {
+            document_style_node,
+            document_style_record,
+        }
+    }
+
+    /// Runs the build over the arena of `state`. The host calls the walk owes go into `work`, as the
+    /// walk, holding no main thread token, can only queue them; what the host hears of the boxes
+    /// nodes gain and lose must be queued already.
+    pub(crate) fn run(self, state: &mut ArenaHandle, work: &OwedHostWork) -> TreeBuildAnswer {
+        let host = dom_tree_builder_host(state, work);
+        let document_identity = self.document_style_node;
+        host.layout().arena().set_document_style_node(document_identity);
+        let mut state = TreeBuilderState::default();
+        // The viewport's style is the document's, which the host makes rather than publishes, so a
+        // build that may build the viewport is handed it before it starts.
+        if let Some(record) = self.document_style_record {
+            state.document_style = Some(
+                host.layout()
+                    .arena()
+                    .with_style_engine(|engine| DerivedStyleRecord::pin(engine, record)),
+            );
+        }
+        let mut context = TreeBuilderContext {
+            document_needs_full_layout_tree_update: host.layout().arena().needs_full_layout_tree_update(),
+            ..Default::default()
+        };
+        // Whether the document already had a viewport, read before the build replaces it.
+        let document_had_layout_node = !host.layout().arena().layout_root().is_invalid();
+
+        update_layout_tree_from(
+            &host,
+            &mut state,
+            document_identity,
+            &mut context,
+            false,
+            FfiInsertionMode::Append,
+            true,
+        );
+
+        let document_layout_node = host.layout().arena().layout_root();
+        let rebuilt_subtrees_were_updated_individually = !document_layout_node.is_invalid()
+            && !(context.document_needs_full_layout_tree_update
+                || !document_had_layout_node
+                || state.layout_tree_update_escaped_rebuild_roots);
+        if !document_layout_node.is_invalid() {
+            let layout_host = host.layout();
+            if rebuilt_subtrees_were_updated_individually {
+                fixup_tables_in_rebuilt_subtrees(
+                    &layout_host,
+                    &state.rebuilt_subtree_roots,
+                    &state.reused_child_list_update_roots,
+                    &state.additional_table_fixup_roots,
+                );
+            } else {
+                layout_host.arena().set_needs_full_scrollable_overflow_recalculation();
+                fixup_tables(&layout_host, document_layout_node);
+            }
+
+            // https://drafts.csswg.org/css-scrollbars/#scrollbar-width
+            // UAs must apply the scrollbar-color value set on the root element to the viewport.
+            // The document element is the document's only DOM child the style mirror holds: a doctype, a
+            // comment and a processing instruction hold no place in its child sequence, and a document
+            // can have no text child.
+            let root_layout_node = host
+                .first_dom_child(document_identity)
+                .map_or(NodeSlotId::INVALID, |document_element| {
+                    layout_host.arena().bound_row(document_element)
+                });
+            if !root_layout_node.is_invalid() {
+                let scrollbar_width = layout_host
+                    .style(root_layout_node)
+                    .expect("the document element's box publishes its style during the build")
+                    .misc_reset()
+                    .scrollbar_width;
+                layout_host
+                    .arena()
+                    .update_layout_style(layout_host.host_calls(), document_layout_node, |style| {
+                        style.set_scrollbar_width(scrollbar_width);
+                    });
+            }
+        }
+
+        for &element in &state.layout_tree_rebuild_requests {
+            // A request that names no element asks for the whole tree, which the arena answers itself.
+            let Some(element) = element else {
+                host.layout().arena().set_needs_full_layout_tree_update(true);
+                continue;
+            };
+            state.reports.push(crate::layout::commit::FfiCommitMessage::new(
+                element.raw(),
+                crate::layout::commit::FfiCommitMessageKind::LayoutTreeRebuildRequested,
+            ));
+        }
+
+        let built_scroll_containers = host.arena().take_built_scroll_containers();
+        let arena = host.arena();
+        if rebuilt_subtrees_were_updated_individually {
+            let attached_roots = arena.derive_facts_after_tree_update(&state.rebuilt_subtree_roots);
+            arena.resolve_deferred_child_list_insertions(&attached_roots);
+        } else {
+            // NB: The full layout entry must derive the facts of this tree.
+            arena.record_partial_relayout_escape();
+            arena.resolve_deferred_child_list_insertions(&Default::default());
+        }
+
+        // Table fixup can free a rebuilt root after it was recorded, such as whitespace at the edge of a
+        // row group, so only the roots that are still live wait for the partial relayout plan.
+        let live_rebuilt_subtree_roots: Vec<NodeSlotId> = state
+            .rebuilt_subtree_roots
+            .iter()
+            .copied()
+            .filter(|root| arena.slot_is_live(*root))
+            .collect();
+        let rebuilt_subtree_root_count = live_rebuilt_subtree_roots.len();
+        arena.set_pending_rebuilt_subtree_roots(
+            live_rebuilt_subtree_roots,
+            state.layout_tree_update_escaped_rebuild_roots,
+        );
+        let viewport = arena.layout_root();
+        assert!(!viewport.is_invalid(), "a layout tree build places the viewport");
+        state.release_pinned_style_records(arena);
+        let outcome = FfiLayoutTreeBuildOutcome {
+            viewport,
+            rebuilt_subtree_root_count,
+            layout_tree_update_escaped_rebuild_roots: state.layout_tree_update_escaped_rebuild_roots,
+            needs_another_build_pass: !state.layout_tree_rebuild_requests.is_empty() || state.reached_unstyled_element,
+        };
+        TreeBuildAnswer {
+            outcome,
+            reports: state.reports,
+            built_scroll_containers,
+        }
+    }
+}
+
+fn dom_tree_builder_host<'a>(state: &'a mut ArenaHandle, work: &'a OwedHostWork) -> DomTreeBuilderHost<'a> {
     DomTreeBuilderHost {
-        callbacks: unsafe { &*callbacks },
-        arena: arena.cast(),
+        arena: std::ptr::from_mut(state).cast(),
+        work,
     }
 }
 
@@ -1346,32 +1526,167 @@ fn update_layout_tree_for_assigned_slottables(
     });
 }
 
-/// What the shadow-including walk that clears stale layout boxes needs. The navigation is the style
-/// mirror's, read out of the arena by identity; clearing one node's box is the host's.
+/// What the shadow-including walk that clears stale layout boxes needs: the arena, whose style
+/// mirror the walk navigates by identity, and who answers the host calls freeing a box makes.
 #[derive(Clone, Copy)]
-struct StaleSubtreeHost {
+struct StaleSubtreeHost<'a> {
     arena: *mut LayoutNodeArena,
-    context: *mut c_void,
-    clear_stale_layout_node: unsafe extern "C" fn(*mut c_void, u32, u32) -> bool,
+    host_calls: HostCalls<'a>,
 }
 
-impl StaleSubtreeHost {
+impl StaleSubtreeHost<'_> {
     fn arena(&self) -> &LayoutNodeArena {
         // SAFETY: The arena outlives every walk over it.
         unsafe { &*self.arena }
     }
 
-    /// Clears the stale layout box of `node`, answering whether its subtree survives with it.
+    /// Clears the stale layout box of `node`, and the boxes of its pseudo-elements, answering
+    /// whether its subtree survives with it, which only an SVG resource box's does.
+    /// `cleared_subtree_root` is the root of the subtree being cleared, or none when the clear is
+    /// not bounded to one.
     fn clear_stale_layout_node(&self, node: StyleNodeID, cleared_subtree_root: Option<StyleNodeID>) -> bool {
-        // SAFETY: The host remains live throughout the walk, and the identity names a live node.
-        unsafe {
-            (self.clear_stale_layout_node)(
-                self.context,
-                node.raw(),
-                cleared_subtree_root.map_or(0, StyleNodeID::raw),
-            )
+        self.arena().retire_layout_tree_update_marks_of_cleared_node(node);
+
+        let row = self.arena().bound_row(node);
+        if !row.is_invalid() {
+            // A resource box hangs under the element that references it rather than at its own DOM
+            // position.
+            if node_kind_is_svg_resource_box(self.arena().data(row).kind.get())
+                && svg_resource_box_survives(self.arena(), row, cleared_subtree_root)
+            {
+                return true;
+            }
+            // SAFETY: The arena handle is the one the walk was given, and the clear borrows the
+            // arena for itself.
+            unsafe { crate::painting::ffi::paintable_cleared_from_node(self.host_calls, self.arena, row) };
+            super::layout_node_arena::prepare_row_for_detach(self.host_calls, self.arena(), row);
+            self.arena().unbind_row(row);
+            let parent = self.arena().data(row).parent.get();
+            if !parent.is_invalid() {
+                assert!(self.arena().detach_from_parent(row));
+                self.host_calls.free_subtree(self.arena, row);
+                // The parent may keep its subtree (a child lost its box in place); an emptied
+                // container reads as having block-level children, like a freshly built one.
+                let arena = self.arena();
+                if arena.data(parent).first_child.get().is_invalid() {
+                    arena.set_node_flag(parent, NodeFlag::ChildrenAreInline, false);
+                }
+            }
+        }
+
+        if node.element_index().is_some() {
+            clear_synthetic_pseudo_element_boxes(self.host_calls, self.arena, node);
+        }
+        false
+    }
+}
+
+/// Detaches the top layer element `element`'s layout placement and clears every stale projected
+/// subtree of it. Called at DOM mutation processing time, outside layout tree construction.
+pub(crate) fn detach_top_layer_element_layout_subtree(
+    host_calls: HostCalls<'_>,
+    arena: *mut LayoutNodeArena,
+    element: StyleNodeID,
+) {
+    let host = StaleSubtreeHost { arena, host_calls };
+    let element_layout_node = host.arena().bound_row(element);
+    if !element_layout_node.is_invalid() {
+        let topmost = topmost_layout_node_of_top_layer_placement(arena, element_layout_node);
+        let layout_node_to_detach = if topmost.is_invalid() {
+            element_layout_node
+        } else {
+            topmost
+        };
+        super::layout_node_arena::prepare_subtree_for_detach(host_calls, host.arena(), layout_node_to_detach);
+        if host.arena().detach_from_parent(layout_node_to_detach) {
+            host_calls.free_subtree(arena, layout_node_to_detach);
         }
     }
+
+    clear_stale_subtree(host, element, StaleSubtreeClearScope::InclusiveBoundedToRoot);
+    clear_stale_assigned_slottables(host, element);
+}
+
+/// Whether the kind names a box laid out on behalf of an element that references it, rather than
+/// at its own place in the tree.
+fn node_kind_is_svg_resource_box(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::SVGPatternBox | NodeKind::SVGMaskBox | NodeKind::SVGClipBox
+    )
+}
+
+/// Every pseudo-element of the element gives up the box it holds, subtree and all.
+/// Detaches what is left of the boxes of the node `node` names as the node leaves the document, while its identity
+/// still names them. Its box is read until the parent's rebuild frees it, so its style record is pinned and its
+/// committed box cleared now. Its box's top layer placement is a viewport child rather than part of the parent's box
+/// subtree, so the parent's rebuild never reaches it, and it is detached and freed here. The rows are found by
+/// identity, so this makes no shell.
+pub(crate) fn detach_remaining_rows_for_removal(
+    host_calls: HostCalls<'_>,
+    arena: *mut LayoutNodeArena,
+    node: StyleNodeID,
+) {
+    // A pseudo-element's boxes are found through its generator's identity, so they go while the identity still finds
+    // them. A ::backdrop box sits outside the generator's box, so no rebuild of the parent would free it.
+    if node.element_index().is_some() {
+        clear_synthetic_pseudo_element_boxes(host_calls, arena, node);
+    }
+    // SAFETY: The render state holds the arena, and nothing else reaches it meanwhile.
+    let row = unsafe { &*arena }.bound_row(node);
+    if row.is_invalid() {
+        return;
+    }
+    // SAFETY: As above.
+    unsafe { &*arena }.pin_style_record_for_detachment(row);
+    // SAFETY: As above; the clear borrows the arena for itself.
+    unsafe { crate::painting::ffi::paintable_cleared_from_node(host_calls, arena, row) };
+    let top_layer_placement = topmost_layout_node_of_top_layer_placement(arena, row);
+    if !top_layer_placement.is_invalid() {
+        // SAFETY: As above; the shared borrow ends before the subtree is freed.
+        super::layout_node_arena::prepare_subtree_for_detach(host_calls, unsafe { &*arena }, top_layer_placement);
+        // SAFETY: As above.
+        let was_attached = unsafe { &*arena }.detach_from_parent(top_layer_placement);
+        assert!(was_attached, "a top layer placement is a viewport child");
+        host_calls.free_subtree(arena, top_layer_placement);
+    }
+}
+
+pub(crate) fn clear_synthetic_pseudo_element_boxes(
+    host_calls: HostCalls<'_>,
+    arena: *mut LayoutNodeArena,
+    node: StyleNodeID,
+) {
+    for generated_for in GENERATED_FOR_AFTER..=crate::layout::node_data::GENERATED_FOR_LAST_SYNTHETIC {
+        free_pseudo_element_box(host_calls, arena, node, generated_for);
+    }
+}
+
+/// The pseudo-element of kind `generated_for` on the element `node` gives up its box, subtree and
+/// all. Answers whether the box was attached under a parent, or none when there was no box.
+fn free_pseudo_element_box(
+    host_calls: HostCalls<'_>,
+    arena: *mut LayoutNodeArena,
+    node: StyleNodeID,
+    generated_for: u8,
+) -> Option<bool> {
+    // SAFETY: The arena outlives every walk over it.
+    let arena_ref = unsafe { &*arena };
+    let row = arena_ref.bound_pseudo_element_row(node, generated_for);
+    if row.is_invalid() {
+        return None;
+    }
+    let mut rows = Vec::new();
+    arena_ref.for_each_node_in_layout_subtree_in_pre_order(row, |row| rows.push(row));
+    for row in rows {
+        // SAFETY: The arena handle is the one the walk was given, and the clear borrows the arena
+        // for itself.
+        unsafe { crate::painting::ffi::paintable_cleared_from_node(host_calls, arena, row) };
+    }
+    super::layout_node_arena::prepare_subtree_for_detach(host_calls, arena_ref, row);
+    let was_attached = arena_ref.detach_from_parent(row);
+    host_calls.free_subtree(arena, row);
+    Some(was_attached)
 }
 
 /// Clears every stale layout node in the shadow-including subtree `root` names.
@@ -1831,34 +2146,9 @@ unsafe fn update_principal_node_descendants(
                 // they generate boxes as if they were siblings of the root element.
                 let prior_layout_top_layer = context.layout_top_layer;
                 context.layout_top_layer = true;
-                // SAFETY: The DOM document remains live and owns a stable top-layer list during this pass.
-                let count = unsafe { (host.callbacks.top_layer_element_count)(host.callbacks.builder) };
-                let mut top_layer_elements = vec![
-                    FfiIdentifiedDomNode {
-                        node: std::ptr::null_mut(),
-                        style_node: 0,
-                    };
-                    count
-                ];
-                // SAFETY: The output slice has room for the stable top-layer list reported above.
-                unsafe {
-                    (host.callbacks.copy_top_layer_elements)(
-                        host.callbacks.builder,
-                        top_layer_elements.as_mut_ptr(),
-                        count,
-                    );
-                }
-                for FfiIdentifiedDomNode {
-                    node: element,
-                    style_node,
-                } in top_layer_elements
-                {
-                    assert!(!element.is_null());
-                    // An element that was never styled has no identity, and the style store holds it
-                    // nowhere in the top layer.
-                    let Some(member) = StyleNodeID::from_raw(style_node) else {
-                        continue;
-                    };
+                // The walk below reads the store again, so the list is read a member at a time rather
+                // than borrowed across it.
+                for member in (0..).map_while(|index| host.arena().top_layer_element(index)) {
                     if !host.rendered_in_top_layer(Some(member)) {
                         continue;
                     }
@@ -2044,6 +2334,8 @@ struct PrincipalBoxConstruction {
     layout_node: LayoutNode,
     created_box: Option<UnplacedLayoutNode>,
     handled_display_contents: bool,
+    /// The box replaces its element's contents with a single image, whose provider it owns.
+    owns_content_replacement_image: bool,
 }
 
 impl PrincipalBoxConstruction {
@@ -2052,6 +2344,7 @@ impl PrincipalBoxConstruction {
             layout_node: NodeSlotId::INVALID,
             created_box: None,
             handled_display_contents: false,
+            owns_content_replacement_image: false,
         }
     }
 }
@@ -2082,6 +2375,7 @@ fn construct_principal_layout_node(
 ) -> PrincipalBoxConstruction {
     let host = update.host;
     let mut created_box = None;
+    let mut owns_content_replacement_image = false;
     // The box this visit leaves the node with: the one it entered with when the node keeps it,
     // otherwise the one the host just built. Nothing between the entry and here rebinds the node.
     let mut layout_node = NodeSlotId::INVALID;
@@ -2108,14 +2402,49 @@ fn construct_principal_layout_node(
                 layout_host.free_subtree(old_backdrop);
             }
         }
-        // SAFETY: The builder remains live, and the identity names a live element.
-        unsafe {
-            (host.callbacks.prepare_principal_element)(
-                host.callbacks.builder,
-                update.identity.raw(),
-                should_create_layout_node,
-            );
+        let element = update.identity;
+        if should_create_layout_node {
+            // The box is built again from scratch, so every pseudo-element box it holds goes.
+            clear_synthetic_pseudo_element_boxes(host.host_calls(), host.arena, element);
+        } else if host.arena().layout_tree_update_reuse_reasons(element)
+            & layout_tree_update_reuse_reason::PSEUDO_ELEMENT_CHANGE
+            != 0
+        {
+            // The box stays and only its generated content is regenerated, which is the ::before
+            // and ::after boxes and nothing else.
+            for generated_for in [GENERATED_FOR_BEFORE, GENERATED_FOR_AFTER] {
+                let freed = free_pseudo_element_box(host.host_calls(), host.arena, element, generated_for);
+                assert!(
+                    freed != Some(false),
+                    "a regenerated pseudo-element's box was not attached"
+                );
+            }
+            let box_kept = host.arena().bound_row(element);
+            if host.layout().first_child(box_kept).is_invalid() {
+                host.layout().set_children_are_inline(box_kept, false);
+            }
         }
+        let published_record = || {
+            host.arena()
+                .with_style_store(|engine| engine.element_published_style_record(element))
+        };
+        let Some(record) = published_record() else {
+            assert!(
+                should_create_layout_node,
+                "an element whose box stays has published its style"
+            );
+            // Nothing published a style for the element, so a bypass path reached it without the
+            // style update settling it. It gets no box in this build: the document styles it once
+            // the build is over, and builds its box in the next one.
+            update.state.reports.push(crate::layout::commit::FfiCommitMessage::new(
+                element.raw(),
+                crate::layout::commit::FfiCommitMessageKind::UnstyledElementReached,
+            ));
+            update.state.reached_unstyled_element = true;
+            return PrincipalBoxConstruction::none();
+        };
+        // The record the box is built from is held for the whole build.
+        update.state.pin_style_record_for_build(host.arena(), record);
         let display = host.published_display(update.style_node);
         let generation = principal_box_generation_decision(
             true,
@@ -2151,17 +2480,26 @@ fn construct_principal_layout_node(
                 context.layout_svg_mask_or_clip_path,
                 context.layout_svg_pattern,
             );
-            // SAFETY: The builder remains live, and the identity names a live element.
-            let created = unsafe {
-                (host.callbacks.create_principal_element_layout)(
-                    host.callbacks.builder,
-                    update.identity.raw(),
-                    layout_kind,
-                )
+            let box_kind = host.layout().arena().element_box_kind(update.style_node);
+            let kind = match layout_kind {
+                FfiElementLayoutKind::ContentReplacement => Some(NodeKind::ImageBox),
+                FfiElementLayoutKind::SvgMask => Some(NodeKind::SVGMaskBox),
+                FfiElementLayoutKind::SvgClipPath => Some(NodeKind::SVGClipBox),
+                FfiElementLayoutKind::SvgPattern => Some(NodeKind::SVGPatternBox),
+                FfiElementLayoutKind::Normal => {
+                    let facts = host
+                        .layout()
+                        .arena()
+                        .published_box_facts(update.style_node)
+                        .expect("an element the walk builds a box for has published its style");
+                    node_kind_for_element_box_kind(box_kind, facts.display, facts.appearance)
+                }
             };
-            layout_node = created;
-            if !created.is_invalid() {
+            if let Some(kind) = kind {
+                let created = host.layout().create_element_box(update.identity, kind);
+                layout_node = created;
                 created_box = Some(host.layout().created(created));
+                owns_content_replacement_image = layout_kind == FfiElementLayoutKind::ContentReplacement;
             }
             if matches!(
                 layout_kind,
@@ -2178,8 +2516,12 @@ fn construct_principal_layout_node(
         }
     } else if should_create_layout_node {
         if update.kind.is_document() {
-            // SAFETY: The builder and its document remain live throughout construction.
-            let created = unsafe { (host.callbacks.create_principal_document_layout)(host.callbacks.builder) };
+            let document_style = update
+                .state
+                .document_style
+                .take()
+                .expect("a build that builds the viewport is handed the document's style");
+            let created = host.layout().create_document_box(document_style);
             layout_node = created;
             created_box = Some(host.layout().created(created));
         } else if update.kind.is_text() {
@@ -2191,9 +2533,7 @@ fn construct_principal_layout_node(
                 layout_host.arena().text_is_ascii_whitespace(update.style_node),
                 facts.parent_collapses_whitespace,
             );
-            // SAFETY: The builder remains live, and the identity names a live text node.
-            let text_layout_node =
-                unsafe { (host.callbacks.create_principal_text_layout)(host.callbacks.builder, update.identity.raw()) };
+            let text_layout_node = layout_host.create_text_box(update.identity);
             if needs_style_wrapper {
                 let wrapper = layout_host.create_anonymous_box_from_style_record(
                     facts.style_record,
@@ -2219,6 +2559,7 @@ fn construct_principal_layout_node(
         layout_node,
         created_box,
         handled_display_contents: false,
+        owns_content_replacement_image,
     }
 }
 
@@ -2268,9 +2609,12 @@ fn update_principal_node_after_entry(
     if !construction.layout_node.is_invalid() {
         let layout_node = construction.layout_node;
         if update.kind.is_element() || update.kind.is_document() {
-            // SAFETY: The builder remains live, and the box is a live NodeWithStyle for elements and
-            // documents.
-            unsafe { (host.callbacks.attach_style_resources)(host.callbacks.builder, layout_node) };
+            host.arena().owe_image_resources(
+                layout_node,
+                OwedImageResources::StyleResources {
+                    owns_content_replacement_image: construction.owns_content_replacement_image,
+                },
+            );
         }
 
         let starts_new_subtree = entry_decision.should_create_layout_node && update.state.new_subtree_root.is_invalid();
@@ -2286,7 +2630,7 @@ fn update_principal_node_after_entry(
         let adjustment = replaced_element_display_adjustment(&host.layout(), layout_node);
         if adjustment != FfiReplacedElementDisplayAdjustment::None {
             // SAFETY: The box the host just built is a live NodeWithStyle.
-            apply_replaced_display_adjustment(host.layout().arena(), layout_node, adjustment);
+            apply_replaced_display_adjustment(host.host_calls(), host.layout().arena(), layout_node, adjustment);
         }
 
         let old_layout_node = update.old_layout_node;
@@ -2392,13 +2736,7 @@ fn update_principal_node_after_entry(
                     arena.set_committed_fragment_link(new_data, link, None);
                 }
                 transfer_fragments_to_replacement_box(arena, old_layout_node, layout_node);
-                // SAFETY: The old layout node is still attached and still has its shell.
-                unsafe {
-                    (layout_host.callbacks.prepare_subtree_for_detach)(
-                        layout_host.callbacks.context,
-                        layout_host.shell(old_layout_node),
-                    );
-                }
+                super::layout_node_arena::prepare_subtree_for_detach(layout_host.host_calls(), arena, old_layout_node);
                 let old_parent = layout_host.parent(old_layout_node);
                 assert!(!old_parent.is_invalid());
                 let replaced_old_box = arena.replace_child(
@@ -2564,145 +2902,6 @@ pub struct FfiLayoutTreeBuildOutcome {
     pub needs_another_build_pass: bool,
 }
 
-/// Builds or incrementally updates a document's layout tree and applies table fixup.
-///
-/// # Safety
-///
-/// The callback table, arena, and document must remain valid for the duration of the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_build_layout_tree(
-    callbacks: *const FfiDomTreeBuilderCallbacks,
-    arena: *mut c_void,
-    document: *mut c_void,
-    document_style_node: u32,
-) -> FfiLayoutTreeBuildOutcome {
-    assert!(!document.is_null());
-    // SAFETY: Guaranteed by the entry point's contract.
-    let host = unsafe { dom_tree_builder_host(callbacks, arena) };
-    let document_identity =
-        StyleNodeID::from_raw(document_style_node).expect("a document that lays out is named in the style mirror");
-    let mut state = TreeBuilderState::default();
-    let mut context = TreeBuilderContext {
-        document_needs_full_layout_tree_update: host.layout().arena().needs_full_layout_tree_update(),
-        ..Default::default()
-    };
-    // Whether the document already had a viewport, read before the build replaces it.
-    let document_had_layout_node = !host.layout().arena().layout_root().is_invalid();
-
-    update_layout_tree_from(
-        &host,
-        &mut state,
-        document_identity,
-        &mut context,
-        false,
-        FfiInsertionMode::Append,
-        true,
-    );
-
-    let document_layout_node = host.layout().arena().layout_root();
-    let rebuilt_subtrees_were_updated_individually = !document_layout_node.is_invalid()
-        && !(context.document_needs_full_layout_tree_update
-            || !document_had_layout_node
-            || state.layout_tree_update_escaped_rebuild_roots);
-    if !document_layout_node.is_invalid() {
-        let layout_host = host.layout();
-        if rebuilt_subtrees_were_updated_individually {
-            fixup_tables_in_rebuilt_subtrees(
-                &layout_host,
-                &state.rebuilt_subtree_roots,
-                &state.reused_child_list_update_roots,
-                &state.additional_table_fixup_roots,
-            );
-        } else {
-            layout_host.arena().set_needs_full_scrollable_overflow_recalculation();
-            fixup_tables(&layout_host, document_layout_node);
-        }
-
-        // https://drafts.csswg.org/css-scrollbars/#scrollbar-width
-        // UAs must apply the scrollbar-color value set on the root element to the viewport.
-        // The document element is the document's only DOM child the style mirror holds: a doctype, a
-        // comment and a processing instruction hold no place in its child sequence, and a document
-        // can have no text child.
-        let root_layout_node = host
-            .first_dom_child(document_identity)
-            .map_or(NodeSlotId::INVALID, |document_element| {
-                layout_host.arena().bound_row(document_element)
-            });
-        if !root_layout_node.is_invalid() {
-            let scrollbar_width = layout_host
-                .style(root_layout_node)
-                .expect("the document element's box publishes its style during the build")
-                .misc_reset()
-                .scrollbar_width;
-            layout_host
-                .arena()
-                .update_layout_style(document_layout_node, |style| style.set_scrollbar_width(scrollbar_width));
-        }
-    }
-
-    for &element in &state.layout_tree_rebuild_requests {
-        // A request that names no element asks for the whole tree, which the arena answers itself.
-        let Some(element) = element else {
-            host.layout().arena().set_needs_full_layout_tree_update(true);
-            continue;
-        };
-        state.reports.push(crate::layout::commit::FfiCommitMessage::new(
-            element.raw(),
-            crate::layout::commit::FfiCommitMessageKind::LayoutTreeRebuildRequested,
-        ));
-    }
-
-    // What the build found out goes to the document now that the walk that could clear DOM update
-    // flags is complete, in the order the build found it out.
-    if !state.reports.is_empty() {
-        let layout_host = host.layout().arena().layout_host();
-        // SAFETY: The document outlives the build, and no arena borrow is held here.
-        unsafe {
-            (layout_host.deliver_commit_messages)(layout_host.context, state.reports.as_ptr(), state.reports.len());
-        }
-    }
-
-    if rebuilt_subtrees_were_updated_individually {
-        let layout_host = host.layout();
-        let attached_roots = layout_host
-            .arena()
-            .derive_facts_after_tree_update(&state.rebuilt_subtree_roots);
-        layout_host
-            .arena()
-            .resolve_deferred_child_list_insertions(&attached_roots);
-    } else {
-        // NB: The full layout entry must derive the facts of this tree.
-        host.layout().arena().record_partial_relayout_escape();
-        host.layout()
-            .arena()
-            .resolve_deferred_child_list_insertions(&Default::default());
-    }
-
-    // Table fixup can free a rebuilt root after it was recorded, such as whitespace at the edge of a
-    // row group, so only the roots that are still live wait for the partial relayout plan.
-    let layout_host = host.layout();
-    let arena = layout_host.arena();
-    let live_rebuilt_subtree_roots: Vec<NodeSlotId> = state
-        .rebuilt_subtree_roots
-        .iter()
-        .copied()
-        .filter(|root| arena.slot_is_live(*root))
-        .collect();
-    let rebuilt_subtree_root_count = live_rebuilt_subtree_roots.len();
-    arena.set_pending_rebuilt_subtree_roots(
-        live_rebuilt_subtree_roots,
-        state.layout_tree_update_escaped_rebuild_roots,
-    );
-    let viewport = arena.layout_root();
-    assert!(!viewport.is_invalid(), "a layout tree build places the viewport");
-    FfiLayoutTreeBuildOutcome {
-        viewport,
-        rebuilt_subtree_root_count,
-        layout_tree_update_escaped_rebuild_roots: state.layout_tree_update_escaped_rebuild_roots,
-        needs_another_build_pass: !state.layout_tree_rebuild_requests.is_empty(),
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FfiReplacedElementDisplayAdjustment {
@@ -2725,11 +2924,9 @@ pub enum FfiPseudoElement {
     None,
 }
 
+/// What a record's `content` computes to: one of the two keywords the property takes, or a list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-// NB: `List` is constructed by C++ through the FFI.
-#[allow(dead_code)]
-pub enum FfiComputedContentType {
+pub enum ComputedContentType {
     Normal,
     None,
     List,
@@ -2744,12 +2941,12 @@ pub enum FfiPseudoElementDecision {
     Box,
 }
 
+/// What the build knows about a pseudo-element when it decides whether the pseudo-element gets a box.
 #[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiPseudoElementFacts {
+pub struct PseudoElementFacts {
     pub has_style: bool,
     pub pseudo_element: FfiPseudoElement,
-    pub content_type: FfiComputedContentType,
+    pub content_type: ComputedContentType,
     pub display_is_none: bool,
     pub display_is_contents: bool,
     pub display_is_list_item: bool,
@@ -2765,44 +2962,25 @@ pub struct FfiPseudoElementFacts {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum FfiGeneratedContentItemKind {
-    Text,
+pub enum FfiGeneratedImageKind {
     /// An `<image>` in the pseudo-element's `content` list.
     ContentImage,
-    /// The marker box's `list-style-image`.
+    /// A marker box's `list-style-image`.
     ListStyleImage,
 }
 
-/// One node the host allocates for the generated content of a pseudo-element.
+/// The image a generated image box shows.
+#[derive(Clone, Copy)]
 #[repr(C)]
-pub struct FfiGeneratedContentItem {
-    pub kind: FfiGeneratedContentItemKind,
-    /// For `Text`: the text, as an `AK::Utf16String` reference the host adopts.
-    pub text: usize,
+pub struct FfiGeneratedImage {
+    pub kind: FfiGeneratedImageKind,
     /// For `ContentImage`: the image's index in the `content` list.
     pub content_index: usize,
-    /// The list marker a list-item pseudo-element nests, when the item is that marker's content;
-    /// invalid for the pseudo-element's own content.
-    pub nested_marker: NodeSlotId,
+    /// For `ListStyleImage`: the marker box whose `list-style-image` it is.
+    pub marker: NodeSlotId,
 }
 
-#[repr(C)]
-pub struct FfiPseudoTreeBuilderCallbacks {
-    pub builder: *mut c_void,
-    pub initialize: unsafe extern "C" fn(*mut c_void, u32, FfiPseudoElement) -> FfiPseudoElementFacts,
-    /// The last argument is the list-item box a `::marker` belongs to, or an invalid slot when the
-    /// pseudo-element is not a marker.
-    pub create_layout_node:
-        unsafe extern "C" fn(*mut c_void, u32, FfiPseudoElement, FfiPseudoElementDecision, NodeSlotId) -> NodeSlotId,
-    /// The last argument of each of these is the pseudo-element's own box, which the build tracks
-    /// by slot.
-    pub create_nested_list_marker: unsafe extern "C" fn(*mut c_void, u32, FfiPseudoElement, NodeSlotId) -> NodeSlotId,
-    pub configure_layout_node: unsafe extern "C" fn(*mut c_void, u32, FfiPseudoElement, NodeSlotId),
-    pub create_content_item:
-        unsafe extern "C" fn(*mut c_void, u32, FfiPseudoElement, FfiGeneratedContentItem, NodeSlotId) -> NodeSlotId,
-}
-
-pub(crate) fn pseudo_element_decision(facts: FfiPseudoElementFacts) -> FfiPseudoElementDecision {
+pub(crate) fn pseudo_element_decision(facts: PseudoElementFacts) -> FfiPseudoElementDecision {
     abort_on_panic(|| {
         if !facts.has_style {
             return FfiPseudoElementDecision::None;
@@ -2818,19 +2996,19 @@ pub(crate) fn pseudo_element_decision(facts: FfiPseudoElementFacts) -> FfiPseudo
         if matches!(facts.pseudo_element, FfiPseudoElement::Before | FfiPseudoElement::After)
             && matches!(
                 facts.content_type,
-                FfiComputedContentType::Normal | FfiComputedContentType::None
+                ComputedContentType::Normal | ComputedContentType::None
             )
         {
             return FfiPseudoElementDecision::None;
         }
 
         // For ::marker with content 'none' -- do nothing.
-        if facts.pseudo_element == FfiPseudoElement::Marker && facts.content_type == FfiComputedContentType::None {
+        if facts.pseudo_element == FfiPseudoElement::Marker && facts.content_type == ComputedContentType::None {
             return FfiPseudoElementDecision::None;
         }
 
         if facts.pseudo_element == FfiPseudoElement::Marker
-            && facts.content_type == FfiComputedContentType::Normal
+            && facts.content_type == ComputedContentType::Normal
             && !facts.originating_list_box.is_invalid()
         {
             // https://www.w3.org/TR/css-lists-3/#content-property
@@ -2892,13 +3070,22 @@ fn counter_owner_of_pseudo_element(
 ) -> crate::layout::counters::CounterOwner {
     let generated_for = match pseudo_element {
         FfiPseudoElement::None => 0,
+        _ => generated_for_of(pseudo_element),
+    };
+    crate::layout::counters::CounterOwner { element, generated_for }
+}
+
+/// The pseudo-element a box-generating `FfiPseudoElement` names, as a row's `generated_for`.
+fn generated_for_of(pseudo_element: FfiPseudoElement) -> u8 {
+    match pseudo_element {
         FfiPseudoElement::Before => GENERATED_FOR_BEFORE,
         FfiPseudoElement::After => GENERATED_FOR_AFTER,
         FfiPseudoElement::Marker => GENERATED_FOR_MARKER,
         FfiPseudoElement::Backdrop => GENERATED_FOR_BACKDROP,
-        FfiPseudoElement::Other => unreachable!("only a box-generating pseudo-element owns counters"),
-    };
-    crate::layout::counters::CounterOwner { element, generated_for }
+        FfiPseudoElement::Other | FfiPseudoElement::None => {
+            unreachable!("only a box-generating pseudo-element has a box")
+        }
+    }
 }
 
 /// Tells the document the content of `owner` shows the `list-item` counter's value.
@@ -2915,31 +3102,236 @@ fn report_list_item_counter_rendering(
     }
 }
 
-fn generated_content_item(
-    item: crate::layout::generated_content::ContentItem,
-    nested_marker: NodeSlotId,
-) -> FfiGeneratedContentItem {
-    use crate::layout::generated_content::ContentItem;
-    match item {
-        ContentItem::Text(text) => FfiGeneratedContentItem {
-            kind: FfiGeneratedContentItemKind::Text,
-            text: ak::Utf16String::from_utf16(&text).into_raw(),
-            content_index: 0,
-            nested_marker,
-        },
-        ContentItem::Image(content_index) => FfiGeneratedContentItem {
-            kind: FfiGeneratedContentItemKind::ContentImage,
-            text: 0,
-            content_index,
-            nested_marker,
-        },
-        ContentItem::ListStyleImage => FfiGeneratedContentItem {
-            kind: FfiGeneratedContentItemKind::ListStyleImage,
-            text: 0,
-            content_index: 0,
-            nested_marker,
-        },
+/// What the style mirror published for the pseudo-element `pseudo_element` on `element`, for the
+/// build to decide whether it gets a box.
+fn published_pseudo_element_facts(
+    layout: &TreeBuilderHost<'_>,
+    element: StyleNodeID,
+    pseudo_element: FfiPseudoElement,
+) -> PseudoElementFacts {
+    let facts = PseudoElementFacts {
+        has_style: false,
+        pseudo_element,
+        content_type: ComputedContentType::None,
+        display_is_none: false,
+        display_is_contents: false,
+        display_is_list_item: false,
+        display_is_inline_flow: false,
+        has_content_replacement: false,
+        originating_list_box: NodeSlotId::INVALID,
+        normal_marker_has_content: false,
+        marker_position_is_inside: false,
+    };
+    let published = layout.arena().with_style_store(|engine| {
+        engine
+            .pseudo_published_style_view(element, pseudo_kind_of(generated_for_of(pseudo_element)))
+            .map(|view| {
+                let display = view.display();
+                PseudoElementFacts {
+                    has_style: true,
+                    content_type: if !view.content_is_keyword() {
+                        ComputedContentType::List
+                    } else if view.content_keyword_is_none() {
+                        ComputedContentType::None
+                    } else {
+                        ComputedContentType::Normal
+                    },
+                    display_is_none: display.is_none(),
+                    display_is_contents: display.is_contents(),
+                    display_is_list_item: display.is_list_item(),
+                    display_is_inline_flow: display.is_inline_outside() && display.is_flow_inside(),
+                    has_content_replacement: view.content_is_single_image(),
+                    ..facts
+                }
+            })
+    });
+    // A pseudo-element the mirror holds no record for generates nothing.
+    let Some(mut facts) = published else {
+        return facts;
+    };
+    // A ::marker belongs to the list item box its element was built as, and takes its position and
+    // its default content from that box's style.
+    if pseudo_element == FfiPseudoElement::Marker {
+        let originating_box = layout.arena().bound_row(element);
+        if !originating_box.is_invalid() && layout.data(originating_box).kind.get() == NodeKind::ListItemBox {
+            facts.originating_list_box = originating_box;
+            if let Some(list_style) = layout.style(originating_box) {
+                facts.normal_marker_has_content =
+                    !list_style.list_style_type_is_none() || list_style.list_style_image_is_set();
+                facts.marker_position_is_inside = list_style.list_style_position_is_inside();
+            }
+        }
     }
+    facts
+}
+
+/// The row a pseudo-element's box is built in, stamped from the record the style mirror published for
+/// the pseudo-element, and its layout node; none for a display that generates no box.
+fn stamp_pseudo_element_box_row(
+    layout_host: &TreeBuilderHost<'_>,
+    generator: StyleNodeID,
+    pseudo_element: FfiPseudoElement,
+    decision: FfiPseudoElementDecision,
+    facts: PseudoElementFacts,
+) -> Option<NodeSlotId> {
+    let generated_for = generated_for_of(pseudo_element);
+    let is_list_item_marker = decision == FfiPseudoElementDecision::Box && !facts.originating_list_box.is_invalid();
+    let kind = match decision {
+        FfiPseudoElementDecision::None => unreachable!("a pseudo-element that generates nothing gets no box"),
+        // The image box owns the image it replaces the pseudo-element's contents with.
+        FfiPseudoElementDecision::ContentReplacement => NodeKind::ImageBox,
+        // https://drafts.csswg.org/css-content-3/#content-property
+        // A pseudo-element whose contents are a content list is an inline box holding them.
+        FfiPseudoElementDecision::Contents => NodeKind::InlineNode,
+        FfiPseudoElementDecision::Box if is_list_item_marker => NodeKind::ListItemMarkerBox,
+        FfiPseudoElementDecision::Box => layout_host
+            .arena()
+            .with_style_store(|engine| {
+                engine
+                    .pseudo_published_style_view(generator, pseudo_kind_of(generated_for))
+                    .map(|view| view.display())
+            })
+            .and_then(node_kind_for_display)?,
+    };
+    // SAFETY: Entry points guarantee that the arena remains live, and callers hold no reference
+    // derived from it across the allocation.
+    let slot = unsafe { &mut *layout_host.arena }.allocate_unbound();
+    layout_host
+        .arena()
+        .stamp_pseudo_element_row(slot, kind, generator, generated_for);
+    if decision == FfiPseudoElementDecision::Contents {
+        layout_host
+            .arena()
+            .update_layout_style(layout_host.host_calls(), slot, |style| {
+                style.set_display(FfiDisplay::outside_and_inside(
+                    crate::css::css_enums::display_outside::INLINE,
+                    crate::css::css_enums::display_inside::FLOW,
+                    false,
+                ));
+            });
+    }
+    if is_list_item_marker {
+        layout_host
+            .arena()
+            .set_node_flag(slot, NodeFlag::ListMarkerIsInside, facts.marker_position_is_inside);
+    }
+    layout_host.note_style_of_built_row(slot, None);
+    Some(slot)
+}
+
+/// The row the list marker a list-item pseudo-element nests is built in, and its layout node. The
+/// marker belongs to the pseudo-element that nests it, not to the generator's own `::marker`, so it
+/// is generated for that pseudo-element and never becomes the `::marker`'s box.
+fn stamp_nested_list_marker_row(
+    host: &DomTreeBuilderHost<'_>,
+    generator: StyleNodeID,
+    pseudo_element: FfiPseudoElement,
+    list_item_box: NodeSlotId,
+) -> NodeSlotId {
+    let layout_host = host.layout();
+    let derived = layout_host.arena().with_style_engine(|engine| {
+        // The generator's own `::marker` record, which the engine derives for this read alone where the generator
+        // holds none. It answers one for every list item; should it not, the marker takes the generator's style.
+        let record = engine
+            .pseudo_published_style_record(generator, pseudo_kind_of(GENERATED_FOR_MARKER))
+            .or_else(|| {
+                let demand = RecordDemand::PseudoElement(
+                    FfiPseudoElementRecordDemand::ReadOnly,
+                    FfiDemandedPseudoElement::Marker,
+                );
+                let record = answer_record_demand(engine, generator, demand).record.style_record;
+                (record != 0).then_some(record)
+            })
+            .or_else(|| engine.element_published_style_record(generator))
+            .expect("a list item the build reaches has published its style");
+        // NB: Republishing the generator's own `::marker` record can retire its animation record while the nested
+        //     marker still refers to it. The marker takes a record of its own, copied from it.
+        LayoutStyle::from_record(engine, record).intern(engine)
+    });
+    // SAFETY: Entry points guarantee that the arena remains live, and callers hold no reference
+    // derived from it across the allocation.
+    let slot = unsafe { &mut *layout_host.arena }.allocate_unbound();
+    layout_host
+        .arena()
+        .stamp_anonymous_box(slot, NodeKind::ListItemMarkerBox, derived);
+    layout_host
+        .arena()
+        .set_node_generated_for(slot, generated_for_of(pseudo_element), Some(generator));
+    let marker_position_is_inside = layout_host
+        .style(list_item_box)
+        .is_some_and(ComputedValuesView::list_style_position_is_inside);
+    layout_host
+        .arena()
+        .set_node_flag(slot, NodeFlag::ListMarkerIsInside, marker_position_is_inside);
+    layout_host.note_style_of_built_row(slot, None);
+    layout_host.arena().owe_image_resources(
+        slot,
+        OwedImageResources::StyleResources {
+            owns_content_replacement_image: false,
+        },
+    );
+    slot
+}
+
+/// The row one item of a pseudo-element's generated content is built in, and its layout node. An
+/// image item takes the style of `style_box`, the pseudo-element's box or the marker it nests, as
+/// an inline box.
+fn create_generated_content_item(
+    host: &DomTreeBuilderHost<'_>,
+    generator: StyleNodeID,
+    pseudo_element: FfiPseudoElement,
+    item: crate::layout::generated_content::ContentItem,
+    style_box: NodeSlotId,
+) -> NodeSlotId {
+    use crate::layout::generated_content::ContentItem;
+    let layout_host = host.layout();
+    let image = match item {
+        ContentItem::Text(text) => {
+            let slot = layout_host.stamp_generated_text_box(&text);
+            layout_host
+                .arena()
+                .set_node_generated_for(slot, generated_for_of(pseudo_element), Some(generator));
+            return slot;
+        }
+        ContentItem::Image(content_index) => FfiGeneratedImage {
+            kind: FfiGeneratedImageKind::ContentImage,
+            content_index,
+            marker: NodeSlotId::INVALID,
+        },
+        ContentItem::ListStyleImage => FfiGeneratedImage {
+            kind: FfiGeneratedImageKind::ListStyleImage,
+            content_index: 0,
+            marker: style_box,
+        },
+    };
+    // https://drafts.csswg.org/css-content-3/#content-property
+    // For <image>, this is an inline anonymous replaced element.
+    let derived = layout_host.arena().derive_style_record_with_display(
+        layout_host.arena().node_style_record(style_box),
+        FfiDisplay::outside_and_inside(
+            crate::css::css_enums::display_outside::INLINE,
+            crate::css::css_enums::display_inside::FLOW,
+            false,
+        ),
+    );
+    // SAFETY: Entry points guarantee that the arena remains live, and callers hold no reference
+    // derived from it across the allocation.
+    let slot = unsafe { &mut *layout_host.arena }.allocate_unbound();
+    layout_host
+        .arena()
+        .stamp_anonymous_box(slot, NodeKind::ImageBox, derived);
+    layout_host
+        .arena()
+        .set_node_generated_for(slot, generated_for_of(pseudo_element), Some(generator));
+    layout_host.arena().owe_image_resources(
+        slot,
+        OwedImageResources::GeneratedImage {
+            generator,
+            pseudo_element,
+            image,
+        },
+    );
+    slot
 }
 
 fn create_pseudo_element(
@@ -2949,29 +3341,25 @@ fn create_pseudo_element(
     pseudo_element: FfiPseudoElement,
     insertion_mode: Option<FfiInsertionMode>,
 ) -> Option<UnplacedLayoutNode> {
-    let callbacks = &host.callbacks.pseudo;
-    let element = element_identity.raw();
-    // SAFETY: The builder remains live, and the identity names a live element.
-    let facts = unsafe { (callbacks.initialize)(callbacks.builder, element, pseudo_element) };
+    // The record the pseudo-element's boxes are built from is held for the whole build.
+    let record = host.arena().with_style_store(|engine| {
+        engine.pseudo_published_style_record(element_identity, pseudo_kind_of(generated_for_of(pseudo_element)))
+    });
+    if let Some(record) = record {
+        state.pin_style_record_for_build(host.arena(), record);
+    }
+    // The pseudo-element gives up the box it holds from an earlier build before the walk decides
+    // whether it gets a new one.
+    host.arena()
+        .clear_pseudo_element_box(element_identity, generated_for_of(pseudo_element));
+    let facts = published_pseudo_element_facts(&host.layout(), element_identity, pseudo_element);
     let decision = pseudo_element_decision(facts);
     if decision == FfiPseudoElementDecision::None {
         return None;
     }
 
-    // SAFETY: The builder remains live, and the identity names a live element.
-    let layout_node = unsafe {
-        (callbacks.create_layout_node)(
-            callbacks.builder,
-            element,
-            pseudo_element,
-            decision,
-            facts.originating_list_box,
-        )
-    };
-    if layout_node.is_invalid() {
-        return None;
-    }
     let layout_host = host.layout();
+    let layout_node = stamp_pseudo_element_box_row(&layout_host, element_identity, pseudo_element, decision, facts)?;
     let mut unplaced_box = Some(layout_host.created(layout_node));
 
     // https://drafts.csswg.org/css-lists-3/#list-style-position-outside
@@ -2986,20 +3374,23 @@ fn create_pseudo_element(
         layout_host.attach_child(list_item_box, unplaced_box.take().expect("the marker box"), first_child);
     }
 
-    // SAFETY: The builder remains live, and the box the host just built is a live NodeWithStyle.
-    unsafe { (host.callbacks.attach_style_resources)(host.callbacks.builder, layout_node) };
+    host.arena()
+        .stamp_pseudo_element_box(layout_node, element_identity, generated_for_of(pseudo_element));
+    host.arena().owe_image_resources(
+        layout_node,
+        OwedImageResources::StyleResources {
+            owns_content_replacement_image: decision == FfiPseudoElementDecision::ContentReplacement,
+        },
+    );
     if decision == FfiPseudoElementDecision::ContentReplacement {
         let adjustment = replaced_element_display_adjustment(&host.layout(), layout_node);
         if adjustment != FfiReplacedElementDisplayAdjustment::None {
             // SAFETY: The box the host just built is a live NodeWithStyle.
-            apply_replaced_display_adjustment(layout_host.arena(), layout_node, adjustment);
+            apply_replaced_display_adjustment(layout_host.host_calls(), layout_host.arena(), layout_node, adjustment);
         }
     }
 
     let initial_quote_nesting_level = state.quote_nesting_level;
-    // SAFETY: The builder remains live, the identity names a live element, and the box the host just
-    // built is a live NodeWithStyle.
-    unsafe { (callbacks.configure_layout_node)(callbacks.builder, element, pseudo_element, layout_node) };
     let layout_node_kind = layout_host.data(layout_node).kind.get();
     let is_outside_marker = layout_node_kind == NodeKind::ListItemMarkerBox && !facts.marker_position_is_inside;
     if let Some(insertion_mode) = insertion_mode
@@ -3021,12 +3412,8 @@ fn create_pseudo_element(
 
     // FIXME: This code actually computes style for element::marker, and shouldn't for element::pseudo::marker.
     if layout_node_kind == NodeKind::ListItemBox {
-        // SAFETY: The builder remains live, the identity names a live element, and the box the host just
-        // built is a live BlockContainer.
-        let marker = layout_host.created(unsafe {
-            (callbacks.create_nested_list_marker)(callbacks.builder, element, pseudo_element, layout_node)
-        });
-        let marker_slot = marker.slot();
+        let marker_slot = stamp_nested_list_marker_row(host, element_identity, pseudo_element, layout_node);
+        let marker = layout_host.created(marker_slot);
         let first_child = layout_host.first_child(layout_node);
         layout_host.attach_child(layout_node, marker, first_child);
         let marker_content = crate::layout::generated_content::resolve_nested_marker_content(
@@ -3036,19 +3423,9 @@ fn create_pseudo_element(
             layout_node,
         );
         report_list_item_counter_rendering(state, owner, marker_content.renders_list_item_counter_value);
-        // SAFETY: The builder remains live, and the identity names a live element.
-        let content = unsafe {
-            (callbacks.create_content_item)(
-                callbacks.builder,
-                element,
-                pseudo_element,
-                generated_content_item(marker_content.item, marker_slot),
-                layout_node,
-            )
-        };
-        if !content.is_invalid() {
-            layout_host.attach_child(marker_slot, layout_host.created(content), NodeSlotId::INVALID);
-        }
+        let content =
+            create_generated_content_item(host, element_identity, pseudo_element, marker_content.item, marker_slot);
+        layout_host.attach_child(marker_slot, layout_host.created(content), NodeSlotId::INVALID);
         layout_host.set_children_are_inline(marker_slot, true);
     }
 
@@ -3082,19 +3459,7 @@ fn create_pseudo_element(
             {
                 continue;
             }
-            // SAFETY: The builder remains live, and the identity names a live element.
-            let content_item = unsafe {
-                (callbacks.create_content_item)(
-                    callbacks.builder,
-                    element,
-                    pseudo_element,
-                    generated_content_item(item, NodeSlotId::INVALID),
-                    layout_node,
-                )
-            };
-            if content_item.is_invalid() {
-                continue;
-            }
+            let content_item = create_generated_content_item(host, element_identity, pseudo_element, item, layout_node);
             let current_parent = state.current_parent();
             let is_inline_outside = node_is_inline_outside(&layout_host, content_item);
             insert_node_into_inline_or_block_ancestor(
@@ -3158,35 +3523,22 @@ pub(crate) fn adjusted_table_display_for_replaced_element(
 }
 
 #[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiFirstLetterTarget {
-    pub text_node: *mut c_void,
+pub struct FirstLetterTarget {
     pub text_layout_node: NodeSlotId,
-    pub letter_start: usize,
     pub letter_end: usize,
     pub source_length: usize,
     pub found: bool,
 }
 
-impl FfiFirstLetterTarget {
+impl FirstLetterTarget {
     fn not_found() -> Self {
         Self {
-            text_node: std::ptr::null_mut(),
             text_layout_node: NodeSlotId::INVALID,
-            letter_start: 0,
             letter_end: 0,
             source_length: 0,
             found: false,
         }
     }
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiFirstLetterNodes {
-    pub wrapper: NodeSlotId,
-    pub first_letter_slice: NodeSlotId,
-    pub remainder_slice: NodeSlotId,
 }
 
 #[derive(Clone, Copy)]
@@ -3221,12 +3573,6 @@ pub(crate) enum FfiInsertionMode {
     InDomOrder,
 }
 
-#[repr(C)]
-pub struct FfiTreeBuilderCallbacks {
-    pub context: *mut c_void,
-    pub prepare_subtree_for_detach: unsafe extern "C" fn(*mut c_void, *mut c_void),
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TraversalDecision {
     Continue,
@@ -3235,8 +3581,8 @@ enum TraversalDecision {
 }
 
 struct TreeBuilderHost<'a> {
-    callbacks: &'a FfiTreeBuilderCallbacks,
     arena: *mut LayoutNodeArena,
+    work: &'a OwedHostWork,
 }
 
 fn node_has_flag(data: &NodeData, flag: NodeFlag) -> bool {
@@ -3335,7 +3681,7 @@ fn node_kind_is_text(kind: NodeKind) -> bool {
 /// Whether a row of this kind is a `Layout::NodeWithStyle`. A text row is not: it follows its
 /// parent's style rather than holding a record of its own, so a reader that wants the row's own
 /// box values must skip it.
-fn node_kind_is_node_with_style(kind: NodeKind) -> bool {
+pub(crate) fn node_kind_is_node_with_style(kind: NodeKind) -> bool {
     !node_kind_is_text(kind) && !matches!(kind, NodeKind::Unset | NodeKind::Node)
 }
 
@@ -3356,22 +3702,6 @@ pub extern "C" fn layout_node_kind_is_svg_box(kind: NodeKind) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn layout_node_kind_is_svg_graphics_box(kind: NodeKind) -> bool {
     svg_formatting_context::kind_is_svg_graphics_box(kind)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_node_is_atomic_inline(arena: *mut c_void, id: NodeSlotId) -> bool {
-    // SAFETY: The C++ caller keeps the arena alive for this synchronous call.
-    let arena = unsafe { LayoutNodeArena::from_handle(arena) };
-    let data = arena.data(id);
-    node_facts::node_is_atomic_inline(data, node_facts::node_style_view(data))
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_node_is_fragmented_inline(arena: *mut c_void, id: NodeSlotId) -> bool {
-    // SAFETY: The C++ caller keeps the arena alive for this synchronous call.
-    let arena = unsafe { LayoutNodeArena::from_handle(arena) };
-    let data = arena.data(id);
-    node_facts::node_is_fragmented_inline(data, node_facts::node_style_view(data))
 }
 
 fn node_is_generated_for_pseudo_element(data: &NodeData) -> bool {
@@ -3433,12 +3763,6 @@ impl TreeBuilderHost<'_> {
         })
     }
 
-    fn shell(&self, node: LayoutNode) -> *mut c_void {
-        let shell = self.arena().node_shell(node);
-        assert!(!shell.is_null());
-        shell
-    }
-
     fn set_children_are_inline(&self, node: LayoutNode, children_are_inline: bool) {
         self.arena()
             .set_node_flag(node, NodeFlag::ChildrenAreInline, children_are_inline);
@@ -3451,6 +3775,163 @@ impl TreeBuilderHost<'_> {
 
     fn created(&self, slot: NodeSlotId) -> UnplacedLayoutNode {
         UnplacedLayoutNode::new(slot)
+    }
+
+    /// The row an element's principal box of `kind` is built in, stamped with the style the
+    /// element published. A fieldset and a media element adjust their box as it is built.
+    fn create_element_box(&self, element: StyleNodeID, kind: NodeKind) -> NodeSlotId {
+        let slot = self.stamp_dom_box(kind, Some(element));
+        self.arena().stamp_published_style(slot, element);
+        match kind {
+            // https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements
+            // If the computed outer display type is inline, the fieldset is expected to behave as inline-block.
+            // Otherwise, it is expected to behave as flow-root. This does not change the computed value.
+            NodeKind::FieldSetBox => {
+                let display = self.style(slot).map(|style| style.display());
+                if let Some(display) = display.filter(FfiDisplay::is_flow_inside) {
+                    self.arena().update_layout_style(self.host_calls(), slot, |style| {
+                        style.set_display(FfiDisplay::outside_and_inside(
+                            display.outside,
+                            crate::css::css_enums::display_inside::FLOW_ROOT,
+                            false,
+                        ));
+                    });
+                }
+            }
+            // A media element renders the children of its shadow root, such as its controls.
+            NodeKind::AudioBox | NodeKind::VideoBox => {
+                let has_shadow_root = self.arena().shadow_root_of(element).is_some();
+                self.arena()
+                    .set_node_flag(slot, NodeFlag::ReplacedBoxCanHaveChildren, has_shadow_root);
+            }
+            _ => {}
+        }
+        self.note_style_of_built_row(slot, Some(element));
+        slot
+    }
+
+    /// The row a piece of generated text is rendered from, which names no DOM node and carries no
+    /// style of its own.
+    fn stamp_generated_text_box(&self, text: &[u16]) -> NodeSlotId {
+        // SAFETY: Entry points guarantee that the arena remains live, and callers hold no reference
+        // derived from it across the allocation.
+        let arena = unsafe { &mut *self.arena };
+        let slot = arena.allocate_unbound();
+        arena.stamp_generated_text_row(slot, ak::Utf16String::from_utf16(text));
+        slot
+    }
+
+    /// Stamps a row for a DOM node, or for the document with no identity, and makes it the node's
+    /// row.
+    fn stamp_dom_box(&self, kind: NodeKind, style_node: Option<StyleNodeID>) -> NodeSlotId {
+        // SAFETY: Entry points guarantee that the arena remains live, and callers hold no reference
+        // derived from it across the allocation.
+        let slot = unsafe { &mut *self.arena }.allocate_unbound();
+        self.arena().stamp_dom_row(slot, kind, style_node);
+        self.arena().take_over_rows_of_bound_node(slot);
+        slot
+    }
+
+    /// The row a text node's box is built in, stamped out of the text node's identity.
+    fn create_text_box(&self, style_node: StyleNodeID) -> NodeSlotId {
+        let slot = self.stamp_dom_box(NodeKind::TextNode, Some(style_node));
+        self.stamp_text_row_facts(slot, style_node);
+        slot
+    }
+
+    /// What giving a row its style tells the rest of the document: which scroll containers
+    /// snapping may happen in, with the root element's box standing in for the viewport, and what
+    /// an element's highlight pseudo-element styles paint highlighted text with. None of it needs
+    /// the row's layout node.
+    fn note_style_of_built_row(&self, slot: NodeSlotId, element: Option<StyleNodeID>) {
+        if let Some(element) = element
+            && self.holds_highlight_style(element)
+        {
+            crate::painting::selection::note_built_row_highlight_pseudo_styles(self.arena(), slot, element);
+        }
+        if self.arena().node_flags(slot) & NodeFlag::IsDocumentElement as u32 != 0 {
+            let viewport = self.arena().bound_viewport_row();
+            if !viewport.is_invalid() {
+                self.arena().note_built_scroll_container(viewport);
+            }
+        } else if node_facts::kind_and_style_make_scroll_container(self.data(slot).kind.get(), self.style(slot)) {
+            self.arena().note_built_scroll_container(slot);
+        }
+    }
+
+    /// A text row is stamped with whether an empty text produces a line box fragment, which text
+    /// controls and editing hosts rely on: the fragment keeps the line box alive with real font
+    /// metrics, giving the caret an anchor to paint at and the control its baseline. The document
+    /// restamps it when editability changes. Under an element with a highlight pseudo-element style
+    /// and no box of its own, the row takes that style's paint facts itself.
+    fn stamp_text_row_facts(&self, slot: NodeSlotId, text: StyleNodeID) {
+        use crate::css::style::bridge::element_construction_fact::{IS_EDITING_HOST, IS_HTML_INPUT_ELEMENT};
+        let is_in_user_agent_shadow_tree =
+            self.arena().node_flags(slot) & NodeFlag::IsInUserAgentShadowTree as u32 != 0;
+        let (produces_line_box_fragment_when_empty, parent_element) = self.arena().with_style_store(|engine| {
+            let tree = engine.tree();
+            let parent = tree.text_parent(text);
+            let parent_element = parent.filter(|parent| parent.element_index().is_some());
+            let parent_is_editing_host =
+                parent_element.is_some_and(|parent| engine.element_construction_facts(parent) & IS_EDITING_HOST != 0);
+            // NB: Tree relations are keyed by element identity, so the walk to the host starts at the
+            //     text's parent.
+            let is_in_text_control = is_in_user_agent_shadow_tree
+                && parent
+                    .and_then(|parent| tree.shadow_host_of(parent))
+                    .is_some_and(|host| {
+                        engine.element_construction_facts(host) & IS_HTML_INPUT_ELEMENT != 0
+                            || engine.element_box_kind(host) == ElementBoxKind::TextArea
+                    });
+            (parent_is_editing_host || is_in_text_control, parent_element)
+        });
+        self.arena().set_node_flag(
+            slot,
+            NodeFlag::ProducesLineBoxFragmentWhenEmpty,
+            produces_line_box_fragment_when_empty,
+        );
+        if let Some(parent) = parent_element
+            && self.holds_highlight_style(parent)
+            && self.arena().bound_row(parent).is_invalid()
+        {
+            crate::painting::selection::note_built_row_highlight_pseudo_styles(self.arena(), slot, parent);
+        }
+    }
+
+    /// Whether the element published a record for a highlight pseudo-element. An element whose own
+    /// rules style no `::selection` still holds one inherited from an ancestor's, which the
+    /// published pseudo-element mask does not show.
+    fn holds_highlight_style(&self, element: StyleNodeID) -> bool {
+        self.arena().with_style_store(|engine| {
+            crate::painting::selection::HighlightPseudoElement::ALL
+                .iter()
+                .any(|highlight| {
+                    engine
+                        .pseudo_published_style_record(element, highlight.pseudo_kind())
+                        .is_some()
+                })
+        })
+    }
+
+    /// The row the document's viewport is built in, stamped out of its kind and the document's
+    /// style the build was handed.
+    fn create_document_box(&self, document_style: DerivedStyleRecord) -> NodeSlotId {
+        let slot = self.stamp_dom_box(NodeKind::Viewport, None);
+        // The viewport is the document's row, painted with what the document published and named
+        // by the document's name.
+        let document = self
+            .arena()
+            .document_style_node()
+            .expect("a build names the document it lays out");
+        self.arena().stamp_dom_paint_facts(slot, document);
+        let unique_node_id = self
+            .arena()
+            .with_style_store(|engine| engine.element_unique_node_id(document));
+        self.arena().unique_node_ids().publish(slot, unique_node_id);
+        self.arena()
+            .apply_reinherited_style_record(self.host_calls(), slot, document_style);
+        self.arena().note_built_scroll_container(slot);
+        slot
     }
 
     fn create_anonymous_box(
@@ -3483,8 +3964,14 @@ impl TreeBuilderHost<'_> {
         let slot = unsafe { &mut *self.arena }.allocate_unbound();
         self.arena().stamp_anonymous_box(slot, node_kind, derived);
         self.arena().refresh_insets_use_anchor_functions_flag(slot);
+        // An anonymous inline box takes its style from its parent, so it may name images too.
         if node_kind == NodeKind::InlineNode {
-            assert!(!self.arena().node_shell(slot).is_null());
+            self.arena().owe_image_resources(
+                slot,
+                OwedImageResources::StyleResources {
+                    owns_content_replacement_image: false,
+                },
+            );
         }
         UnplacedLayoutNode::new(slot)
     }
@@ -3518,7 +4005,11 @@ impl TreeBuilderHost<'_> {
     }
 
     fn free_subtree(&self, node: LayoutNode) {
-        free_subtree_and_destroy_shells(self.arena, node);
+        self.host_calls().free_subtree(self.arena, node);
+    }
+
+    fn host_calls(&self) -> HostCalls<'_> {
+        HostCalls(self.work)
     }
 
     fn parent(&self, node: LayoutNode) -> LayoutNode {
@@ -4040,7 +4531,7 @@ pub(crate) fn find_first_letter_in_text(
     preserves_segment_breaks: bool,
     next_grapheme_boundary: impl Fn(usize) -> usize,
     code_point_facts: impl Fn(u32) -> FfiCodePointCategoryFacts,
-) -> FfiFirstLetterTarget {
+) -> FirstLetterTarget {
     // NB: Matches the first-letter text pattern: (P (Zs|P)*)? (L|N|S) ((Zs|P-(Ps|Pd))* (P-(Ps|Pd))?)?
 
     let code_units = text.len();
@@ -4052,7 +4543,7 @@ pub(crate) fn find_first_letter_in_text(
         // When white-space preserves segment breaks, a newline before any letter puts the letter on a later line, so
         // the first formatted line is empty and ::first-letter must not match.
         if preserves_segment_breaks && (starting_code_point == b'\n' as u32 || starting_code_point == b'\r' as u32) {
-            return FfiFirstLetterTarget::not_found();
+            return FirstLetterTarget::not_found();
         }
 
         let starting_facts = code_point_facts(starting_code_point);
@@ -4082,10 +4573,8 @@ pub(crate) fn find_first_letter_in_text(
         // The letter (L|N|S) must follow the preceding group. If the preceding punctuation consumed the entire text
         // node, accept it as the first-letter.
         if cursor >= code_units {
-            return FfiFirstLetterTarget {
-                text_node: std::ptr::null_mut(),
+            return FirstLetterTarget {
                 text_layout_node: NodeSlotId::INVALID,
-                letter_start: match_start,
                 letter_end: cursor,
                 source_length: code_units,
                 found: true,
@@ -4120,24 +4609,21 @@ pub(crate) fn find_first_letter_in_text(
             letter_end = next_grapheme_boundary(letter_end);
         }
 
-        return FfiFirstLetterTarget {
-            text_node: std::ptr::null_mut(),
+        return FirstLetterTarget {
             text_layout_node: NodeSlotId::INVALID,
-            letter_start: match_start,
             letter_end,
             source_length: code_units,
             found: true,
         };
     }
-    FfiFirstLetterTarget::not_found()
+    FirstLetterTarget::not_found()
 }
 
-fn find_first_letter_in_layout_text(host: &TreeBuilderHost<'_>, node: LayoutNode) -> FfiFirstLetterTarget {
-    // SAFETY: Tree building owns the arena, and no borrow crosses the source callback.
-    let source = unsafe { super::rendered_text::text_source_for_node(host.arena, node) };
-    // SAFETY: Copy the raw source before any further host call. First-letter
-    // matching determines source ranges before text transforms are applied.
-    let text = unsafe { source.text.to_utf16() }.expect("first-letter source carries no storage");
+fn find_first_letter_in_layout_text(host: &TreeBuilderHost<'_>, node: LayoutNode) -> FirstLetterTarget {
+    // First-letter matching determines source ranges before text transforms are applied, so it reads
+    // the published characters rather than the rendered ones.
+    let source = host.arena().published_text_source(node, false);
+    let text = source.data.to_utf16();
     let segmenter = GraphemeSegmenter::new(&text);
     let preserves_segment_breaks = matches!(
         host.style(host.parent(node))
@@ -4156,36 +4642,95 @@ fn find_first_letter_in_layout_text(host: &TreeBuilderHost<'_>, node: LayoutNode
         },
     );
     if target.found {
-        target.text_node = host.shell(node);
         target.text_layout_node = node;
     }
     target
 }
 
-fn create_first_letter_boxes(host: &DomTreeBuilderHost<'_>, element: StyleNodeID, target: FfiFirstLetterTarget) {
+fn create_first_letter_boxes(host: &DomTreeBuilderHost<'_>, element: StyleNodeID, target: FirstLetterTarget) {
     let layout_host = host.layout();
-    // SAFETY: `element` names a live Element and `target` identifies a live descendant text node.
-    let nodes = unsafe { (host.callbacks.create_first_letter_nodes)(host.callbacks.builder, element.raw(), target) };
-    let first_letter_slice = layout_host.created(nodes.first_letter_slice);
-    let remainder_slice = layout_host.created(nodes.remainder_slice);
-    if nodes.wrapper.is_invalid() {
+    let text_node = target.text_layout_node;
+    let slices_a_dom_text_node = layout_host.data(text_node).kind.get() == NodeKind::TextNode;
+
+    // The first-letter and remainder boxes render slices of the same DOM text node. Generated text
+    // has no DOM node, and gets plain generated slices of its characters instead.
+    let (first_letter_slice, remainder_slice) = if slices_a_dom_text_node {
+        // The remainder takes the text node's rows over, and the first letter's slice renders the
+        // same node without becoming the row the node is bound to.
+        let text = layout_host.arena().node_style_node(text_node);
+        let remainder_slice = layout_host.stamp_dom_box(NodeKind::TextNode, text);
+        // SAFETY: Entry points guarantee that the arena remains live, and callers hold no reference
+        // derived from it across the allocation.
+        let first_letter_slice = unsafe { &mut *layout_host.arena }.allocate_unbound();
+        layout_host
+            .arena()
+            .stamp_dom_row(first_letter_slice, NodeKind::TextNode, text);
+        layout_host
+            .arena()
+            .note_rows_share_dom_node(remainder_slice, first_letter_slice);
+        (first_letter_slice, remainder_slice)
+    } else {
+        let source = layout_host.arena().published_text_source(text_node, false).data;
+        let source = source.to_utf16();
+        let letter_end = target.letter_end.min(source.len());
+        (
+            layout_host.stamp_generated_text_box(&source[..letter_end]),
+            layout_host.stamp_generated_text_box(&source[letter_end..]),
+        )
+    };
+    if let Some(text) = layout_host.arena().node_style_node(first_letter_slice) {
+        for slice in [first_letter_slice, remainder_slice] {
+            layout_host.stamp_text_row_facts(slice, text);
+        }
+    }
+    let first_letter_slice_slot = first_letter_slice;
+    let remainder_slice_slot = remainder_slice;
+    let first_letter_slice = layout_host.created(first_letter_slice);
+    let remainder_slice = layout_host.created(remainder_slice);
+
+    let wrapper_kind = layout_host
+        .arena()
+        .with_style_store(|engine| {
+            engine
+                .pseudo_published_style_view(element, pseudo_kind_of(GENERATED_FOR_FIRST_LETTER))
+                .map(|view| view.display())
+        })
+        .and_then(node_kind_for_display);
+    let Some(wrapper_kind) = wrapper_kind else {
+        // A `::first-letter` whose display generates no box leaves the text it matched alone.
         layout_host.free_unplaced(first_letter_slice);
         layout_host.free_unplaced(remainder_slice);
         return;
-    }
-    if layout_host.data(nodes.remainder_slice).kind.get() == NodeKind::TextNode {
-        // SAFETY: The host callback has returned and no arena borrow survives it.
+    };
+    if slices_a_dom_text_node {
+        // SAFETY: No arena borrow survives into the call.
         // Initialize the source ranges before attaching or rendering either slice.
         unsafe { &mut *layout_host.arena }.set_first_letter_slices(
-            nodes.first_letter_slice,
-            nodes.remainder_slice,
+            first_letter_slice_slot,
+            remainder_slice_slot,
             target.letter_end,
             target.source_length,
         );
     }
-    let wrapper = layout_host.created(nodes.wrapper);
-    let wrapper_slot = wrapper.slot();
-    let text_node = target.text_layout_node;
+
+    // SAFETY: Entry points guarantee that the arena remains live, and callers hold no reference
+    // derived from it across the allocation.
+    let wrapper_slot = unsafe { &mut *layout_host.arena }.allocate_unbound();
+    layout_host
+        .arena()
+        .stamp_pseudo_element_row(wrapper_slot, wrapper_kind, element, GENERATED_FOR_FIRST_LETTER);
+    layout_host.note_style_of_built_row(wrapper_slot, None);
+    layout_host.arena().owe_image_resources(
+        wrapper_slot,
+        OwedImageResources::StyleResources {
+            owns_content_replacement_image: false,
+        },
+    );
+    host.arena()
+        .clear_pseudo_element_box(element, GENERATED_FOR_FIRST_LETTER);
+    host.arena()
+        .stamp_pseudo_element_box(wrapper_slot, element, GENERATED_FOR_FIRST_LETTER);
+    let wrapper = layout_host.created(wrapper_slot);
     let parent = layout_host.parent(text_node);
     assert!(!parent.is_invalid());
     layout_host.set_children_are_inline(wrapper_slot, true);
@@ -4201,12 +4746,12 @@ fn is_marker_content(data: &NodeData) -> bool {
 }
 
 // https://drafts.csswg.org/css-pseudo-4/#first-letter-application
-fn find_first_letter_in_block(host: &DomTreeBuilderHost<'_>, block: LayoutNode) -> FfiFirstLetterTarget {
+fn find_first_letter_in_block(host: &DomTreeBuilderHost<'_>, block: LayoutNode) -> FirstLetterTarget {
     let layout_host = host.layout();
     // NB: This walks a block container's inline descendants looking for the first-letter text. If the block has block
     //     children instead of inline, recurses into each in-flow block child in turn.
     if node_has_flag(layout_host.data(block), NodeFlag::ChildrenAreInline) {
-        let mut result = FfiFirstLetterTarget::not_found();
+        let mut result = FirstLetterTarget::not_found();
         let mut is_root = true;
         layout_host.for_each_in_inclusive_subtree(block, |node| {
             if is_root {
@@ -4260,7 +4805,7 @@ fn find_first_letter_in_block(host: &DomTreeBuilderHost<'_>, block: LayoutNode) 
         }
         child = layout_host.next_sibling(child);
     }
-    FfiFirstLetterTarget::not_found()
+    FirstLetterTarget::not_found()
 }
 
 fn wrap_button_contents_if_needed(host: &TreeBuilderHost<'_>, layout_node: LayoutNode) {
@@ -4349,12 +4894,13 @@ fn wrap_fieldset_contents_if_needed(host: &TreeBuilderHost<'_>, layout_node: Lay
             overflow_x: style.box_values().overflow_x,
             overflow_y: style.box_values().overflow_y,
         };
-        host.arena().update_layout_style(layout_node, |style| {
-            style.set_overflow(
-                crate::css::css_enums::overflow::VISIBLE,
-                crate::css::css_enums::overflow::VISIBLE,
-            );
-        });
+        host.arena()
+            .update_layout_style(host.host_calls(), layout_node, |style| {
+                style.set_overflow(
+                    crate::css::css_enums::overflow::VISIBLE,
+                    crate::css::css_enums::overflow::VISIBLE,
+                );
+            });
         let wrapper = host.create_anonymous_box(
             layout_node,
             AnonymousStyleKind::FieldsetContentWrapper,
@@ -4430,7 +4976,7 @@ fn is_tabular_container(host: &TreeBuilderHost<'_>, node: LayoutNode) -> bool {
 
 fn text_is_ascii_whitespace(host: &TreeBuilderHost<'_>, node: LayoutNode) -> bool {
     // SAFETY: Tree building owns the arena; no borrowed node data crosses the refresh.
-    unsafe { super::rendered_text::ensure_text_content(host.arena, node) };
+    super::rendered_text::ensure_text_content(unsafe { &mut *host.arena }, node);
     host.arena()
         .text_content(node)
         .expect("text was just refreshed")
@@ -4752,7 +5298,8 @@ fn generate_missing_parents(host: &TreeBuilderHost<'_>, root: LayoutNode) -> Vec
                 AnonymousStyleOverrides::default(),
                 NodeKind::TableWrapper,
             );
-            host.arena().reset_table_box_style_used_by_wrapper(table_root);
+            host.arena()
+                .reset_table_box_style_used_by_wrapper(host.host_calls(), table_root);
             let wrapper_slot = wrapper.slot();
             host.move_child(table_root, wrapper_slot, NodeSlotId::INVALID);
             host.attach_child(parent, wrapper, nearest_sibling);
@@ -4990,14 +5537,71 @@ mod tests {
     use crate::css::style::bridge::element_adjustment_fact;
     use crate::layout::node_data::NodeSlotId;
     use crate::layout::tree_builder::{
-        FfiCodePointCategoryFacts, FfiComputedContentType, FfiElementLayoutKind, FfiPrincipalBoxPlacement,
-        FfiPseudoElement, FfiPseudoElementDecision, FfiPseudoElementFacts, FfiReplacedElementDisplayAdjustment,
-        LayoutNodeReuse, PrincipalBoxGenerationDecision, PrincipalBoxPlacementFacts, PrincipalNodeEntryFacts,
-        PrincipalNodeKind, SvgEntryDecision, TopLayerEntryDecision, TreeBuilderContext,
+        ComputedContentType, FfiCodePointCategoryFacts, FfiElementLayoutKind, FfiPrincipalBoxPlacement,
+        FfiPseudoElement, FfiPseudoElementDecision, FfiReplacedElementDisplayAdjustment, LayoutNodeReuse,
+        PrincipalBoxGenerationDecision, PrincipalBoxPlacementFacts, PrincipalNodeEntryFacts, PrincipalNodeKind,
+        PseudoElementFacts, SvgEntryDecision, TopLayerEntryDecision, TreeBuilderContext,
         adjusted_table_display_for_replaced_element, display_contents_text_needs_style_wrapper, element_layout_kind,
         find_first_letter_in_text, principal_box_generation_decision, principal_box_placement_decision,
         principal_node_entry_decision, pseudo_element_decision,
     };
+    #[test]
+    fn clearing_a_stale_node_frees_its_box_and_its_pseudo_element_boxes() {
+        use crate::css::style::tree::StyleNodeID;
+        use crate::layout::LayoutNodeArena;
+        use crate::layout::node_data::{FfiNodeConstructionFacts, NodeFlag, NodeKind};
+        use crate::layout::tree_mutation::UnplacedLayoutNode;
+        use crate::stage::MainThread;
+
+        let facts = |style_node: Option<StyleNodeID>| FfiNodeConstructionFacts {
+            kind: NodeKind::BlockContainer,
+            is_anonymous: style_node.is_none(),
+            is_html_input_element: false,
+            is_html_html_element: false,
+            is_document_element: false,
+            is_in_user_agent_shadow_tree: false,
+            uses_button_layout: false,
+            is_editing_host: false,
+            is_body: false,
+            dom_paint_facts: 0,
+            style_node: style_node.map_or(0, StyleNodeID::raw),
+        };
+        // The rows name their generators, whose unique node ids the style mirror answers for.
+        let mut engine = crate::css::style::StyleEngine::new(crate::css::style::memory::DeviceClass::ForegroundDesktop);
+        let mut arena = LayoutNodeArena::new();
+        arena.set_style_engine(crate::css::style::StyleEngineHandle::from_raw(&raw mut engine));
+        let element = StyleNodeID::element(4);
+        let parent = arena.allocate(facts(None));
+        let element_box = arena.allocate(facts(Some(element)));
+        let before_box = arena.allocate(facts(None));
+        arena.set_node_generated_for(before_box, 1, Some(element));
+        arena.attach_child(parent, UnplacedLayoutNode::new(element_box), NodeSlotId::INVALID);
+        arena.attach_child(element_box, UnplacedLayoutNode::new(before_box), NodeSlotId::INVALID);
+        arena.bind_row(element_box);
+        arena.bind_row(before_box);
+        arena.set_node_flag(parent, NodeFlag::ChildrenAreInline, true);
+
+        let main_thread = MainThread::for_test();
+        let work = crate::layout::tree_mutation::OwedHostWork::default();
+        arena.queue_box_presence();
+        let host = super::StaleSubtreeHost {
+            arena: &raw mut arena,
+            host_calls: crate::layout::tree_mutation::HostCalls(&work),
+        };
+        assert!(!host.clear_stale_layout_node(element, None));
+        work.resolve(&arena).pay(&main_thread);
+
+        assert!(!arena.slot_is_live(element_box));
+        assert!(!arena.slot_is_live(before_box));
+        assert!(arena.bound_row(element).is_invalid());
+        assert!(arena.bound_pseudo_element_row(element, 1).is_invalid());
+        assert!(arena.data(parent).first_child.get().is_invalid());
+        assert!(arena.data(parent).flags.get() & NodeFlag::ChildrenAreInline as u32 == 0);
+        arena
+            .free_subtree(parent)
+            .destroy_shells_and_invoke_callbacks(&main_thread);
+    }
+
     fn code_point_facts(code_point: u32) -> FfiCodePointCategoryFacts {
         FfiCodePointCategoryFacts {
             is_space_separator: code_point == b' ' as u32,
@@ -5013,7 +5617,7 @@ mod tests {
     fn first_letter_target(
         text: &str,
         preserves_segment_breaks: bool,
-    ) -> crate::layout::tree_builder::FfiFirstLetterTarget {
+    ) -> crate::layout::tree_builder::FirstLetterTarget {
         let text = text.encode_utf16().collect::<Vec<_>>();
         find_first_letter_in_text(&text, preserves_segment_breaks, |index| index + 1, code_point_facts)
     }
@@ -5046,19 +5650,19 @@ mod tests {
     fn first_letter_text_pattern() {
         let target = first_letter_target("  Hello", false);
         assert!(target.found);
-        assert_eq!((target.letter_start, target.letter_end), (2, 3));
+        assert_eq!(target.letter_end, 3);
 
         let target = first_letter_target("\") A", false);
         assert!(target.found);
-        assert_eq!((target.letter_start, target.letter_end), (0, 4));
+        assert_eq!(target.letter_end, 4);
 
         let target = first_letter_target("H!ello", false);
         assert!(target.found);
-        assert_eq!((target.letter_start, target.letter_end), (0, 2));
+        assert_eq!(target.letter_end, 2);
 
         let target = first_letter_target("H-ello", false);
         assert!(target.found);
-        assert_eq!((target.letter_start, target.letter_end), (0, 1));
+        assert_eq!(target.letter_end, 1);
 
         assert!(!first_letter_target("\nHello", true).found);
     }
@@ -5077,10 +5681,7 @@ mod tests {
             },
         );
         assert!(target.found);
-        assert_eq!(
-            (target.letter_start, target.letter_end, target.source_length),
-            (2, 4, 7)
-        );
+        assert_eq!((target.letter_end, target.source_length), (4, 7));
 
         let text: Vec<u16> = "I\u{0307}abc".encode_utf16().collect();
         let target = find_first_letter_in_text(
@@ -5090,7 +5691,7 @@ mod tests {
             code_point_facts,
         );
         assert!(target.found);
-        assert_eq!((target.letter_start, target.letter_end), (0, 2));
+        assert_eq!(target.letter_end, 2);
     }
 
     #[test]
@@ -5119,7 +5720,7 @@ mod tests {
                       has_content_replacement,
                       originating_layout_node_is_list_item: bool,
                       normal_marker_has_content| {
-            pseudo_element_decision(FfiPseudoElementFacts {
+            pseudo_element_decision(PseudoElementFacts {
                 has_style: true,
                 pseudo_element,
                 content_type,
@@ -5141,7 +5742,7 @@ mod tests {
         assert_eq!(
             decide(
                 FfiPseudoElement::Before,
-                FfiComputedContentType::Normal,
+                ComputedContentType::Normal,
                 false,
                 false,
                 false,
@@ -5154,7 +5755,7 @@ mod tests {
         assert_eq!(
             decide(
                 FfiPseudoElement::Marker,
-                FfiComputedContentType::Normal,
+                ComputedContentType::Normal,
                 false,
                 false,
                 false,
@@ -5167,7 +5768,7 @@ mod tests {
         assert_eq!(
             decide(
                 FfiPseudoElement::Other,
-                FfiComputedContentType::List,
+                ComputedContentType::List,
                 false,
                 false,
                 false,
@@ -5180,7 +5781,7 @@ mod tests {
         assert_eq!(
             decide(
                 FfiPseudoElement::Other,
-                FfiComputedContentType::List,
+                ComputedContentType::List,
                 false,
                 true,
                 false,
@@ -5193,7 +5794,7 @@ mod tests {
         assert_eq!(
             decide(
                 FfiPseudoElement::Other,
-                FfiComputedContentType::List,
+                ComputedContentType::List,
                 false,
                 false,
                 true,

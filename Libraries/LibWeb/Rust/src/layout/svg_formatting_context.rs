@@ -158,6 +158,15 @@ pub struct FfiSvgAttributeFacts {
     pub stroke_reference_atom: u32,
     /// The `startOffset` of a `<textPath>`, against the length of the path it follows.
     pub text_path_start_offset: FfiSvgNumberPercentage,
+    /// An `<svg>`'s `width` and `height` where they are a `<length>`, which its natural size is
+    /// negotiated from.
+    pub natural_width: FfiSvgLengthValue,
+    pub natural_height: FfiSvgLengthValue,
+    /// The natural aspect ratio an `<svg>`'s active SVG view or viewBox gives it, which the
+    /// negotiation falls back to where its width and height do not both give it one.
+    pub has_view_box_aspect_ratio: bool,
+    pub view_box_aspect_ratio_numerator: CssPixels,
+    pub view_box_aspect_ratio_denominator: CssPixels,
 }
 
 pub const SVG_GEOMETRY_KIND_NONE: u8 = 0;
@@ -168,76 +177,6 @@ pub const SVG_GEOMETRY_KIND_ELLIPSE: u8 = 4;
 pub const SVG_GEOMETRY_KIND_LINE: u8 = 5;
 pub const SVG_GEOMETRY_KIND_POLYLINE: u8 = 6;
 pub const SVG_GEOMETRY_KIND_POLYGON: u8 = 7;
-
-/// Publishes what the SVG element `style_node` names parses to. A <polyline> or <polygon> passes
-/// its `points` list beside the facts, since it is the one geometry attribute that is not a fixed
-/// number of values.
-///
-/// # Safety
-///
-/// `arena` must be a live handle from `layout_arena_create`, used on the document thread, and
-/// `points` must address `count` points for the duration of the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_set_style_node_svg_attribute_facts(
-    arena: *mut c_void,
-    style_node: u32,
-    facts: FfiSvgAttributeFacts,
-    points: *const FfiFloatPoint,
-    count: usize,
-) {
-    // SAFETY: Guaranteed by the caller.
-    let arena = unsafe { LayoutNodeArena::from_handle(arena) };
-    let Some(style_node) = crate::css::style::tree::StyleNodeID::from_raw(style_node) else {
-        return;
-    };
-    let points = if count == 0 {
-        &[][..]
-    } else {
-        // SAFETY: The caller keeps the list alive for this synchronous call.
-        unsafe { std::slice::from_raw_parts(points, count) }
-    };
-    arena.set_style_node_svg_attribute_facts(style_node, facts, points);
-}
-
-/// Publishes only the resources a graphics element's style names, leaving what its attributes
-/// parse to alone. Style records are replaced far more often than an SVG attribute changes, and
-/// parsing every presentation attribute again to carry four names would make every style change pay
-/// for it.
-///
-/// # Safety
-///
-/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_set_style_node_svg_style_references(
-    arena: *mut c_void,
-    style_node: u32,
-    mask: u32,
-    clip_path: u32,
-    fill: u32,
-    stroke: u32,
-) {
-    // SAFETY: Guaranteed by the caller.
-    let arena = unsafe { LayoutNodeArena::from_handle(arena) };
-    let Some(style_node) = crate::css::style::tree::StyleNodeID::from_raw(style_node) else {
-        return;
-    };
-    arena.set_style_node_svg_style_references(style_node, [mask, clip_path, fill, stroke]);
-}
-
-/// Retires what the SVG element `style_node` named published, once that identity is retired.
-///
-/// # Safety
-///
-/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_clear_style_node_svg_attribute_facts(arena: *mut c_void, style_node: u32) {
-    // SAFETY: Guaranteed by the caller.
-    let arena = unsafe { LayoutNodeArena::from_handle(arena) };
-    let Some(style_node) = crate::css::style::tree::StyleNodeID::from_raw(style_node) else {
-        return;
-    };
-    arena.clear_style_node_svg_attribute_facts(style_node);
-}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SvgMaskAreaFacts {
@@ -941,70 +880,9 @@ impl<'pass> SvgFormattingContext<'pass> {
             SVG_LENGTH_KIND_PERCENTAGE => {
                 CssPixels::truncated_value_for(reference.to_double() * value.value / 100.0).to_float()
             }
-            SVG_LENGTH_KIND_LENGTH => {
-                let context = self.length_resolution_context(node, value.unit);
-                let absolutized =
-                    crate::css::style_compute::absolutize_length_for_calc(value.value, value.unit as usize, &context);
-                CssPixels::nearest_value_for(absolutized.px).to_float()
-            }
+            SVG_LENGTH_KIND_LENGTH => resolve_svg_length(&self.callbacks, node, value).to_float(),
             _ => 0.0,
         }
-    }
-
-    fn font_metrics_for_length_resolution(style: StyleValues<'_>) -> crate::css::style_compute::FfiFontMetrics {
-        let font = style.font();
-        crate::css::style_compute::FfiFontMetrics {
-            font_size: style.font_size().to_double(),
-            x_height: CssPixels::nearest_value_for_f32(font.font_x_height).to_double(),
-            // FIXME: This is only approximately the cap height, exactly as Length::FontMetrics has it.
-            cap_height: CssPixels::nearest_value_for_f32(font.font_ascent).to_double(),
-            zero_advance: CssPixels::nearest_value_for_f32(font.font_zero_advance).to_double(),
-            line_height: style.line_height().to_double(),
-        }
-    }
-
-    fn length_resolution_context(&self, node: Node, unit: u8) -> crate::css::style_compute::FfiLengthResolutionContext {
-        let style = self.style(node);
-        let root_style = self.document_element_style(node).unwrap_or(style);
-        let viewport_width = self.callbacks.initial_containing_block_inline_size.to_double();
-        let viewport_height = self.callbacks.initial_containing_block_block_size.to_double();
-        // A container unit resolves against the nearest size query container on its axis, or the small viewport size
-        // without one. Finding that container is style's business, so it is asked only for a length that needs it.
-        let container_bases = crate::css::style_compute::length_unit_is_container_relative(unit).then(|| {
-            let host = self.callbacks.host;
-            // SAFETY: The registered callbacks and the box's shell stay alive for the pass.
-            unsafe { (host.container_length_bases)(host.context, self.callbacks.shell(node)) }
-        });
-        crate::css::style_compute::FfiLengthResolutionContext {
-            viewport_width,
-            viewport_height,
-            font_metrics: Self::font_metrics_for_length_resolution(style),
-            root_font_metrics: Self::font_metrics_for_length_resolution(root_style),
-            // Only the out-flag below consumes these, and this resolution reports no dependency.
-            font_metrics_depend_on_viewport_metrics: false,
-            root_font_metrics_depend_on_viewport_metrics: false,
-            has_container_width_basis: container_bases.is_some(),
-            has_container_height_basis: container_bases.is_some(),
-            container_width_basis: container_bases.map_or(0.0, |bases| bases.width),
-            container_height_basis: container_bases.map_or(0.0, |bases| bases.height),
-            container_width_basis_depends_on_viewport_metrics: false,
-            container_height_basis_depends_on_viewport_metrics: false,
-            subject_inline_axis_is_horizontal: style.writing_mode() == writing_mode::HORIZONTAL_TB,
-            resolved_viewport_relative_length: std::ptr::null_mut(),
-        }
-    }
-
-    /// The style of the document element, which a root-relative length resolves against.
-    fn document_element_style(&self, node: Node) -> Option<StyleValues<'pass>> {
-        let mut ancestor = node;
-        while !ancestor.is_invalid() {
-            let data = self.callbacks.node_data(ancestor);
-            if node_facts::has_flag(data, NodeFlag::IsDocumentElement) {
-                return self.callbacks.arena().style_payloads(ancestor).map(StyleValues::new);
-            }
-            ancestor = data.parent.get();
-        }
-        None
     }
 
     /// The character data an SVG text content element renders: its direct child text, as written.
@@ -1129,23 +1007,21 @@ impl<'pass> SvgFormattingContext<'pass> {
         if text.is_empty() {
             return;
         }
-        let cascade_list = style.font_cascade_list();
-        // Neighbouring code points nearly always share a font, so the last one is the hint.
-        let font_for = |offset: usize, hint: Option<&libgfx_rust::font::FontHandle>| {
-            cascade_list.font_for_code_point(
+        let frozen_font_list = style.frozen_font_list();
+        let font_for = |offset: usize| {
+            frozen_font_list.font_for_code_point(
                 code_point_at(text, offset),
                 libgfx_rust::font::EmojiPresentation {
                     is_emoji: false,
                     forced: false,
                 },
-                hint,
             )
         };
-        let mut last_font = font_for(0, None);
+        let mut last_font = font_for(0);
         let mut run_start = 0;
         let mut offset = code_point_length_at(text, 0);
         while offset < text.len() {
-            let font = font_for(offset, Some(&last_font));
+            let font = font_for(offset);
             if font != last_font {
                 run(&last_font, &text[run_start..offset]);
                 last_font = font;
@@ -2060,5 +1936,151 @@ impl<'pass> SvgFormattingContext<'pass> {
         self.place_child(container, min_x, min_y);
         used.has_definite_inline_size.set(true);
         used.has_definite_block_size.set(true);
+    }
+}
+
+fn font_metrics_for_length_resolution(style: StyleValues<'_>) -> crate::css::style_compute::FfiFontMetrics {
+    let font = style.font();
+    crate::css::style_compute::FfiFontMetrics {
+        font_size: style.font_size().to_double(),
+        x_height: CssPixels::nearest_value_for_f32(font.font_x_height).to_double(),
+        // FIXME: This is only approximately the cap height, exactly as Length::FontMetrics has it.
+        cap_height: CssPixels::nearest_value_for_f32(font.font_ascent).to_double(),
+        zero_advance: CssPixels::nearest_value_for_f32(font.font_zero_advance).to_double(),
+        line_height: style.line_height().to_double(),
+    }
+}
+
+/// What a length one of an SVG element's attributes gives resolves against: the element's own style,
+/// the document element's, and the viewport.
+fn length_resolution_context(
+    callbacks: &LayoutPass<'_>,
+    node: Node,
+    unit: u8,
+) -> crate::css::style_compute::FfiLengthResolutionContext {
+    let style = StyleValues::for_node(callbacks, node);
+    let root_style = document_element_style(callbacks, node).unwrap_or(style);
+    let viewport_width = callbacks.initial_containing_block_inline_size.to_double();
+    let viewport_height = callbacks.initial_containing_block_block_size.to_double();
+    // A container unit resolves against the nearest size query container on its axis, or the small viewport size
+    // without one. Finding that container is style's business, so it is asked only for a length that needs it. A pass
+    // that cannot ask resolves it against the viewport, and leaves the layout to the host to lay out again.
+    let container_bases = if crate::css::style_compute::length_unit_is_container_relative(unit) {
+        let element = callbacks
+            .arena()
+            .dom_node_style_node(node)
+            .expect("an SVG element's attribute length is resolved for the element's own box");
+        let bases = callbacks.container_length_bases.bases(element);
+        if bases.is_none() {
+            callbacks.arena().note_unresolved_container_lengths();
+        }
+        bases
+    } else {
+        None
+    };
+    crate::css::style_compute::FfiLengthResolutionContext {
+        viewport_width,
+        viewport_height,
+        font_metrics: font_metrics_for_length_resolution(style),
+        root_font_metrics: font_metrics_for_length_resolution(root_style),
+        // Only the out-flag below consumes these, and this resolution reports no dependency.
+        font_metrics_depend_on_viewport_metrics: false,
+        root_font_metrics_depend_on_viewport_metrics: false,
+        has_container_width_basis: container_bases.is_some(),
+        has_container_height_basis: container_bases.is_some(),
+        container_width_basis: container_bases.map_or(0.0, |bases| bases.width),
+        container_height_basis: container_bases.map_or(0.0, |bases| bases.height),
+        container_width_basis_depends_on_viewport_metrics: false,
+        container_height_basis_depends_on_viewport_metrics: false,
+        subject_inline_axis_is_horizontal: style.writing_mode() == writing_mode::HORIZONTAL_TB,
+        resolved_viewport_relative_length: std::ptr::null_mut(),
+    }
+}
+
+/// The style of the document element, which a root-relative length resolves against.
+fn document_element_style<'pass>(callbacks: &LayoutPass<'pass>, node: Node) -> Option<StyleValues<'pass>> {
+    let mut ancestor = node;
+    while !ancestor.is_invalid() {
+        let data = callbacks.node_data(ancestor);
+        if node_facts::has_flag(data, NodeFlag::IsDocumentElement) {
+            return callbacks.arena().style_payloads(ancestor).map(StyleValues::new);
+        }
+        ancestor = data.parent.get();
+    }
+    None
+}
+
+/// The pixels an absolute or relative `<length>` an SVG element's attribute gives resolves to.
+fn resolve_svg_length(callbacks: &LayoutPass<'_>, node: Node, length: FfiSvgLengthValue) -> CssPixels {
+    let context = length_resolution_context(callbacks, node, length.unit);
+    let absolutized =
+        crate::css::style_compute::absolutize_length_for_calc(length.value, length.unit as usize, &context);
+    CssPixels::nearest_value_for(absolutized.px)
+}
+
+// https://www.w3.org/TR/SVG2/coords.html#SizingSVGInCSS
+/// The natural size of an `<svg>` root's box, negotiated from what its element published.
+pub(crate) fn svg_root_natural_size(
+    callbacks: &LayoutPass<'_>,
+    node: Node,
+) -> (Option<CssPixels>, Option<CssPixels>, Option<(CssPixels, CssPixels)>) {
+    let attributes = callbacks.arena().svg_attribute_facts(node);
+    // The intrinsic dimensions must also be determined from the width and height sizing properties. If either width or
+    // height are not specified, the used value is the initial value 'auto'. 'auto' and percentage lengths must not be
+    // used to determine an intrinsic width or intrinsic height.
+    let resolve = |length: FfiSvgLengthValue| {
+        (length.kind == SVG_LENGTH_KIND_LENGTH).then(|| resolve_svg_length(callbacks, node, length))
+    };
+    let width = resolve(attributes.natural_width);
+    let height = resolve(attributes.natural_height);
+    let view_box_aspect_ratio = attributes.has_view_box_aspect_ratio.then_some((
+        attributes.view_box_aspect_ratio_numerator,
+        attributes.view_box_aspect_ratio_denominator,
+    ));
+    (
+        width,
+        height,
+        svg_root_natural_aspect_ratio(width, height, view_box_aspect_ratio),
+    )
+}
+
+/// The intrinsic aspect ratio must be calculated using the following algorithm. If the algorithm returns null, then
+/// there is no intrinsic aspect ratio.
+fn svg_root_natural_aspect_ratio(
+    width: Option<CssPixels>,
+    height: Option<CssPixels>,
+    view_box_aspect_ratio: Option<(CssPixels, CssPixels)>,
+) -> Option<(CssPixels, CssPixels)> {
+    match (width, height) {
+        // 1. If the width and height sizing properties on the ‘svg’ element are both absolute values: return width /
+        //    height.
+        (Some(width), Some(height)) => {
+            (width != CssPixels::default() && height != CssPixels::default()).then_some((width, height))
+        }
+        // 2.-4. What the active SVG view or the viewBox gives it, if anything.
+        _ => view_box_aspect_ratio,
+    }
+}
+
+#[cfg(test)]
+mod svg_root_natural_size_tests {
+    use super::svg_root_natural_aspect_ratio;
+    use crate::layout::CssPixels;
+
+    #[test]
+    fn an_svg_root_takes_its_aspect_ratio_from_its_size_before_its_view_box() {
+        let px = CssPixels::from_integer;
+        let view_box = Some((px(4), px(3)));
+        assert_eq!(
+            svg_root_natural_aspect_ratio(Some(px(200)), Some(px(100)), view_box),
+            Some((px(200), px(100)))
+        );
+        // A zero width or height gives no ratio, and the view box is not consulted.
+        assert_eq!(
+            svg_root_natural_aspect_ratio(Some(px(0)), Some(px(100)), view_box),
+            None
+        );
+        assert_eq!(svg_root_natural_aspect_ratio(Some(px(200)), None, view_box), view_box);
+        assert_eq!(svg_root_natural_aspect_ratio(None, None, None), None);
     }
 }

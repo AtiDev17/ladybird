@@ -395,6 +395,9 @@ scalar_accessors! {
         is_inline_size_container: bool => is_inline_size_container,
         aspect_ratio_uses_natural_when_available: bool => aspect_ratio.use_natural_aspect_ratio_if_available,
     }
+    misc_reset: {
+        appearance: u8 => appearance,
+    }
     border_facts: {
         border_top_width: CssPixels => border_top.width,
         border_right_width: CssPixels => border_right.width,
@@ -439,6 +442,7 @@ scalar_accessors! {
         font_ascent: f32 => font_ascent,
         font_descent: f32 => font_descent,
         font_x_height: f32 => font_x_height,
+        font_zero_advance: f32 => font_zero_advance,
     }
     alignment: {
         webkit_box_orient: u8 => webkit_box_orient,
@@ -724,6 +728,29 @@ impl<'a> ComputedValuesView<'a> {
         self.native_group(STYLE_GROUP_INDEX_INHERITED_LIST)
     }
 
+    /// Whether `content` computes to the keyword `none`. The property takes exactly two keywords,
+    /// so a keyword that is not `none` is `normal`.
+    pub(crate) fn content_keyword_is_none(self) -> bool {
+        matches!(
+            self.content().content.data(),
+            Some(StyleValueData::Keyword { keyword }) if *keyword == crate::css::css_enums::keyword::NONE
+        )
+    }
+
+    /// Whether `list-style-type` computes to `none`, the marker that renders nothing.
+    pub(crate) fn list_style_type_is_none(self) -> bool {
+        matches!(
+            self.inherited_list().list_style_type.data(),
+            Some(StyleValueData::Keyword { keyword }) if *keyword == crate::css::css_enums::keyword::NONE
+        )
+    }
+
+    /// Whether `list-style-position` computes to `inside`, which puts the marker box inside the
+    /// principal block box rather than outside it.
+    pub(crate) fn list_style_position_is_inside(self) -> bool {
+        self.inherited_list().list_style_position == crate::css::css_enums::list_style_position::INSIDE
+    }
+
     /// Whether `list-style-image` names an image, which a list marker then shows instead of its
     /// marker string.
     pub(crate) fn list_style_image_is_set(self) -> bool {
@@ -981,13 +1008,20 @@ impl<'a> ComputedValuesView<'a> {
         unsafe { libgfx_rust::font::FontHandle::intern(font.first_available_font) }
     }
 
-    pub(crate) fn font_cascade_list(self) -> &'a libgfx_rust::font::FontCascadeListHandle {
-        let list = &self.font().font_cascade_list;
-        debug_assert!(
-            !list.is_null(),
-            "layout read a font group that never received a font list"
-        );
-        list
+    /// The frozen cascade a render pass reads.
+    pub(crate) fn frozen_font_list(self) -> &'a libgfx_rust::font::FrozenFontList {
+        self.font()
+            .frozen_font_list
+            .list()
+            .expect("layout read a font group that never received a frozen font list")
+    }
+
+    /// A counted reference to the frozen cascade, for a render row that outlives this payload.
+    pub(crate) fn frozen_font_list_ref(self) -> std::sync::Arc<libgfx_rust::font::FrozenFontList> {
+        self.font()
+            .frozen_font_list
+            .to_arc()
+            .expect("layout read a font group that never received a frozen font list")
     }
 
     pub(crate) fn box_sizing_for_aspect_ratio(self) -> u8 {

@@ -4,10 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::css_pixels::CssPixels;
 use crate::layout::svg_formatting_context::FfiSvgNumberPercentage;
 use crate::layout::used_values;
 use crate::painting::display_list::commands::{OptionalAffineTransform, OptionalColor};
+use crate::stage::MainThread;
 use libgfx_rust::{Color, IntRect, InterpolationColorSpace};
 use std::ffi::c_void;
 
@@ -40,6 +40,9 @@ pub struct FfiRecordingInputs {
     pub selection_background_from_palette: Color,
     pub selection_background_light: Color,
     pub selection_background_dark: Color,
+    pub inactive_selection_background_from_palette: Color,
+    pub inactive_selection_background_light: Color,
+    pub inactive_selection_background_dark: Color,
     pub palette_is_dark: bool,
     pub document_has_supported_color_schemes: bool,
     pub has_inspector_highlight: bool,
@@ -61,15 +64,17 @@ pub struct FfiRecordingInputs {
 }
 
 impl FfiRecordingInputs {
+    /// The inputs of a recording, which copy what they read of the arrays and byte buffers.
+    ///
     /// # Safety
     ///
-    /// Nonempty arrays and byte buffers must be aligned, valid and immutable for the
-    /// returned inputs' lifetime. Fonts for enabled overlays must point to live `Gfx::Font`s.
-    pub(crate) unsafe fn borrow_recording_inputs(
+    /// Nonempty arrays and byte buffers must be aligned, valid and immutable for this call. Fonts
+    /// for enabled overlays must point to live `Gfx::Font`s.
+    pub(crate) unsafe fn recording_inputs(
         &self,
         tree_inputs: super::FfiVisualContextTreeInputs,
-        root_background_source: super::FfiRootBackgroundSource,
-    ) -> crate::painting::record::inputs::RecordingInputs<'_> {
+        root_background_source: super::RootBackgroundSource,
+    ) -> crate::painting::record::inputs::RecordingInputs {
         use crate::painting::display_list::commands::UniqueNodeId;
         use crate::painting::force_dark::ForceDarkSettings;
         use crate::painting::record::inputs::{
@@ -78,7 +83,7 @@ impl FfiRecordingInputs {
         };
         use libcompositing_rust::ffi::ffi_slice;
 
-        // SAFETY: The caller lends these arrays and buffers for the returned inputs' lifetime.
+        // SAFETY: The caller lends these arrays and buffers for this call.
         let (grid_overlays, flex_overlays, outline_path) = unsafe {
             (
                 ffi_slice(self.grid_overlays, self.grid_overlay_count),
@@ -139,6 +144,9 @@ impl FfiRecordingInputs {
             selection_background_from_palette: self.selection_background_from_palette,
             selection_background_light: self.selection_background_light,
             selection_background_dark: self.selection_background_dark,
+            inactive_selection_background_from_palette: self.inactive_selection_background_from_palette,
+            inactive_selection_background_light: self.inactive_selection_background_light,
+            inactive_selection_background_dark: self.inactive_selection_background_dark,
             palette_is_dark: self.palette_is_dark,
             document_has_supported_color_schemes: self.document_has_supported_color_schemes,
             inspector_highlight: self.has_inspector_highlight.then(|| {
@@ -154,7 +162,7 @@ impl FfiRecordingInputs {
                 };
                 InspectorHighlight {
                     paintable: self.inspector_highlight_paintable,
-                    label: String::from_utf8_lossy(text),
+                    label: String::from_utf8_lossy(text).into_owned(),
                     fonts,
                 }
             }),
@@ -162,11 +170,11 @@ impl FfiRecordingInputs {
             tooltip_text_color: self.tooltip_text_color,
             tooltip_border_color: self.tooltip_border_color,
             grid_overlays: (!grid_overlays.is_empty()).then(|| GridOverlays {
-                inputs: grid_overlays,
+                inputs: grid_overlays.into(),
                 // SAFETY: The caller supplies live label fonts when grid overlays are enabled.
                 fonts: unsafe { self.grid_label_fonts.retain() },
             }),
-            flex_overlays,
+            flex_overlays: flex_overlays.into(),
             caret_debug_rect: self
                 .caret_debug_rect
                 .has_value
@@ -183,9 +191,9 @@ impl FfiRecordingInputs {
                 start: control.start,
                 end: control.end,
             }),
-            focused_area_outline: (!outline_path.is_empty()).then_some(FocusedAreaOutline {
+            focused_area_outline: (!outline_path.is_empty()).then(|| FocusedAreaOutline {
                 image: self.focused_area_outline.image,
-                path_bytes: outline_path,
+                path_bytes: outline_path.into(),
                 color: self.focused_area_outline.color,
                 width: self.focused_area_outline.width,
             }),
@@ -421,18 +429,10 @@ pub struct FfiSvgPatternDescription {
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
-pub struct FfiSelectionShadowLayer {
-    pub color: Color,
-    pub offset_x: CssPixels,
-    pub offset_y: CssPixels,
-    pub blur_radius: CssPixels,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
 pub struct FfiSelectionStyleFacts {
     pub colors_authored: bool,
     pub background_color: Color,
+    pub background_color_is_current_color: bool,
     pub text_color: OptionalColor,
     pub wash_color: Color,
     pub has_text_shadow: bool,
@@ -441,6 +441,7 @@ pub struct FfiSelectionStyleFacts {
     pub text_decoration_line_count: u32,
     pub text_decoration_style: u8,
     pub text_decoration_color: Color,
+    pub text_decoration_color_is_current_color: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -526,34 +527,40 @@ pub struct FfiSnapAreaGeometry {
     pub always_stop: bool,
 }
 
+/// Where a recording's resources go once it is published. The fields are private: the callbacks
+/// are reached only through the methods below, which take the main thread token.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiRecordingPublishCallbacks {
-    pub context: *mut c_void,
-    pub add_font: unsafe extern "C" fn(*mut c_void, *const c_void),
-    pub add_image_frame: unsafe extern "C" fn(*mut c_void, *const c_void),
-    pub resolve_vector_image_display_list: unsafe extern "C" fn(*mut c_void, *const FfiVectorImageRenderRequest) -> u64,
-    pub add_video_sink: unsafe extern "C" fn(*mut c_void, u64, u64),
+    context: *mut c_void,
+    add_font: unsafe extern "C" fn(*mut c_void, *const c_void),
+    add_image_frame: unsafe extern "C" fn(*mut c_void, *const c_void),
+    resolve_vector_image_display_list: unsafe extern "C" fn(*mut c_void, *const FfiVectorImageRenderRequest) -> u64,
+    add_video_sink: unsafe extern "C" fn(*mut c_void, u64, u64),
 }
 
 impl FfiRecordingPublishCallbacks {
-    pub(crate) fn add_font(&self, font: &libgfx_rust::font::FontHandle) {
+    pub(crate) fn add_font(&self, _: &MainThread, font: &libgfx_rust::font::FontHandle) {
         // SAFETY: The C++ host registers the live font synchronously.
         unsafe { (self.add_font)(self.context, font.as_raw()) };
     }
 
-    pub(crate) fn add_image_frame(&self, frame: &libgfx_rust::image_frame::ImageFrameHandle) {
+    pub(crate) fn add_image_frame(&self, _: &MainThread, frame: &libgfx_rust::image_frame::ImageFrameHandle) {
         // SAFETY: The C++ host copies the live frame synchronously.
         unsafe { (self.add_image_frame)(self.context, frame.as_raw()) };
     }
 
-    pub(crate) fn resolve_vector_image_display_list(&self, request: &FfiVectorImageRenderRequest) -> u64 {
+    pub(crate) fn resolve_vector_image_display_list(
+        &self,
+        _: &MainThread,
+        request: &FfiVectorImageRenderRequest,
+    ) -> u64 {
         // SAFETY: The C++ host records the image's display list synchronously and reads the
         // request only for the duration of the call.
         unsafe { (self.resolve_vector_image_display_list)(self.context, request) }
     }
 
-    pub(crate) fn add_video_sink(&self, resource_id: u64, sink_handle: u64) {
+    pub(crate) fn add_video_sink(&self, _: &MainThread, resource_id: u64, sink_handle: u64) {
         // SAFETY: The C++ host registers the sink synchronously.
         unsafe { (self.add_video_sink)(self.context, resource_id, sink_handle) };
     }

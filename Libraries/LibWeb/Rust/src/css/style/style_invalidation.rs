@@ -7,6 +7,7 @@
 use super::bridge::{FfiAnimationInvalidation, FfiStyleInvalidationField, element_adjustment_fact};
 use super::{RetainedState, StyleNodeID};
 use crate::css::animated_overlay::{AnimatedOverlay, overlay_wins};
+use crate::css::computed_longhand_table::ComputedLonghandTable;
 use crate::css::computed_value_types::SVG_PAINT_NONE;
 use crate::css::computed_value_views::ComputedValuesView;
 use crate::css::computed_values::style_group_payloads_equal;
@@ -41,7 +42,7 @@ struct StyleInvalidation {
     non_inherited_inheritance_source: bool,
     any_computed_value_changed: bool,
     affects_hit_testing: bool,
-    repaint_selection: bool,
+    repaint_highlights: bool,
 }
 
 impl StyleInvalidation {
@@ -91,7 +92,7 @@ impl StyleInvalidation {
         self.non_inherited_inheritance_source |= other.non_inherited_inheritance_source;
         self.any_computed_value_changed |= other.any_computed_value_changed;
         self.affects_hit_testing |= other.affects_hit_testing;
-        self.repaint_selection |= other.repaint_selection;
+        self.repaint_highlights |= other.repaint_highlights;
     }
 
     fn unpack(packed: u32) -> Self {
@@ -111,7 +112,7 @@ impl StyleInvalidation {
             non_inherited_inheritance_source: has(FfiStyleInvalidationField::NonInheritedInheritanceSource),
             any_computed_value_changed: has(FfiStyleInvalidationField::AnyComputedValueChanged),
             affects_hit_testing: has(FfiStyleInvalidationField::AffectsHitTesting),
-            repaint_selection: has(FfiStyleInvalidationField::RepaintSelection),
+            repaint_highlights: has(FfiStyleInvalidationField::RepaintHighlights),
         }
     }
 
@@ -130,7 +131,7 @@ impl StyleInvalidation {
         packed |=
             u32::from(self.any_computed_value_changed) * FfiStyleInvalidationField::AnyComputedValueChanged as u32;
         packed |= u32::from(self.affects_hit_testing) * FfiStyleInvalidationField::AffectsHitTesting as u32;
-        packed |= u32::from(self.repaint_selection) * FfiStyleInvalidationField::RepaintSelection as u32;
+        packed |= u32::from(self.repaint_highlights) * FfiStyleInvalidationField::RepaintHighlights as u32;
         packed
     }
 }
@@ -153,7 +154,7 @@ pub(super) fn child_reaction_facts_of_damage(damages: impl IntoIterator<Item = u
         && !damage.resnap_scroll_container
         && !damage.recompute_descendants
         && damage.inherited_groups == 0
-        && !damage.repaint_selection
+        && !damage.repaint_highlights
         && !damage.affects_hit_testing
         && !damage.repaint_text_decorations
         && !damage.non_inherited_inheritance_source
@@ -629,19 +630,18 @@ fn effective_value<'a>(view: &super::computed::StyleRecordView<'a>, property: u1
     unsafe { view.longhand_values[index].cast::<StyleValueData>().deref() }
 }
 
-fn effective_value_with_overlay(
-    view: &super::computed::StyleRecordView<'_>,
-    overlay: Option<&AnimatedOverlay>,
+/// The value of `property` in the record whose table `table` is, with `overlay` over it in place of the record's own.
+fn effective_value_with_overlay<'a>(
+    table: &'a ComputedLonghandTable,
+    overlay: Option<&'a AnimatedOverlay>,
     property: u16,
-) -> *const StyleValueData {
-    let index = usize::from(property - FIRST_LONGHAND_PROPERTY_ID);
-    let table = unsafe { view.longhand_table.deref() };
+) -> Option<&'a StyleValueData> {
     if let Some(entry) = overlay.and_then(|overlay| overlay.get(property))
         && overlay_wins(entry, table.is_important(property))
     {
-        return entry.value();
+        return Some(entry.value());
     }
-    view.longhand_values[index].cast::<StyleValueData>().as_ptr()
+    table.get(property).map(|value| value.data())
 }
 
 fn animation_overlay_properties<'a>(
@@ -662,22 +662,22 @@ fn animation_overlay_properties<'a>(
 }
 
 fn animation_value_changed(
-    record: &super::computed::StyleRecordView<'_>,
+    table: &ComputedLonghandTable,
     old_overlay: Option<&AnimatedOverlay>,
     new_overlay: Option<&AnimatedOverlay>,
     property: u16,
 ) -> bool {
-    let old = effective_value_with_overlay(record, old_overlay, property);
-    let new = effective_value_with_overlay(record, new_overlay, property);
-    old != new && unsafe { *old != *new }
+    let old = effective_value_with_overlay(table, old_overlay, property);
+    let new = effective_value_with_overlay(table, new_overlay, property);
+    old.map(std::ptr::from_ref) != new.map(std::ptr::from_ref) && old != new
 }
 
 fn inheritance_dependent_value_changed(
-    old: &crate::css::computed_longhand_table::ComputedLonghandTable,
-    new: &crate::css::computed_longhand_table::ComputedLonghandTable,
+    old: &ComputedLonghandTable,
+    new: &ComputedLonghandTable,
     property: u16,
 ) -> bool {
-    let value = |table: &crate::css::computed_longhand_table::ComputedLonghandTable| {
+    let value = |table: &ComputedLonghandTable| {
         table
             .inheritance_dependent_values()
             .find(|(candidate, _)| *candidate == property)
@@ -694,22 +694,18 @@ fn inheritance_dependent_value_changed(
         }
 }
 
-impl RetainedState {
-    pub(crate) fn animation_overlay_changed(
-        &self,
-        old_style_record: u64,
-        animated_overlay: *const AnimatedOverlay,
-    ) -> bool {
-        let old_record = self
-            .computed_group_sets
-            .style_record_view(old_style_record)
-            .unwrap_or_else(|| panic!("old style record {old_style_record:#x} is not live"));
-        let old_overlay = unsafe { old_record.animated_overlay.as_ref() };
-        let new_overlay = unsafe { animated_overlay.as_ref() };
-        animation_overlay_properties(old_overlay, new_overlay)
-            .any(|property| animation_value_changed(&old_record, old_overlay, new_overlay, property))
-    }
+/// Whether `new_overlay` changes any effective value of a published record whose table is `table`, in place of the
+/// record's own overlay, `old_overlay`.
+pub(crate) fn animation_overlay_changed(
+    table: &ComputedLonghandTable,
+    old_overlay: Option<&AnimatedOverlay>,
+    new_overlay: Option<&AnimatedOverlay>,
+) -> bool {
+    animation_overlay_properties(old_overlay, new_overlay)
+        .any(|property| animation_value_changed(table, old_overlay, new_overlay, property))
+}
 
+impl RetainedState {
     pub(crate) fn compare_animation_overlay(
         &self,
         old_style_record: u64,
@@ -722,6 +718,8 @@ impl RetainedState {
             .style_record_view(old_style_record)
             .unwrap_or_else(|| panic!("old style record {old_style_record:#x} is not live"));
         assert_eq!(payloads.len(), old_record.payloads.len());
+        // SAFETY: A live record's table lives as long as the record.
+        let table = unsafe { old_record.longhand_table.deref() };
         let old_overlay = unsafe { old_record.animated_overlay.as_ref() };
         let new_overlay = unsafe { animated_overlay.as_ref() };
         let old_values = ComputedValuesView::new(SharedPayload::as_pointer_slice(old_record.payloads));
@@ -731,7 +729,7 @@ impl RetainedState {
         let mut text_decoration_line_animated = false;
 
         for property in animation_overlay_properties(old_overlay, new_overlay) {
-            if !animation_value_changed(&old_record, old_overlay, new_overlay, property) {
+            if !animation_value_changed(table, old_overlay, new_overlay, property) {
                 continue;
             }
             if matches!(
@@ -1045,15 +1043,15 @@ impl RetainedState {
         originating_style_record: u64,
         counter_styles_changed: bool,
     ) -> u32 {
-        use super::publication::pseudo_kind::{AFTER, BEFORE, MARKER, SELECTION};
+        use super::publication::pseudo_kind::{AFTER, BEFORE, MARKER};
         if old_style_record == new_style_record {
             return 0;
         }
-        // NB: Selection highlights do not generate boxes or affect layout.
-        if pseudo_kind == SELECTION {
+        // NB: Highlight pseudo-elements do not generate boxes or affect layout.
+        if super::publication::pseudo_kind::is_highlight(pseudo_kind) {
             return StyleInvalidation {
                 level: INVALIDATION_REPAINT,
-                repaint_selection: true,
+                repaint_highlights: true,
                 any_computed_value_changed: true,
                 ..StyleInvalidation::default()
             }

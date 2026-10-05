@@ -8,6 +8,8 @@
 #include <LibGC/Heap.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/Bindings/SVGImageElement.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentObserver.h>
 #include <LibWeb/DOM/Event.h>
@@ -16,18 +18,13 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Namespace.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 
 namespace Web::SVG {
 
 GC_DEFINE_ALLOCATOR(SVGImageElement);
-
-Layout::Node const* SVGImageElement::image_provider_layout_node() const
-{
-    return unsafe_layout_node();
-}
 
 SVGImageElement::SVGImageElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGGraphicsElement(document, move(qualified_name))
@@ -99,11 +96,13 @@ void SVGImageElement::fetch_the_document(URL::URL const& url)
     m_load_event_delayer.emplace(document());
     unregister_with_decoded_image_data_if_needed();
     m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), url);
+    CSS::record_element_replaced_content_input(*this);
     m_resource_request->add_callbacks(
         [this, resource_request = GC::Root { m_resource_request }] {
             m_load_event_delayer.clear();
             register_with_decoded_image_data_if_needed();
-            image_provider_contents_changed();
+            CSS::record_element_replaced_content_input(*this);
+            Painting::push_replaced_image_paint_facts(*this);
             set_needs_layout_update(DOM::SetNeedsLayoutReason::SVGImageElementFetchTheDocument);
 
             dispatch_event(DOM::Event::create(HTML::EventNames::load,
@@ -114,6 +113,9 @@ void SVGImageElement::fetch_the_document(URL::URL const& url)
 
             dispatch_event(DOM::Event::create(HTML::EventNames::error,
                 HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this))));
+        },
+        [this] {
+            m_load_event_delayer.clear();
         });
 
     if (m_resource_request->needs_fetching()) {
@@ -123,9 +125,9 @@ void SVGImageElement::fetch_the_document(URL::URL const& url)
     }
 }
 
-Layout::Node* SVGImageElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind SVGImageElement::box_kind() const
 {
-    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGImageBox);
+    return CSS::ElementBoxKind::SvgImage;
 }
 
 GC::Ptr<HTML::DecodedImageData> SVGImageElement::decoded_image_data() const
@@ -133,6 +135,13 @@ GC::Ptr<HTML::DecodedImageData> SVGImageElement::decoded_image_data() const
     if (!m_resource_request)
         return nullptr;
     return m_resource_request->image_data();
+}
+
+void SVGImageElement::decoded_image_data_did_update()
+{
+    // An SVG image works out its natural size again after it redraws itself or changes color scheme.
+    CSS::record_element_replaced_content_input(*this);
+    Painting::push_replaced_image_paint_facts(*this);
 }
 
 }

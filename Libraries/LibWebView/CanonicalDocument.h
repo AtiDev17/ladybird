@@ -12,6 +12,7 @@
 #include <AK/Weakable.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
+#include <LibWebCommon/HTML/CrossOrigin/OpenerPolicy.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/Forward.h>
 
@@ -47,9 +48,17 @@ public:
     // https://html.spec.whatwg.org/multipage/dom.html#is-initial-about:blank
     bool is_initial_about_blank() const { return m_is_initial_about_blank == IsInitialAboutBlank::Yes; }
 
+    // https://html.spec.whatwg.org/multipage/dom.html#concept-document-coop
+    Web::HTML::OpenerPolicy const& opener_policy() const { return m_opener_policy; }
+    void set_opener_policy(Web::HTML::OpenerPolicy opener_policy) { m_opener_policy = move(opener_policy); }
+
     // https://html.spec.whatwg.org/multipage/dom.html#completely-loaded
     bool is_completely_loaded() const { return m_completely_loaded; }
     void set_completely_loaded() { m_completely_loaded = true; }
+
+    // The origin of the top-level document of this document's browsing context, or nothing if that browsing context has
+    // been discarded.
+    Optional<URL::Origin> top_level_origin() const;
 
     RefPtr<WebContentPage> const& host() const { return m_host; }
     void set_host(RefPtr<WebContentPage>);
@@ -64,6 +73,7 @@ private:
     NonnullRefPtr<CanonicalBrowsingContext> m_browsing_context;
     NonnullRefPtr<CanonicalWindow> m_relevant_global_object;
     IsInitialAboutBlank m_is_initial_about_blank { IsInitialAboutBlank::No };
+    Web::HTML::OpenerPolicy m_opener_policy;
     bool m_completely_loaded { false };
     RefPtr<WebContentPage> m_host;
 };

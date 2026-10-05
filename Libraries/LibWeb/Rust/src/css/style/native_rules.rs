@@ -29,7 +29,7 @@ pub(super) struct NativeRuleTarget {
 #[derive(Clone)]
 struct NativeRuleConditions {
     layer_name: Box<[u16]>,
-    containers: Vec<Arc<ContainerConditionsData>>,
+    containers: Box<[Arc<ContainerConditionsData>]>,
 }
 
 pub(super) struct NativeRuleRegistry {
@@ -142,42 +142,31 @@ impl RetainedState {
         self.native_rules.identities.get(&identity)
     }
 
-    /// Register immutable cascade inputs independently of document-local rule owners.
-    ///
-    /// # Safety
-    /// Containers must belong to live Arc allocations.
-    pub(crate) unsafe fn register_native_rule(
+    /// Register immutable cascade inputs independently of document-local rule owners, with the container conditions
+    /// the rule is inside, innermost first.
+    pub(crate) fn register_native_rule(
         &mut self,
         id: RuleID,
         identity: u64,
         declarations: Option<Arc<DeclarationBlockData>>,
         source_identity: u64,
         layer_name: &[u16],
-        containers: &[*const ContainerConditionsData],
+        containers: Box<[Arc<ContainerConditionsData>]>,
     ) {
         // Whole-sheet replacement can reuse the semantic ID with a new native rule. Retire the
         // old reverse lookup before installing the replacement; detached CSSOM rules keep their
         // native identity but no longer name a rule in this engine.
         self.native_rules.remove(id, &mut self.memory);
-        let target = unsafe {
-            NativeRuleTarget {
-                identity: NonZeroU64::new(identity).expect("native rule identities are nonzero"),
-                declarations,
-                source_identity,
-                conditions: (!layer_name.is_empty() || !containers.is_empty()).then(|| {
-                    Box::new(NativeRuleConditions {
-                        layer_name: layer_name.into(),
-                        containers: containers
-                            .iter()
-                            .rev()
-                            .map(|&container| {
-                                Arc::increment_strong_count(container);
-                                Arc::from_raw(container)
-                            })
-                            .collect(),
-                    })
-                }),
-            }
+        let target = NativeRuleTarget {
+            identity: NonZeroU64::new(identity).expect("native rule identities are nonzero"),
+            declarations,
+            source_identity,
+            conditions: (!layer_name.is_empty() || !containers.is_empty()).then(|| {
+                Box::new(NativeRuleConditions {
+                    layer_name: layer_name.into(),
+                    containers,
+                })
+            }),
         };
         self.native_rules.identities.insert(identity, id);
         self.native_rules.targets.insert(id, target);
@@ -192,7 +181,6 @@ mod tests {
     use crate::css::parser::value_parser::ParseContext;
     use crate::css::rule::{rust_rule_identity, rust_rule_list_at, rust_rule_list_clear, rust_rule_retain};
     use crate::css::style::StyleEngine;
-    use crate::css::style::bridge::style_engine_native_rule_id;
     use crate::css::style::memory::DeviceClass;
     use crate::css::style::program::{CascadeOrigin, RuleKind, StyleSheetObjectID};
     use crate::css::style_sheet::NativeStyleSheet;
@@ -228,13 +216,15 @@ mod tests {
                 engine.add_non_matching_rule(sheet, None, RuleKind::Function);
             }
             let id = engine.add_non_matching_rule(sheet, None, RuleKind::Function);
-            unsafe {
-                engine.register_native_rule(id, identity, rule.cascade_declarations(), source.identity(), &[], &[])
-            };
-            assert_eq!(
-                unsafe { style_engine_native_rule_id(std::ptr::from_ref(engine).cast(), identity) },
-                id.0 + 1
+            engine.register_native_rule(
+                id,
+                identity,
+                rule.cascade_declarations(),
+                source.identity(),
+                &[],
+                Box::default(),
             );
+            assert_eq!(engine.native_rule_id(identity), Some(id));
             ids.push(id);
             assert_eq!(
                 engine.native_rules.targets.get(&id).unwrap().source_identity,
@@ -266,7 +256,7 @@ mod tests {
     #[test]
     fn declaration_edits_resolve_native_owners_and_use_engine_revisions() {
         use crate::css::rule::rust_rule_children;
-        use crate::css::style::bridge::style_engine_native_rule_declarations_changed;
+        use crate::css::style::rule_writes::publish_native_rule_declarations;
         let source = source();
         let rule = unsafe { &*rust_rule_list_at(source.rules(), 0) };
         let children = unsafe { &*rust_rule_children(rule) };
@@ -274,53 +264,37 @@ mod tests {
         let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
         let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
         let id = engine.add_non_matching_rule(sheet, None, RuleKind::Function);
-        unsafe {
-            engine.register_native_rule(
-                id,
-                rust_rule_identity(rule),
-                rule.cascade_declarations(),
-                source.identity(),
-                &[],
-                &[],
-            )
-        };
+        engine.register_native_rule(
+            id,
+            rust_rule_identity(rule),
+            rule.cascade_declarations(),
+            source.identity(),
+            &[],
+            Box::default(),
+        );
         let mut notifications = Vec::<u32>::new();
-        unsafe extern "C" fn notify(context: *mut std::ffi::c_void, rule: u32) {
-            unsafe { &mut *context.cast::<Vec<u32>>() }.push(rule);
-        }
+        // What the engine does with the host's write: it publishes the edit through the rule that owns the declarations.
+        let declarations_changed = |engine: &mut StyleEngine, notifications: &mut Vec<u32>| {
+            if let Some(owner) = child
+                .declaration_owner_identity()
+                .and_then(|identity| engine.native_rule_id(identity))
+            {
+                notifications.push(owner.0 + 1);
+                publish_native_rule_declarations(engine, child.cascade_declarations(), owner);
+            }
+        };
         let initial = engine.current_rule_version(id).declaration_block;
-        unsafe {
-            style_engine_native_rule_declarations_changed(
-                (&raw mut engine).cast(),
-                Rc::as_ptr(&child).cast(),
-                (&raw mut notifications).cast(),
-                notify,
-            );
-        }
+        declarations_changed(&mut engine, &mut notifications);
         let first = engine.current_rule_version(id).declaration_block;
         assert_ne!(initial, first);
         // Inline declarations and whole-sheet replacement use the same revision issuer.
         engine.next_declaration_block_version();
-        unsafe {
-            style_engine_native_rule_declarations_changed(
-                (&raw mut engine).cast(),
-                Rc::as_ptr(&child).cast(),
-                (&raw mut notifications).cast(),
-                notify,
-            );
-        }
+        declarations_changed(&mut engine, &mut notifications);
         let second = engine.current_rule_version(id).declaration_block;
         assert_ne!(first, second);
         assert_eq!(notifications, [id.0 + 1, id.0 + 1]);
         rust_rule_list_clear(children);
-        unsafe {
-            style_engine_native_rule_declarations_changed(
-                (&raw mut engine).cast(),
-                Rc::as_ptr(&child).cast(),
-                (&raw mut notifications).cast(),
-                notify,
-            );
-        }
+        declarations_changed(&mut engine, &mut notifications);
         assert_eq!(engine.current_rule_version(id).declaration_block, second);
         assert_eq!(notifications.len(), 2);
     }
@@ -334,24 +308,22 @@ mod tests {
         let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
         let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
         let id = engine.add_non_matching_rule(sheet, None, RuleKind::Function);
-        unsafe {
-            engine.register_native_rule(
-                id,
-                rust_rule_identity(old_rule),
-                old_rule.cascade_declarations(),
-                old_source.identity(),
-                &[],
-                &[],
-            );
-            engine.register_native_rule(
-                id,
-                rust_rule_identity(new_rule),
-                new_rule.cascade_declarations(),
-                new_source.identity(),
-                &[],
-                &[],
-            );
-        }
+        engine.register_native_rule(
+            id,
+            rust_rule_identity(old_rule),
+            old_rule.cascade_declarations(),
+            old_source.identity(),
+            &[],
+            Box::default(),
+        );
+        engine.register_native_rule(
+            id,
+            rust_rule_identity(new_rule),
+            new_rule.cascade_declarations(),
+            new_source.identity(),
+            &[],
+            Box::default(),
+        );
         assert!(
             !engine
                 .native_rules

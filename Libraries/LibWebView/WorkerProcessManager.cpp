@@ -68,6 +68,16 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
     }
     request.outside_settings.origin = outside_settings->origin();
 
+    // NB: A worker shares the ancestors of the environment that creates it.
+    auto has_cross_site_ancestor = owner.client.visit(
+        [&](WebContentOwner const& web_content_owner) {
+            auto* page = web_content_owner.client ? web_content_owner.client->page(web_content_owner.page_id) : nullptr;
+            return !page || page->hosted_environment_has_cross_site_ancestor(outside_settings->id()).value_or(true);
+        },
+        [&](WebWorkerOwner const&) {
+            return static_cast<CanonicalWorkerEnvironmentSettingsObject const&>(*outside_settings).has_cross_site_ancestor();
+        });
+
     // 9. Let outsideStorageKey be the result of running obtain a storage key for non-storage purposes given
     //    outsideSettings.
     auto outside_storage_key = obtain_a_storage_key_for_non_storage_purposes(*outside_settings);
@@ -79,6 +89,8 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
             .storage_key = outside_storage_key,
             .url = request.url,
             .name = Utf16String::from_utf8(request.name),
+            .top_level_site = network_isolation_top_level_site(*outside_settings),
+            .has_cross_site_ancestor = has_cross_site_ancestor,
         };
 
         // 11.2. For each scope in the list of all SharedWorkerGlobalScope objects: if workerStorageKey
@@ -143,13 +155,24 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
     auto session = client->session();
     if (!session)
         session = Application::session_for_new_view(is_private);
-    auto request_server_handle = MUST(connect_new_request_server_client(*session));
+    // The worker makes its requests for the sites its owner makes them for.
+    owner.client.visit(
+        [&](WebContentOwner const& web_content_owner) {
+            if (web_content_owner.client)
+                client->request_server_site_bindings().bind_sites_of(web_content_owner.client->request_server_site_bindings());
+        },
+        [&](WebWorkerOwner const& web_worker_owner) {
+            client->request_server_site_bindings().bind_sites_of(web_worker_owner.client->request_server_site_bindings());
+        });
+
+    auto request_server_connection = MUST(connect_new_request_server_client(*session, RequestServer::SiteBinding::Bound));
     auto image_decoder_handle = MUST(connect_new_image_decoder_client());
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     auto wasm_compiler_handle = MUST(connect_new_wasm_compiler_client());
 #endif
 
-    client->async_connect_to_request_server(request_server_handle);
+    client->request_server_site_bindings().did_connect(request_server_connection.client_id);
+    client->async_connect_to_request_server(move(request_server_connection.handle));
     client->async_set_site_compatibility_data(Application::the().site_compatibility_data());
     client->async_connect_to_image_decoder(image_decoder_handle);
 #if defined(HAVE_WASM_COMPILER_SERVICE)
@@ -168,7 +191,12 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
     auto origin = request.url.scheme() == "data"sv ? URL::Origin::create_opaque() : outside_settings->origin();
 
     // 5. Set settings object's id to a new unique opaque string, [...]
-    auto inside_settings = make<CanonicalWorkerEnvironmentSettingsObject>(move(origin), Web::HTML::EnvironmentId::generate());
+    // 6. If worker global scope is a DedicatedWorkerGlobalScope object, then set settings object's top-level origin to
+    //    outside settings's top-level origin.
+    // 7. Otherwise, set settings object's top-level origin to an implementation-defined value.
+    // NB: As storage partitioning in other browsers does, a shared worker takes the top-level origin of the outside
+    //     settings it is created for, too.
+    auto inside_settings = make<CanonicalWorkerEnvironmentSettingsObject>(move(origin), outside_settings->top_level_origin(), has_cross_site_ancestor, Web::HTML::EnvironmentId::generate());
     auto environment_id = inside_settings->id();
 
     // AD-HOC: Seed worker_is_secure_context with the caller's value so reuse requests arriving before
@@ -195,6 +223,8 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
             .storage_key = move(outside_storage_key),
             .url = request.url,
             .name = Utf16String::from_utf8(request.name),
+            .top_level_site = network_isolation_top_level_site(*outside_settings),
+            .has_cross_site_ancestor = has_cross_site_ancestor,
         };
         m_shared_workers.set(*agent.shared_worker_key, agent_id);
     }
@@ -301,6 +331,14 @@ void WorkerProcessManager::post_broadcast_channel_message(Web::HTML::PostedBroad
     }
 }
 
+void WorkerProcessManager::for_each_request_server_site_bindings(Function<IterationDecision(RequestServerSiteBindings&)> const& callback)
+{
+    for (auto& entry : m_agents) {
+        if (callback(entry.value.client->request_server_site_bindings()) == IterationDecision::Break)
+            return;
+    }
+}
+
 ErrorOr<void> WorkerProcessManager::reconnect_to_request_server()
 {
     return reconnect_to_request_server([](auto const&) { return true; });
@@ -318,8 +356,9 @@ ErrorOr<void> WorkerProcessManager::reconnect_to_request_server(Function<bool(Wo
         if (!session)
             continue;
 
-        auto request_server_handle = TRY(connect_new_request_server_client(*session));
-        agent.client->async_connect_to_request_server(move(request_server_handle));
+        auto request_server_connection = TRY(connect_new_request_server_client(*session, RequestServer::SiteBinding::Bound));
+        agent.client->request_server_site_bindings().did_connect(request_server_connection.client_id);
+        agent.client->async_connect_to_request_server(move(request_server_connection.handle));
     }
     return {};
 }
@@ -343,8 +382,9 @@ ErrorOr<void> WorkerProcessManager::simulate_request_server_connection_loss_for_
     for (auto& client : clients) {
         auto session = client->session();
         VERIFY(session);
-        auto request_server_handle = TRY(connect_new_request_server_client(*session));
-        auto response = client->send_sync_but_allow_failure<Messages::WebWorkerServer::SimulateRequestServerConnectionLossAndReconnectForTesting>(move(request_server_handle));
+        auto request_server_connection = TRY(connect_new_request_server_client(*session, RequestServer::SiteBinding::Bound));
+        client->request_server_site_bindings().did_connect(request_server_connection.client_id);
+        auto response = client->send_sync_but_allow_failure<Messages::WebWorkerServer::SimulateRequestServerConnectionLossAndReconnectForTesting>(move(request_server_connection.handle));
         if (!response)
             return Error::from_string_literal("WebWorker disconnected while reconnecting to RequestServer");
     }

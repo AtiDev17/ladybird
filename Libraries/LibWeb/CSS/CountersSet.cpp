@@ -14,18 +14,13 @@
 
 namespace Web::CSS {
 
-static void* layout_node_arena_handle(DOM::Element const& element)
-{
-    auto* arena = element.document().layout_node_arena_if_created();
-    return arena ? const_cast<Layout::NodeArena*>(arena)->handle() : nullptr;
-}
-
 bool innermost_list_item_counter_is_own_forward_counter(DOM::Element const& element)
 {
-    auto* arena = layout_node_arena_handle(element);
-    if (!arena)
+    // A layout tree build resolves the element's counters from the style it has installed.
+    auto const& style = element.installed_style();
+    if (!style)
         return false;
-    return Layout::RustFFI::layout_arena_innermost_list_item_counter_is_own_forward_counter(arena, element.style_node_id().value());
+    return Layout::RustFFI::style_resets_forward_list_item_counter(style.view().payloads, style.view().payload_count);
 }
 
 Utf16FlyString const& list_item_counter_name()

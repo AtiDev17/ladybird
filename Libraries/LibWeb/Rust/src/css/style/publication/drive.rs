@@ -20,7 +20,8 @@ pub(in crate::css::style) enum Unanswered {
     Suspended(Suspension),
     Refused,
     /// The row inherits from a parent that holds no record yet: one the host styles in the same
-    /// update. The host retries the row once it has applied the rows before it.
+    /// update. The style pass settles the row in its next wave, once the host installed the rows
+    /// before it.
     AwaitsParent,
 }
 
@@ -186,21 +187,6 @@ struct DriveProgress {
 }
 
 impl RetainedState {
-    /// Whether what an explicit `inherit` of a non-inherited property reads from the parent, the
-    /// parent's record with the composition its animations laid over it, is what the child's
-    /// after-change style inherits. A parent that declares transitions may hold the current value
-    /// of one, which the after-change style leaves out and the host's transition decision cannot
-    /// tell from the parent's own.
-    fn parent_record_answers_explicit_inheritance(&self, parent: Option<StyleNodeID>) -> bool {
-        parent.is_none_or(|parent| {
-            self.computed_group_sets
-                .assigned_style_record(parent)
-                .and_then(|record| self.computed_group_sets.style_record_view(record.raw()))
-                .and_then(|view| unsafe { view.longhand_table.as_ref() })
-                .is_some_and(|table| !crate::css::style_compute::has_active_transition_properties(table))
-        })
-    }
-
     /// The font size the monospace recascade gives a drive target: the cascaded font-size of every
     /// ancestor it inherits from, root first, walked again from a 13px default. A pseudo-element
     /// inherits from its originating element. A length the walk cannot resolve from the document's
@@ -266,6 +252,7 @@ impl RetainedState {
                 font_weight: 400.0,
                 font_width: 100.0,
                 font_optical_sizing: 0,
+                font_feature_values_scope: TreeScopeID::DOCUMENT.0,
                 font_environment_generation: inputs.font_environment_generation,
             };
             let Some(resolved) = self
@@ -353,6 +340,24 @@ impl RetainedState {
         ))
     }
 
+    /// The tree scope whose `@font-feature-values` an element's `font-variant-alternates` names
+    /// features through: the nearest around it, through the trees its hosts are in, that declares
+    /// some, or the document's. Those of the trees between add nothing.
+    fn font_feature_values_scope(&self, node: StyleNodeID) -> TreeScopeID {
+        let declaring = self
+            .font_resolution
+            .as_ref()
+            .map_or(&[][..], |resolutions| resolutions.feature_values_shadow_scopes());
+        let mut scope = self.tree.tree_scope(node);
+        while scope != TreeScopeID::DOCUMENT && !declaring.contains(&scope) {
+            let Some(host) = self.scope_root(scope).and_then(|root| self.tree.host_of(root)) else {
+                return TreeScopeID::DOCUMENT;
+            };
+            scope = self.tree.tree_scope(host);
+        }
+        scope
+    }
+
     /// Run the drive's remaining phase for the selected longhands over a copy of the node's
     /// current table, against the record's own font metrics, the document's computation inputs
     /// and the parent's record. The required driver inputs recompute on every drive and their
@@ -366,7 +371,6 @@ impl RetainedState {
         store: &WinnerStore,
         selected: &[u64],
         inputs: &bridge::FfiDocumentStyleComputationInputs,
-        installed_ancestors: Option<&InstalledAncestors>,
         counters: &mut Counters,
     ) -> Drive<PartialDrive> {
         let random_base_values = store
@@ -394,18 +398,16 @@ impl RetainedState {
             counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
             return Err(Unanswered::Refused);
         }
-        // A record holding no table has no slots to copy the unselected properties from; the caller
-        // drives it in full.
-        let Some(old_table) = (unsafe { view.longhand_table.as_ref() }) else {
+        // A record holding no table has no slots to copy the unselected properties from, and one
+        // under display:none may have kept values its moved ancestors no longer pass on: the caller
+        // drives either in full.
+        let Some(old_table) =
+            (unsafe { view.longhand_table.as_ref() }).filter(|_| view.dependency_flags & IN_DISPLAY_NONE_SUBTREE == 0)
+        else {
             return Ok(PartialDrive::DriverInputMoved);
         };
-        // A record under display:none may no longer be the style C++ holds.
-        if view.dependency_flags & (1 << 2) != 0 {
-            counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
-            return Err(Unanswered::Refused);
-        }
         let parent = self
-            .record_inheritance_parent(node, installed_ancestors)
+            .record_inheritance_parent(node)
             .inspect_err(|_| counters.bump(Counter::EngineComputedRecordBailRecordParent))?;
         let snapshot = match parent.and_then(|parent| self.computed_group_sets.assigned_style_record(parent)) {
             None => None,
@@ -535,15 +537,6 @@ impl RetainedState {
             counters.bump(Counter::EngineComputedRecordBailDrive);
             return Err(Unanswered::Refused);
         }
-        // An `inherit` of a non-inherited property reads the half of the parent's style a child
-        // normally cannot see. The value is computed here, and the mark C++ leaves on the parent
-        // beside it travels with the row.
-        if results.explicitly_inherited_non_inherited_style_groups != 0
-            && !self.parent_record_answers_explicit_inheritance(parent)
-        {
-            counters.bump(Counter::EngineComputedRecordBailDrive);
-            return Err(Unanswered::Refused);
-        }
         // An input the drive reads for properties it did not select moved with the selection: the
         // caller drives the record in full instead.
         if table.display_before_box_type_transformation() != old_table.display_before_box_type_transformation() {
@@ -591,6 +584,62 @@ impl RetainedState {
         }))
     }
 
+    /// What the box-type transformation of a style reads besides its own display, position and
+    /// float: the facts the host published for the element and the display of `parent`, the
+    /// element it inherits from, past any display:contents ancestor, as its record composes it.
+    /// A record the engine drives and a composition the host samples over it are transformed
+    /// against the same input.
+    pub(in crate::css::style) fn box_type_transformation_input(
+        &self,
+        facts: u32,
+        target: crate::css::style_compute::FfiStyleAdjustmentTarget,
+        parent: Option<StyleNodeID>,
+    ) -> crate::css::style_compute::FfiBoxTypeTransformationInput {
+        use crate::css::style_compute::effective_display;
+
+        let mut parent_display = None;
+        let mut ancestor = parent;
+        while let Some(current) = ancestor
+            && let Some(record) = self.computed_group_sets.assigned_style_record(current)
+            && let Some(view) = self.computed_group_sets.style_record_view(record.raw())
+            && let Some(table) = unsafe { view.longhand_table.as_ref() }
+        {
+            let display = effective_display(table, unsafe { view.animated_overlay.as_ref() });
+            if !display.is_contents() {
+                parent_display = Some(display);
+                break;
+            }
+            ancestor = self.tree.inheritance_parent(current);
+        }
+        crate::css::style_compute::rust_box_type_transformation_input(
+            facts,
+            target,
+            parent_display.is_some(),
+            parent_display.unwrap_or_else(crate::css::display::FfiDisplay::block),
+        )
+    }
+
+    /// The box-type transformation input of the composition the host samples over the record of
+    /// `node`, or of its pseudo-element of `pseudo_kind`, which inherits from the element.
+    pub(crate) fn composition_box_type_transformation_input(
+        &self,
+        node: StyleNodeID,
+        pseudo_kind: u8,
+    ) -> crate::css::style_compute::FfiBoxTypeTransformationInput {
+        use crate::css::style_compute::FfiStyleAdjustmentTarget;
+
+        let facts = self.computed_group_sets.adjustment_facts(node);
+        if pseudo_kind == crate::css::cascaded_properties::NO_PSEUDO_ELEMENT {
+            self.box_type_transformation_input(
+                facts,
+                FfiStyleAdjustmentTarget::Element,
+                self.tree.inheritance_parent(node),
+            )
+        } else {
+            self.box_type_transformation_input(facts, FfiStyleAdjustmentTarget::PseudoElement, Some(node))
+        }
+    }
+
     /// Drive a record through every phase: the font phase against the parent's metrics, the
     /// element's font resolved through the document's resolver, line-height and color-scheme
     /// against that font, and the remaining phase with the element facts the box-type
@@ -630,7 +679,7 @@ impl RetainedState {
             FfiEffectiveColorSchemeInput, FfiFontMetrics, FfiInputLineHeightMetrics, FfiLengthResolutionContext,
             FfiStyleComputationEnvironment, LONGHAND_DRIVE_PHASE_COLOR_SCHEME, LONGHAND_DRIVE_PHASE_FONT,
             LONGHAND_DRIVE_PHASE_LINE_HEIGHT, LONGHAND_DRIVE_PHASE_REMAINING, drive_property_computation,
-            effective_display, empty_longhand_driver_results, font_family_is_monospace, keyword,
+            empty_longhand_driver_results, font_family_is_monospace,
         };
         use bridge::element_adjustment_fact as fact;
 
@@ -687,17 +736,7 @@ impl RetainedState {
                     return Err(Unanswered::Refused);
                 }
                 // A record holding no table is driven from a fresh one, like a first record.
-                let old_table = unsafe { view.longhand_table.as_ref() };
-                // A record kept under display:none is still what the element's own style is driven
-                // from, but the animations it names start only when C++ computes the element out of
-                // that subtree.
-                if old_table
-                    .is_some_and(|old_table| view.dependency_flags & (1 << 2) != 0 && table_names_animations(old_table))
-                {
-                    counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
-                    return Err(Unanswered::Refused);
-                }
-                old_table
+                unsafe { view.longhand_table.as_ref() }
             }
             None => None,
         };
@@ -747,36 +786,6 @@ impl RetainedState {
                 }
                 None => (initial_metrics, false, 0.0),
             };
-        // C++ computes no first style under a display:none ancestor.
-        if old_style_record.is_none()
-            && parent_view
-                .as_ref()
-                .is_some_and(|parent_view| parent_view.dependency_flags & (1 << 2) != 0)
-        {
-            counters.bump(Counter::EngineComputedRecordBailRecordParent);
-            return Err(Unanswered::Refused);
-        }
-        // The parent's display, past any display:contents ancestor, is what the box-type
-        // transformation reads.
-        let mut parent_display = None;
-        let mut ancestor = parent;
-        while let Some(current) = ancestor {
-            let Some(record) = self.computed_group_sets.assigned_style_record(current) else {
-                break;
-            };
-            let Some(ancestor_view) = self.computed_group_sets.style_record_view(record.raw()) else {
-                break;
-            };
-            let Some(ancestor_table) = (unsafe { ancestor_view.longhand_table.as_ref() }) else {
-                break;
-            };
-            let display = effective_display(ancestor_table, None);
-            if !display.is_contents() {
-                parent_display = Some(display);
-                break;
-            }
-            ancestor = self.tree.inheritance_parent(current);
-        }
         let snapshot = match &parent_view {
             Some(parent_view) => {
                 let Some(parent_table) = (unsafe { parent_view.longhand_table.as_ref() }) else {
@@ -788,15 +797,15 @@ impl RetainedState {
                     parent_table,
                     unsafe { parent_view.animated_overlay.as_ref() },
                     parent_font_metrics_depend_on_viewport_metrics,
-                    parent_view.dependency_flags & (1 << 2) != 0,
                 ))
             }
             None => None,
         };
-        // A ::selection inherits its applicable properties from the nearest ancestor's ::selection.
-        let highlight = (target.pseudo_kind() == pseudo_kind::SELECTION).then(|| {
+        // A highlight pseudo-element inherits its applicable properties from the same
+        // pseudo-element of the nearest ancestor.
+        let highlight = pseudo_kind::is_highlight(target.pseudo_kind()).then(|| {
             let snapshot = self
-                .retained_highlight_inheritance_parent_style_record(target.node(), pseudo_kind::SELECTION)
+                .retained_highlight_inheritance_parent_style_record(target.node(), target.pseudo_kind())
                 .and_then(|record| self.computed_group_sets.style_record_view(record.raw()))
                 .and_then(|view| {
                     let table = unsafe { view.longhand_table.as_ref() }?;
@@ -804,11 +813,10 @@ impl RetainedState {
                         table,
                         unsafe { view.animated_overlay.as_ref() },
                         view.dependency_flags & (1 << 1) != 0,
-                        view.dependency_flags & (1 << 2) != 0,
                     ))
                 });
             crate::css::style_compute::HighlightInheritance {
-                pseudo_kind: pseudo_kind::SELECTION,
+                pseudo_kind: target.pseudo_kind(),
                 snapshot,
             }
         });
@@ -836,11 +844,10 @@ impl RetainedState {
         // A tree-counting function on a pseudo-element counts its originating element's siblings.
         let sibling_position = self.sibling_position(subject.target.node());
         let environment = FfiStyleComputationEnvironment {
-            box_type_input: crate::css::style_compute::rust_box_type_transformation_input(
+            box_type_input: self.box_type_transformation_input(
                 facts,
                 crate::css::style_compute::FfiStyleAdjustmentTarget::Element,
-                parent_display.is_some(),
-                parent_display.unwrap_or_else(crate::css::display::FfiDisplay::block),
+                parent,
             ),
             color_scheme_input: FfiEffectiveColorSchemeInput {
                 preferred_color_scheme: inputs.preferred_color_scheme,
@@ -998,20 +1005,10 @@ impl RetainedState {
             }
         }
 
-        // `font-variant-alternates` names features through its tree scope's `@font-feature-values`,
-        // and the engine's resolver only has the document's. An element in a shadow tree that sets it
-        // keeps its record in C++.
-        if self.tree.tree_scope(target.node()) != TreeScopeID::DOCUMENT
-            && !matches!(
-                engine_sample::effective_data(&table, None, prop::FONT_VARIANT_ALTERNATES),
-                Some(StyleValueData::Keyword { keyword }) if *keyword == keyword::NORMAL
-            )
-        {
-            counters.bump(Counter::EngineComputedRecordBailFontPhase);
-            return Err(Unanswered::Refused);
-        }
         // The element's own font, resolved as the C++ font computer would for these values.
-        let request = engine_sample::font_resolution_request(&table, None, inputs);
+        let request = engine_sample::font_resolution_request(&table, None, inputs, || {
+            self.font_feature_values_scope(target.node())
+        });
         let font_size = request.font_size();
         let Some(resolved) = self
             .font_resolution
@@ -1171,15 +1168,6 @@ impl RetainedState {
             counters.bump(Counter::EngineComputedRecordBailDrive);
             return Err(Unanswered::Refused);
         }
-        // An `inherit` of a non-inherited property reads the half of the parent's style a child
-        // normally cannot see; a pseudo-element's parent is its originating element. The mark C++
-        // leaves beside it travels with the element's row.
-        if results.explicitly_inherited_non_inherited_style_groups != 0
-            && !self.parent_record_answers_explicit_inheritance(parent)
-        {
-            counters.bump(Counter::EngineComputedRecordBailDrive);
-            return Err(Unanswered::Refused);
-        }
         let line_height_used_after = engine_sample::used_line_height(&table, None, &request, &resolved);
         let font = engine_sample::font_group_build_inputs(&table, None, &request, line_height_used_after, &resolved);
         let length = FfiLengthResolutionContext {
@@ -1194,19 +1182,6 @@ impl RetainedState {
             explicitly_inherited_groups: results.explicitly_inherited_non_inherited_style_groups,
         }))
     }
-}
-
-/// Whether a computed table's `animation-name` names any animation.
-fn table_names_animations(table: &ComputedLonghandTable) -> bool {
-    use crate::css::style_compute::keyword;
-    let is_none =
-        |value: &StyleValueData| matches!(value, StyleValueData::Keyword { keyword: name } if *name == keyword::NONE);
-    table
-        .get(crate::css::property_metadata::property_id::ANIMATION_NAME)
-        .is_some_and(|value| match value.data() {
-            StyleValueData::ValueList { values, .. } => values.as_slice().iter().any(|value| !is_none(value.data())),
-            value => !is_none(value),
-        })
 }
 
 /// A font's pixel metric as the drive resolves font-relative units against it: the C++ length

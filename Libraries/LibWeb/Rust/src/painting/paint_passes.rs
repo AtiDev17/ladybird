@@ -1,0 +1,499 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+//! The steps of paint preparation, as passes the host sends its document's render state and waits for. A pass reads
+//! and writes the arena alone: what it owes the host, such as the scroll offsets it clamped, comes back in its answer.
+
+use crate::css::css_pixels::CssPixelPoint;
+use crate::layout::LayoutNodeArena;
+use crate::layout::node_data::NodeSlotId;
+use crate::painting::host::{
+    FfiCompositorAnimationPublishOutcome, FfiVisualContextTreeInputs, FfiVisualContextUpdateOutcome,
+    RootBackgroundSource,
+};
+use crate::painting::svg_paint_resources::{PublishedSvgFilter, PublishedSvgPaintServer, SvgPaintResourceKind};
+use crate::painting::visual_animation::VisualAnimation;
+use crate::painting::visual_context::VisualContextState;
+use crate::painting::visual_context::dirty::{VisualContextGlobalRebuildReason, VisualContextUpdateScope};
+use crate::painting::visual_context::incremental::{
+    IncrementalUpdateResult, debug_assert_every_live_node_is_owned, update_visual_context_tree,
+};
+use crate::render_state::{BegunRead, DocumentHost, PreparationPending, RenderMessage, ask, wait_for_render_state};
+use libgfx_rust::FloatPoint;
+
+/// One step of paint preparation over a document's render state. A pass that reads the viewport the render side draws
+/// into carries what the host knows of it, so the host hands it over only to a pass that runs.
+pub(crate) enum PaintPass {
+    /// Settles the scrollable overflow left unmeasured, and with it the root background and the sticky constraints.
+    PrepareForRendering {
+        pending: PendingPreparation,
+        visual_context_update_pending: bool,
+        inputs: FfiVisualContextTreeInputs,
+    },
+    /// Brings the visual context tree up to date with the rows, rebuilding what the dirty boxes name.
+    UpdateAccumulatedVisualContexts {
+        viewport: NodeSlotId,
+        inputs: FfiVisualContextTreeInputs,
+    },
+    /// Gives the visual context tree the transform of the visual viewport.
+    UpdateVisualViewportTransform(FfiVisualContextTreeInputs),
+    /// Re-reads the scroll containers' offsets, when something invalidated them or `force` asks.
+    RefreshScrollState {
+        force: bool,
+        device_pixels_per_css_pixel: f64,
+    },
+    /// Answers the SVG paint resources of the enrolled rows the host resolves from the DOM, if they changed since they
+    /// were resolved last.
+    SvgPaintResourceRequests,
+    /// Publishes the SVG paint resources the host resolved.
+    PublishSvgPaintResources(Vec<ResolvedSvgPaintResource>),
+    /// Gives the visual context tree the compositor animations of an update pass, or none where it was discarded.
+    PublishCompositorAnimations(Vec<VisualAnimation>),
+}
+
+/// What a paint pass answers.
+pub(crate) enum PaintPassAnswer {
+    Prepared(RenderingPreparation),
+    VisualContexts(FfiVisualContextUpdateOutcome),
+    VisualViewportTransform,
+    /// The dense device-pixel offsets of every scroll container, or none where nothing was refreshed.
+    ScrollState(Option<Vec<FloatPoint>>),
+    SvgPaintResourceRequests(Option<Vec<SvgPaintResourceRequest>>),
+    /// Whether a published SVG paint resource changed.
+    SvgPaintResourcesPublished(bool),
+    CompositorAnimationsPublished(FfiCompositorAnimationPublishOutcome),
+}
+
+#[derive(Default)]
+#[repr(C)]
+pub struct FfiRenderingPreparationOutcome {
+    pub requires_display_list_recording: bool,
+    pub requires_visual_context_update: bool,
+    pub visual_context_values_changed: bool,
+}
+
+/// What preparing for rendering answers: its outcome, and the scroll offsets the new overflow moved out of range,
+/// each clamped into it, for the host to store.
+pub(crate) struct RenderingPreparation {
+    pub(crate) outcome: FfiRenderingPreparationOutcome,
+    pub(crate) clamped_scroll_offsets: Vec<(NodeSlotId, CssPixelPoint)>,
+}
+
+impl PaintPass {
+    /// Whether the pass writes the rows throughout: it measures every unmeasured overflow, or brings the visual
+    /// context of every dirty box up to date.
+    fn rewrites_rows(&self) -> bool {
+        matches!(
+            self,
+            Self::PrepareForRendering { .. }
+                | Self::UpdateAccumulatedVisualContexts { .. }
+                | Self::RefreshScrollState { .. }
+        )
+    }
+
+    /// Whether the pass leaves the paint and hit testing properties the host prepared current: it is one of the passes
+    /// that prepare them, or changes nothing they are prepared from.
+    pub(crate) fn leaves_paint_preparation_current(&self) -> bool {
+        self.rewrites_rows()
+            || matches!(
+                self,
+                Self::SvgPaintResourceRequests | Self::PublishCompositorAnimations(_)
+            )
+    }
+
+    /// Runs the pass over `arena`.
+    pub(crate) fn run(self, arena: &mut LayoutNodeArena) -> PaintPassAnswer {
+        match self {
+            Self::PrepareForRendering {
+                pending,
+                visual_context_update_pending,
+                inputs,
+            } => PaintPassAnswer::Prepared(prepare_for_rendering(
+                arena,
+                pending.root_background_source,
+                visual_context_update_pending,
+                &inputs,
+            )),
+            Self::UpdateAccumulatedVisualContexts { viewport, inputs } => {
+                PaintPassAnswer::VisualContexts(update_accumulated_visual_contexts(arena, viewport, inputs))
+            }
+            Self::UpdateVisualViewportTransform(inputs) => {
+                update_visual_viewport_transform(arena, &inputs);
+                PaintPassAnswer::VisualViewportTransform
+            }
+            Self::RefreshScrollState {
+                force,
+                device_pixels_per_css_pixel,
+            } => PaintPassAnswer::ScrollState(refresh_scroll_state(arena, force, device_pixels_per_css_pixel)),
+            Self::SvgPaintResourceRequests => {
+                PaintPassAnswer::SvgPaintResourceRequests(svg_paint_resource_requests(arena))
+            }
+            Self::PublishSvgPaintResources(resolved) => {
+                PaintPassAnswer::SvgPaintResourcesPublished(publish_resolved_svg_paint_resources(arena, resolved))
+            }
+            Self::PublishCompositorAnimations(animations) => PaintPassAnswer::CompositorAnimationsPublished(
+                crate::painting::visual_context::publish_compositor_animations(
+                    &mut arena.paint_state().borrow_mut().visual_context,
+                    animations,
+                ),
+            ),
+        }
+    }
+}
+
+/// Runs `pass` on the render state of `host`'s document in `read`, as the host prepares to paint, and answers what it
+/// answered.
+pub(crate) fn run(read: &BegunRead, host: &DocumentHost, pass: PaintPass) -> PaintPassAnswer {
+    if pass.rewrites_rows() {
+        host.let_go_of_rows();
+    }
+    wait_for_render_state(read, host, |reply| RenderMessage::Paint { pass, reply })
+}
+
+/// Proof that preparing a document for rendering has something to do, which only [`rendering_preparation_pending`]
+/// mints: a host never sends a preparation that would answer that nothing changed. It carries the root background
+/// source it was found with, for the preparation to take over.
+pub(crate) struct PendingPreparation {
+    root_background_source: RootBackgroundSource,
+}
+
+/// Whether preparing `arena` for rendering would change anything: its root background source moved, or scrollable
+/// overflow is left to settle or to measure, or a measurement changed what the preparation answers.
+pub(crate) fn rendering_preparation_pending(arena: &LayoutNodeArena) -> Option<PendingPreparation> {
+    let root_background_source = crate::layout::viewport_propagation::root_background_source(arena);
+    let overflow = &arena.scrollable_overflow;
+    let pending = arena.paint_state().borrow().root_background_source != Some(root_background_source)
+        || overflow.full_layout_commit.get()
+        || overflow.measurement_awaits_preparation()
+        || arena.scrollable_overflow_recalculation_is_scheduled()
+        || !arena.scrollable_overflow_is_measured();
+    pending.then_some(PendingPreparation { root_background_source })
+}
+
+/// Asks the render state of `host`'s document in `read` whether preparing it for rendering has something to do, unless
+/// the host knows it has nothing.
+pub(crate) fn pending_preparation(read: &BegunRead, host: &DocumentHost) -> Option<PendingPreparation> {
+    if host
+        .known_facts()
+        .is_some_and(|facts| !facts.rendering_preparation_pending)
+    {
+        return None;
+    }
+    ask(read, host, PreparationPending)
+}
+
+pub(crate) fn prepare_for_rendering(
+    arena: &LayoutNodeArena,
+    root_background_source: RootBackgroundSource,
+    visual_context_update_pending: bool,
+    inputs: &FfiVisualContextTreeInputs,
+) -> RenderingPreparation {
+    let background_source_changed = arena
+        .paint_state()
+        .borrow_mut()
+        .update_root_background_source(arena, root_background_source);
+    // This measures all overflow left unmeasured, including the root's: the root background covers
+    // the viewport united with it, so a flip in its scrollability is seen here rather than while
+    // recording holds the paint state.
+    let clamped_scroll_offsets = crate::painting::scrollable_overflow::update_scrollable_overflow(arena);
+    let changed = arena.scrollable_overflow.geometry_changed.replace(false);
+    let flipped = arena.scrollable_overflow.scrollability_changed.replace(false);
+    let mut visual_context_values_changed = false;
+    if changed && !flipped && !visual_context_update_pending {
+        let rows = arena.paintable_rows();
+        let mut state = arena.paint_state().borrow_mut();
+        let state = &mut state.visual_context;
+        if let Some(tree) = state.tree.as_mut() {
+            visual_context_values_changed = crate::painting::visual_context::refresh::refresh_sticky_constraints(
+                &rows,
+                &state.scroll_state,
+                tree,
+                inputs,
+            );
+        }
+        state.needs_to_refresh_scroll_state = true;
+    }
+    RenderingPreparation {
+        outcome: FfiRenderingPreparationOutcome {
+            requires_display_list_recording: changed || background_source_changed,
+            requires_visual_context_update: flipped,
+            visual_context_values_changed,
+        },
+        clamped_scroll_offsets,
+    }
+}
+
+fn refresh_scroll_state(
+    arena: &LayoutNodeArena,
+    force: bool,
+    device_pixels_per_css_pixel: f64,
+) -> Option<Vec<FloatPoint>> {
+    arena.measure_scrollable_overflow();
+    let paintable_rows = arena.paintable_rows();
+    let mut paint_state = arena.paint_state().borrow_mut();
+    let state = &mut paint_state.visual_context;
+    if !force && !state.needs_to_refresh_scroll_state {
+        return None;
+    }
+    state.needs_to_refresh_scroll_state = false;
+    crate::painting::visual_context::refresh::refresh_scroll_state(&paintable_rows, &mut state.scroll_state);
+    let mut snapshot = state.scroll_state.snapshot(device_pixels_per_css_pixel);
+    // https://drafts.csswg.org/css-position/#sticky-pos
+    if let Some(tree) = state.tree.as_deref() {
+        tree.resolve_sticky_offsets_in_place(&mut snapshot);
+    }
+    Some(snapshot)
+}
+
+fn update_visual_viewport_transform(arena: &LayoutNodeArena, inputs: &FfiVisualContextTreeInputs) {
+    let mut paint_state = arena.paint_state().borrow_mut();
+    if let Some(tree) = &mut paint_state.visual_context.tree {
+        std::sync::Arc::make_mut(tree).set_visual_viewport_transform(
+            crate::painting::visual_context::node_values::visual_viewport_transform_data(inputs),
+        );
+    }
+}
+
+fn update_accumulated_visual_contexts(
+    arena: &mut LayoutNodeArena,
+    viewport: NodeSlotId,
+    inputs: FfiVisualContextTreeInputs,
+) -> FfiVisualContextUpdateOutcome {
+    arena.measure_scrollable_overflow();
+    if !arena.paintable_row_is_populated(viewport) {
+        return FfiVisualContextUpdateOutcome::default();
+    }
+    let mut state = std::mem::take(&mut arena.paint_state().borrow_mut().visual_context);
+    state.release_quarantined_slots_while_no_handle_is_retained();
+
+    let mut reason = state.dirty_boxes.global_reason;
+    if state.tree.is_none() {
+        reason = reason.max(VisualContextGlobalRebuildReason::FirstBuild);
+    }
+    if state.last_tree_inputs.is_some_and(|last| {
+        last.device_pixels_per_css_pixel != inputs.device_pixels_per_css_pixel
+            || last.viewport_wheel_overflow_x != inputs.viewport_wheel_overflow_x
+            || last.viewport_wheel_overflow_y != inputs.viewport_wheel_overflow_y
+    }) {
+        reason = reason.max(VisualContextGlobalRebuildReason::TreeInputsChanged);
+    }
+    if state.tree.as_deref().is_some_and(|tree| tree.should_compact()) {
+        reason = reason.max(VisualContextGlobalRebuildReason::Compaction);
+    }
+
+    loop {
+        let scope = VisualContextUpdateScope::for_reason(reason);
+        if scope == VisualContextUpdateScope::FreshTree {
+            break;
+        }
+        let result = update_visual_context_tree(&arena.paintable_rows(), viewport, inputs, scope, &mut state);
+        match result {
+            IncrementalUpdateResult::Applied(mut outcome) => {
+                super::ffi::apply_walk_assignments(arena, viewport, &mut outcome, &mut state);
+                arena.resort_stacking_context_entries_flagged_for_resort();
+                crate::painting::fragment_ownership::assign_fragment_ownership_for_pending_line_roots(arena);
+                let performed_full_build = scope == VisualContextUpdateScope::EveryBox;
+                if performed_full_build {
+                    state.build_count += 1;
+                    state.last_full_build_reason = reason;
+                    debug_assert_every_live_node_is_owned(
+                        &arena.paintable_rows(),
+                        state.tree.as_deref().expect("an applied walk keeps the tree"),
+                        viewport,
+                    );
+                } else {
+                    state.incremental_update_count += 1;
+                }
+                state.dirty_boxes.clear();
+                state.last_tree_inputs = Some(inputs);
+                let outcome = FfiVisualContextUpdateOutcome {
+                    performed_full_build,
+                    structural_epoch_changed: outcome.delta.structural_epoch_changed,
+                    requires_display_list_recording: outcome.delta.requires_display_list_recording,
+                    structural_epoch: state.structural_epoch(),
+                };
+                arena.paint_state().borrow_mut().visual_context = state;
+                return outcome;
+            }
+            IncrementalUpdateResult::NeedsFullBuild(fallback_reason) => {
+                assert!(
+                    VisualContextUpdateScope::for_reason(fallback_reason) > scope,
+                    "a fallback widens the update scope"
+                );
+                reason = fallback_reason;
+            }
+        }
+    }
+
+    state.last_full_build_reason = reason;
+    let outcome = fresh_visual_context_tree_build(arena, viewport, inputs, &mut state);
+    state.last_tree_inputs = Some(inputs);
+    arena.paint_state().borrow_mut().visual_context = state;
+    outcome
+}
+
+fn fresh_visual_context_tree_build(
+    arena: &mut LayoutNodeArena,
+    viewport: NodeSlotId,
+    inputs: crate::painting::host::FfiVisualContextTreeInputs,
+    state: &mut VisualContextState,
+) -> FfiVisualContextUpdateOutcome {
+    let mut fresh_tree = crate::painting::visual_context::build::create_fresh_tree_with_viewport_nodes(
+        &arena.paintable_rows(),
+        viewport,
+        &inputs,
+    );
+    fresh_tree.viewport_assignment.node_identity = arena.unique_node_ids().id(viewport);
+    {
+        let mut paintable_rows = arena.paintable_rows_mut();
+        paintable_rows.drop_all_visual_context_records();
+        fresh_tree.viewport_assignment.apply(&mut paintable_rows);
+    }
+    state.tree = Some(std::sync::Arc::new(fresh_tree.tree));
+    state.dirty_boxes.clear();
+    state.build_count += 1;
+    let mut outcome = match update_visual_context_tree(
+        &arena.paintable_rows(),
+        viewport,
+        inputs,
+        VisualContextUpdateScope::FreshTree,
+        state,
+    ) {
+        IncrementalUpdateResult::Applied(outcome) => *outcome,
+        IncrementalUpdateResult::NeedsFullBuild(_) => {
+            unreachable!("a fresh tree walk has a tree and a viewport record")
+        }
+    };
+    outcome.mask_node_owners_changed = true;
+    // Everything records again; pushing that first keeps the per-row pushes below free.
+    arena.push_all_paint_damage();
+    super::ffi::apply_walk_assignments(arena, viewport, &mut outcome, state);
+    arena.rebuild_all_stacking_context_entries_from_records(viewport);
+    arena.take_line_roots_needing_fragment_ownership();
+    crate::painting::fragment_ownership::assign_fragment_ownership(&arena.paintable_rows(), viewport);
+    state.quarantined_slots_are_releasable = false;
+    debug_assert_every_live_node_is_owned(
+        &arena.paintable_rows(),
+        state.tree.as_deref().expect("a fresh tree walk keeps the tree"),
+        viewport,
+    );
+    FfiVisualContextUpdateOutcome {
+        performed_full_build: true,
+        structural_epoch_changed: true,
+        requires_display_list_recording: true,
+        structural_epoch: state.structural_epoch(),
+    }
+}
+
+/// An SVG paint resource of an enrolled row the host resolves from the DOM.
+pub(crate) enum SvgPaintResourceRequest {
+    PaintServer {
+        slot: NodeSlotId,
+        kind: SvgPaintResourceKind,
+    },
+    /// A filter list, with the `url()` of each filter that names an SVG filter.
+    Filter {
+        slot: NodeSlotId,
+        kind: SvgPaintResourceKind,
+        urls: Vec<crate::css::style_value::RetainedStyleValueData>,
+    },
+}
+
+/// What the host resolved of an [`SvgPaintResourceRequest`].
+pub(crate) enum ResolvedSvgPaintResource {
+    PaintServer {
+        slot: NodeSlotId,
+        kind: SvgPaintResourceKind,
+        published: PublishedSvgPaintServer,
+    },
+    Filter {
+        slot: NodeSlotId,
+        kind: SvgPaintResourceKind,
+        published: PublishedSvgFilter,
+    },
+}
+
+/// What the host resolves of the enrolled SVG paint resources, if they changed since they were
+/// resolved last. A row that went away, or whose filters name no SVG filter any more, leaves them.
+pub(crate) fn svg_paint_resource_requests(arena: &LayoutNodeArena) -> Option<Vec<SvgPaintResourceRequest>> {
+    let resources = arena.svg_paint_resources();
+    if !resources.take_needs_sync() {
+        return None;
+    }
+    let mut requests = Vec::new();
+    for (slot, kind) in resources.enrolled_entries() {
+        let Some(style) = arena.node_style_if_live(slot) else {
+            resources.forget_slot(slot);
+            continue;
+        };
+        if matches!(kind, SvgPaintResourceKind::Fill | SvgPaintResourceKind::Stroke) {
+            requests.push(SvgPaintResourceRequest::PaintServer { slot, kind });
+            continue;
+        }
+        let effects = style.effects();
+        let filter_list = match kind {
+            SvgPaintResourceKind::Filter => &effects.filter,
+            SvgPaintResourceKind::BackdropFilter => &effects.backdrop_filter,
+            SvgPaintResourceKind::Fill | SvgPaintResourceKind::Stroke => unreachable!(),
+        };
+        if !crate::painting::css_filter::contains_url(filter_list) {
+            resources.withdraw(slot, kind);
+            continue;
+        }
+        let urls = filter_list
+            .operations
+            .as_slice()
+            .iter()
+            .filter(|operation| operation.kind == crate::painting::css_filter::FILTER_KIND_URL)
+            .map(|operation| {
+                // SAFETY: The row's style holds the value live; the request holds a reference of its
+                // own, as the host may restyle the row while it resolves.
+                unsafe {
+                    crate::css::style_value::RetainedStyleValueData::from_retained_optional_pointer(
+                        crate::css::style_value::retain_style_value(operation.url_value.pointer.cast()),
+                    )
+                }
+            })
+            .collect();
+        requests.push(SvgPaintResourceRequest::Filter { slot, kind, urls });
+    }
+    Some(requests)
+}
+
+/// Publishes what the host resolved of the enrolled SVG paint resources, and answers whether any
+/// changed.
+pub(crate) fn publish_resolved_svg_paint_resources(
+    arena: &LayoutNodeArena,
+    resolved: Vec<ResolvedSvgPaintResource>,
+) -> bool {
+    use crate::painting::record::damage::PaintDamage;
+    let resources = arena.svg_paint_resources();
+    let mut any_changed = false;
+    for resolved in resolved {
+        match resolved {
+            ResolvedSvgPaintResource::PaintServer { slot, kind, published } => {
+                if arena.slot_is_live(slot) && resources.publish_paint_server(slot, kind, published) {
+                    any_changed = true;
+                    arena.push_paint_damage(slot, PaintDamage::SVG | PaintDamage::SCOPE_PREAMBLE);
+                }
+            }
+            ResolvedSvgPaintResource::Filter { slot, kind, published } => {
+                if !arena.slot_is_live(slot) || !resources.publish_filter(slot, kind, published) {
+                    continue;
+                }
+                any_changed = true;
+                if arena.paintable_row_is_populated(slot) {
+                    arena.note_visual_context_box_dirty(
+                        slot,
+                        crate::painting::visual_context::dirty::VisualContextBoxDirtyKind::StyleValueChange,
+                    );
+                    arena.push_paint_damage(slot, PaintDamage::SVG | PaintDamage::SCOPE_PREAMBLE);
+                }
+            }
+        }
+    }
+    any_changed
+}

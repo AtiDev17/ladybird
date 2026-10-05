@@ -22,6 +22,7 @@ class HttpResponse;
 class MemoryCache;
 
 struct Header;
+struct NetworkIsolationKey;
 
 }
 
@@ -29,6 +30,7 @@ namespace HTTP::Cookie {
 
 struct Cookie;
 struct ParsedCookie;
+struct PartitionContext;
 struct VersionedCookie;
 
 enum class IncludeCredentials : u8;

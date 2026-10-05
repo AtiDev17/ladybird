@@ -110,6 +110,9 @@ public:
 
     // ^Layout::ImageProvider
     virtual bool is_image_pending() const override;
+
+    // What new image data changes about the image's box, once the invalidation journal found it.
+    void apply_image_data_change(Badge<DOM::InvalidationJournal>, Layout::Node&, DOM::SetNeedsLayoutReason);
     virtual GC::Ptr<DecodedImageData> decoded_image_data() const override;
     virtual Optional<CSSPixels> intrinsic_width() const override;
     virtual Optional<CSSPixels> intrinsic_height() const override;
@@ -135,7 +138,7 @@ private:
     // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attributes
     virtual bool supports_dimension_attributes() const override { return true; }
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     virtual void did_set_viewport_rect(CSSPixelRect const&) override;
 
@@ -147,8 +150,7 @@ private:
     void update_alt_text_shadow_tree();
     void set_needs_layout_update_or_repaint_after_image_data_change(DOM::SetNeedsLayoutReason);
 
-    virtual void decoded_image_data_did_update() override { image_provider_contents_changed(); }
-    virtual Layout::Node const* image_provider_layout_node() const override;
+    virtual void decoded_image_data_did_update() override;
 
     Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
 

@@ -10,6 +10,7 @@
 #include <AK/Error.h>
 #include <AK/MemoryStream.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/OwnPtr.h>
 #include <AK/Span.h>
 #include <AK/String.h>
 #include <AK/StringView.h>
@@ -34,16 +35,16 @@ public:
     [[nodiscard]] Optional<time_t> modified_time() const;
 
     [[nodiscard]] ByteBuffer clone_data() const;
-    [[nodiscard]] ByteBuffer release_data() &&;
     [[nodiscard]] ReadonlyBytes data() const;
+    [[nodiscard]] NonnullOwnPtr<Core::MappedFile> release_mapped_file();
     [[nodiscard]] FixedMemoryStream stream() const;
 
     [[nodiscard]] Vector<String> children() const;
     // Depth-first
-    template<IteratorFunction<Resource const&> Callback>
+    template<IteratorFunction<Resource&> Callback>
     IterationDecision for_each_descendant(Callback&&) const;
 
-    template<IteratorFunction<Resource const&> Callback>
+    template<IteratorFunction<Resource&> Callback>
     void for_each_descendant_file(Callback&&) const;
 
     struct DirectoryTag { };
@@ -57,17 +58,16 @@ private:
     };
 
     Resource(String path, Scheme, NonnullOwnPtr<Core::MappedFile>, time_t modified_time);
-    Resource(String path, Scheme, ByteBuffer, time_t modified_time);
     Resource(String path, Scheme, DirectoryTag, time_t modified_time);
 
     String m_path; // Relative to scheme root. File: abspath, Resource: resource root
     Scheme m_scheme;
 
-    Variant<DirectoryTag, NonnullOwnPtr<Core::MappedFile>, ByteBuffer> m_data;
+    Variant<DirectoryTag, OwnPtr<Core::MappedFile>> m_data;
     time_t m_modified_time {};
 };
 
-template<IteratorFunction<Resource const&> Callback>
+template<IteratorFunction<Resource&> Callback>
 IterationDecision Resource::for_each_descendant(Callback&& callback) const
 {
     auto children = this->children();
@@ -82,10 +82,10 @@ IterationDecision Resource::for_each_descendant(Callback&& callback) const
     return IterationDecision::Continue;
 }
 
-template<IteratorFunction<Resource const&> Callback>
+template<IteratorFunction<Resource&> Callback>
 void Resource::for_each_descendant_file(Callback&& callback) const
 {
-    for_each_descendant([callback = forward<Callback>(callback)](Resource const& resource) {
+    for_each_descendant([callback = forward<Callback>(callback)](Resource& resource) {
         if (resource.is_directory())
             return IterationDecision::Continue;
         return callback(resource);

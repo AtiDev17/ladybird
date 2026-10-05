@@ -10,6 +10,7 @@
 #include <AK/OwnPtr.h>
 #include <LibGC/CellAllocator.h>
 #include <LibJS/Heap/Cell.h>
+#include <LibWeb/CSS/InstalledStyle.h>
 #include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
@@ -30,12 +31,13 @@ class WEB_API PseudoElement : public JS::Cell {
     GC_DECLARE_ALLOCATOR(PseudoElement);
 
 public:
-    virtual Layout::NodeWithStyle* layout_node() const = 0;
-    virtual Layout::NodeWithStyle* unsafe_layout_node() const = 0;
+    virtual Layout::NodeWithStyle* layout_node(Layout::BegunRead const& read) const = 0;
+    virtual Layout::NodeWithStyle* unsafe_layout_node(Layout::BegunRead const& read) const = 0;
 
     virtual Node& root() const = 0;
 
-    virtual CSS::StyleRecordID style_record_identity() const = 0;
+    virtual CSS::InstalledStyle const& installed_style() const = 0;
+    CSS::StyleRecordID style_record_identity() const { return installed_style().record(); }
     virtual void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&) = 0;
 };
 
@@ -50,20 +52,20 @@ public:
 
     CSS::PseudoElement type() const { return m_type; }
 
-    Layout::NodeWithStyle* layout_node() const override { return unsafe_layout_node(); }
-    Layout::NodeWithStyle* unsafe_layout_node() const override;
-    void set_layout_node(Layout::NodeWithStyle*);
+    Layout::NodeWithStyle* layout_node(Layout::BegunRead const& read) const override { return unsafe_layout_node(read); }
+    Layout::NodeWithStyle* unsafe_layout_node(Layout::BegunRead const& read) const override;
 
     virtual Node& root() const override;
 
-    virtual CSS::StyleRecordID style_record_identity() const override { return m_style_record_identity; }
+    virtual CSS::InstalledStyle const& installed_style() const override { return m_installed_style; }
     void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&) override;
     void set_computed_style(CSS::StyleRecordID);
     void clear_computed_style(RefPtr<CSS::ComputedValues const> style_to_preserve_for_detachment = nullptr);
     void refresh_computed_style(CSS::StyleRecordID);
 
     CSSPixelPoint scroll_offset() const { return m_scroll_offset; }
-    void set_scroll_offset(CSSPixelPoint value) { m_scroll_offset = value; }
+    void set_scroll_offset(CSSPixelPoint);
+    void publish_scroll_offset() const;
 
     virtual void visit_edges(JS::Cell::Visitor&) override;
 
@@ -74,7 +76,7 @@ private:
     GC::Ptr<Element> m_originating_element;
     // The authoritative StyleEngine record. C++ compatibility consumers borrow the record-owned
     // computed-values view rather than retaining one complete style per pseudo-element.
-    CSS::StyleRecordID m_style_record_identity;
+    CSS::InstalledStyle m_installed_style;
     CSSPixelPoint m_scroll_offset {};
 };
 
@@ -103,12 +105,12 @@ class WEB_API ElementReferencePseudoElement : public PseudoElement {
     {
     }
 
-    Layout::NodeWithStyle* layout_node() const override;
-    Layout::NodeWithStyle* unsafe_layout_node() const override;
+    Layout::NodeWithStyle* layout_node(Layout::BegunRead const& read) const override;
+    Layout::NodeWithStyle* unsafe_layout_node(Layout::BegunRead const& read) const override;
 
     virtual Node& root() const override;
 
-    virtual CSS::StyleRecordID style_record_identity() const override;
+    virtual CSS::InstalledStyle const& installed_style() const override;
     void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&) override;
 
     GC::Ref<Element> const& referenced_element() const { return m_referenced_element; }

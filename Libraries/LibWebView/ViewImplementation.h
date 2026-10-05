@@ -108,8 +108,6 @@ public:
     u64 view_id() const { return m_view_id; }
 
     CanonicalTraversable& traversable() const;
-    void display_traversable(Badge<WebContentClient>, CanonicalTraversable&);
-    bool has_display_page() const;
     virtual void prepare_page_for_tab(WebContentPage&);
     void did_change_display_page(Badge<CanonicalNavigable>, RefPtr<WebContentPage> previous_page);
 
@@ -122,13 +120,12 @@ public:
     void set_favicon(Badge<WebContentPage>, Optional<Gfx::Bitmap const&>);
     Optional<String> const& favicon_hash() const { return m_favicon_hash; }
 
-    String const& handle() const { return m_client_state.client_handle; }
+    String const& handle() const { return m_window_handle; }
 
     void server_did_paint(Badge<WebContentPage>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect);
 
     void set_window_position(Gfx::IntPoint);
     void set_window_size(Gfx::IntSize);
-    Web::HTML::VisibilityState system_visibility_state() const { return m_system_visibility_state; }
     void set_system_visibility_state(Web::HTML::VisibilityState);
     void set_has_system_focus(bool);
 
@@ -241,6 +238,7 @@ public:
     void find_in_page(Utf16String const& query, CaseSensitivity = CaseSensitivity::CaseInsensitive);
     void find_in_page_next_match();
     void find_in_page_previous_match();
+    void find_in_page_end();
 
     void get_source();
 
@@ -414,7 +412,7 @@ public:
 
     Function<void()> on_ready_to_paint;
     Function<void(TabPerformanceStats const&)> on_performance_stats;
-    Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, WebContentClient& page_process, Optional<Web::PageId>)> on_new_web_view;
+    Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, CanonicalTraversable&)> on_new_web_view;
     Function<void()> on_activate_tab;
     Function<void()> on_close;
     Function<void(URL::URL const&)> on_link_hover;
@@ -526,9 +524,6 @@ public:
     Action& toggle_bookmark_action() { return *m_toggle_bookmark_action; }
     Action& reset_zoom_action() { return *m_reset_zoom_action; }
 
-    WebContentClient& client();
-    WebContentClient const& client() const;
-    Web::PageId page_id() const;
     WebContentPage& page() const;
 
     virtual Web::DevicePixelSize viewport_size() const = 0;
@@ -597,11 +592,8 @@ protected:
     void set_page_background_color(Gfx::Color);
     Gfx::Color preferred_canvas_background_color() const;
 
-    enum class CreateNewClient {
-        No,
-        Yes,
-    };
-    virtual void initialize_client(CreateNewClient = CreateNewClient::Yes);
+    void initialize_tab(Web::HTML::VisibilityState, Optional<CanonicalTraversable&> = {});
+    void display_traversable(CanonicalTraversable&, Web::HTML::VisibilityState);
     void display_page_changed(RefPtr<WebContentPage> previous_page);
     void cancel_all_native_geolocation_requests();
     void send_geolocation_emulated_position(WebContentPage&);
@@ -657,12 +649,10 @@ protected:
         OwnPtr<Gfx::SharedImageBuffer> shared_image_buffer;
     };
 
-    struct ClientState {
-        String client_handle;
-        SharedBitmap front_bitmap;
-        Vector<SharedBitmap> other_bitmaps;
-        bool has_usable_bitmap { false };
-    } m_client_state;
+    String m_window_handle;
+    SharedBitmap m_front_bitmap;
+    Vector<SharedBitmap> m_other_bitmaps;
+    bool m_has_usable_bitmap { false };
 
     IsPrivate m_is_private { IsPrivate::No };
     NonnullRefPtr<BrowsingSession> m_session;
@@ -842,7 +832,6 @@ protected:
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
 
     CanonicalTraversable* m_top_level_traversable { nullptr };
-    Web::HTML::VisibilityState m_system_visibility_state { Web::HTML::VisibilityState::Hidden };
     Optional<SessionTabId> m_session_tab_id;
     Optional<SessionHistorySnapshot> m_captured_session_history_snapshot_for_testing;
     RefPtr<Core::Promise<Empty>> m_pending_session_history_reset_for_testing;

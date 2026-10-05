@@ -838,6 +838,8 @@ void AnimationUpdateContext::publish()
         // animation style into.
         if (target->style_node_id() == 0)
             continue;
+        // Republishing the element's style is the update's own read of its document's render state.
+        Layout::ForcedReadScope read { target->document(), false };
         // An earlier entry already republished this style with the current animation values.
         if (element.style_record_identity() != it.value.style_record_before_update)
             continue;
@@ -864,18 +866,26 @@ void AnimationUpdateContext::publish()
                 effects_to_collect.append(dirty_effect);
         }
         if (!effects_to_collect.is_empty())
-            target->document().style_computer().collect_animations_into(element, effects_to_collect.span(), *style, CSS::StyleComputer::AnimationRefresh::Yes);
+            target->document().style_computer().collect_animations_into(read, element, effects_to_collect.span(), *style, CSS::StyleComputer::AnimationRefresh::Yes);
         auto& style_computer = target->document().style_computer();
-        if (!style_computer.style_engine().animation_overlay_changed(it.value.style_record_before_update, style->animated_overlay()))
+        if (!element.installed_style().animation_overlay_changed(style->animated_overlay()))
             continue;
 
-        auto [animated_property_invalidation, publication] = style_computer.publish_sampled_animation_overlay(element, *style, it.value.style_record_before_update, [&](auto const& overlay_invalidation) {
-            if (style->animated_overlay() && !animated_overlay_entries(style->animated_overlay()).is_empty()
-                && target->document().is_in_style_stabilization_epoch()
-                && (target->document().style_stabilization_has_style_reactions() || overlay_invalidation.requires_base_style_recomputation)) {
+        // The record the element installed may become a transition baseline once the publication is compared with it,
+        // which the publication can release: an element holds its record until it installs the published one, but a
+        // pseudo-element holds it nowhere, so the update pins it across the publication.
+        bool const may_record_baseline = style->animated_overlay() && !animated_overlay_entries(style->animated_overlay()).is_empty()
+            && target->document().is_in_style_stabilization_epoch();
+        bool const pins_installed_record = may_record_baseline && element.pseudo_element().has_value();
+        auto& style_engine = style_computer.style_engine();
+        if (pins_installed_record)
+            style_engine.pin_style_record(it.value.style_record_before_update);
+        auto [animated_property_invalidation, publication] = style_computer.publish_sampled_animation_overlay(read, element, *style, [&](auto const& overlay_invalidation) {
+            if (may_record_baseline && (target->document().style_stabilization_has_style_reactions() || overlay_invalidation.requires_base_style_recomputation))
                 style_computer.record_transition_stabilization_baseline(element, it.value.style_record_before_update);
-            }
         });
+        if (pins_installed_record)
+            style_engine.unpin_style_record(it.value.style_record_before_update);
         auto invalidation = CSS::decode_style_invalidation(animated_property_invalidation.invalidation);
         target->refresh_computed_style(element.pseudo_element(), publication.new_style_record);
         if (auto* svg_element = as_if<SVG::SVGElement>(*target); svg_element && !element.pseudo_element().has_value())
@@ -886,8 +896,7 @@ void AnimationUpdateContext::publish()
         // exact feedback action so the ordinary reaction path re-cascades that base before the
         // frame becomes observable.
         if (animated_property_invalidation.requires_base_style_recomputation && !it.value.base_is_current)
-            target->document().style_computer().style_engine().record_derived_element_style_input_change(
-                target->style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
+            target->document().style_computer().style_engine().record_derived_element_style_input_change(target->style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
 
         if (!element.pseudo_element().has_value() && invalidation.inherited_style_changed()) {
             // Recomputing pseudo-element styles can start transitions, which stay provisional until a stabilization
@@ -898,7 +907,7 @@ void AnimationUpdateContext::publish()
             ScopeGuard end_stabilization_epoch = [&] {
                 document.end_style_stabilization_epoch();
             };
-            invalidation |= target->recompute_pseudo_element_styles();
+            invalidation |= target->recompute_pseudo_element_styles(read);
         }
 
         // An animated value can be inherited through shadow and slot boundaries. Publish the exact
@@ -934,9 +943,9 @@ void AnimationUpdateContext::publish()
                 layout_node.attach_style_resources();
         };
         if (!element.pseudo_element().has_value()) {
-            if (auto* layout_node = target->unsafe_layout_node())
+            if (auto* layout_node = target->unsafe_layout_node(read))
                 apply_layout_node_style_side_effects(*layout_node, target->style_record_identity());
-        } else if (auto pseudo_element_node = target->pseudo_element_unsafe_layout_node(element.pseudo_element().value())) {
+        } else if (auto pseudo_element_node = target->pseudo_element_unsafe_layout_node(read, element.pseudo_element().value())) {
             apply_layout_node_style_side_effects(*pseudo_element_node, target->style_record_identity(element.pseudo_element()));
         }
 
@@ -946,7 +955,7 @@ void AnimationUpdateContext::publish()
             auto rebuild_root = element.pseudo_element().has_value()
                 ? CSS::LayoutTreeRebuildRoot::Parent
                 : invalidation.layout_tree_rebuild_root();
-            target->set_needs_layout_tree_rebuild(DOM::SetNeedsLayoutTreeUpdateReason::KeyframeEffect, rebuild_root);
+            target->set_needs_layout_tree_rebuild(read, DOM::SetNeedsLayoutTreeUpdateReason::KeyframeEffect, rebuild_root);
         }
         if (invalidation.accumulated_visual_contexts() != CSS::AccumulatedVisualContextInvalidation::None) {
             auto scope = invalidation.accumulated_visual_contexts() == CSS::AccumulatedVisualContextInvalidation::Rebuild
@@ -955,16 +964,16 @@ void AnimationUpdateContext::publish()
             // NB: Element-reference pseudo elements (e.g. ::placeholder) are not synthetic, so schedule their
             //     layout node directly instead of going through the owning element.
             if (element.pseudo_element().has_value()) {
-                if (auto pseudo_element_node = target->pseudo_element_unsafe_layout_node(element.pseudo_element().value()))
+                if (auto pseudo_element_node = target->pseudo_element_unsafe_layout_node(read, element.pseudo_element().value()))
                     element.document().schedule_accumulated_visual_context_update(*pseudo_element_node, scope);
             } else {
-                element.document().schedule_accumulated_visual_context_update(target, scope);
+                element.document().schedule_accumulated_visual_context_update(read, target, scope);
             }
         }
 
         auto* repaint_layout_node = element.pseudo_element().has_value()
-            ? target->pseudo_element_unsafe_layout_node(*element.pseudo_element())
-            : target->unsafe_layout_node();
+            ? target->pseudo_element_unsafe_layout_node(read, *element.pseudo_element())
+            : target->unsafe_layout_node(read);
         if (repaint_layout_node && Painting::has_committed_box(*repaint_layout_node))
             Painting::repaint_after_style_change(*repaint_layout_node, invalidation);
     }

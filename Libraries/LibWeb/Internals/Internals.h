@@ -110,6 +110,11 @@ public:
     Utf16String current_cursor();
 
     Utf16String selected_text_for_clipboard();
+
+    void find_in_page(Utf16String const& query);
+    void find_in_page_next_match();
+    void find_in_page_end();
+
     WebIDL::ExceptionOr<void> set_clipboard_file(Utf16String const& name, Utf16String const& mime_type, Utf16String const& data);
 
     void set_marked_text_from_input_method(Utf16String const& text);
@@ -133,6 +138,7 @@ public:
     WebIDL::ExceptionOr<bool> has_cookie_for_url(Utf16String const& url, String const& name, String const& value);
 
     bool set_http_memory_cache_enabled(bool enabled);
+    bool set_disk_cache_enabled_for_navigations(bool enabled);
     void simulate_request_server_connection_loss();
     void simulate_worker_request_server_connection_loss();
     WebIDL::ExceptionOr<void> send_bad_ipc_message_for_testing(Utf16String const& kind);
@@ -200,7 +206,7 @@ public:
     bool has_shadow_root(GC::Ref<DOM::Element>);
     GC::Ptr<DOM::ShadowRoot> get_shadow_root(GC::Ref<DOM::Element>);
 
-    void handle_sdl_input_events();
+    void pump_gamepad_events();
 
     GC::Ref<InternalGamepad> connect_virtual_gamepad();
     void disconnect_virtual_gamepad(GC::Ref<InternalGamepad>);
@@ -221,6 +227,9 @@ public:
     void reset_rendering_scheduler_counters();
     void set_manual_rendering_opportunities(bool enabled);
     void inject_rendering_opportunity(double frame_time_ms);
+    Utf16String frame_scheduler_state() const;
+    void hold_next_frame();
+    void release_held_frame();
     void update_compositor_animations();
     bool run_empty_animation_style_update_for_testing();
     void arm_compositor_animation_timers_for_testing();
@@ -239,6 +248,7 @@ public:
     u64 paint_style_record_identity(DOM::Element&);
     u64 layout_node_identity(DOM::Node&);
     u64 layout_arena_live_slot_count();
+    void panic_render_state_for_testing();
     u64 layout_arena_shell_count();
     double style_engine_match_document();
     Utf16String style_engine_matched_rules();

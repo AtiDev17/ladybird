@@ -293,7 +293,7 @@ struct ExtraBoxMetrics {
 }
 
 struct TextNodeContext<'pass> {
-    chunks: std::rc::Rc<super::rendered_text::CachedTextChunks>,
+    chunks: std::sync::Arc<super::rendered_text::CachedTextChunks>,
     text: &'pass [u16],
     next_chunk_index: usize,
     should_collapse_whitespace: bool,
@@ -879,7 +879,7 @@ impl InlineLevelIterator {
         atomic_sizing: AtomicInlineSizing,
     ) -> Option<Self> {
         let callbacks = context.callbacks;
-        match callbacks.arena().take_inline_item_stash(context.containing_block) {
+        match callbacks.scratch().take_inline_item_stash(context.containing_block) {
             Some(stash) => Some(Self::from_stash(context, stash)),
             None => InlineLevelIteratorGenerator::generate(context, atomic_sizing),
         }
@@ -915,7 +915,7 @@ impl InlineLevelIterator {
                 return;
             }
         }
-        context.callbacks.arena().store_inline_item_stash(
+        context.callbacks.scratch().store_inline_item_stash(
             context.containing_block,
             StashedInlineItems {
                 items: self.items.collect(),

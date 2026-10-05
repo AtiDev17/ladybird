@@ -123,6 +123,30 @@ test("string escape sequences", () => {
     expect(JSON.parse('"\\u0000"')).toBe("\0");
 });
 
+test("malformed literals inside arrays and objects", () => {
+    expect(() => JSON.parse("[nope]")).toThrow(SyntaxError);
+    expect(() => JSON.parse("[nul]")).toThrow(SyntaxError);
+    expect(() => JSON.parse("[nulltrue]")).toThrow(SyntaxError);
+    expect(() => JSON.parse('{"a":nonsense}')).toThrow(SyntaxError);
+    expect(JSON.parse('[null, {"a": null}]')).toEqual([null, { a: null }]);
+});
+
+test("malformed literals at the top level", () => {
+    expect(() => JSON.parse("falsy")).toThrow(SyntaxError);
+    expect(() => JSON.parse("falsz\t")).toThrow(SyntaxError);
+    expect(JSON.parse("false")).toBeFalse();
+    expect(JSON.parse(" true ")).toBeTrue();
+});
+
+test("overflowing numbers followed by other content", () => {
+    expect(() => JSON.parse("1e400 x")).toThrow(SyntaxError);
+    expect(() => JSON.parse("1e400\f")).toThrow(SyntaxError);
+    expect(() => JSON.parse("1\v")).toThrow(SyntaxError);
+    expect(JSON.parse("1e400 ")).toBe(Infinity);
+    expect(JSON.parse("[1e400 ]")).toEqual([Infinity]);
+    expect(JSON.parse('{"a": -1e400\n}')).toEqual({ a: -Infinity });
+});
+
 test("unicode and surrogate pairs", () => {
     expect(JSON.parse('"café"')).toBe("café");
     expect(JSON.parse('"日本語"')).toBe("日本語");
@@ -160,6 +184,13 @@ test("lone surrogates among non-ASCII text", () => {
 
     expect(JSON.parse('{"日\uD800":"\uD83D\uDE00"}')["日\uD800"]).toBe("😀");
     expect(() => JSON.parse("\uD800")).toThrow(SyntaxError);
+});
+
+test("lone surrogate after a backslash", () => {
+    expect(() => JSON.parse('"\\' + "\uD800" + '"')).toThrow(SyntaxError);
+    expect(() => JSON.parse('{"\\' + "\uDC00" + '": 1}')).toThrow(SyntaxError);
+    expect(() => JSON.rawJSON('"\\' + "\uD800" + '"')).toThrow(SyntaxError);
+    expect(JSON.parse('"\\\\' + "\uD800" + '"')).toBe("\\\uD800");
 });
 
 test("object keys repeated across many objects", () => {

@@ -114,6 +114,8 @@ pub enum PaintableRowResetKind {
     Recommitted = 0,
     Cleared = 1,
     Freed = 2,
+    /// The viewport's row, which the document is bound to, was recommitted.
+    ViewportRecommitted = 3,
 }
 
 pub use crate::layout::inline_content::{FragmentRecord, GlyphRunRecord, InlineBoxPieceRecord};
@@ -161,27 +163,67 @@ pub struct PaintableSideData {
     // Invalidation also runs while paint geometry is borrowed. Keep this
     // mutable cache state out of the plain-data row shared with C++.
     pub(crate) overflow_style: Option<crate::painting::scrollable_overflow::OverflowStyle>,
-    pub(crate) overflow_valid_across_recommits: Cell<bool>,
-    pub(crate) overflow_relative_to_padding_box: Cell<FfiOverflowData>,
     pub(crate) overflow_measured_this_commit: Cell<bool>,
-    pub(crate) inline_content: Option<std::sync::Arc<crate::layout::inline_content::InlineContent>>,
-    pub(crate) piece_indices: Vec<u32>,
-    pub(crate) svg_filter_bounds: Cell<Option<used_values::FfiCssPixelRect>>,
-    // Only meaningful while is_self_painting(); assigned by the containing block's
-    // assign_fragment_ownership().
-    pub(crate) fragment_ownership: Option<crate::painting::fragment_ownership::FragmentOwnershipFilter>,
     // The filter a recommit cleared, kept so the next assignment can tell whether the box
     // paints a different selection of fragments than before.
-    pub(crate) fragment_ownership_before_recommit: Option<crate::painting::fragment_ownership::FragmentOwnershipFilter>,
+    pub(crate) fragment_ownership_before_recommit:
+        Option<std::sync::Arc<crate::painting::fragment_ownership::FragmentOwnershipFilter>>,
 }
 
-impl PaintableSideData {
+/// What a row committed beside its geometry that painting reads with it: its inline content, the
+/// pieces an inline box has in its line root's content, its measured scrollable overflow, and what
+/// paint preparation adds for the recording. Shared records are held by `Arc`, so copying a row
+/// copies reference counts.
+#[derive(Clone, Default)]
+pub(crate) struct CommittedSideData {
+    pub(crate) inline_content: Option<std::sync::Arc<crate::layout::inline_content::InlineContent>>,
+    pub(crate) piece_indices: Option<std::sync::Arc<[u32]>>,
+    pub(crate) overflow_valid_across_recommits: bool,
+    pub(crate) overflow_relative_to_padding_box: FfiOverflowData,
+    /// The bounds of the SVG filter the box references, as the visual context update resolved
+    /// them.
+    pub(crate) svg_filter_bounds: Option<used_values::FfiCssPixelRect>,
+    // Only meaningful while is_self_painting(); assigned by the containing block's
+    // assign_fragment_ownership().
+    pub(crate) fragment_ownership: Option<std::sync::Arc<crate::painting::fragment_ownership::FragmentOwnershipFilter>>,
+    /// The paint-order decisions paint preparation gathered for the row, if it gathered them.
+    pub(crate) order_inputs: crate::painting::paint_order_plan::PaintOrderInputs,
+}
+
+/// Rows are the same when they hold equal records; a shared record is compared only when the rows
+/// hold different allocations of it.
+impl PartialEq for CommittedSideData {
+    fn eq(&self, other: &Self) -> bool {
+        use crate::cow_column::same_payload;
+        self.overflow_valid_across_recommits == other.overflow_valid_across_recommits
+            && self.overflow_relative_to_padding_box == other.overflow_relative_to_padding_box
+            && self.svg_filter_bounds == other.svg_filter_bounds
+            && self.order_inputs == other.order_inputs
+            && same_payload(self.piece_indices.as_ref(), other.piece_indices.as_ref(), |a, b| a == b)
+            && same_payload(
+                self.fragment_ownership.as_ref(),
+                other.fragment_ownership.as_ref(),
+                |a, b| a == b,
+            )
+            && same_payload(self.inline_content.as_ref(), other.inline_content.as_ref(), |a, b| {
+                a == b
+            })
+    }
+}
+
+impl CommittedSideData {
+    pub(crate) fn prepared_order_inputs(&self) -> Option<crate::painting::paint_order_plan::PaintOrderInputs> {
+        self.order_inputs.is_initialized().then_some(self.order_inputs)
+    }
+
     pub(crate) fn clear_committed_records(&mut self) {
         self.inline_content = None;
-        self.piece_indices.clear();
-        if let Some(filter) = self.fragment_ownership.take() {
-            self.fragment_ownership_before_recommit = Some(filter);
-        }
+        self.piece_indices = None;
+    }
+
+    /// The indices of an inline box's pieces in its line root's inline content.
+    pub(crate) fn piece_indices(&self) -> &[u32] {
+        self.piece_indices.as_deref().unwrap_or_default()
     }
 
     pub(crate) fn lines(&self) -> &[crate::layout::inline_content::LineRecord] {

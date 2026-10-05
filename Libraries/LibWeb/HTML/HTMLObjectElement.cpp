@@ -6,9 +6,11 @@
 
 #include <LibGC/Heap.h>
 #include <LibGfx/DecodedImageFrame.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/Invalidation/EmbeddedContentInvalidator.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
@@ -41,11 +43,6 @@
 namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(HTMLObjectElement);
-
-Layout::Node const* HTMLObjectElement::image_provider_layout_node() const
-{
-    return unsafe_layout_node();
-}
 
 static GC::Ref<DOM::Event> create_event_for_element(HTMLElement& element, Utf16FlyString const& event_name)
 {
@@ -192,22 +189,18 @@ void HTMLObjectElement::apply_presentational_hints(Vector<CSS::StyleProperty>& p
     });
 }
 
-Layout::Node* HTMLObjectElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind HTMLObjectElement::box_kind() const
 {
     switch (m_representation) {
     case Representation::Children:
-        return NavigableContainer::create_layout_node(style);
+        return NavigableContainer::box_kind();
     case Representation::ContentNavigable:
-        return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::NavigableContainerViewport);
+        return CSS::ElementBoxKind::NavigableContainerViewport;
     case Representation::Image:
-        if (image_data())
-            return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::ImageBox);
-        break;
+        return image_data() ? CSS::ElementBoxKind::Image : CSS::ElementBoxKind::NoBox;
     default:
-        break;
+        return CSS::ElementBoxKind::NoBox;
     }
-
-    return nullptr;
 }
 
 bool HTMLObjectElement::has_ancestor_media_element_or_object_element_not_showing_fallback_content() const
@@ -235,9 +228,12 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
 
     // This task being queued or actively running must delay the load event of the element's node document.
     m_document_load_event_delayer_for_object_representation_task.empend(document());
+    auto release_load_event_delay = GC::create_function(GC::Heap::the(), [this] {
+        m_document_load_event_delayer_for_object_representation_task.take_last();
+    });
 
-    queue_an_element_task(HTML::Task::Source::DOMManipulation, [this]() {
-        ScopeGuard guard { [&]() { m_document_load_event_delayer_for_object_representation_task.take_last(); } };
+    auto steps = [this, release_load_event_delay]() {
+        ScopeGuard guard { [&] { release_load_event_delay->function()(); } };
 
         auto& realm = HTML::relevant_realm(*this);
         // FIXME: 1. If the user has indicated a preference that this object element's fallback content be shown instead of the
@@ -329,7 +325,9 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
             //       response callback to invoke the fallback steps. This prevents the fallback layout from flashing very
             //       briefly between here and the resource loading.
         }
-    });
+    };
+
+    queue_an_element_task(HTML::Task::Source::DOMManipulation, move(steps), release_load_event_delay);
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element:concept-event-fire-2
@@ -527,13 +525,20 @@ void HTMLObjectElement::load_image()
     m_document_load_event_delayer_for_resource_load.empend(document());
 
     m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), *url);
+    // An image representation has a box only once the new request has image data.
+    CSS::record_element_box_kind(*this);
+    CSS::record_element_replaced_content_input(*this);
     m_resource_request->add_callbacks(
         [this] {
+            CSS::record_element_replaced_content_input(*this);
             run_object_representation_completed_steps(Representation::Image);
             m_document_load_event_delayer_for_resource_load.take_last();
         },
         [this] {
             run_object_representation_fallback_steps();
+            m_document_load_event_delayer_for_resource_load.take_last();
+        },
+        [this] {
             m_document_load_event_delayer_for_resource_load.take_last();
         });
 
@@ -554,6 +559,9 @@ void HTMLObjectElement::update_layout_and_child_objects(Representation represent
     }
 
     m_representation = representation;
+    // The representation decides which box the element asks for, and what that box is sized from.
+    CSS::record_element_box_kind(*this);
+    CSS::record_element_replaced_content_input(*this);
 
     if (auto parent_element = this->parent_element())
         parent_element->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLObjectElementUpdateLayoutAndChildObjects);
@@ -564,6 +572,13 @@ i32 HTMLObjectElement::default_tab_index_value() const
 {
     // See the base function for the spec comments.
     return 0;
+}
+
+void HTMLObjectElement::set_natural_size_of_content_document(CSS::SizeWithAspectRatio const& natural_size)
+{
+    m_natural_size_of_content_document = natural_size;
+    CSS::record_element_replaced_content_input(*this);
+    set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLObjectElementContentDocumentResized);
 }
 
 GC::Ptr<DecodedImageData> HTMLObjectElement::image_data() const

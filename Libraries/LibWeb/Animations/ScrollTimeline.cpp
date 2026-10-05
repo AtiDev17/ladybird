@@ -11,6 +11,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/BoxViews.h>
 
@@ -36,6 +37,8 @@ GC::Ref<ScrollTimeline> ScrollTimeline::create_for_constructor(JS::Object& relev
             return options.source.value();
         return document.scrolling_element();
     }();
+    // A script reads the new timeline's current time from the boxes, which waits for a frame in flight.
+    Layout::ForcedReadScope read { document, true };
     return create(document, source, options.axis);
 }
 
@@ -119,7 +122,10 @@ static Optional<ScrollOffsetData> compute_scroll_offset_data(Variant<GC::Ptr<DOM
     if (propagated_source.visit([](auto const& source) { return source == nullptr; }))
         return {};
 
-    auto const& layout_node = propagated_source.visit([](auto const& source) -> Layout::NodeWithStyle const* { return source->unsafe_layout_node(); });
+    // The scroll container's box is the timeline's own read of the render state.
+    Layout::ForcedReadScope read { propagated_source.visit([](auto const& source) -> DOM::Document const& { return source->document(); }), false };
+
+    auto const& layout_node = propagated_source.visit([&read](auto const& source) -> Layout::NodeWithStyle const* { return source->unsafe_layout_node(read); });
 
     if (!layout_node || !layout_node->is_scroll_container())
         return {};

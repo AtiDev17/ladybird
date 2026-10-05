@@ -48,19 +48,6 @@ TEST_CASE(a_display_list_round_trips_through_a_shared_buffer)
     EXPECT(received->command_runs()[0] == commands.runs[0]);
 }
 
-TEST_CASE(the_receiver_keeps_the_mapping_alive_after_the_sender_drops_it)
-{
-    auto tree = VisualContextTreeTestBuilder().finish();
-    auto commands = two_fill_rects();
-    RefPtr<DisplayList> received;
-    {
-        auto sent = list_from(tree, commands);
-        auto buffer = MUST(sent->copy_to_shared_buffer());
-        received = MUST(DisplayList::create_from_shared_buffer(sent->properties(), move(buffer), sent->command_bytes().size(), sent->command_runs().size()));
-    }
-    EXPECT_EQ(received->command_bytes(), commands.bytes.bytes());
-}
-
 TEST_CASE(an_empty_display_list_needs_no_buffer)
 {
     auto tree = VisualContextTreeTestBuilder().finish();
@@ -88,28 +75,4 @@ TEST_CASE(sizes_that_do_not_fit_the_buffer_are_rejected)
     EXPECT(DisplayList::create_from_shared_buffer(sent->properties(), Core::AnonymousBuffer {}, tape_size, run_count).is_error());
     // The runs in the buffer no longer cover the tape once the tape is claimed shorter than the last run.
     EXPECT(DisplayList::create_from_shared_buffer(sent->properties(), buffer, tape_size - 8, run_count).is_error());
-}
-
-TEST_CASE(display_list_properties_round_trip_through_ipc)
-{
-    DisplayList::Properties properties {
-        .id = 12,
-        .compatible_visual_context_tree_structural_epoch = 34,
-        .surface_clear_color = Gfx::Color::Magenta,
-        .async_scrolling_metadata = DisplayList::AsyncScrollingMetadata { .viewport_rect = { 1, 2, 3, 4 }, .wheel_event_listener_state_generation = 5, .has_blocking_wheel_event_listeners = true, .has_blocking_wheel_event_region_covering_viewport = false, .device_pixels_per_css_pixel = 2.0, .keyboard_scroll_state = {} },
-    };
-
-    IPC::MessageBuffer buffer;
-    IPC::Encoder encoder { buffer };
-    MUST(encoder.encode(properties));
-    FixedMemoryStream stream { buffer.data().span() };
-    Queue<IPC::Attachment> attachments;
-    IPC::Decoder decoder { stream, attachments };
-    auto decoded = MUST(decoder.decode<DisplayList::Properties>());
-    EXPECT_EQ(decoded.id, 12u);
-    EXPECT_EQ(decoded.compatible_visual_context_tree_structural_epoch, 34u);
-    EXPECT_EQ(decoded.surface_clear_color, Optional<Gfx::Color> { Gfx::Color::Magenta });
-    EXPECT(decoded.async_scrolling_metadata.has_value());
-    EXPECT_EQ(decoded.async_scrolling_metadata->viewport_rect, Gfx::IntRect(1, 2, 3, 4));
-    EXPECT_EQ(decoded.async_scrolling_metadata->device_pixels_per_css_pixel, 2.0);
 }

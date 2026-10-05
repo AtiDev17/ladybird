@@ -23,9 +23,9 @@
 
 namespace WebView {
 
-NonnullOwnPtr<FontService> FontService::create(Vector<String> additional_font_directories)
+NonnullRefPtr<FontService> FontService::create(Vector<String> additional_font_directories)
 {
-    return adopt_own(*new FontService(move(additional_font_directories)));
+    return adopt_ref(*new FontService(move(additional_font_directories)));
 }
 
 FontService::FontService(Vector<String> additional_font_directories)
@@ -120,7 +120,7 @@ ErrorOr<void> FontService::build_catalog()
                                             .format = format,
                                         });
         };
-        Gfx::PathFontProvider::for_each_typeface_in_uri(uri, loaded_paths, move(collect_typeface), Gfx::PathFontProvider::FontDataSource::SharedMapping);
+        Gfx::PathFontProvider::for_each_typeface_in_uri(uri, loaded_paths, move(collect_typeface));
         if (callback_error.has_value())
             return callback_error.release_value();
     }
@@ -246,16 +246,18 @@ Gfx::BrokeredFont FontService::materialize_typeface(NonnullRefPtr<Gfx::TypefaceS
     // each character a page uses, and a renderer would load each copy as a typeface of its own.
     auto ttc_index = typeface->collection_index();
     auto face_key = MUST(String::formatted("face:{}", typeface->platform_typeface_id()));
-    if (auto face_id = m_dynamic_match_cache.get(face_key); face_id.has_value()) {
-        m_dynamic_match_cache.set(move(cache_key), *face_id);
-        return open_font_without_lock(m_generation, *face_id);
+    if (auto cached_face_id = m_dynamic_match_cache.get(face_key); cached_face_id.has_value()) {
+        // Copy the id out first: adding a key may grow the cache and free the entry it points at.
+        auto face_id = *cached_face_id;
+        m_dynamic_match_cache.set(move(cache_key), face_id);
+        return open_font_without_lock(m_generation, face_id);
     }
 
     auto face_id = m_next_dynamic_face_id++;
 
     // The platform does not always load a matched typeface's data back (CoreText rejects the hvgl-only data it hands
     // out for PingFang), so such fonts are referred to by family and style for the client to re-match itself.
-    if (Gfx::TypefaceSkia::load_from_buffer(typeface->font_data(), ttc_index).is_error()) {
+    if (Gfx::TypefaceSkia::try_load_from_temporary_memory(typeface->font_data(), ttc_index).is_error()) {
         m_memory_font_sources.set(face_id, Gfx::SystemFontReference {
                                                .family = typeface->family().to_string(),
                                                .weight = typeface->weight(),

@@ -599,7 +599,7 @@ public:
     Function<void()> on_confirm;
 };
 
-Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client, Web::PageId page_index)
+Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> traversable)
     : QWidget(window)
     , m_window(window)
 {
@@ -615,7 +615,7 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
         .display_id = window->display_id(),
     };
 
-    m_view = new WebContentView(this, parent_client, page_index, AK::move(view_initial_state));
+    m_view = new WebContentView(this, traversable, AK::move(view_initial_state));
     m_javascript_dialog = new JavaScriptDialog(m_view);
     m_find_in_page = new FindInPageWidget(this, m_view);
     m_find_in_page->setVisible(false);
@@ -1327,7 +1327,7 @@ QString Tab::title() const
     if (!WebView::Application::settings().config_variable_as_bool(WebView::ConfigVariableID::ShowWebContentProcessIDInTabTitle))
         return m_title;
 
-    return QString("%1 [%2]").arg(m_title).arg(view().client().pid());
+    return QString("%1 [%2]").arg(m_title).arg(view().page().client().pid());
 }
 
 void Tab::update_tab_title()

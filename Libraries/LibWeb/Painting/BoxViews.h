@@ -25,11 +25,11 @@ bool should_paint_viewport_scrollbars();
 WEB_API GC::Ptr<SVG::SVGFilterElement> resolve_svg_filter_reference(CSS::ComputedValuesFFI::ComputedStyleValueHandle const& url_value, Layout::NodeWithStyle const&);
 
 Compositing::RustFFI::NodeSlotId committed_row_slot(Layout::Node const&);
-Compositing::RustFFI::NodeSlotId viewport_row_slot(DOM::Document const&);
-Layout::RustFFI::PaintableData const* committed_row(Layout::Node const&);
+Compositing::RustFFI::NodeSlotId viewport_row_slot(Layout::BegunRead const&, DOM::Document const&);
+Optional<Layout::RustFFI::PaintableData> committed_row(Layout::Node const&);
 
 WEB_API bool has_committed_box(Layout::Node const&);
-WEB_API Layout::Node* layout_node_for_committed_slot(Layout::NodeArena&, Compositing::RustFFI::NodeSlotId);
+WEB_API Layout::Node* layout_node_for_committed_slot(Layout::BegunRead const&, Layout::NodeArena&, Compositing::RustFFI::NodeSlotId);
 
 WEB_API CSSPixelRect absolute_rect(Layout::Node const&);
 WEB_API CSSPixelRect absolute_padding_box_rect(Layout::Node const&);
@@ -77,14 +77,16 @@ WEB_API Optional<String> grid_layout_json(Layout::Node const&, UniqueNodeID);
 WEB_API Optional<String> flex_layout_json(Layout::Node const&, UniqueNodeID);
 
 WEB_API CSSPixelPoint box_type_agnostic_position(Layout::Node const&);
-WEB_API CSSPixelRect caret_rect_for_child_offset(Layout::Node const&, size_t offset);
+WEB_API CSSPixelRect caret_rect_for_child_offset(Layout::BegunRead const&, Layout::Node const&, size_t offset);
 
 // Per-document paint facts the recording inputs carry, resolved once per recording.
-WEB_API Layout::RustFFI::FfiCaretPaint resolve_document_caret_paint(DOM::Document&);
-WEB_API Layout::RustFFI::FfiFocusedTextControlSelection resolve_focused_text_control_selection(DOM::Document const&);
-WEB_API Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(DOM::Document const&, Vector<u8>& path_bytes);
-WEB_API void push_selection_pseudo_style(DOM::Element const&);
-WEB_API void push_selection_pseudo_style_of_parent(Layout::TextNode&);
+WEB_API Layout::RustFFI::FfiCaretPaint resolve_document_caret_paint(Layout::BegunRead const&, DOM::Document&);
+WEB_API Layout::RustFFI::FfiFocusedTextControlSelection resolve_focused_text_control_selection(Layout::BegunRead const&, DOM::Document const&);
+WEB_API Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(Layout::BegunRead const&, DOM::Document const&, Vector<u8>& path_bytes);
+WEB_API void push_highlight_pseudo_styles(DOM::Element const&);
+
+// The node a layout row stands for, as the arena names it.
+WEB_API DOM::NodeIdentity node_identity_of(Layout::RustFFI::FfiNodeIdentity);
 
 // The identity a mark on this box goes into the document's invalidation journal under: its node's, if the box is the one
 // the layout node arena binds to that node. Any other box (anonymous, generated for a pseudo-element, or one of several
@@ -97,6 +99,9 @@ WEB_API void set_needs_repaint_in_subtree(Layout::Node const&);
 WEB_API void apply_repaint_damage(Layout::Node const&, InvalidateDisplayList);
 WEB_API void apply_text_repaint_damage(Layout::TextNode const&, InvalidateDisplayList);
 WEB_API void apply_subtree_repaint_damage(Layout::Node const&);
+// Records the document's display list again without damaging any row, for a change that pushes the damage of the rows it
+// changes itself.
+WEB_API void request_document_repaint(Layout::Node const&, InvalidateDisplayList);
 
 enum class PaintCacheInvalidation : u8 {
     PaintAndHitTest,

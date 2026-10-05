@@ -49,6 +49,8 @@ class CompositorConnection;
 class CompositorContextHandle;
 class CompositorHost;
 class CompositorHostBase;
+class NavigablePresenter;
+struct CompositorFrame;
 
 }
 
@@ -226,6 +228,8 @@ class SubtleCrypto;
 
 namespace Web::CSS {
 
+enum class ElementBoxKind : u8;
+
 class AbstractImageStyleValue;
 class AbstractOrHypotheticalElement;
 class AnchorStyleValue;
@@ -238,7 +242,6 @@ class BorderImageSliceStyleValue;
 class BorderRadiusRectStyleValue;
 class BorderRadiusStyleValue;
 class CalculatedStyleValue;
-class CascadedProperties;
 class CustomPropertyData;
 class Clip;
 class ColorFilterStyleValue;
@@ -248,7 +251,6 @@ class ColorStyleValue;
 class ComputedStyleWorkingSet;
 class ComputedValues;
 class ComputedStyleRecordView;
-class LayoutStyle;
 class ConicGradientStyleValue;
 class ContainerQuery;
 class ContentStyleValue;
@@ -954,16 +956,24 @@ class IntersectionObserverEntry;
 
 }
 
+namespace Web::Layout::RustFFI {
+
+struct BegunRead;
+
+}
+
 namespace Web::Layout {
 
 class ImageProvider;
 class Box;
+class ForcedReadScope;
 class Node;
 class NodeArena;
 class NodeWithStyle;
 class TextNode;
-class LayoutTreeBuilderAccess;
 class Viewport;
+
+using BegunRead = RustFFI::BegunRead;
 
 }
 

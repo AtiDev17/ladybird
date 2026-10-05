@@ -5,6 +5,7 @@
  */
 
 use super::*;
+use crate::css::style::{NaturalSize, ReplacedContentInput};
 
 pub(crate) fn node_may_have_replaced_content_facts(data: &NodeData) -> bool {
     kind_is_replaced_box(data.kind.get())
@@ -31,6 +32,245 @@ pub(crate) fn node_may_have_replaced_content_facts_including_size_containment(da
     style.has_size_containment() || style.is_size_container()
 }
 
+// https://drafts.csswg.org/css-contain-2/#containment-size
+fn style_has_size_containment(style: ComputedValuesView<'_>) -> bool {
+    // Giving an element size containment has no effect if its inner display type is 'table', or if its principal box
+    // is an internal table box.
+    let display = style.display();
+    if display.is_table_inside() || display.is_internal_table() {
+        return false;
+    }
+    style.has_size_containment() || style.is_size_container()
+}
+
+/// The replaced content facts of an enrolled node, from its kind, its computed style and what its
+/// element published as the input of its replaced content.
+pub(crate) fn derived_replaced_content_facts(data: &NodeData, input: ReplacedContentInput) -> FfiReplacedContentFacts {
+    if data.kind.get() == NodeKind::SVGImageBox {
+        return svg_image_facts(input);
+    }
+    node_style_view(data).map_or_else(Default::default, |style| {
+        replaced_content_facts(data.kind.get(), ReplacedContentStyle::of(style), input)
+    })
+}
+
+/// What a replaced box's facts read of its computed style.
+#[derive(Clone, Copy)]
+struct ReplacedContentStyle {
+    /// The explicit intrinsic inner size that stands for the natural size of a size-contained box,
+    /// zero in an axis that has none.
+    size_contained: Option<(CssPixels, CssPixels)>,
+    /// The `ch` unit.
+    zero_advance: CssPixels,
+    line_height: CssPixels,
+    is_horizontal: bool,
+    appearance_is_none: bool,
+}
+
+impl ReplacedContentStyle {
+    fn of(style: ComputedValuesView<'_>) -> Self {
+        // https://drafts.csswg.org/css-contain-2/#containment-size
+        // Replaced elements must be treated as having a natural width and height of 0 and no natural aspect ratio.
+        // https://drafts.csswg.org/css-sizing-4/#intrinsic-size-override
+        // If an element has an explicit intrinsic inner size in an axis, [...] the size of the contents in that axis
+        // are instead treated as being the explicit intrinsic inner size.
+        let explicit_size = |has_length: bool, length_px: f64| {
+            if has_length {
+                CssPixels::nearest_value_for(length_px)
+            } else {
+                CssPixels::default()
+            }
+        };
+        Self {
+            size_contained: style_has_size_containment(style).then(|| {
+                (
+                    explicit_size(
+                        style.contain_intrinsic_width_has_length(),
+                        style.contain_intrinsic_width_px(),
+                    ),
+                    explicit_size(
+                        style.contain_intrinsic_height_has_length(),
+                        style.contain_intrinsic_height_px(),
+                    ),
+                )
+            }),
+            zero_advance: CssPixels::nearest_value_for_f32(style.font_zero_advance()),
+            line_height: style.line_height(),
+            is_horizontal: style.writing_mode() == crate::css::css_enums::writing_mode::HORIZONTAL_TB,
+            appearance_is_none: style.appearance() == crate::css::css_enums::appearance::NONE,
+        }
+    }
+
+    /// `count` characters, the `ch` unit.
+    fn characters(self, count: u32) -> CssPixels {
+        CssPixels::nearest_value_for(f64::from(count) * self.zero_advance.to_double())
+    }
+
+    /// An inline size and a block size as a width and a height.
+    fn in_writing_mode(self, inline_size: CssPixels, block_size: CssPixels) -> (CssPixels, CssPixels) {
+        if self.is_horizontal {
+            (inline_size, block_size)
+        } else {
+            (block_size, inline_size)
+        }
+    }
+
+    // https://html.spec.whatwg.org/multipage/rendering.html#the-input-element-as-a-text-entry-widget
+    fn text_control_default_preferred_size(self, size: u32) -> (CssPixels, CssPixels) {
+        // [...] If the element has a size attribute, and parsing that attribute's value using the rules for parsing
+        // non-negative integers doesn't generate an error, return the value obtained from applying the converting a
+        // character width to pixels algorithm to the value of the attribute. Otherwise, return the value obtained from
+        // applying the converting a character width to pixels algorithm to the number 20.
+        // FIXME: Implement the specified "converting a character width to pixels" algorithm.
+        // FIXME: HTML does not yet detail the primitive appearance of text inputs. Use one line for the default
+        //        preferred block size, matching the native appearance described by HTML and the behavior of other
+        //        engines.
+        self.in_writing_mode(self.characters(size), self.line_height)
+    }
+}
+
+// An SVG <image> runs the default sizing algorithm over its own geometry, so it takes the natural size exactly as its
+// image reports it, absent rather than zero while nothing has decoded, together with the default object size that
+// applies once something has. Size containment does not apply to it.
+fn svg_image_facts(input: ReplacedContentInput) -> FfiReplacedContentFacts {
+    let (ReplacedContentInput::NaturalSize(natural_size) | ReplacedContentInput::DecodedSvgImage(natural_size)) = input
+    else {
+        panic!("an SVG image publishes its natural size as it arrives");
+    };
+    let mut facts = FfiReplacedContentFacts::default();
+    set_auto_content_size(&mut facts, AutoContentSize::natural(natural_size));
+    // The SVG formatting context reads the default object size as it is. It is no preferred size the
+    // sizing of an ordinary replaced box would take, so the flags that offer it as one stay clear.
+    if matches!(input, ReplacedContentInput::DecodedSvgImage(_)) {
+        facts.default_preferred_width = CssPixels::from_integer(300);
+        facts.default_preferred_height = CssPixels::from_integer(150);
+    }
+    facts
+}
+
+fn set_auto_content_size(facts: &mut FfiReplacedContentFacts, auto_content_size: AutoContentSize) {
+    if let Some(width) = auto_content_size.width {
+        facts.has_auto_content_width = true;
+        facts.auto_content_width = width;
+    }
+    if let Some(height) = auto_content_size.height {
+        facts.has_auto_content_height = true;
+        facts.auto_content_height = height;
+    }
+    if let Some((numerator, denominator)) = auto_content_size.aspect_ratio {
+        facts.auto_content_aspect_ratio_numerator = numerator;
+        facts.auto_content_aspect_ratio_denominator = denominator;
+    }
+}
+
+fn replaced_content_facts(
+    kind: NodeKind,
+    style: ReplacedContentStyle,
+    input: ReplacedContentInput,
+) -> FfiReplacedContentFacts {
+    let mut facts = FfiReplacedContentFacts::default();
+    set_auto_content_size(&mut facts, auto_content_size(kind, style, input));
+    if style.appearance_is_none
+        && let ReplacedContentInput::Input {
+            size,
+            is_text_entry: true,
+        } = input
+    {
+        let (width, height) = style.text_control_default_preferred_size(size);
+        facts.has_default_preferred_width = true;
+        facts.default_preferred_width = width;
+        facts.has_default_preferred_height = true;
+        facts.default_preferred_height = height;
+    }
+    facts
+}
+
+/// A replaced box's natural size and aspect ratio, any of which it can lack.
+#[derive(Default)]
+struct AutoContentSize {
+    width: Option<CssPixels>,
+    height: Option<CssPixels>,
+    aspect_ratio: Option<(CssPixels, CssPixels)>,
+}
+
+impl AutoContentSize {
+    fn of_size((width, height): (CssPixels, CssPixels)) -> Self {
+        Self {
+            width: Some(width),
+            height: Some(height),
+            aspect_ratio: None,
+        }
+    }
+
+    fn natural(natural_size: NaturalSize) -> Self {
+        Self {
+            width: natural_size.width.map(CssPixels::from_raw),
+            height: natural_size.height.map(CssPixels::from_raw),
+            aspect_ratio: natural_size
+                .aspect_ratio
+                .map(|(numerator, denominator)| (CssPixels::from_raw(numerator), CssPixels::from_raw(denominator))),
+        }
+    }
+}
+
+fn auto_content_size(kind: NodeKind, style: ReplacedContentStyle, input: ReplacedContentInput) -> AutoContentSize {
+    if let Some(explicit_size) = style.size_contained {
+        return AutoContentSize::of_size(explicit_size);
+    }
+    match kind {
+        NodeKind::CheckBox => AutoContentSize::of_size((CssPixels::from_integer(13), CssPixels::from_integer(13))),
+        NodeKind::RadioButton => AutoContentSize::of_size((CssPixels::from_integer(12), CssPixels::from_integer(12))),
+        // AD-HOC: A slider has no in-flow content to size itself from, so provide a default content-box size for when
+        //         its `width` or `height` is `auto`: 20ch by 16px.
+        NodeKind::RangeInputBox => AutoContentSize::of_size((style.characters(20), CssPixels::from_integer(16))),
+        NodeKind::TextAreaBox => {
+            let ReplacedContentInput::TextArea { cols, rows } = input else {
+                panic!("a textarea publishes its cols and rows as it arrives");
+            };
+            let block_size = CssPixels::nearest_value_for(f64::from(rows) * style.line_height.to_double());
+            AutoContentSize::of_size(style.in_writing_mode(style.characters(cols), block_size))
+        }
+        NodeKind::CanvasBox => {
+            let ReplacedContentInput::Canvas { width, height } = input else {
+                panic!("a canvas publishes its width and height as it arrives");
+            };
+            let width = CssPixels::from_integer(i64::from(width));
+            let height = CssPixels::from_integer(i64::from(height));
+            AutoContentSize {
+                width: Some(width),
+                height: Some(height),
+                aspect_ratio: (width != CssPixels::default() && height != CssPixels::default())
+                    .then_some((width, height)),
+            }
+        }
+        NodeKind::TextInputBox => {
+            let ReplacedContentInput::Input { size, .. } = input else {
+                panic!("an input publishes its size as it arrives");
+            };
+            AutoContentSize::of_size(style.text_control_default_preferred_size(size))
+        }
+        NodeKind::VideoBox => {
+            let ReplacedContentInput::NaturalSize(natural_size) = input else {
+                panic!("a video publishes its natural size as it arrives");
+            };
+            AutoContentSize::natural(natural_size)
+        }
+        NodeKind::ImageBox => {
+            let ReplacedContentInput::NaturalSize(natural_size) = input else {
+                panic!("an image box's element or its provider publishes its image's natural size");
+            };
+            AutoContentSize::natural(natural_size)
+        }
+        // An <object> showing an SVG document is sized from the document's root. Any other navigable container has
+        // no natural size.
+        NodeKind::NavigableContainerViewport => match input {
+            ReplacedContentInput::NaturalSize(natural_size) => AutoContentSize::natural(natural_size),
+            _ => AutoContentSize::default(),
+        },
+        _ => AutoContentSize::default(),
+    }
+}
+
 /// The node's own computed style, read off the style container the node data points at. Callers inside a layout pass go
 /// through the pass callbacks instead; this is for the node-data entry points the C++ side calls directly.
 pub(crate) fn node_style_view(data: &NodeData) -> Option<ComputedValuesView<'_>> {
@@ -39,7 +279,7 @@ pub(crate) fn node_style_view(data: &NodeData) -> Option<ComputedValuesView<'_>>
     }
     // SAFETY: A non-null style pointer addresses the container's group
     // pointer array, which FfiStylePayloads mirrors exactly.
-    let payloads = unsafe { &*data.style.get().cast::<crate::layout::FfiStylePayloads>() };
+    let payloads = unsafe { data.style.get().deref() };
     Some(ComputedValuesView::new(&payloads.groups))
 }
 
@@ -74,7 +314,7 @@ pub(crate) fn node_uses_anchor_positioning(data: &NodeData) -> bool {
         })
 }
 
-pub(crate) fn node_is_out_of_flow(data: &NodeData, style: Option<ComputedValuesView<'_>>) -> bool {
+pub(crate) fn node_is_out_of_flow(data: &impl NodeShape, style: Option<ComputedValuesView<'_>>) -> bool {
     let Some(style) = style else {
         return false;
     };
@@ -83,7 +323,7 @@ pub(crate) fn node_is_out_of_flow(data: &NodeData, style: Option<ComputedValuesV
 
 /// Painting treats flex and grid items with a z-index other than auto as if
 /// they were positioned, in addition to boxes whose position is not static.
-pub(crate) fn node_is_positioned(data: &NodeData, style: Option<ComputedValuesView<'_>>) -> bool {
+pub(crate) fn node_is_positioned(data: &impl NodeShape, style: Option<ComputedValuesView<'_>>) -> bool {
     let Some(style) = style else {
         return false;
     };
@@ -100,7 +340,7 @@ pub(crate) fn node_position(style: Option<ComputedValuesView<'_>>) -> u8 {
 }
 
 /// Flex items never float, whatever their computed float value says.
-pub(crate) fn node_is_floating(data: &NodeData, style: Option<ComputedValuesView<'_>>) -> bool {
+pub(crate) fn node_is_floating(data: &impl NodeShape, style: Option<ComputedValuesView<'_>>) -> bool {
     style.is_some_and(|style| style.is_floating()) && !has_flag(data, NodeFlag::IsFlexItem)
 }
 
@@ -112,8 +352,8 @@ pub(crate) fn node_display(style: Option<ComputedValuesView<'_>>) -> crate::css:
     style.map_or_else(crate::css::display::FfiDisplay::none, |style| style.display())
 }
 
-pub(crate) fn node_can_have_children(data: &NodeData) -> bool {
-    match data.kind.get() {
+pub(crate) fn node_can_have_children(data: &impl NodeShape) -> bool {
+    match data.kind() {
         NodeKind::BreakNode => false,
         NodeKind::AudioBox | NodeKind::VideoBox => has_flag(data, NodeFlag::ReplacedBoxCanHaveChildren),
         NodeKind::SVGSVGBox => true,
@@ -126,8 +366,11 @@ pub(crate) fn node_can_have_children(data: &NodeData) -> bool {
 /// in-flow containing blocks ask, so anything that walks past a box on behalf of an enclosing formatting context has
 /// to ask it too: the boxes inside such a box are laid out against it, not against the block container of the
 /// context the walk started in.
-pub(crate) fn node_forms_containing_block_for_children(data: &NodeData, style: Option<ComputedValuesView<'_>>) -> bool {
-    if kind_is_block_container(data.kind.get()) && !node_is_fragmented_inline(data, style) {
+pub(crate) fn node_forms_containing_block_for_children(
+    data: &impl NodeShape,
+    style: Option<ComputedValuesView<'_>>,
+) -> bool {
+    if kind_is_block_container(data.kind()) && !node_is_fragmented_inline(data, style) {
         return true;
     }
     if let Some(style) = style {
@@ -136,7 +379,7 @@ pub(crate) fn node_forms_containing_block_for_children(data: &NodeData, style: O
             return true;
         }
     }
-    kind_is_replaced_box(data.kind.get()) && node_can_have_children(data)
+    kind_is_replaced_box(data.kind()) && node_can_have_children(data)
 }
 
 /// https://drafts.csswg.org/css-display/#atomic-inline
@@ -145,9 +388,9 @@ pub(crate) fn node_forms_containing_block_for_children(data: &NodeData, style: O
 /// of the enclosing inline formatting context: a box that is its own children's containing block has to be laid out as
 /// one box instead. Elements whose box type does not follow from their display reach that case, since <legend> and
 /// <fieldset> get a block container box whatever their computed display says.
-pub(crate) fn node_is_atomic_inline(data: &NodeData, style: Option<ComputedValuesView<'_>>) -> bool {
+pub(crate) fn node_is_atomic_inline(data: &impl NodeShape, style: Option<ComputedValuesView<'_>>) -> bool {
     has_flag(data, NodeFlag::IsReplacedElement)
-        || data.kind.get() == NodeKind::ListItemMarkerBox
+        || data.kind() == NodeKind::ListItemMarkerBox
         || style.is_some_and(|style| {
             let display = style.display();
             display.is_inline_outside()
@@ -155,9 +398,9 @@ pub(crate) fn node_is_atomic_inline(data: &NodeData, style: Option<ComputedValue
         })
 }
 
-pub(crate) fn node_is_fragmented_inline(data: &NodeData, style: Option<ComputedValuesView<'_>>) -> bool {
-    data.kind.get() == NodeKind::InlineNode
-        || (data.kind.get() == NodeKind::ListItemBox
+pub(crate) fn node_is_fragmented_inline(data: &impl NodeShape, style: Option<ComputedValuesView<'_>>) -> bool {
+    data.kind() == NodeKind::InlineNode
+        || (data.kind() == NodeKind::ListItemBox
             && style.is_some_and(|style| {
                 let display = style.display();
                 display.is_inline_outside() && display.is_flow_inside()
@@ -234,22 +477,46 @@ pub(crate) fn has_ancestor_fact(data: &NodeData, fact: AncestorFact) -> bool {
     data.ancestor_facts.get() & fact as u8 != 0
 }
 
-pub(crate) fn construction_flags(facts: &FfiNodeConstructionFacts) -> u32 {
-    let has_style = facts.kind != NodeKind::Node && !kind_is_text(facts.kind);
+/// The construction facts a test row is built with, as the word the style mirror publishes them in.
+#[cfg(test)]
+pub(crate) fn construction_fact_word(facts: &FfiNodeConstructionFacts) -> u32 {
+    use crate::css::style::bridge::element_construction_fact as fact;
+    [
+        (fact::IS_HTML_INPUT_ELEMENT, facts.is_html_input_element),
+        (fact::IS_HTML_HTML_ELEMENT, facts.is_html_html_element),
+        (fact::IS_IN_USER_AGENT_SHADOW_TREE, facts.is_in_user_agent_shadow_tree),
+        (fact::USES_BUTTON_LAYOUT, facts.uses_button_layout),
+        (fact::IS_EDITING_HOST, facts.is_editing_host),
+        (fact::IS_BODY, facts.is_body),
+        (fact::IS_DOCUMENT_ELEMENT, facts.is_document_element),
+    ]
+    .into_iter()
+    .filter(|&(_, is_set)| is_set)
+    .fold(0, |word, (bit, _)| word | bit)
+}
+
+/// The flags a row of `kind` is built with, from its node's published construction facts.
+pub(crate) fn construction_flags(kind: NodeKind, is_anonymous: bool, construction_facts: u32) -> u32 {
+    use crate::css::style::bridge::element_construction_fact as fact;
+    let has = |bit: u32| construction_facts & bit != 0;
+    let has_style = kind != NodeKind::Node && !kind_is_text(kind);
     // Some native controls use a generic box so they can host their internal shadow tree, but
     // remain replaced elements for CSS box generation and inline layout.
-    let is_replaced_element = kind_is_replaced_box(facts.kind) || facts.is_html_input_element;
+    let is_replaced_element = kind_is_replaced_box(kind) || has(fact::IS_HTML_INPUT_ELEMENT);
     [
-        (NodeFlag::Anonymous, facts.is_anonymous),
+        (NodeFlag::Anonymous, is_anonymous),
         (NodeFlag::HasStyle, has_style),
         (NodeFlag::IsReplacedElement, is_replaced_element),
-        (NodeFlag::IsHtmlInputElement, facts.is_html_input_element),
-        (NodeFlag::IsHtmlHtmlElement, facts.is_html_html_element),
-        (NodeFlag::IsDocumentElement, facts.is_document_element),
-        (NodeFlag::IsInUserAgentShadowTree, facts.is_in_user_agent_shadow_tree),
-        (NodeFlag::UsesButtonLayout, facts.uses_button_layout),
-        (NodeFlag::IsEditingHost, facts.is_editing_host),
-        (NodeFlag::IsBody, facts.is_body),
+        (NodeFlag::IsHtmlInputElement, has(fact::IS_HTML_INPUT_ELEMENT)),
+        (NodeFlag::IsHtmlHtmlElement, has(fact::IS_HTML_HTML_ELEMENT)),
+        (NodeFlag::IsDocumentElement, has(fact::IS_DOCUMENT_ELEMENT)),
+        (
+            NodeFlag::IsInUserAgentShadowTree,
+            has(fact::IS_IN_USER_AGENT_SHADOW_TREE),
+        ),
+        (NodeFlag::UsesButtonLayout, has(fact::USES_BUTTON_LAYOUT)),
+        (NodeFlag::IsEditingHost, has(fact::IS_EDITING_HOST)),
+        (NodeFlag::IsBody, has(fact::IS_BODY)),
     ]
     .into_iter()
     .filter(|(_, is_set)| *is_set)
@@ -264,8 +531,51 @@ pub(crate) fn containing_block_establishment_flag(is_fixed_position: bool) -> No
     }
 }
 
-pub(crate) fn has_flag(data: &NodeData, flag: NodeFlag) -> bool {
-    data.flags.get() & flag as u32 != 0
+/// The facts of a node the questions above answer from: the live [`NodeData`] or a published
+/// [`super::node_data::PaintNode`].
+pub(crate) trait NodeShape {
+    fn kind(&self) -> NodeKind;
+    fn flags(&self) -> u32;
+}
+
+impl NodeShape for NodeData {
+    #[inline]
+    fn kind(&self) -> NodeKind {
+        self.kind.get()
+    }
+
+    #[inline]
+    fn flags(&self) -> u32 {
+        self.flags.get()
+    }
+}
+
+impl NodeShape for (NodeKind, u32) {
+    #[inline]
+    fn kind(&self) -> NodeKind {
+        self.0
+    }
+
+    #[inline]
+    fn flags(&self) -> u32 {
+        self.1
+    }
+}
+
+impl NodeShape for super::node_data::PaintNode {
+    #[inline]
+    fn kind(&self) -> NodeKind {
+        self.kind
+    }
+
+    #[inline]
+    fn flags(&self) -> u32 {
+        self.flags
+    }
+}
+
+pub(crate) fn has_flag(data: &impl NodeShape, flag: NodeFlag) -> bool {
+    data.flags() & flag as u32 != 0
 }
 
 pub(crate) fn kind_is_text(kind: NodeKind) -> bool {
@@ -419,7 +729,11 @@ impl<'pass> NodeFacts<'pass> {
         self.callbacks.computed_values_view_if_styled(parent)
     }
 
+    #[inline]
     fn replaced_content(&self) -> crate::layout::FfiReplacedContentFacts {
+        if self.data().kind.get() == NodeKind::SVGSVGBox {
+            return self.svg_root_replaced_content();
+        }
         let Some(facts) = self.callbacks.replaced_content_facts(self.node) else {
             // The kind check is cheap enough for release builds; the style
             // half of the enrollment predicate is debug-only because this
@@ -434,6 +748,45 @@ impl<'pass> NodeFacts<'pass> {
             );
             return crate::layout::FfiReplacedContentFacts::default();
         };
+        facts
+    }
+
+    /// An <svg> root's natural size resolves the lengths its element published against its style and the
+    /// viewport, so the pass negotiates it rather than reading synced facts.
+    #[cold]
+    fn svg_root_replaced_content(&self) -> crate::layout::FfiReplacedContentFacts {
+        let mut facts = derived_replaced_content_facts(self.data(), ReplacedContentInput::None);
+        let arena = self.callbacks.arena();
+        let is_document_element_box = arena.is_document_svg_root_box(self.node);
+        let size_contained = self.node_has_size_containment();
+        if size_contained && !is_document_element_box {
+            return facts;
+        }
+        let (width, height, aspect_ratio) =
+            super::svg_formatting_context::svg_root_natural_size(&self.callbacks, self.node);
+        // An <object> showing the document is sized from what its <svg> document element would be
+        // without size containment.
+        if is_document_element_box {
+            arena.note_document_svg_root_natural_size(
+                self.node,
+                NaturalSize {
+                    width: width.map(CssPixels::raw_value),
+                    height: height.map(CssPixels::raw_value),
+                    aspect_ratio: aspect_ratio
+                        .map(|(numerator, denominator)| (numerator.raw_value(), denominator.raw_value())),
+                },
+            );
+        }
+        if !size_contained {
+            set_auto_content_size(
+                &mut facts,
+                AutoContentSize {
+                    width,
+                    height,
+                    aspect_ratio,
+                },
+            );
+        }
         facts
     }
 
@@ -795,12 +1148,7 @@ impl<'pass> NodeFacts<'pass> {
     }
 
     pub(crate) fn node_has_size_containment(&self) -> bool {
-        let display = self.display();
-        if display.is_table_inside() || display.is_internal_table() {
-            return false;
-        }
-        let style = self.style();
-        style.has_size_containment() || style.is_size_container()
+        node_style_view(self.data()).is_some_and(style_has_size_containment)
     }
 
     // https://drafts.csswg.org/css-contain-2/#containment-inline-size
@@ -942,14 +1290,14 @@ impl<'pass> NodeFacts<'pass> {
 
 #[cfg(test)]
 mod node_facts_tests {
+    use crate::css::style::{NaturalSize, ReplacedContentInput};
+    use crate::layout::CssPixels;
     use crate::layout::node_data::{NodeData, NodeFlag, NodeKind};
-    use std::cell::Cell;
 
     fn data_with_kind(kind: NodeKind) -> NodeData {
-        NodeData {
-            kind: Cell::new(kind),
-            ..NodeData::default()
-        }
+        let mut data = NodeData::default();
+        *data.kind.get_mut() = kind;
+        data
     }
 
     #[test]
@@ -968,11 +1316,137 @@ mod node_facts_tests {
         assert!(super::node_can_have_children(&data_with_kind(NodeKind::InlineNode)));
         assert!(super::node_can_have_children(&data_with_kind(NodeKind::TextNode)));
 
-        let media = data_with_kind(NodeKind::AudioBox);
+        let mut media = data_with_kind(NodeKind::AudioBox);
         assert!(!super::node_can_have_children(&media));
-        media.flags.set(NodeFlag::ReplacedBoxCanHaveChildren as u32);
+        *media.flags.get_mut() = NodeFlag::ReplacedBoxCanHaveChildren as u32;
         assert!(super::node_can_have_children(&media));
-        media.kind.set(NodeKind::VideoBox);
+        *media.kind.get_mut() = NodeKind::VideoBox;
         assert!(super::node_can_have_children(&media));
     }
+    fn horizontal_style() -> super::ReplacedContentStyle {
+        super::ReplacedContentStyle {
+            size_contained: None,
+            zero_advance: CssPixels::from_integer(8),
+            line_height: CssPixels::from_integer(16),
+            is_horizontal: true,
+            appearance_is_none: false,
+        }
+    }
+
+    fn auto_content_size(facts: crate::layout::FfiReplacedContentFacts) -> Option<(i64, i64)> {
+        (facts.has_auto_content_width && facts.has_auto_content_height).then(|| {
+            (
+                i64::from(facts.auto_content_width.to_int()),
+                i64::from(facts.auto_content_height.to_int()),
+            )
+        })
+    }
+
+    #[test]
+    fn a_vertical_textarea_takes_its_columns_in_the_block_axis() {
+        let input = ReplacedContentInput::TextArea { cols: 10, rows: 3 };
+        let horizontal = super::replaced_content_facts(NodeKind::TextAreaBox, horizontal_style(), input);
+        assert_eq!(auto_content_size(horizontal), Some((80, 48)));
+        let vertical_style = super::ReplacedContentStyle {
+            is_horizontal: false,
+            ..horizontal_style()
+        };
+        let vertical = super::replaced_content_facts(NodeKind::TextAreaBox, vertical_style, input);
+        assert_eq!(auto_content_size(vertical), Some((48, 80)));
+    }
+
+    #[test]
+    fn a_text_entry_input_without_appearance_gets_a_default_preferred_size() {
+        let input = ReplacedContentInput::Input {
+            size: 20,
+            is_text_entry: true,
+        };
+        let text_input = super::replaced_content_facts(NodeKind::TextInputBox, horizontal_style(), input);
+        assert_eq!(auto_content_size(text_input), Some((160, 16)));
+        assert!(!text_input.has_default_preferred_width);
+
+        let primitive_style = super::ReplacedContentStyle {
+            appearance_is_none: true,
+            ..horizontal_style()
+        };
+        let primitive = super::replaced_content_facts(NodeKind::BlockContainer, primitive_style, input);
+        assert_eq!(auto_content_size(primitive), None);
+        assert!(primitive.has_default_preferred_width && primitive.has_default_preferred_height);
+        assert_eq!(primitive.default_preferred_width.to_int(), 160);
+
+        let checkbox_input = ReplacedContentInput::Input {
+            size: 20,
+            is_text_entry: false,
+        };
+        let checkbox = super::replaced_content_facts(NodeKind::BlockContainer, primitive_style, checkbox_input);
+        assert!(!checkbox.has_default_preferred_width);
+    }
+
+    #[test]
+    fn an_empty_canvas_has_no_aspect_ratio() {
+        let empty = super::replaced_content_facts(
+            NodeKind::CanvasBox,
+            horizontal_style(),
+            ReplacedContentInput::Canvas { width: 0, height: 150 },
+        );
+        assert_eq!(auto_content_size(empty), Some((0, 150)));
+        assert_eq!(empty.auto_content_aspect_ratio_denominator, CssPixels::default());
+        let sized = super::replaced_content_facts(
+            NodeKind::CanvasBox,
+            horizontal_style(),
+            ReplacedContentInput::Canvas {
+                width: 300,
+                height: 150,
+            },
+        );
+        assert_eq!(sized.auto_content_aspect_ratio_numerator.to_int(), 300);
+        assert_eq!(sized.auto_content_aspect_ratio_denominator.to_int(), 150);
+    }
+
+    #[test]
+    fn a_video_without_a_size_has_no_natural_size_and_containment_overrides_any() {
+        let without_size = super::replaced_content_facts(
+            NodeKind::VideoBox,
+            horizontal_style(),
+            ReplacedContentInput::NaturalSize(NaturalSize::default()),
+        );
+        assert!(!without_size.has_auto_content_width && !without_size.has_auto_content_height);
+        let contained_style = super::ReplacedContentStyle {
+            size_contained: Some((CssPixels::from_integer(5), CssPixels::default())),
+            ..horizontal_style()
+        };
+        let contained = super::replaced_content_facts(
+            NodeKind::VideoBox,
+            contained_style,
+            ReplacedContentInput::NaturalSize(NaturalSize::default()),
+        );
+        assert_eq!(auto_content_size(contained), Some((5, 0)));
+    }
+}
+
+/// Writes the natural size of the document's `<svg>` document element as its last layout
+/// negotiated it to `natural_size` and returns true, unless it is what the last call handed over.
+/// The size is all absent if the document element is no `<svg>` with a box.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread, and `natural_size` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn render_state_take_changed_document_svg_root_natural_size(
+    host: *const crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
+    natural_size: *mut crate::painting::host::FfiNaturalSize,
+) -> bool {
+    // SAFETY: Guaranteed by the caller.
+    let changed = unsafe {
+        super::shell_reads::read_arena(host, read, (), |arena, ()| {
+            arena.take_changed_document_svg_root_natural_size()
+        })
+    };
+    let Some(changed) = changed else {
+        return false;
+    };
+    // SAFETY: Guaranteed by the caller.
+    unsafe { natural_size.write(changed.into()) };
+    true
 }

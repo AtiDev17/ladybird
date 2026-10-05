@@ -8,6 +8,7 @@ use super::bridge::{
     FfiElementArrival, FfiElementDeclarationDelta, FfiElementStyleInput, FfiLocalFeatureDelta, FfiStateDelta,
     FfiTreeDelta,
 };
+#[cfg(feature = "style-recording")]
 use super::publication::ExactCascadeDonor;
 use super::*;
 use crate::css::declaration_block;
@@ -17,6 +18,14 @@ pub struct StyleEngine {
     pub(super) counters: Counters,
     pub(super) state: StyleEngineState,
 }
+
+// The engine may move to whichever thread runs a style stage. Every host object it keeps a
+// reference to says by its type whether it may be shared between threads, so one that cannot be
+// fails this rather than passing as an opaque pointer.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<StyleEngine>();
+};
 
 impl std::ops::Deref for StyleEngine {
     type Target = StyleEngineState;
@@ -52,7 +61,7 @@ impl StyleEngine {
     pub(crate) fn intern_element_declared_properties(
         &mut self,
         declarations: &[declaration_block::DeclaredProperty],
-    ) -> (Vec<DeclaredProperty>, Vec<RetainedStyleValueData>) {
+    ) -> Vec<(DeclaredProperty, RetainedStyleValueData)> {
         self.state
             .intern_element_declared_properties(declarations, &mut self.counters)
     }
@@ -113,6 +122,21 @@ impl StyleEngine {
     ) -> RuleID {
         self.state
             .add_style_rule_in_scope(sheet, before, selectors, namespaces, scope, &mut self.counters)
+    }
+
+    /// Add a style rule of a user-agent sheet, compiling its selectors only if no document in the
+    /// process has compiled them with the same inputs before.
+    #[inline]
+    pub(super) fn add_user_agent_style_rule(
+        &mut self,
+        sheet: SheetID,
+        before: Option<RuleID>,
+        rule_identity: u64,
+        selectors: &[&CompiledSelector],
+        namespaces: Option<&super::rule_writes::NamespaceTexts>,
+    ) -> RuleID {
+        self.state
+            .add_user_agent_style_rule(sheet, before, rule_identity, selectors, namespaces, &mut self.counters)
     }
 
     #[cfg(feature = "style-recording")]
@@ -199,17 +223,29 @@ impl StyleEngine {
             .record_rule_declarations_changed(rule, block_version, &mut self.counters);
     }
 
-    /// Mint `out.len()` element identities in one call. Identity allocation is batched because a
-    /// call per element is exactly the boundary shape this design rules out.
+    /// Make the identities the host minted live, ahead of anything the host records about their
+    /// nodes.
     #[inline]
-    pub fn allocate_style_nodes(&mut self, out: &mut [u32]) {
-        self.state.allocate_style_nodes(out, &mut self.counters);
+    pub fn mint_style_nodes(&mut self, nodes: &[u32]) {
+        self.state.mint_style_nodes(nodes, &mut self.counters);
     }
 
-    /// Mint `out.len()` text identities in one call.
-    #[inline]
+    /// Mint `out.len()` element identities from the tree's own space, for a test.
+    #[cfg(test)]
+    pub fn allocate_style_nodes(&mut self, out: &mut [u32]) {
+        for slot in out.iter_mut() {
+            *slot = self.state.retained.tree.mint_test_identity(false).raw();
+        }
+        self.mint_style_nodes(out);
+    }
+
+    /// Mint `out.len()` text identities from the tree's own space, for a test.
+    #[cfg(test)]
     pub fn allocate_text_style_nodes(&mut self, out: &mut [u32]) {
-        self.state.allocate_text_style_nodes(out);
+        for slot in out.iter_mut() {
+            *slot = self.state.retained.tree.mint_test_identity(true).raw();
+        }
+        self.mint_style_nodes(out);
     }
 
     /// Stage a structural change. The normalized transaction installs the final relation rows at
@@ -360,28 +396,16 @@ impl StyleEngine {
     ///
     /// An element-attached declaration is a cascade component above layers: a style attribute beats
     /// every layered and unlayered rule in its context, whatever layer they are in.
-    #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn set_element_declared_properties(
         &mut self,
         node: StyleNodeID,
         kind: ElementDeclarationKind,
-        declared: &[DeclaredProperty],
-        written_values: Vec<RetainedStyleValueData>,
-        custom_declarations: Vec<CustomDeclaration>,
-        custom_written_values: Vec<RetainedStyleValueData>,
-        declarations_are_complete: bool,
+        declarations: Vec<(DeclaredProperty, RetainedStyleValueData)>,
+        custom_declarations: Vec<(CustomDeclaration, RetainedStyleValueData)>,
     ) {
-        self.state.set_element_declared_properties(
-            node,
-            kind,
-            declared,
-            written_values,
-            custom_declarations,
-            custom_written_values,
-            declarations_are_complete,
-            &mut self.counters,
-        );
+        self.state
+            .set_element_declared_properties(node, kind, declarations, custom_declarations, &mut self.counters);
     }
 
     #[inline]
@@ -459,6 +483,11 @@ impl StyleEngine {
     #[inline]
     pub(crate) fn flush_without_document_root(&mut self) {
         self.state.flush_without_document_root(&mut self.counters);
+    }
+
+    /// Leaves the atom sweep of the transactions taken until the next call to a later one, where `defers`.
+    pub(crate) fn defer_atom_sweep(&mut self, defers: bool) {
+        self.state.host.defers_atom_sweep = defers;
     }
 
     #[inline]
@@ -583,8 +612,9 @@ impl StyleEngine {
     }
 
     #[inline]
-    pub(super) fn discard_style_transaction_outputs(&mut self) {
-        self.state.discard_style_transaction_outputs(&mut self.counters);
+    /// Ends the transaction the engine published last, and answers the identities its end released.
+    pub(super) fn discard_style_transaction_outputs(&mut self) -> Vec<u32> {
+        self.state.discard_style_transaction_outputs(&mut self.counters)
     }
 
     /// Route a possible relational witness through the anchors whose truth it can flip.
@@ -898,19 +928,6 @@ impl StyleEngine {
         self.state.consume_published_match_answer(node, &mut self.counters)
     }
 
-    /// Stream a published answer into its consumer. A materialized payload needs no copy; an
-    /// identity-only payload is restored in cascade order before it crosses the bridge.
-    #[inline]
-    pub(super) fn consume_published_match_answer_with(
-        &mut self,
-        node: StyleNodeID,
-        capacity: usize,
-        consume: impl FnMut(usize, StyleNodeID, RuleID, SemanticDeclarationID, Option<tree::PseudoElementTarget>, u32, u32),
-    ) -> Option<usize> {
-        self.state
-            .consume_published_match_answer_with(node, capacity, consume, &mut self.counters)
-    }
-
     /// Read the shareable identity of one answer from the immediately preceding style transaction.
     ///
     /// A contextual answer has no identity and must still consume its complete payload. A shared
@@ -971,18 +988,6 @@ impl StyleEngine {
         )
     }
 
-    #[inline]
-    pub(crate) fn lookup_shared_style_record(
-        &mut self,
-        node: StyleNodeID,
-        parent_record: u64,
-        environment: u64,
-        shape: [u64; 4],
-    ) -> Option<u64> {
-        self.state
-            .lookup_shared_style_record(node, parent_record, environment, shape, &mut self.counters)
-    }
-
     /// C++ installed the record the engine derived for `node`: the winner state it was computed
     /// from becomes the node's cascade state, and the answer counts as consumed.
     #[inline]
@@ -996,20 +1001,12 @@ impl StyleEngine {
         self.state.abandon_demanded_records(node, &mut self.counters);
     }
 
-    /// Retry a record after C++ has installed earlier records in the same preorder batch. A record
-    /// rejected while the batch was planned may become computable once its inheritance parent is
-    /// authoritative.
-    #[inline]
-    pub(crate) fn retry_engine_record_after_ancestor(&mut self, node: StyleNodeID) -> publication::RetriedEngineRecord {
-        self.state.retry_engine_record_after_ancestor(node, &mut self.counters)
-    }
-
     /// Answer a read of one element's style the host makes before the next style update.
     #[inline]
     pub(super) fn answer_record_demand(
         &mut self,
         node: StyleNodeID,
-        demand: bridge::FfiRecordDemand,
+        demand: publication::RecordDemand,
     ) -> publication::Drive<publication::RecordDemandAnswer> {
         self.state.answer_record_demand(node, demand, &mut self.counters)
     }
@@ -1021,9 +1018,10 @@ impl StyleEngine {
         subject: StyleNodeID,
         facts: u32,
         declarations: &[(ElementDeclarationKind, &crate::css::declaration_block::DeclaredProperty)],
+        custom_declarations: &[(CustomDeclaration, RetainedStyleValueData)],
     ) -> publication::Drive<computed::FinalStyleRecordID> {
         self.state
-            .declared_only_record(subject, facts, declarations, &mut self.counters)
+            .declared_only_record(subject, facts, declarations, custom_declarations, &mut self.counters)
     }
 
     /// Settle the pseudo-element records of an element whose record C++ just installed.
@@ -1032,7 +1030,7 @@ impl StyleEngine {
         &mut self,
         node: StyleNodeID,
         old_is_list_item: bool,
-    ) -> (publication::RetriedEngineRecord, bool) {
+    ) -> bridge::FfiSettledPseudoRecords {
         self.state
             .settle_pseudo_records_after_host_record(node, old_is_list_item, &mut self.counters)
     }
@@ -1059,33 +1057,6 @@ impl StyleEngine {
         )
     }
 
-    /// Keep the style record already assigned to a target whose recomputation its input record
-    /// answered.
-    #[inline]
-    pub(crate) fn reaffirm_style_record(
-        &mut self,
-        target: computed::ComputedStyleTarget,
-    ) -> Option<computed::FinalStyleRecordID> {
-        self.state.reaffirm_style_record(target, &mut self.counters)
-    }
-
-    #[inline]
-    pub(crate) fn assign_shared_style_record(
-        &mut self,
-        target: computed::ComputedStyleTarget,
-        style_record: u64,
-        inherited_group_count: usize,
-        inherited_group_swap_eligible: bool,
-    ) -> computed::ComputedGroupPublication {
-        self.state.assign_shared_style_record(
-            target,
-            style_record,
-            inherited_group_count,
-            inherited_group_swap_eligible,
-            &mut self.counters,
-        )
-    }
-
     /// Intern the immutable computed-group payloads of a style which has no live StyleEngine target.
     #[inline]
     pub(crate) fn intern_computed_groups(
@@ -1102,6 +1073,11 @@ impl StyleEngine {
             metadata_input,
             &mut self.counters,
         )
+    }
+
+    #[inline]
+    pub(crate) fn free_style_records_kept_for_leases(&mut self) {
+        self.state.free_style_records_kept_for_leases(&mut self.counters);
     }
 
     #[inline]
@@ -1124,18 +1100,6 @@ impl StyleEngine {
             payloads,
             &mut self.counters,
         )
-    }
-
-    #[inline]
-    pub(crate) fn publish_exact_cascade_state(
-        &mut self,
-        target: computed::ComputedStyleTarget,
-        store: &CascadedPropertyStore,
-        inherited_style_groups: u8,
-        donor: Option<ExactCascadeDonor>,
-    ) -> (bridge::FfiExactCascadePublication, Vec<(u16, SpecifiedWinnerKey)>, bool) {
-        self.state
-            .publish_exact_cascade_state(target, store, inherited_style_groups, donor, &mut self.counters)
     }
 
     #[cfg(feature = "style-recording")]
