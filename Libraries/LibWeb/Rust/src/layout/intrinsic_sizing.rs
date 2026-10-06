@@ -60,13 +60,7 @@ pub(super) fn compute_inline_sizes(
                 sizing.constraints_for_child_context(node, constraints),
                 ParticipationInParentFormattingContext::BlockLevel,
             );
-            if let Some(measurement) = compute_from_atomic_children(&run, input) {
-                if fc_run_cache::fc_run_cache_mode_from_environment() == fc_run_cache::FcRunCacheMode::Shadow {
-                    assert_eq!(Some(measurement), compute_from_items(&run, input));
-                }
-                return Some(measurement);
-            }
-            compute_from_items(&run, input)
+            compute_from_atomic_children(&run, input).or_else(|| compute_from_items(&run, input))
         },
     )
 }
@@ -110,8 +104,7 @@ fn compute_from_atomic_children(
         return None;
     }
     let sizing = run.sizing();
-    let mut child = callbacks.first_child(run.box_);
-    while !child.is_invalid() {
+    for child in callbacks.children(run.box_) {
         let facts = NodeFacts::new(&callbacks, child);
         if facts.data().kind.get() != NodeKind::BlockContainer
             || !facts.is_atomic_inline()
@@ -123,13 +116,11 @@ fn compute_from_atomic_children(
         {
             return None;
         }
-        child = callbacks.next_sibling(child);
     }
     let wraps = containing_style.text_wrap_mode() == text_wrap_mode::WRAP;
     let mut max_content_lines = inline_formatting_context::LinesWithoutLineBoxes::new(false);
     let mut min_content_lines = Some(inline_formatting_context::LinesWithoutLineBoxes::new(true));
-    child = callbacks.first_child(run.box_);
-    while !child.is_invalid() {
+    for child in callbacks.children(run.box_) {
         let contribution =
             sizing.atomic_inline_contribution(child, input.available_space, input.containing_block_constraints);
         max_content_lines.append_atomic_inline(contribution.inline_advance(contribution.content_inline_size), wraps);
@@ -139,7 +130,6 @@ fn compute_from_atomic_children(
                 lines.append_atomic_inline(contribution.inline_advance(content), wraps);
                 lines
             });
-        child = callbacks.next_sibling(child);
     }
     Some(IntrinsicInlineSizeMeasurement {
         automatic_content_inline_size: clamp_to_max_dimension_value(max_content_lines.finish_measurement()),

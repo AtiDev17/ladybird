@@ -11,7 +11,6 @@
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <AK/Vector.h>
-#include <LibGfx/TextLayout.h>
 #include <LibWeb/CSS/Enums.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Layout/Box.h>
@@ -36,15 +35,8 @@ public:
 
     virtual Utf16String const& text() const { return dom_node().data(); }
 
-    // Borrows the arena's rendered text until this node's content is republished or freed.
-    Utf16View text_for_rendering() const;
     Utf16String rendered_text_for_dom(bool collapse_whitespace) const;
     RustFFI::FfiTextSourceRange word_range_at(size_t dom_offset) const;
-    void invalidate_text_for_rendering();
-
-    void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList) const;
-
-    bool update_produces_line_box_fragment_when_empty_flag();
 
 private:
     virtual bool is_text_node() const final { return true; }
@@ -61,11 +53,6 @@ public:
 private:
     Utf16String m_text;
 };
-
-// Classifies a code point for direction-run splitting during text chunking:
-// strong LTR/RTL, direction-neutral Common, or ContextDependent (resolved
-// from surrounding runs).
-Gfx::GlyphRun::TextType text_type_for_code_point(u32 code_point);
 
 template<>
 inline bool Node::fast_is<TextNode>() const { return is_text_node(); }

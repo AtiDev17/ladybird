@@ -13,32 +13,45 @@
 #include <LibGC/Root.h>
 #include <LibGC/RootVector.h>
 #include <LibJS/Forward.h>
-#include <LibJS/Runtime/Object.h>
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibJS/Heap/Cell.h>
+#include <LibJS/Runtime/HostObject.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::HTML {
 
-class WEB_API WindowProxy final : public Bindings::PlatformObject {
-    WEB_NON_IDL_PLATFORM_OBJECT(WindowProxy, Bindings::PlatformObject)
+extern WEB_API JSHostClass const window_proxy_host_class;
+
+// 7.2.3 The WindowProxy exotic object, https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-windowproxy-exotic-object
+// The exotic object is a host object whose internal methods are those of a WindowProxy. This cell is its companion: it
+// holds the internal slots, and the object and the cell keep each other alive.
+class WEB_API WindowProxy final : public JS::Cell {
+    GC_CELL(WindowProxy, JS::Cell);
     GC_DECLARE_ALLOCATOR(WindowProxy);
 
 public:
+    // Scripts see object(), never this cell.
+    using JSValueConversionIsForbidden = void;
+
     static GC::Ref<WindowProxy> create(JS::Realm&);
+
+    // The WindowProxy whose exotic object this is, or null for any other object.
+    static WindowProxy* from_object(JS::Object const& object)
+    {
+        // Every platform object is a JS::HostObject, so its host class is read here without a virtual call. Every
+        // generated binding reaches this through Bindings::this_value_realm().
+        if (!object.is_platform_object())
+            return nullptr;
+        auto const& host_object = static_cast<JS::HostObject const&>(object);
+        if (&host_object.host_class() != &window_proxy_host_class)
+            return nullptr;
+        return static_cast<WindowProxy*>(host_object.host_data().ptr());
+    }
+
     virtual ~WindowProxy() override = default;
 
-    virtual JS::ThrowCompletionOr<JS::Object*> internal_get_prototype_of() const override;
-    virtual JS::ThrowCompletionOr<bool> internal_set_prototype_of(Object* prototype) override;
-    virtual JS::ThrowCompletionOr<bool> internal_is_extensible() const override;
-    virtual JS::ThrowCompletionOr<bool> internal_prevent_extensions() override;
-    virtual JS::ThrowCompletionOr<Optional<JS::PropertyDescriptor>> internal_get_own_property(JS::PropertyKey const&) const override;
-    virtual JS::ThrowCompletionOr<bool> internal_define_own_property(JS::PropertyKey const&, JS::PropertyDescriptor&, Optional<JS::PropertyDescriptor>* precomputed_get_own_property = nullptr) override;
-    virtual JS::ThrowCompletionOr<JS::Value> internal_get(JS::PropertyKey const&, JS::Value receiver, JS::CacheableGetPropertyMetadata*, PropertyLookupPhase) const override;
-    virtual bool is_cacheable_for_property_absence() const override { return false; }
-    virtual JS::ThrowCompletionOr<bool> internal_set(JS::PropertyKey const&, JS::Value value, JS::Value receiver, JS::CacheableSetPropertyMetadata*, PropertyLookupPhase) override;
-    virtual JS::ThrowCompletionOr<bool> internal_delete(JS::PropertyKey const&) override;
-    virtual JS::ThrowCompletionOr<GC::RootVector<JS::Value>> internal_own_property_keys() const override;
+    JS::HostObject& object() const { return *m_object; }
+    JS::Realm& realm() const;
 
     GC::Ptr<Window> window() const { return m_window; }
     void set_window(GC::Ref<Window>);
@@ -52,8 +65,22 @@ public:
     GC::Ptr<Navigable> navigable() const;
 
 private:
-    explicit WindowProxy(JS::Realm&);
-    Bindings::PlatformObject& cross_origin_window_wrapper() const;
+    friend struct WindowProxyHostObjectTraits;
+
+    explicit WindowProxy(GC::Ref<JS::HostObject>);
+
+    JS::ThrowCompletionOr<JS::Object*> internal_get_prototype_of() const;
+    JS::ThrowCompletionOr<bool> internal_set_prototype_of(JS::Object* prototype);
+    JS::ThrowCompletionOr<bool> internal_is_extensible() const;
+    JS::ThrowCompletionOr<bool> internal_prevent_extensions();
+    JS::ThrowCompletionOr<Optional<JS::PropertyDescriptor>> internal_get_own_property(JS::PropertyKey const&) const;
+    JS::ThrowCompletionOr<bool> internal_define_own_property(JS::PropertyKey const&, JS::PropertyDescriptor&);
+    JS::ThrowCompletionOr<JS::Value> internal_get(JS::PropertyKey const&, JS::Value receiver, JS::CacheableGetPropertyMetadata*, JS::Object::PropertyLookupPhase) const;
+    JS::ThrowCompletionOr<bool> internal_set(JS::PropertyKey const&, JS::Value value, JS::Value receiver);
+    JS::ThrowCompletionOr<bool> internal_delete(JS::PropertyKey const&);
+    JS::ThrowCompletionOr<GC::RootVector<JS::Value>> internal_own_property_keys() const;
+
+    JS::HostObject& cross_origin_window_wrapper() const;
 
     bool is_platform_object_same_origin() const;
     Vector<GC::Root<Navigable>> document_tree_child_navigables() const;
@@ -61,8 +88,9 @@ private:
     Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper(JS::PropertyKey const&) const;
     GC::RootVector<JS::Value> cross_origin_own_property_keys() const;
 
-    virtual bool is_html_window_proxy() const override { return true; }
     virtual void visit_edges(JS::Cell::Visitor&) override;
+
+    GC::Ref<JS::HostObject> m_object;
 
     // [[Window]], https://html.spec.whatwg.org/multipage/window-object.html#concept-windowproxy-window
     // A Window of this process, or the RemoteWindow standing for one hosted by another.
@@ -71,10 +99,7 @@ private:
 
     // Keeps the per-realm Window wrapper alive while cross-origin property descriptors cached on it can be reused
     // through this WindowProxy.
-    mutable GC::Ptr<Bindings::PlatformObject> m_cross_origin_window_wrapper;
+    mutable GC::Ptr<JS::HostObject> m_cross_origin_window_wrapper;
 };
 
 }
-
-template<>
-inline bool JS::Object::fast_is<Web::HTML::WindowProxy>() const { return is_html_window_proxy(); }

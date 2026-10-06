@@ -8,7 +8,7 @@ use crate::css::css_pixels::CssPixelRect;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::dump::push_css_pixel_rect;
-use crate::painting::paint_read::GeometryRead;
+use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::painting::paintable_geometry;
 use crate::painting::style_queries;
 use crate::stage::MainThread;
@@ -26,12 +26,7 @@ pub struct FfiStackingContextDumpCallbacks {
     append_text: unsafe extern "C" fn(context: *mut c_void, bytes: *const u8, byte_count: usize),
 }
 
-/// Mints the main thread token for this module's FFI entry points; only this module can make one.
-pub(crate) struct MainThreadFfiEntry {
-    _private: (),
-}
-
-const MAIN_THREAD_FFI_ENTRY: MainThreadFfiEntry = MainThreadFfiEntry { _private: () };
+crate::stage::main_thread_ffi_entries!();
 
 impl FfiStackingContextDumpCallbacks {
     fn debug_description(&self, _: &MainThread, slot: NodeSlotId) -> String {
@@ -54,14 +49,13 @@ impl FfiStackingContextDumpCallbacks {
 /// `layout_arena_paint_push_bytes`, and `append_text` copies the completed dump synchronously.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_dump_stacking_context_tree(
-    host: *const crate::render_state::DocumentHost,
+    host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     viewport: NodeSlotId,
     callbacks: FfiStackingContextDumpCallbacks,
 ) {
-    assert!(!host.is_null(), "document host is null");
     // SAFETY: Guaranteed by the caller.
-    let main_thread = unsafe { crate::stage::from_ffi_entry(&MAIN_THREAD_FFI_ENTRY, &*host) };
+    let main_thread = unsafe { main_thread(host) };
     // SAFETY: As above.
     let lines = unsafe {
         crate::painting::ffi::read_arena(host, read, viewport, |arena, viewport| {

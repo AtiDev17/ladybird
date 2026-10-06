@@ -23,6 +23,8 @@
 #include <LibJS/Runtime/Shape.h>
 #include <LibJS/Runtime/Value.h>
 
+struct JSHostClass;
+
 namespace JS {
 
 #define JS_OBJECT(class_, base_class) GC_CELL(class_, base_class)
@@ -181,6 +183,25 @@ public:
     virtual ThrowCompletionOr<bool> internal_delete(PropertyKey const&);
     virtual ThrowCompletionOr<GC::RootVector<Value>> internal_own_property_keys() const;
 
+    // Runs [[Get]] on this object as one found in the prototype chain of the lookup that metadata_for_caller belongs to,
+    // and fills that metadata only for a hit that an inline cache can keep. An object that forwards its lookups to
+    // another one can then cache them without reading the metadata itself.
+    ThrowCompletionOr<Value> internal_get_as_prototype_of(PropertyKey const&, Value receiver, CacheableGetPropertyMetadata* metadata_for_caller) const;
+
+    // OrdinaryGetPrototypeOf ( O ) through OrdinaryOwnPropertyKeys ( O ), for exotic objects whose internal methods
+    // defer to the ordinary ones. These never dispatch to an override.
+    ThrowCompletionOr<Object*> ordinary_get_prototype_of() const { return Object::internal_get_prototype_of(); }
+    ThrowCompletionOr<bool> ordinary_set_prototype_of(Object* prototype) { return Object::internal_set_prototype_of(prototype); }
+    ThrowCompletionOr<bool> ordinary_is_extensible() const { return Object::internal_is_extensible(); }
+    ThrowCompletionOr<bool> ordinary_prevent_extensions() { return Object::internal_prevent_extensions(); }
+    ThrowCompletionOr<Optional<PropertyDescriptor>> ordinary_get_own_property(PropertyKey const& property_key) const { return Object::internal_get_own_property(property_key); }
+    ThrowCompletionOr<bool> ordinary_define_own_property(PropertyKey const& property_key, PropertyDescriptor& property_descriptor, Optional<PropertyDescriptor>* precomputed_get_own_property = nullptr) { return Object::internal_define_own_property(property_key, property_descriptor, precomputed_get_own_property); }
+    ThrowCompletionOr<bool> ordinary_has_property(PropertyKey const& property_key) const { return Object::internal_has_property(property_key); }
+    ThrowCompletionOr<Value> ordinary_get(PropertyKey const& property_key, Value receiver, CacheableGetPropertyMetadata* cacheable_metadata = nullptr, PropertyLookupPhase phase = PropertyLookupPhase::OwnProperty) const { return Object::internal_get(property_key, receiver, cacheable_metadata, phase); }
+    ThrowCompletionOr<bool> ordinary_set(PropertyKey const& property_key, Value value, Value receiver, CacheableSetPropertyMetadata* cacheable_metadata = nullptr, PropertyLookupPhase phase = PropertyLookupPhase::OwnProperty) { return Object::internal_set(property_key, value, receiver, cacheable_metadata, phase); }
+    ThrowCompletionOr<bool> ordinary_delete(PropertyKey const& property_key) { return Object::internal_delete(property_key); }
+    ThrowCompletionOr<GC::RootVector<Value>> ordinary_own_property_keys() const { return Object::internal_own_property_keys(); }
+
     // NOTE: Any subclass of Object that overrides property access slots ([[Get]], [[Set]] etc)
     //       to customize access to indexed properties (properties where the name is a positive integer)
     //       must return true for this, to opt out of optimizations that rely on assumptions that
@@ -260,16 +281,6 @@ public:
     void define_native_accessor(Realm&, PropertyKey const&, ESCAPING Function<ThrowCompletionOr<Value>(VM&)> getter, ESCAPING Function<ThrowCompletionOr<Value>(VM&)> setter, PropertyAttributes attributes);
     void define_native_javascript_backed_function(PropertyKey const&, GC::Ref<NativeJavaScriptBackedFunction> function, i32 length, PropertyAttributes attributes);
 
-    virtual bool is_dom_node() const { return false; }
-    virtual bool is_dom_document() const { return false; }
-    virtual bool is_dom_element() const { return false; }
-    virtual bool is_dom_event_target() const { return false; }
-    virtual bool is_dom_event() const { return false; }
-    virtual bool is_html_window() const { return false; }
-    virtual bool is_html_window_proxy() const { return false; }
-    virtual bool is_html_location() const { return false; }
-    virtual bool is_canvas_rendering_context_2d() const { return false; }
-
     [[nodiscard]] bool is_function() const { return m_flags & Flag::IsFunction; }
     virtual bool is_bound_function() const { return false; }
     virtual bool is_promise() const { return false; }
@@ -281,6 +292,7 @@ public:
     virtual bool is_bigint_object() const { return false; }
     virtual bool is_string_object() const { return false; }
     virtual bool is_array_buffer() const { return false; }
+    virtual bool is_data_view() const { return false; }
     virtual bool is_array_exotic_object() const { return false; }
     virtual bool is_global_object() const { return false; }
     virtual bool is_proxy_object() const { return false; }
@@ -431,7 +443,11 @@ protected:
     Object(ConstructWithPrototypeTag, Object& prototype, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
     explicit Object(Shape&, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
 
+    virtual JSHostClass const* host_class_if_host_object() const { return nullptr; }
+
 private:
+    friend JSHostClass const* host_class_of(Object const&);
+
     class StoragePointer {
     public:
         constexpr StoragePointer() = default;
@@ -532,5 +548,12 @@ private:
 #if !defined(AK_OS_WINDOWS)
 static_assert(sizeof(Object) <= 72, "Keep the size of JS::Object down!");
 #endif
+
+// The table that implements the object's internal methods (see LibJS/HostObjectABI.h), or null for an object that the
+// engine implements.
+inline JSHostClass const* host_class_of(Object const& object)
+{
+    return object.host_class_if_host_object();
+}
 
 }

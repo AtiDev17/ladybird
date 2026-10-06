@@ -83,7 +83,7 @@ pub(crate) fn paint<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable:
     let Some(kind) = recorder.source.node_kind_if_live(paintable) else {
         return;
     };
-    if node_painting::is_inline(recorder.source, paintable) {
+    if node_painting::is_fragmented_inline(recorder.source, paintable) {
         inline_box::paint(recorder, paintable, phase);
         return;
     }
@@ -111,7 +111,7 @@ pub(crate) fn paint<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable:
         return;
     }
     match kind {
-        NodeKind::Box | NodeKind::ReplacedBox | NodeKind::AudioBox | NodeKind::SVGBox => {
+        NodeKind::Box | NodeKind::AudioBox => {
             paint_base(recorder, paintable, phase);
         }
         NodeKind::ImageBox
@@ -161,12 +161,7 @@ pub(crate) fn paint<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable:
             svg::paint_path(recorder, paintable, phase);
         }
         NodeKind::SVGImageBox => svg::paint_image_element(recorder, paintable, phase),
-        NodeKind::Unset
-        | NodeKind::BreakNode
-        | NodeKind::GeneratedTextNode
-        | NodeKind::Node
-        | NodeKind::NodeWithStyle
-        | NodeKind::TextNode => {}
+        NodeKind::Unset | NodeKind::BreakNode | NodeKind::GeneratedTextNode | NodeKind::Node | NodeKind::TextNode => {}
         NodeKind::Viewport
         | NodeKind::BlockContainer
         | NodeKind::LegendBox

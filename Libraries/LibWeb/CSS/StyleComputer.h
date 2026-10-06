@@ -29,7 +29,6 @@
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/SelectorMatching.h>
 #include <LibWeb/CSS/SharedCompiledStyleSheet.h>
-#include <LibWeb/CSS/StyleGroupPayloadPins.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/Export.h>
@@ -38,15 +37,6 @@
 #include <LibWeb/CSS/StyleEngineBridge.h>
 
 namespace Web::CSS {
-
-// Matching an originating element answers both its own cascade and every
-// pseudo-element cascade. A caller that computes those cascades as one batch
-// can keep this result between them.
-struct StyleEngineMatchResult {
-    StyleNodeID node;
-    Optional<Vector<StyleEngine::RuleMatch>> matches;
-    Optional<u32> signature;
-};
 
 class WEB_API StyleComputer final : public GC::Cell {
     GC_CELL(StyleComputer, GC::Cell);
@@ -107,14 +97,14 @@ public:
         bool any_computed_value_changed { false };
     };
 
-    // Has the engine compose a sampled overlay over the record the element installed, which it was sampled on, compare
-    // it with that record and publish it. `before_publication` sees the comparison before the element installs the
-    // published record.
-    struct SampledAnimationOverlayPublication {
-        StyleEngineFFI::FfiAnimationInvalidation invalidation;
-        StyleEngine::StyleRecordDelta publication;
+    // Has the engine compose each element's sampled overlay over the record the element installed, which it was sampled
+    // on, compare it with that record and publish it, in one call of the engine, answering each at the same index of
+    // `publications`.
+    struct SampledAnimationOverlay {
+        DOM::AbstractElement element;
+        ComputedStyleWorkingSet const& style;
     };
-    [[nodiscard]] SampledAnimationOverlayPublication publish_sampled_animation_overlay(Layout::BegunRead const& read, DOM::AbstractElement, ComputedStyleWorkingSet& style, Function<void(StyleEngineFFI::FfiAnimationInvalidation const&)> const& before_publication = {}) const;
+    void publish_sampled_animation_overlays(Layout::BegunRead const& read, ReadonlySpan<SampledAnimationOverlay>, Span<StyleEngineFFI::FfiAnimationOverlayPublication> publications) const;
     // Give a layout-only variant of an element or pseudo-element style an authoritative record
     // without replacing the StyleEngine assignment of its DOM target.
     [[nodiscard]] StyleRecordID intern_computed_style_inputs(Layout::BegunRead const& read, DOM::AbstractElement, ComputedValues const&) const;
@@ -146,6 +136,14 @@ public:
         Yes,
     };
     void collect_animations_into(Layout::BegunRead const& read, DOM::AbstractElement, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, ComputedStyleWorkingSet&, AnimationRefresh) const;
+    // One element's animations, refreshed over the record it holds as `collect_animations_into()` refreshes them.
+    struct AnimationRefreshRequest {
+        DOM::AbstractElement abstract_element;
+        ReadonlySpan<GC::Ref<Animations::KeyframeEffect>> effects;
+        ComputedStyleWorkingSet& computed_properties;
+    };
+    // Refreshes the animations of elements of this document, sampling them all in one call of the style engine.
+    void refresh_animations_into_each(Layout::BegunRead const& read, ReadonlySpan<AnimationRefreshRequest>) const;
 
     void apply_animation_definitions(DOM::AbstractElement&, ReadonlySpan<ComputedValuesFFI::FfiComputedAnimation> animation_definitions, bool in_display_none_subtree) const;
     // Applies the animation plan the record an element or pseudo-element holds decides, for a record the style engine
@@ -189,11 +187,15 @@ private:
 private:
     // `sampled_style_record` names the record the working set was reconstructed from, where it was.
     void collect_animation_effects_into(Layout::BegunRead const& read, DOM::AbstractElement, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, ComputedStyleWorkingSet&, StyleRecordID sampled_style_record) const;
+    struct AnimationSample;
+    [[nodiscard]] NonnullOwnPtr<AnimationSample> begin_animation_sample(Layout::BegunRead const& read, DOM::AbstractElement, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, ComputedStyleWorkingSet&, StyleRecordID sampled_style_record) const;
+    void finish_animation_sample(AnimationSample&, ComputedValuesFFI::FfiHostAnimationSampleResult const&) const;
+    void finish_animation_refresh(Layout::BegunRead const& read, DOM::AbstractElement, ComputedStyleWorkingSet&) const;
     void publish_animated_custom_properties(ComputedStyleWorkingSet&, DOM::AbstractElement) const;
     void invalidate_animated_custom_property_readers(DOM::AbstractElement, OrderedHashMap<Utf16FlyString, NonnullRefPtr<StyleValue const>> const& animated_values) const;
     void start_needed_transitions(Layout::BegunRead const& read, ComputedStyleWorkingSet&, DOM::AbstractElement, StyleRecordID before_change_style_record) const;
     [[nodiscard]] bool has_provisional_transition_states(DOM::AbstractElement) const;
-    void finalize_style(Layout::BegunRead const& read, ComputedStyleWorkingSet&, DOM::AbstractElement, ComputedValuesFFI::FfiStyleFinalizationMode) const;
+    void finalize_animated_box_type(Layout::BegunRead const& read, ComputedStyleWorkingSet&, DOM::AbstractElement) const;
 
     [[nodiscard]] CSSPixelRect viewport_rect() const { return m_viewport_rect; }
 
@@ -250,26 +252,12 @@ private:
     mutable Length::FontMetrics m_root_element_font_metrics;
     mutable bool m_root_element_font_metrics_depend_on_viewport_metrics { false };
 
-    mutable Optional<ComputationContext> m_cached_font_computation_context;
-    mutable Optional<ComputationContext> m_cached_line_height_computation_context;
-    mutable Optional<ComputationContext> m_cached_generic_computation_context;
     mutable u64 m_style_update_depth { 0 };
     mutable Optional<MediaEnvironmentSnapshot> m_style_update_media_environment;
     mutable Optional<Parser::ValueParserFFI::FfiMediaEnvironment> m_style_update_ffi_media_environment;
     u64 m_viewport_environment_version { 0 };
     // The environments the style engine resolved, by the identity it minted, materialized once.
     mutable HashMap<u64, NonnullRefPtr<CustomPropertyData const>> m_engine_custom_property_environments;
-
-    // What one final value parses to against one registration's syntax: a pure function of the
-    // value, the syntax, and the registration generation, unlike the computed-value step after it,
-    // which resolves font-relative units against the reading element and runs per read.
-    struct RegisteredCustomPropertyParse {
-        NonnullRefPtr<StyleValue const> value;
-        void const* syntax_identity { nullptr };
-        u64 registration_generation { 0 };
-        NonnullRefPtr<StyleValue const> parsed;
-    };
-    mutable HashMap<void const*, Vector<RegisteredCustomPropertyParse>> m_registered_custom_property_parses;
 
     enum class ProvisionalTransitionAction : u8 {
         None,
@@ -298,19 +286,6 @@ private:
     mutable bool m_transition_baselines_recorded { false };
 
     ComputationContext make_computation_context_for_property(Layout::BegunRead const& read, PropertyID, ComputedStyleWorkingSet const&, Optional<DOM::AbstractElement>) const;
-    ComputationContext const& get_computation_context_for_property(Layout::BegunRead const& read, PropertyID, ComputedStyleWorkingSet const&, Optional<DOM::AbstractElement>) const;
-    void clear_computation_context_caches() const
-    {
-        const_cast<StyleComputer*>(this)->m_cached_font_computation_context = {};
-        const_cast<StyleComputer*>(this)->m_cached_line_height_computation_context = {};
-        const_cast<StyleComputer*>(this)->m_cached_generic_computation_context = {};
-    }
-
-    bool computation_context_cache_is_empty() const
-    {
-        return !m_cached_font_computation_context.has_value() && !m_cached_line_height_computation_context.has_value() && !m_cached_generic_computation_context.has_value();
-    }
-
     CSSPixelRect m_viewport_rect;
 
     mutable StyleEngine m_style_engine;

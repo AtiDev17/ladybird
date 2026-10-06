@@ -14,9 +14,7 @@ use crate::painting::paintable_data::*;
 use crate::painting::published_frame::PublishedRows;
 use crate::painting::record::damage::{DamageSet, PaintDamage, RowPaintState};
 use crate::painting::stacking_context::entries::{StackingContextEntryColumn, drop_table};
-use crate::painting::visual_context::dirty::{
-    RemovedBoxBlocks, VisualContextBoxDirtyKind, VisualContextGlobalRebuildReason,
-};
+use crate::painting::visual_context::dirty::{RemovedBoxBlocks, VisualContextBoxDirtyKind, VisualContextUpdateScope};
 use crate::painting::visual_context::{
     BoxVisualContextNodeHandles, EMPTY_BOX_VISUAL_CONTEXT_NODE_HANDLES, PaintableVisualContextRecord,
 };
@@ -445,7 +443,7 @@ where
                 child = crate::painting::paint_order::next_paint_sibling(self, child_slot);
             }
         }
-        if node_painting::is_inline(self, id) {
+        if node_painting::is_fragmented_inline(self, id) {
             let mut ancestor = crate::painting::paint_order::paint_parent(self, id);
             while let Some(current) = ancestor {
                 repaint(current);
@@ -476,7 +474,7 @@ where
             if crate::painting::style_queries::is_text_decoration_propagation_boundary(self.arena.deref(), current) {
                 continue;
             }
-            if node_painting::has_lines(self, current) || node_painting::is_inline(self, current) {
+            if node_painting::has_lines(self, current) || node_painting::is_fragmented_inline(self, current) {
                 self.arena.push_paint_damage(current, PaintDamage::DRAW_FOREGROUND);
             }
             if let Some(first_child) = crate::painting::paint_order::first_paint_child(self, current) {
@@ -1103,12 +1101,12 @@ impl LayoutNodeArena {
             .note_box(id, kind, pending_box_limit);
     }
 
-    pub(crate) fn request_full_visual_context_rebuild(&self, reason: VisualContextGlobalRebuildReason) {
+    pub(crate) fn request_full_visual_context_rebuild(&self, scope: VisualContextUpdateScope) {
         self.paint_state()
             .borrow_mut()
             .visual_context
             .dirty_boxes
-            .request_full_rebuild(reason);
+            .request_full_rebuild(scope);
     }
 
     pub(crate) fn prepare_paintable_row_freed_reset(&self, layout_slot_index: u32) -> Option<PaintableRowReset> {

@@ -5,9 +5,10 @@ three-layer wrapper model:
 
 1. `Web::Bindings::Wrappable` is the implementation-side base for objects that
    can be reflected into JavaScript.
-2. The WebIDL generator emits `PlatformObject` wrapper classes in
-   `Web::Bindings`. These wrappers hold the implementation object and implement
-   the Web-facing object behavior.
+2. Wrappers are `JS::HostObject`s that hold the implementation object in their
+   wrappable slot. For each interface, the WebIDL generator emits a host class
+   table, whose hooks implement the Web-facing object behavior, and a
+   `create_*_wrapper()` function in `Web::Bindings`.
 3. `Web::Bindings::WrapperWorld` owns wrapper identity for one observable world.
    Wrapping an implementation object means looking up or creating the wrapper in
    the caller's `WrapperWorld`.
@@ -130,12 +131,14 @@ clear.
 ## Window and Location cross-origin descriptors
 
 Cross-origin property descriptor maps live on the per-world wrapper, not on the
-implementation object. `WindowWrapper` and `LocationWrapper` both follow this
-pattern. Descriptor cache reachability is ordinary wrapper reachability: cached
-descriptor values and accessors are traced through the wrapper, but they are not
-roots, so a wrapper/realm cycle can still be collected when nothing outside the
-cycle reaches it. This removes the need for world serials or detach-time pruning
-of implementation-owned maps.
+implementation object. The Window and Location wrappers both keep theirs in a
+companion cell in the wrapper's host data slot, created on the first
+cross-origin property access and reached through
+`HTML::cross_origin_property_descriptor_map()`. Descriptor cache reachability is
+ordinary wrapper reachability: cached descriptor values and accessors are traced
+through the wrapper, but they are not roots, so a wrapper/realm cycle can still
+be collected when nothing outside the cycle reaches it. This removes the need
+for world serials or detach-time pruning of implementation-owned maps.
 
 Each world's wrapper has its own descriptor map. A descriptor cached for one
 world cannot alias another world's descriptor because it is stored in a

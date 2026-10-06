@@ -13,15 +13,16 @@
 //! depend on the element, a value or an easing still to be substituted against it, travels as
 //! written.
 
-use super::animations::AnimationSlot;
+use super::animations::{AnimationSlot, EffectTiming};
 use super::bridge::{
     FfiAnimationEffectVersion, FfiPublishedAnimationCustomDeclaration, FfiPublishedAnimationDeclaration,
     FfiPublishedAnimationEffect, FfiPublishedAnimationKeyframe, FfiPublishedEasingKind, FfiPublishedLinearEasingPoint,
 };
 use super::tree::StyleNodeID;
 use crate::css::animation::FfiCompositeOperation;
-use crate::css::easing::{Easing, FfiLinearEasingPoint};
+use crate::css::easing::{Easing, FfiEasingDescriptor, FfiEasingKind, FfiLinearEasingPoint};
 use crate::css::retained_fly_string::RetainedUtf16FlyString;
+use crate::css::style_compute::FfiEffectTiming;
 use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -104,20 +105,7 @@ pub(crate) fn easing_from_computed_timing_function(value: &StyleValueData) -> Op
         0 => {
             // The stops are canonicalized first, which resolves each one's calculated values and
             // interpolates the inputs it was not given.
-            unsafe extern "C" fn retain_child(_: *const c_void, child: &StyleValueData) -> *const StyleValueData {
-                unsafe { crate::css::style_value::retain_style_value(child) }
-            }
-            // SAFETY: the canonicalization hands back one reference, which the retained value
-            //         owns.
-            let canonical = unsafe {
-                RetainedStyleValueData::from_retained_pointer(
-                    crate::css::absolutize::rust_composite_style_value_absolutize(
-                        value,
-                        std::ptr::null(),
-                        retain_child,
-                    ),
-                )
-            };
+            let canonical = crate::css::absolutize::canonicalize_linear_easing(value);
             let StyleValueData::Easing { linear_stops, .. } = canonical.data() else {
                 return None;
             };
@@ -186,9 +174,43 @@ pub(crate) struct PublishedEffect {
     pub(crate) keyframes: Box<[PublishedKeyframe]>,
     declarations: Box<[PublishedDeclaration]>,
     custom_declarations: Box<[PublishedCustomDeclaration]>,
+    /// The timing the host last sampled the effect with, which moves without the description.
+    pub(crate) timing: Option<EffectTiming>,
 }
 
 impl PublishedEffect {
+    /// The effect of a CSS transition of `property_id` from `start` to `end`, as the host describes one:
+    /// two keyframes, each running the linear easing, that replace the value beneath them.
+    pub(crate) fn transition(
+        identity: u64,
+        property_id: u16,
+        start: RetainedStyleValueData,
+        end: RetainedStyleValueData,
+    ) -> Self {
+        let keyframe = |key, index| PublishedKeyframe {
+            key,
+            easing: Easing::default(),
+            easing_value: None,
+            composite: FfiCompositeOperation::Replace,
+            declarations: index..index + 1,
+            custom_declarations: 0..0,
+        };
+        Self {
+            identity,
+            generation: 0,
+            is_transition: true,
+            resource_context: None,
+            // `KeyframeEffect::AnimationKeyFrameKeyScaleFactor` keys the end at 100%.
+            keyframes: Box::new([keyframe(0, 0), keyframe(100 * 1000, 1)]),
+            declarations: Box::new([start, end].map(|value| PublishedDeclaration {
+                property_id,
+                value: PublishedValue::Declared(value),
+            })),
+            custom_declarations: Box::new([]),
+            timing: None,
+        }
+    }
+
     #[must_use]
     pub(crate) fn declarations_of(&self, keyframe: &PublishedKeyframe) -> &[PublishedDeclaration] {
         &self.declarations[keyframe.declarations.clone()]
@@ -270,6 +292,7 @@ impl PublishedEffectBuffers<'_> {
                     keyframes,
                     declarations: declarations.into(),
                     custom_declarations: custom_declarations.into(),
+                    timing: None,
                 }
             })
             .collect()
@@ -357,6 +380,56 @@ impl AnimationEffectDescriptions {
                 .all(|(effect, version)| effect.identity == version.identity && effect.generation == version.generation)
     }
 
+    /// Keeps `timing` and `easing`, what the host samples one of an element's described effects with, and
+    /// answers the key the effect samples its keyframes at as the host samples it: the one its timing
+    /// gives at the time the host sampled its timeline, or `host_key` where the engine cannot decide the
+    /// timing, or none for an unresolved progress, which samples nothing. An effect the list does not
+    /// describe keeps nothing, and samples nothing either.
+    ///
+    /// # Safety
+    /// The linear points `easing` names must be live.
+    pub(crate) unsafe fn time_effect(
+        &mut self,
+        node: StyleNodeID,
+        slot: AnimationSlot,
+        identity: u64,
+        timing: &FfiEffectTiming,
+        easing: &FfiEasingDescriptor,
+        host_key: f64,
+    ) -> Option<f64> {
+        let effect = self
+            .rows
+            .get_mut(&node)
+            .and_then(|lists| lists.iter_mut().find(|(list_slot, _)| *list_slot == slot))
+            .and_then(|(_, effects)| effects.iter_mut().find(|effect| effect.identity == identity));
+        let effect = effect?;
+        // A timing that has not moved keeps the easing it holds, so a sample allocates nothing.
+        let unchanged = effect
+            .timing
+            .as_ref()
+            .is_some_and(|kept| kept.timing == *timing && unsafe { easing_is(&kept.easing, easing) });
+        if !unchanged {
+            effect.timing = Some(EffectTiming {
+                timing: *timing,
+                easing: unsafe { Easing::from_descriptor(easing) },
+            });
+        }
+        effect.timing.as_ref().expect("the timing was kept above").key(host_key)
+    }
+
+    /// Keeps `timing`, what the host sampled one of an element's described effects with where it sampled
+    /// without asking the engine. An effect the list does not describe keeps nothing.
+    pub(crate) fn keep_timing(&mut self, node: StyleNodeID, slot: AnimationSlot, identity: u64, timing: EffectTiming) {
+        if let Some(effect) = self
+            .rows
+            .get_mut(&node)
+            .and_then(|lists| lists.iter_mut().find(|(list_slot, _)| *list_slot == slot))
+            .and_then(|(_, effects)| effects.iter_mut().find(|effect| effect.identity == identity))
+        {
+            effect.timing = Some(timing);
+        }
+    }
+
     /// Give up the lists of an identity that retires. An identity can be minted again for another
     /// element, so a list left behind would be read as that element's.
     pub(crate) fn retire(&mut self, node: StyleNodeID) {
@@ -424,6 +497,32 @@ impl DescribedVersions {
         for node in released.iter().filter_map(|&node| StyleNodeID::from_raw(node)) {
             self.rows.remove(&node);
         }
+    }
+}
+
+/// Whether `easing` is the function `descriptor` describes.
+///
+/// # Safety
+/// The linear points `descriptor` names must be live.
+unsafe fn easing_is(easing: &Easing, descriptor: &FfiEasingDescriptor) -> bool {
+    match (easing, descriptor.kind) {
+        (Easing::Linear(points), FfiEasingKind::Linear) => {
+            points.len() == descriptor.linear_point_count
+                && (points.is_empty()
+                    || points.as_slice()
+                        == unsafe { std::slice::from_raw_parts(descriptor.linear_points, points.len()) })
+        }
+        (Easing::CubicBezier { x1, y1, x2, y2 }, FfiEasingKind::CubicBezier) => {
+            [*x1, *y1, *x2, *y2] == [descriptor.x1, descriptor.y1, descriptor.x2, descriptor.y2]
+        }
+        (
+            Easing::Steps {
+                interval_count,
+                position,
+            },
+            FfiEasingKind::Steps,
+        ) => *interval_count == descriptor.interval_count && *position == descriptor.step_position,
+        _ => false,
     }
 }
 

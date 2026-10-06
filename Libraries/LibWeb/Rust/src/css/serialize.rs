@@ -21,7 +21,7 @@ use crate::css::style_value::{
     BasicShapeData, COUNTER_FUNCTION_COUNTERS, RetainedColorStopList, RetainedString, StyleValueData,
 };
 
-include!(concat!(env!("OUT_DIR"), "/transform_functions_generated.rs"));
+pub(crate) use crate::css::transform_functions::*;
 
 /// Mirrors `Web::CSS::SerializationMode`.
 #[derive(Clone, Copy, PartialEq)]
@@ -441,8 +441,9 @@ fn format_double_with_precision(sink: &mut TextSink, mut value: f64, precision: 
         value = -value;
     }
 
-    let mut integer_value = value as u64;
-    value -= (value as i64) as f64;
+    // A double past 2^53 has no fraction, and past 2^64 no integer type holds it.
+    let mut integer_part = value.trunc();
+    value -= integer_part;
 
     debug_assert!(precision <= 6);
     let mut fraction_digits: [u8; 6] = [0; 6];
@@ -480,7 +481,7 @@ fn format_double_with_precision(sink: &mut TextSink, mut value: f64, precision: 
             *digit = b'0';
         }
         if carried {
-            integer_value += 1;
+            integer_part += 1.0;
         }
     }
 
@@ -493,7 +494,7 @@ fn format_double_with_precision(sink: &mut TextSink, mut value: f64, precision: 
     } else if sign_always {
         sink.push_ascii("+");
     }
-    sink.push_ascii(&integer_value.to_string());
+    sink.push_ascii(&format!("{integer_part:.0}"));
     if fraction_length > 0 {
         sink.push_ascii(".");
         for &digit in &fraction_digits[..fraction_length] {
@@ -1079,7 +1080,7 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
         }
         StyleValueData::PendingSubstitution { .. } => true,
         StyleValueData::TreeCountingFunction { function, .. } => {
-            // TreeCountingFunctionStyleValue::TreeCountingFunction: SiblingCount is 0.
+            // The parser numbers sibling-count() 0 and sibling-index() 1.
             sink.push_ascii(if *function == 0 {
                 "sibling-count()"
             } else {
@@ -1683,8 +1684,8 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
             color_interpolation_method,
             color_syntax,
         } => {
-            // LinearGradientStyleValue::GradientType: Standard is 0, WebKit is 1; SideOrCorner:
-            // Top, Bottom, Left, Right, TopLeft, TopRight, BottomLeft, BottomRight.
+            // The parser numbers the gradient type Standard 0 and WebKit 1, and the side or corner Top, Bottom,
+            // Left, Right, TopLeft, TopRight, BottomLeft, BottomRight.
             let is_webkit = *gradient_type == 1;
             let default_side = if is_webkit { 0 } else { 1 };
             let has_direction = *has_direction_value || *side_or_corner != default_side;
@@ -3735,7 +3736,6 @@ pub(crate) fn sink_into_raw(sink: TextSink) -> usize {
 /// `value` must point at live style value data.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_serialize(value: *const c_void, mode: u8) -> usize {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::StyleValueSerializeEntry);
     let value = unsafe { &*value.cast::<StyleValueData>() };
     let mut sink = TextSink::new();
     if !serialize_style_value(&mut sink, value, SerializationMode::from_ffi(mode)) {
@@ -3804,6 +3804,15 @@ mod tests {
         assert_eq!(number_to_string(0.1), "0.1");
         assert_eq!(number_to_string(16.0 / 9.0), "1.777778");
         assert_eq!(number_to_string(1.0 / 3.0), "0.333333");
+    }
+
+    #[test]
+    fn number_serialization_holds_integer_parts_past_u64() {
+        assert_eq!(number_to_string(18446744073709551616.0), "18446744073709551616");
+        assert_eq!(number_to_string(-18446744073709551616.0), "-18446744073709551616");
+        assert_eq!(number_to_string(1e21), "1000000000000000000000");
+        assert_eq!(number_to_string(9007199254740993.0), "9007199254740992");
+        assert_eq!(number_to_string(1234567.9999999), "1234568");
     }
 
     #[test]

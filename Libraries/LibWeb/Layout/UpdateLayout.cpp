@@ -22,21 +22,12 @@
 
 namespace Web::DOM {
 
-static Layout::RustFFI::FfiUtf16View ffi_utf16_view(Utf16View view)
-{
-    return {
-        .ascii = view.has_ascii_storage() ? reinterpret_cast<u8 const*>(view.ascii_span().data()) : nullptr,
-        .utf16 = view.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(view.utf16_span().data()),
-        .length = view.length_in_code_units(),
-    };
-}
-
 // The document-side steps of the layout update, which the Rust loop drives through this table.
 Layout::RustFFI::FfiLayoutUpdateHostCallbacks Document::layout_update_host_callbacks()
 {
     return {
         .context = this,
-        .connected_element_count = [](void* context, Layout::BegunRead const* read) -> u32 { return static_cast<Document*>(context)->style_computer().style_engine().connected_element_count(*read); },
+        .connected_element_count = [](void* context, Layout::BegunRead const* read) -> u32 { return CSS::StyleEngineFFI::style_engine_connected_element_count(static_cast<Document*>(context)->style_computer().style_engine().host(), read); },
         .update_style = [](void* context, Layout::BegunRead const*) { static_cast<Document*>(context)->update_style(); },
         .process_pending_list_item_renumbers = [](void* context, Layout::BegunRead const*) { static_cast<Document*>(context)->process_pending_list_item_renumbers(); },
         .process_pending_top_layer_layout_changes = [](void* context, Layout::BegunRead const* read) { static_cast<Document*>(context)->process_pending_top_layer_layout_changes(*read); },
@@ -87,7 +78,7 @@ Layout::RustFFI::FfiLayoutUpdateHostCallbacks Document::layout_update_host_callb
                 arena.free_subtree(*read, replaced_root);
             }
             document.m_paint_state = make<Painting::DocumentPaintState>(arena); },
-        .reconcile_stale_list_item_counters_after_tree_build = [](void* context, Layout::BegunRead const* read) -> bool { return static_cast<Document*>(context)->reconcile_stale_list_item_counters_after_tree_build(*read); },
+        .reconcile_stale_list_item_counters_after_tree_build = [](void* context, Layout::RustFFI::FfiNodeIdentity const* rebuilt_roots, size_t count) -> bool { return static_cast<Document*>(context)->reconcile_stale_list_item_counters_after_tree_build({ rebuilt_roots, count }); },
         .after_layout_commit = [](void* context, Layout::BegunRead const* read, bool layout_tree_changed) { static_cast<Document*>(context)->after_layout_commit(*read, layout_tree_changed ? LayoutTreeChanged::Yes : LayoutTreeChanged::No); },
         .note_full_layout_performed = [](void* context) { static_cast<Document*>(context)->style_invalidation_counters().relayouts_performed++; },
         .evaluate_pending_container_queries = [](void* context, Layout::BegunRead const* read) { static_cast<Document*>(context)->style_computer().style_engine().evaluate_size_containers_needing_evaluation_after_layout(*read); },
@@ -112,92 +103,10 @@ void Document::update_layout(UpdateLayoutReason reason)
 
 namespace Web::DOM {
 
-// Whether a script API names the reason: a read of render state for it is then the script call's forced read, and
-// otherwise the host's own.
-bool reason_is_script_api(UpdateLayoutReason reason)
-{
-    switch (reason) {
-    case UpdateLayoutReason::DocumentElementFromPoint:
-    case UpdateLayoutReason::DocumentElementsFromPoint:
-    case UpdateLayoutReason::DocumentCaretPositionFromPoint:
-    case UpdateLayoutReason::DocumentFindMatchingText:
-    case UpdateLayoutReason::DocumentSetDesignMode:
-    case UpdateLayoutReason::ElementCheckVisibility:
-    case UpdateLayoutReason::ElementClientHeight:
-    case UpdateLayoutReason::ElementClientWidth:
-    case UpdateLayoutReason::ElementGetClientRects:
-    case UpdateLayoutReason::ElementIsPotentiallyScrollable:
-    case UpdateLayoutReason::ElementScroll:
-    case UpdateLayoutReason::ElementScrollHeight:
-    case UpdateLayoutReason::ElementScrollIntoView:
-    case UpdateLayoutReason::ElementScrollLeft:
-    case UpdateLayoutReason::ElementScrollTop:
-    case UpdateLayoutReason::ElementScrollWidth:
-    case UpdateLayoutReason::ElementSetScrollLeft:
-    case UpdateLayoutReason::ElementSetScrollTop:
-    case UpdateLayoutReason::HTMLElementGetTheTextSteps:
-    case UpdateLayoutReason::HTMLElementOffsetHeight:
-    case UpdateLayoutReason::HTMLElementOffsetLeft:
-    case UpdateLayoutReason::HTMLElementOffsetParent:
-    case UpdateLayoutReason::HTMLElementOffsetTop:
-    case UpdateLayoutReason::HTMLElementOffsetWidth:
-    case UpdateLayoutReason::HTMLElementScrollParent:
-    case UpdateLayoutReason::HTMLImageElementHeight:
-    case UpdateLayoutReason::HTMLImageElementWidth:
-    case UpdateLayoutReason::HTMLImageElementX:
-    case UpdateLayoutReason::HTMLImageElementY:
-    case UpdateLayoutReason::HTMLInputElementHeight:
-    case UpdateLayoutReason::HTMLInputElementWidth:
-    case UpdateLayoutReason::InternalsLayoutTest:
-    case UpdateLayoutReason::InternalsHitTest:
-    case UpdateLayoutReason::MediaQueryListMatches:
-    case UpdateLayoutReason::NavigableSelectedText:
-    case UpdateLayoutReason::RangeGetClientRects:
-    case UpdateLayoutReason::ResolvedCSSStyleDeclarationProperty:
-    case UpdateLayoutReason::SVGGraphicsElementGetBBox:
-    case UpdateLayoutReason::SVGGraphicsElementGetScreenCTM:
-    case UpdateLayoutReason::SVGLengthValue:
-    case UpdateLayoutReason::SVGPathLength:
-    case UpdateLayoutReason::WindowScroll:
-        return true;
-    case UpdateLayoutReason::AutoScrollSelection:
-    case UpdateLayoutReason::ChildDocumentStyleUpdate:
-    case UpdateLayoutReason::CursorLineNavigation:
-    case UpdateLayoutReason::Debugging:
-    case UpdateLayoutReason::DocumentReadinessComplete:
-    case UpdateLayoutReason::DumpDisplayList:
-    case UpdateLayoutReason::EventHandlerDispatchChromeWidgetEvent:
-    case UpdateLayoutReason::EventHandlerHandleDragAndDrop:
-    case UpdateLayoutReason::EventHandlerHandleKeyDown:
-    case UpdateLayoutReason::EventHandlerHandleMouseDown:
-    case UpdateLayoutReason::EventHandlerHandleMouseMove:
-    case UpdateLayoutReason::EventHandlerHandleMouseUp:
-    case UpdateLayoutReason::EventHandlerHandleMouseWheel:
-    case UpdateLayoutReason::EventHandlerRunActivationBehavior:
-    case UpdateLayoutReason::EventHandlerShowContextMenu:
-    case UpdateLayoutReason::FontFaceSetReady:
-    case UpdateLayoutReason::HTMLEventLoopRenderingUpdate:
-    case UpdateLayoutReason::HTMLLabelElementActivationBehavior:
-    case UpdateLayoutReason::InspectAccessibilityTree:
-    case UpdateLayoutReason::InspectDOMTree:
-    case UpdateLayoutReason::InspectDevToolsLayoutData:
-    case UpdateLayoutReason::InputCaretRect:
-    case UpdateLayoutReason::NavigableViewportScroll:
-    case UpdateLayoutReason::NodeNameOrDescription:
-    case UpdateLayoutReason::SVGDecodedImageDataRender:
-    case UpdateLayoutReason::ScrollCursorIntoView:
-    case UpdateLayoutReason::ProcessScreenshot:
-    case UpdateLayoutReason::ViewTransitionCapture:
-        return false;
-    }
-    VERIFY_NOT_REACHED();
-}
-
 void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSamplingScope animation_sampling_scope)
 {
-    // The update's waits for the render state are one read, which its first style or layout job spends. An update
-    // inside a read already begun for this document belongs to that read.
-    Layout::ForcedReadScope read { style_computer().style_engine().render_document(), reason_is_script_api(reason) };
+    // The update's waits for the render state are one read, which takes a frame in flight in.
+    Layout::ForcedReadScope read { style_computer().style_engine().render_document() };
     drain_flown_style_transaction(read);
 
     // An image box that owns its image's provider is handed it once the layout update that built the box is over, and
@@ -226,18 +135,85 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
 // to do first, so nothing is sealed while either waits.
 void Document::seal_first_layout_round(Layout::BegunRead const& read)
 {
+    if (!may_seal_first_layout_round())
+        return;
+    update_highlight_states_if_needed(read);
+    auto inputs = first_layout_round_inputs();
+    Layout::RustFFI::render_state_seal_first_layout_round(m_layout_node_arena->host(), &read, &inputs);
+}
+
+bool Document::may_seal_first_layout_round() const
+{
     auto navigable = this->navigable();
     if (!navigable || navigable->active_document().ptr() != this || !m_layout_node_arena)
-        return;
-    if (!m_list_owners_pending_item_renumber.is_empty() || !m_elements_with_pending_top_layer_membership_change.is_empty() || m_top_layer_needs_layout_zone_rebuild)
-        return;
-    drain_invalidation_journal(read);
-    Layout::RustFFI::FfiLayoutUpdateInputs inputs {
+        return false;
+    return m_list_owners_pending_item_renumber.is_empty() && m_elements_with_pending_top_layer_membership_change.is_empty() && !m_top_layer_needs_layout_zone_rebuild;
+}
+
+Layout::RustFFI::FfiLayoutUpdateInputs Document::first_layout_round_inputs() const
+{
+    return {
         .reason_is_inspect_devtools_layout_data = false,
         .is_template_contents_document = m_created_for_appropriate_template_contents,
-        .reason_name = ffi_utf16_view(to_string(UpdateLayoutReason::HTMLEventLoopRenderingUpdate)),
     };
-    Layout::RustFFI::render_state_seal_first_layout_round(m_layout_node_arena->host(), &read, &inputs);
+}
+
+// The style a rendering update's layout lays out is brought up to date first, as the layout update would: the round then
+// reads it as it is, and what is written beside the round is the next layout update's. The round takes in the list items
+// that wait to be renumbered and the top layer changes first, as the layout update's first round does.
+bool Document::let_layout_fly(Layout::RustFFI::FfiFlightBlocker blocker)
+{
+    if (blocker != Layout::RustFFI::FfiFlightBlocker::None)
+        return false;
+    // The round views the style records the style update leaves it as a layout update does, inside an epoch that spans
+    // both and ends behind the round.
+    style_computer().begin_style_record_view_epoch();
+    ScopeGuard end_style_record_view_epoch = [&] {
+        style_computer().end_style_record_view_epoch();
+    };
+    update_style();
+    auto navigable = this->navigable();
+    if (!navigable || navigable->active_document().ptr() != this || !m_layout_node_arena)
+        return false;
+    Layout::ForcedReadScope read { *this };
+    update_highlight_states_if_needed(read);
+    auto inputs = first_layout_round_inputs();
+    return Layout::RustFFI::render_state_let_first_layout_round_fly(m_layout_node_arena->host(), read, &inputs, blocker);
+}
+
+bool Document::take_flown_layout_in()
+{
+    auto navigable = this->navigable();
+    if (!navigable || navigable->active_document().ptr() != this || !m_layout_node_arena)
+        return false;
+    Layout::ForcedReadScope read { *this };
+    auto* host = m_layout_node_arena->host();
+    Layout::RustFFI::document_host_begin_update_layout(host);
+    style_computer().begin_style_record_view_epoch();
+    bool laid_out = Layout::RustFFI::render_state_take_flown_layout_in(host, read);
+    style_computer().end_style_record_view_epoch();
+    Layout::RustFFI::document_host_end_update_layout(host);
+    page().client().flush_pending_dom_mutations();
+    // As after a layout update's pass, a face the round reached is requested now. A box the round built that was handed
+    // an image already there, or a face that was requested, lays out again, as the layout update does: the round did not
+    // lay the document out.
+    if (Gfx::request_wanted_pending_faces())
+        m_requested_wanted_font_faces = true;
+    return laid_out && !m_owed_image_provider_arrived_with_image && !m_requested_wanted_font_faces;
+}
+
+Document::LayoutAsItFlew::LayoutAsItFlew(Document& document)
+    : m_document(document)
+{
+    VERIFY(!m_document->m_reads_layout_as_it_flew);
+    Layout::RustFFI::document_host_set_writes_aside(m_document->layout_node_arena().host());
+    m_document->m_reads_layout_as_it_flew = true;
+}
+
+Document::LayoutAsItFlew::~LayoutAsItFlew()
+{
+    m_document->m_reads_layout_as_it_flew = false;
+    Layout::RustFFI::document_host_queue_writes_set_aside(m_document->layout_node_arena().host());
 }
 
 void Document::update_style_and_layout_once(Layout::BegunRead const& read, UpdateLayoutReason reason, ThrottledAnimationSamplingScope animation_sampling_scope)
@@ -251,10 +227,6 @@ void Document::update_style_and_layout_once(Layout::BegunRead const& read, Updat
         && reason != UpdateLayoutReason::ChildDocumentStyleUpdate
         && animation_sampling_scope == ThrottledAnimationSamplingScope::Document)
         flush_throttled_animation_style_update();
-
-    // Every mark the DOM side has made goes through before the update that reads them starts. Marks made from inside
-    // the update write through on their own.
-    drain_invalidation_journal(read);
 
     auto& arena = layout_node_arena();
     Layout::RustFFI::document_host_begin_update_layout(arena.host());
@@ -284,7 +256,6 @@ void Document::update_style_and_layout_once(Layout::BegunRead const& read, Updat
     Layout::RustFFI::FfiLayoutUpdateInputs inputs {
         .reason_is_inspect_devtools_layout_data = reason == UpdateLayoutReason::InspectDevToolsLayoutData,
         .is_template_contents_document = m_created_for_appropriate_template_contents,
-        .reason_name = ffi_utf16_view(to_string(reason)),
     };
     Layout::RustFFI::render_state_update_layout(arena.host(), &read, &inputs);
 

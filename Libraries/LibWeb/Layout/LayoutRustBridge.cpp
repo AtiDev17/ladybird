@@ -16,7 +16,6 @@
 #include <LibWeb/CSS/Display.h>
 #include <LibWeb/CSS/LengthBox.h>
 #include <LibWeb/CSS/StyleComputer.h>
-#include <LibWeb/CSS/StyleValues/AnchorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/ValueType.h>
 #include <LibWeb/DOM/AbstractElement.h>
@@ -370,7 +369,7 @@ void publish_table_spans(DOM::Element const& element)
     } else {
         return;
     }
-    const_cast<DOM::Document&>(element.document()).style_computer().style_engine().set_element_table_spans(element.style_node_id(), column_span, row_span, raw_column_span);
+    CSS::StyleEngineFFI::style_engine_set_element_table_spans(const_cast<DOM::Document&>(element.document()).style_computer().style_engine().host(), element.style_node_id(), column_span, row_span, raw_column_span);
 }
 
 // The publication is keyed by the element's style node rather than by a row, because an element that draws nothing
@@ -450,39 +449,6 @@ void register_layout_host(NodeArena& arena, DOM::Document& document)
     RustFFI::render_state_set_document_is_decoded_svg(arena.host(), document.is_decoded_svg());
 }
 
-}
-
-extern "C" WEB_API u8 ladybird_layout_text_type_for_code_point(u32 code_point)
-{
-    return static_cast<u8>(to_underlying(Web::Layout::text_type_for_code_point(code_point)));
-}
-
-extern "C" WEB_API bool ladybird_layout_code_point_has_break_all_line_break_class(u32 code_point)
-{
-    return first_is_one_of(Unicode::line_break_class(code_point),
-        Unicode::LineBreakClass::Alphabetic,
-        Unicode::LineBreakClass::Numeric,
-        Unicode::LineBreakClass::ComplexContext,
-        Unicode::LineBreakClass::Ideographic);
-}
-
-extern "C" WEB_API bool ladybird_layout_code_point_has_keep_all_line_break_class(u32 code_point)
-{
-    return first_is_one_of(Unicode::line_break_class(code_point),
-        Unicode::LineBreakClass::Alphabetic,
-        Unicode::LineBreakClass::Numeric,
-        Unicode::LineBreakClass::Ambiguous,
-        Unicode::LineBreakClass::Ideographic);
-}
-
-extern "C" WEB_API bool ladybird_layout_code_point_has_combining_mark_line_break_class(u32 code_point)
-{
-    return Unicode::line_break_class(code_point) == Unicode::LineBreakClass::CombiningMark;
-}
-
-extern "C" WEB_API bool ladybird_layout_code_point_has_emoji_property(u32 code_point)
-{
-    return Unicode::code_point_has_emoji_property(code_point);
 }
 
 extern "C" WEB_API Web::Layout::RustFFI::FfiCodePointCategoryFacts ladybird_layout_code_point_category_facts(u32 code_point)

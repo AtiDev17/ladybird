@@ -18,7 +18,6 @@
 #include <LibJS/Runtime/FunctionObject.h>
 #include <LibJS/Runtime/GlobalEnvironment.h>
 #include <LibJS/Runtime/NativeFunction.h>
-#include <LibJS/Runtime/Shape.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibURL/Origin.h>
 #include <LibWeb/Bindings/IdleRequest.h>
@@ -102,7 +101,7 @@
 
 namespace Web::Bindings {
 
-GC::Ref<JS::NativeFunction> WindowWrapper::create_cross_origin_method(JS::Realm& realm, Utf16FlyString const& property)
+GC::Ref<JS::NativeFunction> create_window_cross_origin_method(JS::Realm& realm, Utf16FlyString const& property)
 {
     if (property == u"close"sv)
         return JS::NativeFunction::create(realm, WindowGlobalMixin::close, 0, property);
@@ -115,7 +114,7 @@ GC::Ref<JS::NativeFunction> WindowWrapper::create_cross_origin_method(JS::Realm&
     VERIFY_NOT_REACHED();
 }
 
-GC::Ref<JS::NativeFunction> WindowWrapper::create_cross_origin_getter(JS::Realm& realm, Utf16FlyString const& property)
+GC::Ref<JS::NativeFunction> create_window_cross_origin_getter(JS::Realm& realm, Utf16FlyString const& property)
 {
     if (property == u"window"sv)
         return JS::NativeFunction::create(realm, WindowGlobalMixin::window_getter, 0, property, &realm, "get"sv);
@@ -138,7 +137,7 @@ GC::Ref<JS::NativeFunction> WindowWrapper::create_cross_origin_getter(JS::Realm&
     VERIFY_NOT_REACHED();
 }
 
-GC::Ref<JS::NativeFunction> WindowWrapper::create_cross_origin_setter(JS::Realm& realm, Utf16FlyString const& property)
+GC::Ref<JS::NativeFunction> create_window_cross_origin_setter(JS::Realm& realm, Utf16FlyString const& property)
 {
     VERIFY(property == u"location"sv);
     return JS::NativeFunction::create(realm, WindowGlobalMixin::location_setter, 1, property, &realm, "set"sv);
@@ -154,15 +153,15 @@ HTML::Window const* window_from_global_object(JS::Object const& object)
     return Bindings::impl_from<HTML::Window>(&object);
 }
 
-PlatformObject& platform_object_for_window(HTML::Window& window)
+JS::HostObject& platform_object_for_window(HTML::Window& window)
 {
-    auto* wrapper = as_if<PlatformObject>(window.principal_realm().global_object());
+    auto* wrapper = as_platform_object(window.principal_realm().global_object());
     VERIFY(wrapper);
     VERIFY(window_from_global_object(*wrapper) == &window);
     return *wrapper;
 }
 
-PlatformObject& platform_object_for_window(HTML::Window& window, JS::Realm& realm)
+JS::HostObject& platform_object_for_window(HTML::Window& window, JS::Realm& realm)
 {
     auto& wrapper_world = Bindings::host_defined_wrapper_world(realm);
     return *Bindings::wrap(wrapper_world, realm, GC::Ref { window });
@@ -259,7 +258,7 @@ JS::Value window_named_item_value(WrapperWorld& wrapper_world, JS::Realm& realm,
 {
     return window.named_item(name).visit(
         [](Empty) -> JS::Value { return JS::js_undefined(); },
-        [](GC::Ref<HTML::WindowProxy> const& value) -> JS::Value { return value.ptr(); },
+        [](GC::Ref<HTML::WindowProxy> const& value) -> JS::Value { return &value->object(); },
         [&wrapper_world, &realm](GC::Ref<DOM::Element> const& value) -> JS::Value { return wrap(wrapper_world, realm, value); },
         [&wrapper_world, &realm](GC::Ref<DOM::HTMLCollection> const& value) -> JS::Value { return wrap(wrapper_world, realm, value); });
 }
@@ -351,7 +350,7 @@ JS::Realm& Window::principal_realm() const
 
     auto wrapper = cached_main_world_wrapper();
     VERIFY(wrapper);
-    return wrapper->realm();
+    return wrapper->shape().realm();
 }
 
 EnvironmentSettingsObject& Window::relevant_settings_object() const
@@ -1137,18 +1136,25 @@ bool Window::is_internals_object_exposed()
     return s_internals_object_exposed;
 }
 
+static GC::Ref<WindowProxy> window_proxy_from_global_this_value(JS::Object& global_this_value)
+{
+    auto* window_proxy = WindowProxy::from_object(global_this_value);
+    VERIFY(window_proxy);
+    return *window_proxy;
+}
+
 // https://html.spec.whatwg.org/multipage/window-object.html#dom-window
 GC::Ref<WindowProxy> Window::window() const
 {
     // The window, frames, and self getter steps are to return this's relevant realm.[[GlobalEnv]].[[GlobalThisValue]].
-    return as<WindowProxy>(relevant_realm(*this).global_environment().global_this_value());
+    return window_proxy_from_global_this_value(relevant_realm(*this).global_environment().global_this_value());
 }
 
 // https://html.spec.whatwg.org/multipage/window-object.html#dom-self
 GC::Ref<WindowProxy> Window::self() const
 {
     // The window, frames, and self getter steps are to return this's relevant realm.[[GlobalEnv]].[[GlobalThisValue]].
-    return as<WindowProxy>(relevant_realm(*this).global_environment().global_this_value());
+    return window_proxy_from_global_this_value(relevant_realm(*this).global_environment().global_this_value());
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-2
@@ -1374,7 +1380,7 @@ GC::Ref<BarProp const> Window::toolbar()
 GC::Ref<WindowProxy> Window::frames() const
 {
     // The window, frames, and self getter steps are to return this's relevant realm.[[GlobalEnv]].[[GlobalThisValue]].
-    return as<WindowProxy>(relevant_realm(*this).global_environment().global_this_value());
+    return window_proxy_from_global_this_value(relevant_realm(*this).global_environment().global_this_value());
 }
 
 // https://html.spec.whatwg.org/multipage/window-object.html#dom-length
@@ -1397,18 +1403,22 @@ GC::Ptr<WindowProxy const> Window::top() const
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-opener
-GC::Ptr<WindowProxy const> Window::opener() const
+JS::Value Window::opener() const
 {
     // 1. Let current be this's browsing context.
     auto current = browsing_context();
 
     // 2. If current is null, then return null.
     if (!current)
-        return {};
+        return JS::js_null();
 
     // 3. If current's opener browsing context is null, then return null.
+    auto opener_window_proxy = current->opener_browsing_context_window_proxy();
+    if (!opener_window_proxy)
+        return JS::js_null();
+
     // 4. Return current's opener browsing context's WindowProxy object.
-    return current->opener_browsing_context_window_proxy();
+    return &opener_window_proxy->object();
 }
 
 WebIDL::ExceptionOr<void> Window::set_opener(JS::Value value)
@@ -1581,7 +1591,7 @@ WebIDL::ExceptionOr<Window::PreparedPostMessage> Window::prepare_post_message(JS
     auto source_origin = incumbent_settings.origin();
 
     // 8.3. Let source be the WindowProxy object corresponding to incumbentSettings's global object (a Window object).
-    auto source = GC::Ref { as<WindowProxy>(incumbent_settings.realm().global_environment().global_this_value()) };
+    auto source = window_proxy_from_global_this_value(incumbent_settings.realm().global_environment().global_this_value());
 
     return PreparedPostMessage {
         .serialize_with_transfer_result = move(serialize_with_transfer_result),
@@ -1925,7 +1935,7 @@ void Window::scroll(ScrollToOptions const& options, GC::Ptr<WebIDL::Promise> pro
     //               This also means we don't need to update layout in that case.
     if (x != 0 || y != 0) {
         // NB: Make sure layout is up-to-date before looking at scrollable overflow metrics.
-        Layout::ForcedReadScope read { *document, true };
+        Layout::ForcedReadScope read { *document };
         document->update_layout(DOM::UpdateLayoutReason::WindowScroll);
 
         auto const* layout_node = document->layout_node(read);

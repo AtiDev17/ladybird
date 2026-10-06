@@ -18,14 +18,10 @@ pub(crate) fn first_child_paintable_of_kind(
     paintable: NodeSlotId,
     kind: NodeKind,
 ) -> Option<NodeSlotId> {
-    let mut child = arena.node_first_child_if_live(paintable);
-    while let Some(node) = child {
-        if arena.node_kind_if_live(node) == Some(kind) {
-            return arena.paintable_row_is_populated(node).then_some(node);
-        }
-        child = arena.node_next_sibling_if_live(node);
-    }
-    None
+    let node = arena
+        .children(paintable)
+        .find(|&node| arena.node_kind_if_live(node) == Some(kind))?;
+    arena.paintable_row_is_populated(node).then_some(node)
 }
 
 /// The object bounding box covers the target's geometry alone. The paintable's border box is not
@@ -186,19 +182,14 @@ fn svg_clip_path_geometry_bounds(
         max_y: CssPixels::default(),
         has_points: false,
     };
-    let mut child = arena.node_first_child_if_live(node);
-    while let Some(child_node) = child {
-        child = arena.node_next_sibling_if_live(child_node);
+    for child_node in arena.children(node) {
         let Some(child_kind) = arena.node_kind_if_live(child_node) else {
             continue;
         };
-        if matches!(
-            child_kind,
-            NodeKind::SVGMaskBox | NodeKind::SVGClipBox | NodeKind::SVGPatternBox
-        ) {
+        if crate::layout::node_facts::kind_is_svg_resource_box(child_kind) {
             continue;
         }
-        if !arena.paintable_row_is_populated(child_node) || !node_painting::is_svg_paintable(child_kind) {
+        if !arena.paintable_row_is_populated(child_node) || !node_painting::is_svg(child_kind) {
             continue;
         }
         let child_transform = multiply_affine(

@@ -42,51 +42,31 @@ public:
     using NumericValue = Variant<Number, Angle, Flex, Frequency, Length, Percentage, Resolution, Time>;
 
     static ValueComparingNonnullRefPtr<CalculatedStyleValue const> create(CalcNodeRef root, NumericType resolved_type, CalculationContext context);
-
-    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
     bool equals(StyleValue const& other) const;
     StyleValueFFI::CalcNode const* rust_calculation_root() const { return m_value->calculated.rust_calculation.node; }
     CalculationContext calculation_context() const;
 
-    bool resolves_to_angle() const { return resolved_type().matches_angle(calculation_context().percentages_resolve_as); }
-    bool resolves_to_angle_percentage() const { return resolved_type().matches_angle_percentage(calculation_context().percentages_resolve_as); }
     Optional<Angle> resolve_angle(CalculationResolutionContext const&) const;
 
-    bool resolves_to_flex() const { return resolved_type().matches_flex(calculation_context().percentages_resolve_as); }
-    Optional<Flex> resolve_flex(CalculationResolutionContext const&) const;
-
-    bool resolves_to_frequency() const { return resolved_type().matches_frequency(calculation_context().percentages_resolve_as); }
-    bool resolves_to_frequency_percentage() const { return resolved_type().matches_frequency_percentage(calculation_context().percentages_resolve_as); }
-
     bool resolves_to_length() const { return resolved_type().matches_length(calculation_context().percentages_resolve_as); }
-    bool resolves_to_length_percentage() const { return resolved_type().matches_length_percentage(calculation_context().percentages_resolve_as); }
     Optional<Length> resolve_length(CalculationResolutionContext const&) const;
-    Optional<double> resolve_raw_length(CalculationResolutionContext const&) const;
 
     bool resolves_to_percentage() const { return resolved_type().matches_percentage(); }
     Optional<Percentage> resolve_percentage(CalculationResolutionContext const&) const;
 
-    bool resolves_to_resolution() const { return resolved_type().matches_resolution(calculation_context().percentages_resolve_as); }
     Optional<Resolution> resolve_resolution(CalculationResolutionContext const&) const;
 
     bool resolves_to_time() const { return resolved_type().matches_time(calculation_context().percentages_resolve_as); }
-    bool resolves_to_time_percentage() const { return resolved_type().matches_time_percentage(calculation_context().percentages_resolve_as); }
     Optional<Time> resolve_time(CalculationResolutionContext const&) const;
 
     bool resolves_to_number() const { return resolved_type().matches_number(calculation_context().percentages_resolve_as); }
     Optional<double> resolve_number(CalculationResolutionContext const&) const;
     Optional<i32> resolve_integer(CalculationResolutionContext const&) const;
 
-    RefPtr<StyleValue const> resolve_as_style_value(CalculationResolutionContext const&) const;
-
     bool contains_percentage() const;
     bool is_fully_simplified() const;
 
     GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
-
-    // Whether any node of the calculation is an anchor() function, which layout must
-    // resolve with the anchor context of the box being positioned.
-    bool contains_anchor_function() const;
 
 private:
     friend class StyleValue;
@@ -111,14 +91,10 @@ private:
     //        There are still some CalculatedStyleValues which we don't call absolutized for (i.e. sub-values of other
     //        StyleValue classes which lack their own absolutized method) which will need to be fixed beforehand.
     Optional<ResolvedValue> resolve_value(CalculationResolutionContext const&, bool apply_censoring_and_clamping = true) const;
-    Optional<ResolvedValue> resolve_value(CalculationContext const&, CalculationResolutionContext const&, bool apply_censoring_and_clamping = true) const;
 
     static StyleValueFFI::StyleValueData const* make_calculated_data_from_rust_root(StyleValueFFI::CalcNode const*, NumericType const&, CalculationContext const&);
 
     NumericType resolved_type() const;
 };
-
-// https://drafts.csswg.org/css-values-4/#calc-simplification
-CalcNodeRef simplify_a_calculation_tree(CalcNodeRef const& root, CalculationContext const& context, CalculationResolutionContext const& resolution_context);
 
 }

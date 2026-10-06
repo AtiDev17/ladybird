@@ -111,7 +111,7 @@ public:
 
     Utf16String selected_text_for_clipboard();
 
-    void find_in_page(Utf16String const& query);
+    void find_in_page(Utf16String const& query, bool highlight_all);
     void find_in_page_next_match();
     void find_in_page_end();
 
@@ -174,6 +174,7 @@ public:
 
     void set_browser_zoom(double factor);
     void set_device_pixel_ratio(double ratio);
+    void resize_window(i32 width, i32 height);
 
     bool headless();
     bool screen_wake_lock_active();
@@ -228,7 +229,12 @@ public:
     void set_manual_rendering_opportunities(bool enabled);
     void inject_rendering_opportunity(double frame_time_ms);
     Utf16String frame_scheduler_state() const;
-    void hold_next_frame();
+    void hold_next_frame(Utf16String const& hold);
+    Utf16String last_frame_presented_by(DOM::Document&);
+    void inject_clock_tick(double frame_time_ms, Optional<double> viewport_scroll_y);
+    Utf16String clock_lease_state(DOM::Document&);
+    GC::Ptr<Geometry::DOMRect> presented_border_box(DOM::Element&);
+    bool last_frame_keyboard_scroll_state_is_current();
     void release_held_frame();
     void update_compositor_animations();
     bool run_empty_animation_style_update_for_testing();

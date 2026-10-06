@@ -27,7 +27,7 @@ use crate::painting::paintable_data::{CommittedSideData, PaintableData};
 use crate::painting::paintable_rows::{CommittedFragmentLinkSlot, PAINTABLE_SLOTS_PER_CHUNK};
 use crate::painting::record::damage::FrameDamage;
 use crate::painting::replaced_paint_facts::ReplacedPaintFactsTable;
-use crate::painting::selection::{HighlightPseudoElement, SelectionRange};
+use crate::painting::selection::{HighlightPseudoElement, SearchTextHighlights, SelectionRange};
 use crate::painting::stacking_context::entries::StackingContextEntries;
 use crate::painting::svg_paint_resources::SvgPaintResourceRows;
 use crate::painting::visual_context::VisualContextTree;
@@ -148,8 +148,9 @@ pub(crate) struct PublishedPaintState {
     pub(crate) has_non_viewport_wheel_scroll_target_candidate: bool,
     pub(crate) selection: Option<Arc<SelectionRange>>,
     pub(crate) selection_pseudo_styles: Arc<SelectionPseudoStyles>,
-    pub(crate) search_text: Option<Arc<SelectionRange>>,
+    pub(crate) search_text: Arc<SearchTextHighlights>,
     pub(crate) search_text_pseudo_styles: Arc<SelectionPseudoStyles>,
+    pub(crate) search_text_current_pseudo_styles: Arc<SelectionPseudoStyles>,
     pub(crate) hit_test_list_generation: u64,
     /// How many items the document's hit-test list held, which the recording's list reserves.
     pub(crate) hit_test_item_capacity_hint: usize,
@@ -160,6 +161,7 @@ impl PublishedPaintState {
         match highlight {
             HighlightPseudoElement::Selection => &self.selection_pseudo_styles,
             HighlightPseudoElement::SearchText => &self.search_text_pseudo_styles,
+            HighlightPseudoElement::SearchTextCurrent => &self.search_text_current_pseudo_styles,
         }
     }
 
@@ -175,6 +177,7 @@ impl PublishedPaintState {
             selection_pseudo_styles: paint_state.selection_pseudo_styles.clone(),
             search_text: paint_state.search_text.clone(),
             search_text_pseudo_styles: paint_state.search_text_pseudo_styles.clone(),
+            search_text_current_pseudo_styles: paint_state.search_text_current_pseudo_styles.clone(),
             hit_test_list_generation: paint_state.hit_test_list_generation,
             hit_test_item_capacity_hint,
         }
@@ -256,7 +259,7 @@ mod tests {
     use crate::layout::LayoutNodeArena;
     use crate::layout::fragment_tree;
     use crate::layout::node_data::{NodeFlag, NodeKind};
-    use crate::painting::paint_read::{GeometryRead, PaintRead, PaintSource};
+    use crate::painting::paint_read::{GeometryRead, PaintRead, PaintRow, PaintSource};
     use crate::painting::record::recorder_state::AbsoluteRectMemo;
     use std::cell::RefCell;
 
@@ -297,9 +300,21 @@ mod tests {
         assert!(arena.committed_side_data(node).piece_indices().is_empty());
     }
 
+    fn derived_facts<'a>(row: Option<impl PaintRow<'a>>) -> Option<[bool; 5]> {
+        row.map(|row| {
+            [
+                row.is_fragmented_inline(),
+                row.is_out_of_flow(),
+                row.is_atomic_inline(),
+                row.is_positioned(),
+                row.is_floating(),
+            ]
+        })
+    }
+
     #[test]
     fn published_rows_answer_every_row_read_as_the_arena_does() {
-        let mut engine = crate::css::style::StyleEngine::new(crate::css::style::memory::DeviceClass::ForegroundDesktop);
+        let mut engine = crate::css::style::StyleEngine::new();
         let mut arena = LayoutNodeArena::new();
         arena.set_style_engine(crate::css::style::StyleEngineHandle::from_raw(&raw mut engine));
         let mut slots = Vec::new();
@@ -346,17 +361,7 @@ mod tests {
             );
             assert_eq!(source.node_generated_for(node), arena.node_generated_for(node));
             assert_eq!(source.node_is_dom_backed(node), arena.node_is_dom_backed(node));
-            assert_eq!(
-                source.node_is_fragmented_inline(node),
-                arena.node_is_fragmented_inline(node)
-            );
-            assert_eq!(
-                source.node_is_out_of_flow_if_live(node),
-                arena.node_is_out_of_flow_if_live(node)
-            );
-            assert_eq!(source.node_is_atomic_inline(node), arena.node_is_atomic_inline(node));
-            assert_eq!(source.node_is_positioned(node), arena.node_is_positioned(node));
-            assert_eq!(source.node_is_floating(node), arena.node_is_floating(node));
+            assert_eq!(derived_facts(source.node(node)), derived_facts(arena.node(node)));
             assert_eq!(
                 source.node_style_if_live(node).is_some(),
                 arena.node_style_if_live(node).is_some()

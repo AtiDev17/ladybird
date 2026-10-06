@@ -7,18 +7,17 @@
 use crate::css::css_enums::{flex_direction, flex_wrap, overflow, positioning, writing_mode};
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixels};
 use crate::css::display::FfiDisplay;
+use crate::fast_hash::FastMap as HashMap;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
-use crate::layout::node_facts;
-use crate::painting::paint_read::PaintRead;
+use crate::layout::node_facts::{self, NodeShape};
+use crate::painting::paint_read::{GeometryRead, PaintRead, PaintRow};
 use crate::painting::paintable_data::FfiOverflowData;
 use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
 use crate::painting::visual_context::node_values;
 use crate::painting::{paintable_geometry, style_queries, text_fragment};
-use libgfx_rust::matrix::{AffineTransform, FloatMatrix4x4};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 
 /// Index boxes whose containing block differs from their layout parent. Direct children are
 /// enumerated from the layout tree when measuring overflow.
@@ -30,35 +29,20 @@ pub(crate) fn refill_contained_boxes_index(
     for contained_boxes in non_child_boxes_by_containing_block.values_mut() {
         contained_boxes.clear();
     }
-    if layout_arena.slot_is_live(root) {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node != root
-                && let Some(sibling) = layout_arena.node_next_sibling_if_live(node)
-            {
-                stack.push(sibling);
-            }
-            if let Some(first_child) = layout_arena.node_first_child_if_live(node) {
-                stack.push(first_child);
-            }
-            let node_is_box_kind = layout_arena
-                .node_kind_if_live(node)
-                .is_some_and(node_facts::kind_is_box);
-            if !node_is_box_kind || !layout_arena.paintable_row_is_populated(node) {
-                continue;
-            }
-            let Some(containing_block) = layout_arena.node_containing_block_if_live(node) else {
-                continue;
-            };
-            if layout_arena.node_parent_if_live(node) == Some(containing_block) {
-                continue;
-            }
+    layout_arena.for_each_node_in_layout_subtree_in_pre_order_with_pruning(root, |node| {
+        if let Some(row) = layout_arena.node(node)
+            && node_facts::kind_is_box(row.kind())
+            && layout_arena.paintable_row_is_populated(node)
+            && let Some(containing_block) = layout_arena.node_containing_block_if_live(node)
+            && row.parent() != containing_block
+        {
             non_child_boxes_by_containing_block
                 .entry(containing_block)
                 .or_default()
                 .push(node);
         }
-    }
+        true
+    });
     non_child_boxes_by_containing_block.retain(|_, contained_boxes| !contained_boxes.is_empty());
 }
 
@@ -138,63 +122,6 @@ pub(crate) fn physical_overflow_directions(
     }
 }
 
-fn extract_two_dimensional_affine_transform(matrix: &FloatMatrix4x4) -> AffineTransform {
-    let elements = &matrix.elements;
-    AffineTransform {
-        values: [
-            elements[0][0],
-            elements[1][0],
-            elements[0][1],
-            elements[1][1],
-            elements[0][3],
-            elements[1][3],
-        ],
-    }
-}
-
-fn affine_is_identity_or_translation(affine: &AffineTransform) -> bool {
-    let [a, b, c, d, _, _] = affine.values;
-    a == 1.0 && b == 0.0 && c == 0.0 && d == 1.0
-}
-
-fn affine_map_point(affine: &AffineTransform, x: f32, y: f32) -> (f32, f32) {
-    let [a, b, c, d, e, f] = affine.values;
-    (a * x + c * y + e, b * x + d * y + f)
-}
-
-struct FloatRectEdges {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-}
-
-fn affine_map_float_rect(affine: &AffineTransform, rect: FloatRectEdges) -> FloatRectEdges {
-    if affine_is_identity_or_translation(affine) {
-        let [_, _, _, _, e, f] = affine.values;
-        return FloatRectEdges {
-            x: rect.x + e,
-            y: rect.y + f,
-            width: rect.width,
-            height: rect.height,
-        };
-    }
-    let (x1, y1) = affine_map_point(affine, rect.x, rect.y);
-    let (x2, y2) = affine_map_point(affine, rect.x + rect.width, rect.y);
-    let (x3, y3) = affine_map_point(affine, rect.x + rect.width, rect.y + rect.height);
-    let (x4, y4) = affine_map_point(affine, rect.x, rect.y + rect.height);
-    let left = x1.min(x2).min(x3).min(x4);
-    let top = y1.min(y2).min(y3).min(y4);
-    let right = x1.max(x2).max(x3).max(x4);
-    let bottom = y1.max(y2).max(y3).max(y4);
-    FloatRectEdges {
-        x: left,
-        y: top,
-        width: right - left,
-        height: bottom - top,
-    }
-}
-
 fn apply_css_transform_to_scrollable_overflow_rect(
     layout_arena: &impl PaintableRowsRead,
     box_paintable: NodeSlotId,
@@ -207,23 +134,7 @@ fn apply_css_transform_to_scrollable_overflow_rect(
     let Some((transform, _is_invertible)) = node_values::compute_transform(layout_arena, box_paintable, 1.0) else {
         return rect;
     };
-
-    let affine = extract_two_dimensional_affine_transform(&transform.matrix);
-    let transformed = affine_map_float_rect(
-        &affine,
-        FloatRectEdges {
-            x: rect.x.to_float() - transform.origin.x,
-            y: rect.y.to_float() - transform.origin.y,
-            width: rect.width.to_float(),
-            height: rect.height.to_float(),
-        },
-    );
-    CssPixelRect::new(
-        CssPixels::nearest_value_for_f32(transformed.x + transform.origin.x),
-        CssPixels::nearest_value_for_f32(transformed.y + transform.origin.y),
-        CssPixels::nearest_value_for_f32(transformed.width),
-        CssPixels::nearest_value_for_f32(transformed.height),
-    )
+    super::scroll_snap::map_rect_through_css_transform(transform.matrix, transform.origin, rect)
 }
 
 fn padding_inflated_scrollable_overflow(
@@ -463,25 +374,24 @@ fn measure_scrollable_overflow_impl(
     //          its 3D rendering context. [CSS3-TRANSFORMS]
     // OPTIMIZATION: The layout tree already indexes direct children. Retain only boxes whose
     //               containing block differs from their parent in the supplemental index.
-    let direct_children = std::iter::successors(layout_arena.node_first_child_if_live(box_node), |&child| {
-        layout_arena.node_next_sibling_if_live(child)
-    });
+    let direct_children = layout_arena.children(box_node);
     let other_contained_boxes = non_child_boxes_by_containing_block
         .get(&box_node)
         .into_iter()
         .flatten()
         .copied();
     for child_node in direct_children.chain(other_contained_boxes) {
-        if !layout_arena
-            .node_kind_if_live(child_node)
-            .is_some_and(node_facts::kind_is_box)
+        let Some(child_row) = layout_arena.node(child_node) else {
+            continue;
+        };
+        if !node_facts::kind_is_box(child_row.kind())
             || !layout_arena.paintable_row_is_populated(child_node)
             || layout_arena.node_containing_block_if_live(child_node) != Some(box_node)
         {
             continue;
         }
 
-        let child_style = layout_arena.node_style_if_live(child_node);
+        let child_style = child_row.style();
         let child_position = child_style.map_or(positioning::STATIC, |style| style.position());
         let child_is_absolutely_positioned = matches!(child_position, positioning::ABSOLUTE | positioning::FIXED);
 
@@ -495,7 +405,7 @@ fn measure_scrollable_overflow_impl(
 
         let child_has_css_transform =
             child_style.is_some_and(|style| style_queries::has_css_transform(layout_arena, child_node, style));
-        let child_flags = layout_arena.node_flags_if_live(child_node);
+        let child_flags = child_row.flags();
         let child_is_flex_or_grid_item = child_flags & (NodeFlag::IsFlexItem as u32 | NodeFlag::IsGridItem as u32) != 0;
         let child_is_floating = !child_is_flex_or_grid_item && child_style.is_some_and(|style| style.is_floating());
         if style_queries::is_invisible_for_line_clamp(layout_arena, child_node) {

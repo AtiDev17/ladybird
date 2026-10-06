@@ -385,14 +385,7 @@ pub(crate) fn place_child_in_containing_block(
             (!containing_block.is_invalid()).then_some(containing_block),
             used,
             containing_block_is_sealed,
-            resolve_containing_line_box_index(
-                records,
-                callbacks,
-                node,
-                containing_block,
-                containing_line_box_fragment,
-                offset,
-            ),
+            resolve_containing_line_box_index(records, callbacks, node, containing_block, containing_line_box_fragment),
             point_add(
                 offset,
                 committed_offset_delta_at_placement(purpose, records, callbacks, node, containing_block, used),
@@ -410,26 +403,24 @@ fn resolve_containing_line_box_index(
     node: Node,
     containing_block: Node,
     coordinate: Option<used_values::LineBoxFragmentCoordinate>,
-    placed_offset: FfiCssPixelPoint,
 ) -> Option<usize> {
     let coordinate = coordinate?;
-    let facts = NodeFacts::new(callbacks, node);
-    if !facts.is_non_fragmented_box() {
+    if !NodeFacts::new(callbacks, node).is_non_fragmented_box() {
         return None;
     }
     assert!(!containing_block.is_invalid());
     let containing_block_used = records.used_values(containing_block);
     let data = containing_block_used.line_data_ref()?;
     let line = data.building().line_boxes.get(coordinate.line_box_index)?;
-    if let Some(fragment) = line.fragments.get(coordinate.fragment_index) {
-        let (x, y) = fragment.offset();
-        debug_assert_eq!(
-            FfiCssPixelPoint { x, y },
-            placed_offset,
-            "stored line fragment offset diverged from the placed offset (is_block_outside={})",
-            facts.display().is_block_outside()
-        );
-    }
+    // The placed offset is not the fragment's offset: atomic inlines are placed shifted by their inline ancestors'
+    // relative insets, which the line data only folds in after placement. An interrupting block is placed before
+    // its line gets its fragment.
+    debug_assert!(
+        line.fragments
+            .get(coordinate.fragment_index)
+            .is_none_or(|fragment| fragment.layout_node == node),
+        "a line box fragment coordinate must name the placed box's own fragment"
+    );
     Some(coordinate.line_box_index)
 }
 
@@ -776,7 +767,6 @@ pub(crate) fn baseline_of_child(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FormattingContextType {
     Block,
-    Inline,
     Flex,
     Grid,
     Table,
@@ -1003,24 +993,13 @@ impl FfiLayoutHostCallbacks {
 /// cleared or the host is destroyed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn document_host_set_layout_host_callbacks(
-    host: *const crate::render_state::DocumentHost,
+    host: &crate::render_state::DocumentHost,
     callbacks: FfiLayoutHostCallbacks,
 ) {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.host_tables().layout_host.set(Some(callbacks));
+    host.host_tables().layout_host.set(Some(callbacks));
 }
 
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn document_host_clear_layout_host_callbacks(host: *const crate::render_state::DocumentHost) {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.host_tables().layout_host.set(None);
-}
-
+#[derive(Clone)]
 pub(crate) struct FormattingContextRun<'pass> {
     pub(crate) purpose: LayoutPurpose,
     pub(crate) records: &'pass RunRecords<'pass>,
@@ -1174,14 +1153,11 @@ fn create_formatting_context_implementation<'pass>(
         FormattingContextType::ReplacedWithChildren => FormattingContextImplementation::ReplacedWithChildren,
         FormattingContextType::InternalReplaced => FormattingContextImplementation::InternalReplaced,
         FormattingContextType::InternalDummy => FormattingContextImplementation::InternalDummy,
-        FormattingContextType::Inline => panic!("no Rust implementation for inline formatting contexts"),
     }
 }
 
 fn register_table_abspos_descendants(run: &FormattingContextRun, parent: Node) {
-    let mut child = run.callbacks.first_child(parent);
-    while !child.is_invalid() {
-        let next = run.callbacks.next_sibling(child);
+    for child in run.callbacks.children(parent) {
         let facts = NodeFacts::new(&run.callbacks, child);
         if facts.is_box() {
             if facts.is_absolutely_positioned() {
@@ -1206,7 +1182,6 @@ fn register_table_abspos_descendants(run: &FormattingContextRun, parent: Node) {
         } else {
             register_table_abspos_descendants(run, child);
         }
-        child = next;
     }
 }
 
@@ -1321,8 +1296,7 @@ fn apply_root_sizing_directives(
         ParticipationInParentFormattingContext::AtomicInline => {
             let run_cache_may_store_this_block_formatting_context_run = fc_type == FormattingContextType::Block
                 && run.layout_mode == LayoutMode::Normal
-                && !run.purpose.is_measurement()
-                && fc_run_cache::fc_run_cache_mode_from_environment() != fc_run_cache::FcRunCacheMode::Disabled;
+                && !run.purpose.is_measurement();
             atomic_root_sizing_repeats_for_available_inline_sizes_at_or_above = run.sizing().dimension_atomic_root(
                 run.box_,
                 input.available_space,
@@ -1443,8 +1417,7 @@ fn in_flow_children_margin_box_block_extent(
 ) -> Option<CssPixels> {
     let mut block_start = CssPixels::default();
     let mut block_end = CssPixels::default();
-    let mut child = callbacks.first_child(node);
-    while !child.is_invalid() {
+    for child in callbacks.children(node) {
         let facts = NodeFacts::new(callbacks, child);
         if facts.is_box() && !facts.is_absolutely_positioned() {
             let used = records.used_values_if_owned(child)?;
@@ -1457,7 +1430,6 @@ fn in_flow_children_margin_box_block_extent(
             block_end =
                 block_end.max(content_block_offset + used.content_block_size.get() + used.margin_box_bottom(collapsed));
         }
-        child = callbacks.next_sibling(child);
     }
     Some(block_end - block_start)
 }
@@ -2188,7 +2160,6 @@ pub(crate) fn run_table_cell_ahead_of_its_intrinsic_block_padding(
     ));
     if run.purpose != LayoutPurpose::Commit
         || run.layout_mode != LayoutMode::Normal
-        || fc_run_cache::fc_run_cache_mode_from_environment() == fc_run_cache::FcRunCacheMode::Disabled
         || formatting_context_type_created_by_box(NodeFacts::new(&run.callbacks, cell))
             != Some(FormattingContextType::Block)
         || !fc_run_cache::table_cell_contents_never_observe_intrinsic_block_padding(&run.callbacks, cell)
@@ -2621,7 +2592,6 @@ fn compute_subtree_layout_fragments(input: LayoutStageInput<'_>, containing_bloc
     // the incremental tree build created; derive the facts of the whole subtree.
     arena.derive_facts_in_subtree(root);
 
-    let read_scope = arena.enter_read_scope(root);
     // Abspos boundaries recompute their size and position in their containing block's space.
     // In-flow SVG boundaries keep their committed geometry and lay out only their contents.
     let root_is_absolutely_positioned = NodeFacts::new(&callbacks, root).is_absolutely_positioned();
@@ -2658,7 +2628,6 @@ fn compute_subtree_layout_fragments(input: LayoutStageInput<'_>, containing_bloc
             finish_entry_pass(entry_records, &entry_fragments, &callbacks, false)
         },
     );
-    drop(read_scope);
     LayoutStageOutput(pass_fragments)
 }
 

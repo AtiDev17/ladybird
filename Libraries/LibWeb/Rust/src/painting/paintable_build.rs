@@ -9,6 +9,7 @@ use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::{DomPaintFact, NodeKind, NodeSlotId};
 use crate::layout::{formatting_context, fragment_tree, node_facts, used_values};
 use crate::painting::node_painting;
+use crate::painting::paint_read::PaintRead;
 use crate::painting::record::damage::PaintDamage;
 use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
 
@@ -44,7 +45,7 @@ fn has_descendant_dependent_paint(arena: &LayoutNodeArena, node: NodeSlotId) -> 
     if node_painting::is_svg(kind)
         || matches!(
             kind,
-            NodeKind::FieldSetBox | NodeKind::SVGBox | NodeKind::SVGSVGBox | NodeKind::SVGForeignObjectBox
+            NodeKind::FieldSetBox | NodeKind::SVGSVGBox | NodeKind::SVGForeignObjectBox
         )
     {
         return true;
@@ -457,7 +458,7 @@ impl<'a> PaintableCommit<'a> {
         }
         for (piece_node, piece_indices) in piece_indices_by_node {
             if !paintable_rows.paintable_row_is_populated(piece_node)
-                || !node_painting::is_inline(&paintable_rows, piece_node)
+                || !node_painting::is_fragmented_inline(&paintable_rows, piece_node)
             {
                 continue;
             }

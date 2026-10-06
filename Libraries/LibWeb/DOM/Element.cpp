@@ -35,7 +35,6 @@
 #include <LibWeb/CSS/CSSStyleProperties.h>
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/ComputedValues.h>
-#include <LibWeb/CSS/CounterStyle.h>
 #include <LibWeb/CSS/CountersSet.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/ElementBoxKind.h>
@@ -1344,8 +1343,7 @@ void Element::run_attribute_change_steps(Utf16FlyString const& local_name, Optio
             svg_element->publish_svg_attribute_facts();
         if (local_name.is_one_of(HTML::AttributeNames::colspan, HTML::AttributeNames::rowspan, HTML::AttributeNames::span)) {
             Layout::publish_table_spans(*this);
-            // The box's span data is the change's own read of the render state.
-            Layout::ForcedReadScope read { document(), false };
+            Layout::ForcedReadScope read { document() };
             if (auto* layout_node = unsafe_layout_node(read))
                 layout_node->synchronize_table_span_data();
         }
@@ -1372,30 +1370,10 @@ static CSS::StyleComputer::ComputedStyleInvalidation decode_style_record_invalid
     result.any_computed_value_changed = packed & to_underlying(CSS::StyleEngineFFI::FfiStyleInvalidationField::AnyComputedValueChanged);
     return result;
 }
-struct ElementDependentInvalidationState {
-    Layout::NodeWithStyle const* layout_node { nullptr };
-    Optional<ValueComparingRefPtr<CSS::CounterStyle const>> list_counter_style;
-    bool has_snapshot { false };
-
-    void snapshot()
-    {
-        if (!layout_node)
-            return;
-        // Only a list item renders a marker, so only its counter style can matter; a display
-        // change to or from list-item rebuilds the box regardless.
-        if (layout_node->display().is_list_item()) {
-            if (auto const& list_style_type = layout_node->list_style_type(); list_style_type.has<RefPtr<CSS::CounterStyle const>>())
-                list_counter_style = list_style_type.get<RefPtr<CSS::CounterStyle const>>();
-        }
-        layout_node = nullptr;
-        has_snapshot = true;
-    }
-};
-
 // Whether the counter styles the element's generated content names now differ from the ones the box built for it
 // renders from. The build resolves them from the published record and the tree scope's registered counter styles, and
 // the arena keeps what each box was built with.
-static bool content_counter_styles_changed(Layout::BegunRead const& read, DOM::AbstractElement const& abstract_element)
+static bool content_counter_styles_changed(Layout::BegunRead const& read, DOM::AbstractElement const& abstract_element, CSS::ComputedValues const& new_computed_values)
 {
     auto* arena = abstract_element.element().document().layout_node_arena_if_created();
     if (!arena)
@@ -1404,41 +1382,25 @@ static bool content_counter_styles_changed(Layout::BegunRead const& read, DOM::A
     auto const pseudo_element = abstract_element.pseudo_element();
     if (!pseudo_element.has_value())
         return false;
+    // A box whose `content` changes is rebuilt for that alone, so only content naming a registered counter style can
+    // render one that changed beneath it. A marker whose `content` is `normal` renders its list item's counter style.
+    if (*pseudo_element != CSS::PseudoElement::Marker
+        && !CSS::ComputedValuesFFI::rust_content_reads_counter_style_environment(new_computed_values.computed_content()->rust_style_value_data()))
+        return false;
     abstract_element.style_scope().publish_counter_style_lookup_chain(read);
     return Layout::RustFFI::render_state_content_counter_styles_changed(arena->host(), &read, abstract_element.element().style_node_id().value(), Layout::Node::encode_generated_for(*pseudo_element));
 }
 
-static void add_element_dependent_invalidation(Layout::BegunRead const& read, CSS::RequiredInvalidationAfterStyleChange& invalidation, CSS::ComputedValues const& new_computed_values, ElementDependentInvalidationState const& old_state, DOM::AbstractElement& abstract_element)
+static void add_element_dependent_invalidation(Layout::BegunRead const& read, CSS::RequiredInvalidationAfterStyleChange& invalidation, CSS::ComputedValues const& new_computed_values, bool had_layout_node, DOM::AbstractElement& abstract_element)
 {
     // NB: Even if the computed value hasn't changed the resolved counter style may have (e.g. if the relevant
     //     @counter-style rule was modified, or a new rule with the same name took precedence over the old one).
+    //     A list item's marker is a pseudo-element of its own, which answers for the list item's counter style.
     // Generated content and the marker live inside the element's own layout subtree, so, like a
     // 'content' change, they rebuild from the element rather than its parent. The rebuild moves no
     // style, so the element's children do not react to it.
-    auto compare = [&](Optional<ValueComparingRefPtr<CSS::CounterStyle const>> const& old_list_counter_style) {
-        if (content_counter_styles_changed(read, abstract_element))
-            invalidation |= CSS::RequiredInvalidationAfterStyleChange::rebuild_layout_tree_for_counter_styles_from(CSS::LayoutTreeRebuildRoot::Self);
-
-        if (old_list_counter_style.has_value()) {
-            auto new_list_style_type = new_computed_values.list_style_type(abstract_element.style_scope());
-            if (new_list_style_type.has<RefPtr<CSS::CounterStyle const>>()) {
-                ValueComparingRefPtr<CSS::CounterStyle const> new_counter_style = new_list_style_type.get<RefPtr<CSS::CounterStyle const>>();
-                if (*old_list_counter_style != new_counter_style)
-                    invalidation |= CSS::RequiredInvalidationAfterStyleChange::rebuild_layout_tree_for_counter_styles_from(CSS::LayoutTreeRebuildRoot::Self);
-            }
-        }
-    };
-
-    if (old_state.layout_node) {
-        Optional<ValueComparingRefPtr<CSS::CounterStyle const>> old_list_counter_style;
-        if (old_state.layout_node->display().is_list_item()) {
-            if (auto const& list_style_type = old_state.layout_node->list_style_type(); list_style_type.has<RefPtr<CSS::CounterStyle const>>())
-                old_list_counter_style = list_style_type.get<RefPtr<CSS::CounterStyle const>>();
-        }
-        compare(old_list_counter_style);
-    } else if (old_state.has_snapshot) {
-        compare(old_state.list_counter_style);
-    }
+    if (had_layout_node && content_counter_styles_changed(read, abstract_element, new_computed_values))
+        invalidation |= CSS::RequiredInvalidationAfterStyleChange::rebuild_layout_tree_for_counter_styles_from(CSS::LayoutTreeRebuildRoot::Self);
 }
 
 static bool style_record_is_unchanged(CSS::StyleEngine::StyleRecordDelta const& delta)
@@ -1461,7 +1423,7 @@ bool Element::is_viewport_propagation_source() const
         && document_element->first_child_of_type<HTML::HTMLBodyElement>() == this;
 }
 
-static CSS::StyleComputer::ComputedStyleInvalidation compute_required_invalidation_with_cache(Layout::BegunRead const& read, CSS::StyleComputer& style_computer, CSS::ComputedValues const& new_computed_values, ElementDependentInvalidationState const& old_state, DOM::AbstractElement& abstract_element, CSS::StyleEngine::StyleRecordDelta const& style_record_delta, Optional<u32> answered_damage = {})
+static CSS::StyleComputer::ComputedStyleInvalidation compute_required_invalidation_with_cache(Layout::BegunRead const& read, CSS::StyleComputer& style_computer, CSS::ComputedValues const& new_computed_values, bool had_layout_node, DOM::AbstractElement& abstract_element, CSS::StyleEngine::StyleRecordDelta const& style_record_delta, Optional<u32> answered_damage = {})
 {
     CSS::StyleComputer::ComputedStyleInvalidation result;
     if (style_record_is_unchanged(style_record_delta)) {
@@ -1477,7 +1439,7 @@ static CSS::StyleComputer::ComputedStyleInvalidation compute_required_invalidati
     if (packed & to_underlying(CSS::StyleEngineFFI::FfiStyleInvalidationField::CacheHit))
         ++abstract_element.document().style_invalidation_counters().style_record_property_damage_cache_hits;
     result = decode_style_record_invalidation(packed);
-    add_element_dependent_invalidation(read, result.invalidation, new_computed_values, old_state, abstract_element);
+    add_element_dependent_invalidation(read, result.invalidation, new_computed_values, had_layout_node, abstract_element);
     return result;
 }
 
@@ -1515,10 +1477,15 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
             return false;
         // A reused originating record keeps the pseudo-element inventory it was computed with; the
         // style engine's answer says which pseudo-elements have rules now.
-        auto const engine_pseudo_element_styles = style_computer.style_engine().published_pseudo_style_mask(read, style_node_id());
+        auto const engine_pseudo_element_styles = CSS::StyleEngineFFI::style_engine_published_pseudo_style_mask(style_computer.style_engine().host(), &read, style_node_id().value());
+        // The transaction whose row composes the element answers which kinds with rules no settle generates or
+        // changes, as `*::before` rules styling nothing but `box-sizing` are.
+        auto const inert_pseudo_elements = CSS::StyleEngineFFI::style_engine_inert_pseudo_kinds(style_computer.style_engine().host(), style_node_id().value());
         // Most elements have no style for any of the kinds the engine settles. A marker is
         // refreshed for a list item only.
         auto may_have_style = [&](CSS::PseudoElement pseudo_element) {
+            if ((inert_pseudo_elements >> to_underlying(pseudo_element)) & 1)
+                return false;
             return ((engine_pseudo_element_styles >> to_underlying(pseudo_element)) & 1)
                 || !!style_record_identity(pseudo_element)
                 || (old_originating_style && old_originating_style->has_pseudo_element_style(pseudo_element))
@@ -1535,7 +1502,8 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
             && !may_have_style(CSS::PseudoElement::FirstLetter)
             && !(m_rendered_in_top_layer && may_have_style(CSS::PseudoElement::Backdrop))
             && !highlight_may_have_style(CSS::PseudoElement::Selection)
-            && !highlight_may_have_style(CSS::PseudoElement::SearchText))
+            && !highlight_may_have_style(CSS::PseudoElement::SearchText)
+            && !highlight_may_have_style(CSS::PseudoElement::SearchTextCurrent))
             return false;
         auto settled = style_computer.style_engine().settle_pseudo_records_after_host_record(read, style_node_id(), had_list_marker);
         // What the settled pseudo-elements' container-relative lengths read of the element's containers.
@@ -1597,18 +1565,10 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
             return;
         auto pseudo_element_style = computed_style(pseudo_element);
         auto const* pseudo_element_values = pseudo_element_style ? &*pseudo_element_style : nullptr;
-        ElementDependentInvalidationState old_state {
-            .layout_node = pseudo_element_unsafe_layout_node(read, pseudo_element),
-            .list_counter_style = {},
-            .has_snapshot = false,
-        };
+        bool const had_layout_node = !!pseudo_element_unsafe_layout_node(read, pseudo_element);
         RefPtr<CSS::ComputedValues const> style_to_preserve_for_detachment;
-        if (pseudo_element_values && pseudo_element_values->animated_properties()) {
-            auto had_layout_node = !!old_state.layout_node;
-            old_state.snapshot();
-            if (had_layout_node)
-                style_to_preserve_for_detachment = CSS::ComputedValues::Builder { *pseudo_element_values }.build();
-        }
+        if (had_layout_node && pseudo_element_values && pseudo_element_values->animated_properties())
+            style_to_preserve_for_detachment = CSS::ComputedValues::Builder { *pseudo_element_values }.build();
 
         CSS::StyleEngine::StyleRecordDelta style_record_delta {};
         style_record_delta.new_style_record = *engine_record;
@@ -1628,7 +1588,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
             } else {
                 DOM::AbstractElement abstract_element { *this, pseudo_element };
                 CSS::RequiredInvalidationAfterStyleChange counter_style_invalidation;
-                add_element_dependent_invalidation(read, counter_style_invalidation, *new_pseudo_element_style, old_state, abstract_element);
+                add_element_dependent_invalidation(read, counter_style_invalidation, *new_pseudo_element_style, had_layout_node, abstract_element);
                 counter_styles_changed = !counter_style_invalidation.is_none();
             }
         }
@@ -1690,12 +1650,13 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
     recompute_pseudo_element_style(CSS::PseudoElement::FirstLetter);
     recompute_pseudo_element_style(CSS::PseudoElement::Selection);
     recompute_pseudo_element_style(CSS::PseudoElement::SearchText);
+    recompute_pseudo_element_style(CSS::PseudoElement::SearchTextCurrent);
     // An element that left the top layer drops the ::backdrop it held.
     if (m_rendered_in_top_layer || !!style_record_identity(CSS::PseudoElement::Backdrop))
         recompute_pseudo_element_style(CSS::PseudoElement::Backdrop);
     recompute_pseudo_element_style(CSS::PseudoElement::Marker);
     if (settled_after_host_record)
-        style_computer.style_engine().acknowledge_engine_computed_record(style_node_id());
+        CSS::StyleEngineFFI::style_engine_acknowledge_engine_computed_record(style_computer.style_engine().host(), style_node_id());
 
     return invalidation;
 }
@@ -1733,7 +1694,11 @@ void Element::set_needs_layout_tree_rebuild(Layout::BegunRead const& read, SetNe
     auto* layout_node = unsafe_layout_node(read);
     // An element that just left the top layer keeps its box as a viewport child until the
     // pending membership change is processed, so the parent must not be rebuilt for it either.
-    bool element_box_is_placed_in_top_layer = layout_node && layout_node->topmost_layout_node_of_top_layer_placement();
+    // Only the document element's box and the boxes placed in the top layer are viewport children,
+    // which spares every other element the walk up its box's ancestors.
+    bool element_box_is_placed_in_top_layer = layout_node
+        && (document().may_have_boxes_placed_in_top_layer() || document().document_element() == this)
+        && layout_node->topmost_layout_node_of_top_layer_placement();
     if (rendered_in_top_layer() || element_box_is_placed_in_top_layer) {
         // An attached box is replaced in its viewport slot, keeping top layer order; a fresh
         // insert of a detached member appends out of order, so it needs a zone rebuild.
@@ -1796,23 +1761,7 @@ static bool element_displays_a_list_item_counter_value(Element const& element)
     }
     if (!CSS::display_from_ffi_display(element.style_group<CSS::ComputedValues::BoxValues>()->display).is_list_item())
         return false;
-    auto list_style_type = element.style_group<CSS::ComputedValues::InheritedListValues>()->list_style_type_value(element.style_scope());
-    return list_style_type.visit(
-        [](Empty const&) {
-            return false;
-        },
-        [](RefPtr<CSS::CounterStyle const> const& counter_style) {
-            return !counter_style || CSS::counter_style_representation_depends_on_value(*counter_style);
-        },
-        [](Utf16String const&) {
-            return false;
-        },
-        [](CSS::UnresolvedCounterStyleName const&) {
-            return true;
-        },
-        [](CSS::ListStyleSymbols const& symbols) {
-            return CSS::counter_style_representation_depends_on_value(*symbols.counter_style);
-        });
+    return element.style_scope().list_style_type_depends_on_counter_value(element.style_group<CSS::ComputedValues::InheritedListValues>()->list_style_type.pointer);
 }
 
 // A list item box that appears or disappears renumbers the list-item counter for everything after
@@ -2056,7 +2005,7 @@ void Element::publish_style_recomputes_on_environment_move()
     auto style_node = style_node_id();
     if (style_node == 0)
         return;
-    document().style_computer().style_engine().set_element_recomputes_on_environment_move(style_node, style_recomputes_on_environment_move());
+    CSS::StyleEngineFFI::style_engine_set_element_recomputes_on_environment_move(document().style_computer().style_engine().host(), style_node, style_recomputes_on_environment_move());
 }
 
 void Element::publish_size_container_query_facts()
@@ -2064,7 +2013,7 @@ void Element::publish_size_container_query_facts()
     auto style_node = style_node_id();
     if (style_node == 0)
         return;
-    document().style_computer().style_engine().set_element_size_container_query_facts(style_node, m_is_size_query_container, m_style_depends_on_size_container_query);
+    CSS::StyleEngineFFI::style_engine_set_element_size_container_query_facts(document().style_computer().style_engine().host(), style_node, m_is_size_query_container, m_style_depends_on_size_container_query);
 }
 
 void Element::set_style_depends_on_viewport_metrics()
@@ -2378,11 +2327,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_r
         }
         auto new_computed_values = style_computer.computed_style_record_view(read, new_style_record);
         VERIFY(new_computed_values);
-        ElementDependentInvalidationState old_state {
-            .layout_node = unsafe_layout_node(read),
-            .list_counter_style = {},
-            .has_snapshot = false,
-        };
+        bool const had_layout_node = !!unsafe_layout_node(read);
         DOM::AbstractElement abstract_element { *this };
         CSS::StyleEngine::StyleRecordDelta style_record_delta {
             .old_style_record = old_style_record,
@@ -2391,7 +2336,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_r
         Optional<u32> answered_damage;
         if (engine_record_damages && engine_record_damages->element.has_value() && engine_record_damages->element->answers(old_style_record, new_style_record))
             answered_damage = engine_record_damages->element->packed;
-        result = compute_required_invalidation_with_cache(read, style_computer, *new_computed_values, old_state, abstract_element, style_record_delta, answered_damage);
+        result = compute_required_invalidation_with_cache(read, style_computer, *new_computed_values, had_layout_node, abstract_element, style_record_delta, answered_damage);
         if (result.any_computed_value_changed)
             counters.element_computed_style_changes++;
         set_computed_style({}, new_style_record);
@@ -2473,7 +2418,7 @@ void Element::clear_computed_styles_from_display_none_descendants(Layout::BegunR
         if (auto* layout_node = element->unsafe_layout_node(read))
             layout_node->pin_style_record_for_detachment();
         element->m_installed_style = {};
-        element->document().style_computer().style_engine().set_held_style_record(element->style_node_id(), {});
+        CSS::StyleEngineFFI::style_engine_set_held_style_record(element->document().style_computer().style_engine().host(), element->style_node_id(), {});
 
         // NB: SVG resources can still affect rendering when a DOM ancestor has display:none.
         //     Restore their styles in this style update, so painting never needs to materialize
@@ -3035,7 +2980,7 @@ static QueryResult query_client_rects_after_layout_update(Element const& element
         return QueryResult {};
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
-    Layout::ForcedReadScope read { document, true };
+    Layout::ForcedReadScope read { document };
     const_cast<Document&>(document).update_layout_if_needed_for_node(element, UpdateLayoutReason::ElementGetClientRects);
 
     // 1. If the element on which it was invoked does not have an associated layout box return an empty DOMRectList
@@ -3075,7 +3020,7 @@ Vector<CSSPixelRect> Element::get_client_rects() const
 
 CSSPixelRect Element::bounding_client_rect_assuming_layout_clean() const
 {
-    Layout::ForcedReadScope read { document(), false };
+    Layout::ForcedReadScope read { document() };
     if (!document().navigable())
         return {};
     return bounding_client_rect_assuming_layout_clean(read, document().visual_context_tree());
@@ -3152,7 +3097,7 @@ int Element::client_width() const
     }
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
-    Layout::ForcedReadScope read { document(), true };
+    Layout::ForcedReadScope read { document() };
     const_cast<Document&>(document()).update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementClientWidth);
 
     // 1. If the element has no associated CSS layout box or if the CSS layout box is inline, return zero.
@@ -3179,7 +3124,7 @@ int Element::client_height() const
     }
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
-    Layout::ForcedReadScope read { document(), true };
+    Layout::ForcedReadScope read { document() };
     const_cast<Document&>(document()).update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementClientHeight);
 
     // 1. If the element has no associated CSS layout box or if the CSS layout box is inline, return zero.
@@ -3310,7 +3255,7 @@ void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
     }
     // A newly minted identity holds none of what the element held under its previous one.
     if (style_node_id != 0 && !!m_installed_style.record())
-        style_engine.set_held_style_record(style_node_id, m_installed_style.record());
+        CSS::StyleEngineFFI::style_engine_set_held_style_record(style_engine.host(), style_node_id, m_installed_style.record().value());
     if (style_node_id != 0)
         publish_children_explicitly_inherit_mark();
 }
@@ -3679,7 +3624,7 @@ double Element::scroll_top() const
         return 0.0;
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
-    Layout::ForcedReadScope read { document, true };
+    Layout::ForcedReadScope read { document };
     const_cast<Document&>(document).update_layout(UpdateLayoutReason::ElementScrollTop);
 
     // 6. If the element is the root element return the value of scrollY on window.
@@ -3725,7 +3670,7 @@ double Element::scroll_left() const
         return 0.0;
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
-    Layout::ForcedReadScope read { document, true };
+    Layout::ForcedReadScope read { document };
     const_cast<Document&>(document).update_layout(UpdateLayoutReason::ElementScrollLeft);
 
     // 6. If the element is the root element return the value of scrollX on window.
@@ -3782,7 +3727,7 @@ void Element::set_scroll_left(double x)
     }
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics or scrolling the page.
-    Layout::ForcedReadScope read { document, true };
+    Layout::ForcedReadScope read { document };
     const_cast<Document&>(document).update_layout(UpdateLayoutReason::ElementSetScrollLeft);
 
     // 9. If the element is the body element, document is in quirks mode, and the element is not potentially scrollable, invoke scroll() on window with x as first argument and scrollY on window as second argument, and terminate these steps.
@@ -3841,7 +3786,7 @@ void Element::set_scroll_top(double y)
     }
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics or scrolling the page.
-    Layout::ForcedReadScope read { document, true };
+    Layout::ForcedReadScope read { document };
     const_cast<Document&>(document).update_layout(UpdateLayoutReason::ElementSetScrollTop);
 
     // 9. If the element is the body element, document is in quirks mode, and the element is not potentially scrollable, invoke scroll() on window with scrollX as first argument and y as second argument, and terminate these steps.
@@ -3878,7 +3823,7 @@ int Element::scroll_width()
         return 0;
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
-    Layout::ForcedReadScope read { document, true };
+    Layout::ForcedReadScope read { document };
     document.update_layout(UpdateLayoutReason::ElementScrollWidth);
     auto const* viewport_layout_node = document.layout_node(read);
     VERIFY(viewport_layout_node && Painting::has_committed_box(*viewport_layout_node));
@@ -3923,7 +3868,7 @@ int Element::scroll_height()
         return 0;
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
-    Layout::ForcedReadScope read { document, true };
+    Layout::ForcedReadScope read { document };
     document.update_layout(UpdateLayoutReason::ElementScrollHeight);
     auto const* viewport_layout_node = document.layout_node(read);
     VERIFY(viewport_layout_node && Painting::has_committed_box(*viewport_layout_node));
@@ -4623,7 +4568,7 @@ void Element::scroll_into_view(Element::ScrollIntoViewOptions const& options, GC
 
     // 7. If the element does not have any associated box, or is not available to user-agent features, then return a
     //    resolved Promise and abort the remaining steps.
-    Layout::ForcedReadScope read { document(), true };
+    Layout::ForcedReadScope read { document() };
     document().update_layout(UpdateLayoutReason::ElementScrollIntoView);
     HTML::TemporaryExecutionContext temporary_execution_context { document().relevant_settings_object() };
     if (!has_layout_box()) {
@@ -5198,8 +5143,7 @@ void Element::update_animated_properties_for_abstract_element(Badge<Web::Animati
 
 void Element::replace_style_record(CSS::StyleRecordID style_record_identity)
 {
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { document(), false };
+    Layout::ForcedReadScope read { document() };
     VERIFY(!style_record_identity || style_node_id() != 0);
     if (m_installed_style.record() == style_record_identity)
         return;
@@ -5209,7 +5153,7 @@ void Element::replace_style_record(CSS::StyleRecordID style_record_identity)
     if (auto* layout_node = unsafe_layout_node(read))
         layout_node->set_style_record_identity(m_installed_style, held_before);
     if (style_node_id() != 0)
-        document().style_computer().style_engine().set_held_style_record(style_node_id(), style_record_identity);
+        CSS::StyleEngineFFI::style_engine_set_held_style_record(document().style_computer().style_engine().host(), style_node_id(), style_record_identity.value());
     // The resources an SVG graphics element's `mask`, `clip-path`, `fill` and `stroke` name are published beside its
     // attributes for the layout tree build to resolve, so they follow every record the element takes.
     if (is<SVG::SVGGraphicsElement>(*this) && !!style_record_identity)
@@ -5361,8 +5305,7 @@ SyntheticPseudoElement& Element::ensure_synthetic_pseudo_element(CSS::PseudoElem
 
 void Element::set_custom_property_data(Optional<CSS::PseudoElement> pseudo_element, RefPtr<CSS::CustomPropertyData const> data)
 {
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { document(), false };
+    Layout::ForcedReadScope read { document() };
     AbstractElement const abstract_element { *this, pseudo_element };
     if (!data || !data->is_animation_overlay_for(abstract_element)) {
         if (auto current = custom_property_data(pseudo_element); current && current->is_animation_overlay_for(abstract_element)) {
@@ -5379,8 +5322,7 @@ void Element::set_custom_property_data(Optional<CSS::PseudoElement> pseudo_eleme
 
 void Element::replace_custom_property_data(Optional<CSS::PseudoElement> pseudo_element, RefPtr<CSS::CustomPropertyData const> data)
 {
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { document(), false };
+    Layout::ForcedReadScope read { document() };
     install_custom_property_data(read, pseudo_element, move(data));
 }
 
@@ -5526,7 +5468,7 @@ void Element::scroll(Bindings::ScrollToOptions options, GC::Ptr<WebIDL::Promise>
     }
 
     // NB: Ensure that layout is up-to-date before looking at metrics.
-    Layout::ForcedReadScope read { document, true };
+    Layout::ForcedReadScope read { document };
     document.update_layout(UpdateLayoutReason::ElementScroll);
 
     // 8. If the element is the root element, return the Promise returned by scroll() on window after the method is
@@ -5610,7 +5552,7 @@ void Element::scroll_by(ScrollToOptions options, GC::Ptr<WebIDL::Promise> promis
 bool Element::check_visibility(CheckVisibilityOptions const& options)
 {
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
-    Layout::ForcedReadScope read { document(), true };
+    Layout::ForcedReadScope read { document() };
     document().update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementCheckVisibility);
 
     // 1. If this does not have an associated box, return false.
@@ -5823,7 +5765,7 @@ static bool subtree_renders_list_item_counters(Element const& ancestor, bool ite
             && style->display().is_list_item()
             && (!marker_style || marker_style->content_is_normal())
             && !style->list_style_image()
-            && CSS::marker_text_depends_on_list_item_counter_value(style->list_style_type(element->style_scope())))
+            && element->style_scope().list_style_type_depends_on_counter_value(style->list_style_type_data()))
             return true;
         if (subtree_renders_list_item_counters(*element, items_renumber_with_walked_owner && !element->is_html_ol_ul_menu_element()))
             return true;
@@ -6458,6 +6400,35 @@ WebIDL::ExceptionOr<void> Element::set_html_unsafe(StringView html)
     auto markup = Utf16String::from_utf8(html);
     TRY(unsafely_set_html(move(target), markup.utf16_view()));
 
+    return {};
+}
+
+// https://html.spec.whatwg.org/multipage/dom.html#advisory-information
+Utf16String Element::advisory_information() const
+{
+    // The advisory information of an element is the value that the following algorithm returns, with the algorithm
+    // being aborted once a value is returned. When the algorithm returns the empty string, then there is no advisory
+    // information.
+    // NB: The loop below takes step 2's recursion as its iteration, so a deep tree can't exhaust the stack.
+    for (auto const* element = this; element; element = element->flat_tree_parent_element()) {
+        // 1. If the element has a title attribute, then return the result of running normalize newlines on its value.
+        // NB: The title attribute is a global attribute of HTML elements, so only an HTML element has one.
+        if (auto const* html_element = as_if<HTML::HTMLElement>(*element)) {
+            if (auto title = html_element->title(); title.has_value())
+                return Infra::normalize_newlines(*title);
+        }
+
+        // 2. If the element has a parent element, then return the parent element's advisory information.
+        // AD-HOC: The spec's parent element is the element's parent in the DOM tree, so the walk ends at the root of a
+        //         shadow tree, and never reaches the slot an element is assigned to. We take the parent element in the
+        //         flat tree instead, so a shadow host's title covers its shadow tree's content, and the titles of a
+        //         slot and its ancestors cover the content assigned to that slot — as Blink, WebKit, and Gecko all do:
+        //         Blink's HitTestResult::Title() walks FlatTreeTraversal::Parent(), WebKit's HitTestResult::title()
+        //         walks parentInComposedTree(), and Gecko's TooltipTextProvider walks flattenedTreeParentNode.
+        //         https://github.com/whatwg/html/issues/13035
+    }
+
+    // 3. Return the empty string.
     return {};
 }
 

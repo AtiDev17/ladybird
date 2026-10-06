@@ -1080,8 +1080,7 @@ bool KeyframeEffect::can_skip_per_frame_style_update() const
     auto target = this->target();
     if (!target)
         return false;
-    // Asking whether the target's boxes are throttled is the update's own read of the render state.
-    Layout::ForcedReadScope read { target->document(), false };
+    Layout::ForcedReadScope read { target->document() };
     auto cache_result = [&](bool result) {
         if (target->document().layout_is_up_to_date()) {
             m_can_skip_per_frame_style_update_cache = CanSkipPerFrameStyleUpdateCache {
@@ -1189,17 +1188,54 @@ bool KeyframeEffect::can_skip_per_frame_animation_tick() const
     if ((m_is_compositor_driven || m_is_compositor_replaced) && (!isinf(iteration_count()) || m_is_observation_relevant_compositor_animation))
         return true;
 
-    // Script animations do not dispatch CSS animation events, even when an ancestor listens for them.
-    if (auto animation = associated_animation(); animation && !animation->is_css_animation())
-        return true;
-
     // NB: Infinite effects cannot reach their natural end, and finite offscreen paint effects have an end timer.
     //     Neither needs a continuous tick for animationend listeners.
     // NB: Starting or cancelling an active animation requests an update independently of playback.
     //     Only iteration events require future updates while a visually throttled effect runs.
-    auto only_iteration_events_require_a_tick = phase == Phase::Active;
-    auto has_css_animation_event_listener_requiring_animation_tick = [only_iteration_events_require_a_tick](DOM::EventTarget const& event_target) {
-        if (only_iteration_events_require_a_tick)
+    return !css_animation_events_are_heard(phase == Phase::Active);
+}
+
+bool KeyframeEffect::may_run_on_the_compositor() const
+{
+    return all_of(target_properties(), [](auto const& property) {
+        return first_is_one_of(property.id(), CSS::PropertyID::Opacity, CSS::PropertyID::BackgroundColor, CSS::PropertyID::Filter,
+            CSS::PropertyID::Translate, CSS::PropertyID::Rotate, CSS::PropertyID::Scale, CSS::PropertyID::Transform);
+    });
+}
+
+bool KeyframeEffect::css_animation_iteration_events_are_heard() const
+{
+    return css_animation_events_are_heard(true);
+}
+
+// Whether a listener on `target`, the nodes its events bubble to or its window hears an event `hears` names.
+template<typename Hears>
+static bool event_is_heard_at(DOM::Element& target, Hears const& hears)
+{
+    for (auto* node = static_cast<DOM::Node*>(&target); node;) {
+        if (hears(*node))
+            return true;
+        if (auto assigned_slot = DOM::assigned_slot_for_node(*node))
+            node = assigned_slot.ptr();
+        else
+            node = node->parent_or_shadow_host();
+    }
+    auto window = target.document().window();
+    return window && hears(*window);
+}
+
+// Whether a listener hears the CSS animation events of the effect that need a tick: only its iteration events if
+// `only_iteration_events`.
+bool KeyframeEffect::css_animation_events_are_heard(bool only_iteration_events) const
+{
+    // Script animations do not dispatch CSS animation events, even when an ancestor listens for them.
+    if (auto animation = associated_animation(); animation && !animation->is_css_animation())
+        return false;
+
+    auto target = this->target();
+    VERIFY(target);
+    return event_is_heard_at(*target, [only_iteration_events](DOM::EventTarget const& event_target) {
+        if (only_iteration_events)
             return event_target.has_event_listener(HTML::EventNames::animationiteration)
                 || event_target.has_event_listener(HTML::EventNames::webkitAnimationIteration);
 
@@ -1208,22 +1244,32 @@ bool KeyframeEffect::can_skip_per_frame_animation_tick() const
             || event_target.has_event_listener(HTML::EventNames::animationstart)
             || event_target.has_event_listener(HTML::EventNames::webkitAnimationIteration)
             || event_target.has_event_listener(HTML::EventNames::webkitAnimationStart);
-    };
+    });
+}
 
+bool KeyframeEffect::phase_events_are_heard() const
+{
+    auto animation = associated_animation();
     auto target = this->target();
-    VERIFY(target);
-    for (auto* node = static_cast<DOM::Node*>(target.ptr()); node;) {
-        if (has_css_animation_event_listener_requiring_animation_tick(*node))
-            return false;
-        if (auto assigned_slot = DOM::assigned_slot_for_node(*node))
-            node = assigned_slot.ptr();
-        else
-            node = node->parent_or_shadow_host();
+    // A script animation's finish reaches script through its promise as well as its event.
+    if (!animation || !target || !(animation->is_css_animation() || animation->is_css_transition()))
+        return true;
+    if (animation->is_css_transition()) {
+        return event_is_heard_at(*target, [](DOM::EventTarget const& event_target) {
+            return event_target.has_event_listener(HTML::EventNames::transitionrun)
+                || event_target.has_event_listener(HTML::EventNames::transitionstart)
+                || event_target.has_event_listener(HTML::EventNames::transitionend)
+                || event_target.has_event_listener(HTML::EventNames::transitioncancel)
+                || event_target.has_event_listener(HTML::EventNames::webkitTransitionEnd);
+        });
     }
-    if (auto window = target->document().window(); window && has_css_animation_event_listener_requiring_animation_tick(*window))
-        return false;
-
-    return true;
+    return event_is_heard_at(*target, [](DOM::EventTarget const& event_target) {
+        return event_target.has_event_listener(HTML::EventNames::animationstart)
+            || event_target.has_event_listener(HTML::EventNames::animationend)
+            || event_target.has_event_listener(HTML::EventNames::animationcancel)
+            || event_target.has_event_listener(HTML::EventNames::webkitAnimationStart)
+            || event_target.has_event_listener(HTML::EventNames::webkitAnimationEnd);
+    });
 }
 
 static bool is_in_display_none_subtree_ignoring_animations(DOM::AbstractElement abstract_element)
@@ -1253,8 +1299,7 @@ void KeyframeEffect::update_computed_properties(AnimationUpdateContext& context)
 
 void KeyframeEffect::update_computed_properties_for_style(AnimationUpdateContext& context, DOM::AbstractElement abstract_element)
 {
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { abstract_element.document(), false };
+    Layout::ForcedReadScope read { abstract_element.document() };
     auto& style_computer = abstract_element.element().document().style_computer();
     auto& element_data = context.elements.ensure(abstract_element, [&abstract_element, &style_computer, &read] {
         auto style_record = abstract_element.style_record_identity();

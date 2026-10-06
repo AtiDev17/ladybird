@@ -12,6 +12,7 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
@@ -42,15 +43,8 @@ Compositing::AccumulatedVisualContextTree DocumentPaintState::visual_context_tre
 Compositing::AccumulatedVisualContextTree DocumentPaintState::visual_context_tree(DOM::Document const& document) const
 {
     ensure_visual_context_tree(document);
-    // The tree is the caller's own read of the paint state.
-    Layout::ForcedReadScope read { document, false };
+    Layout::ForcedReadScope read { document };
     return visual_context_tree_without_update(read, document);
-}
-
-u64 DocumentPaintState::visual_context_tree_structural_epoch(Layout::BegunRead const& read, DOM::Document const& document) const
-{
-    ensure_visual_context_tree(document);
-    return visual_context_tree_structural_epoch_without_update(read);
 }
 
 u64 DocumentPaintState::visual_context_tree_structural_epoch_without_update(Layout::BegunRead const& read) const
@@ -141,26 +135,19 @@ void DocumentPaintState::append_paint_command_cache_source_resources(Compositing
 
 void DocumentPaintState::invalidate_all_cached_paint(DOM::Document& document)
 {
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { document, false };
+    Layout::ForcedReadScope read { document };
     Layout::RustFFI::render_state_invalidate_all_paint_caches(m_layout_node_arena->host());
     Painting::set_needs_repaint(*document.unsafe_layout_node(read));
 }
 
 void DocumentPaintState::refresh_scroll_state(Layout::BegunRead const& read, DOM::Document& document)
 {
-    if (rust_refresh_scroll_state(read, document, m_scroll_state_snapshot))
-        return;
-
-    // LIBWEB_VERIFY_SCROLL_STATE: a skipped refresh must have been skippable. Every producer of a
-    // scroll offset invalidates the state, so re-deriving the snapshot from scratch has to
-    // reproduce the one kept.
-    static bool const verify_scroll_state = getenv("LIBWEB_VERIFY_SCROLL_STATE") != nullptr;
-    if (!verify_scroll_state)
-        return;
-    Compositing::ScrollStateSnapshot rederived_snapshot;
-    rust_refresh_scroll_state(read, document, rederived_snapshot, ForceScrollStateRefresh::Yes);
-    VERIFY(rederived_snapshot.device_offsets() == m_scroll_state_snapshot.device_offsets());
+    // The render state hands over a new snapshot only where something invalidated the one kept.
+    Layout::RustFFI::render_state_refresh_scroll_state(
+        m_layout_node_arena->host(), &read, document.page().client().device_pixels_per_css_pixel(),
+        &m_scroll_state_snapshot, [](void* sink, Gfx::FloatPoint const* offsets, size_t count) {
+            static_cast<Compositing::ScrollStateSnapshot*>(sink)->assign_device_offsets({ offsets, count });
+        });
 }
 
 void DocumentPaintState::reset_selection_states(Layout::BegunRead const& read, DOM::Document& document)
@@ -270,16 +257,35 @@ void DocumentPaintState::reset_search_text_states()
     Layout::RustFFI::render_state_clear_search_text(m_layout_node_arena->host());
 }
 
-void DocumentPaintState::recompute_search_text_states(Layout::BegunRead const& read, DOM::Document& document, DOM::Range& range)
+void DocumentPaintState::recompute_search_text_states(Layout::BegunRead const& read, DOM::Document& document, GC::Ptr<DOM::Range> active_match, Vector<GC::Ref<DOM::Range>> const& highlighted_matches)
 {
     auto is_excluded_from_search_text = [](DOM::Node const&) { return false; };
 
+    Vector<Layout::RustFFI::FfiSearchTextRange> ranges;
     Vector<Layout::RustFFI::FfiSelectionEntry> entries;
-    for_each_node_in_highlight_range(read, range, is_excluded_from_search_text, [&](DOM::Node& node, SelectionState state) {
-        if (is<DOM::Text>(node))
-            append_highlight_entry(read, entries, node, state);
-    });
-    Layout::RustFFI::render_state_apply_search_text(m_layout_node_arena->host(), viewport_row_slot(read, document), entries.data(), entries.size(), range.start_offset(), range.end_offset());
+    auto append_range = [&](DOM::Range& range, bool is_current) {
+        auto first_entry = entries.size();
+        for_each_node_in_highlight_range(read, range, is_excluded_from_search_text, [&](DOM::Node& node, SelectionState state) {
+            if (is<DOM::Text>(node))
+                append_highlight_entry(read, entries, node, state);
+        });
+        if (entries.size() == first_entry)
+            return;
+        ranges.append({
+            .first_entry = first_entry,
+            .entry_count = entries.size() - first_entry,
+            .start_offset = range.start_offset(),
+            .end_offset = range.end_offset(),
+            .is_current = is_current,
+        });
+    };
+    for (auto const& match : highlighted_matches) {
+        if (match.ptr() != active_match.ptr())
+            append_range(*match, false);
+    }
+    if (active_match)
+        append_range(*active_match, true);
+    Layout::RustFFI::render_state_apply_search_text(m_layout_node_arena->host(), viewport_row_slot(read, document), ranges.data(), ranges.size(), entries.data(), entries.size());
 }
 
 }

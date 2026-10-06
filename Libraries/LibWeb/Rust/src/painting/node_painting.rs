@@ -5,26 +5,17 @@
  */
 
 use crate::layout::node_data::{NodeKind, NodeSlotId};
-use crate::painting::paint_read::GeometryRead;
+use crate::painting::paint_read::{GeometryRead, PaintRow};
 
 pub(crate) const fn has_paintable(kind: NodeKind) -> bool {
     !matches!(
         kind,
-        NodeKind::Unset
-            | NodeKind::BreakNode
-            | NodeKind::GeneratedTextNode
-            | NodeKind::Node
-            | NodeKind::NodeWithStyle
-            | NodeKind::TextNode
+        NodeKind::Unset | NodeKind::BreakNode | NodeKind::GeneratedTextNode | NodeKind::Node | NodeKind::TextNode
     )
 }
 
 pub(crate) fn is_fragmented_inline(arena: &impl GeometryRead, node: NodeSlotId) -> bool {
-    arena.node_is_fragmented_inline(node)
-}
-
-pub(crate) fn is_inline(arena: &impl GeometryRead, node: NodeSlotId) -> bool {
-    is_fragmented_inline(arena, node)
+    arena.node(node).is_some_and(PaintRow::is_fragmented_inline)
 }
 
 pub(crate) fn has_lines(arena: &impl GeometryRead, node: NodeSlotId) -> bool {
@@ -67,20 +58,6 @@ pub(crate) const fn is_svg_path(kind: NodeKind) -> bool {
     )
 }
 
-pub(crate) const fn is_svg_paintable(kind: NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::SVGGraphicsBox
-            | NodeKind::SVGGeometryBox
-            | NodeKind::SVGTextBox
-            | NodeKind::SVGTextPathBox
-            | NodeKind::SVGImageBox
-            | NodeKind::SVGMaskBox
-            | NodeKind::SVGClipBox
-            | NodeKind::SVGPatternBox
-    )
-}
-
 pub(crate) const fn supports_svg_masking(kind: NodeKind) -> bool {
     matches!(
         kind,
@@ -91,12 +68,5 @@ pub(crate) const fn supports_svg_masking(kind: NodeKind) -> bool {
             | NodeKind::SVGImageBox
             | NodeKind::SVGMaskBox
             | NodeKind::SVGForeignObjectBox
-    )
-}
-
-pub(crate) const fn forms_unconnected_subtree(kind: NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::SVGMaskBox | NodeKind::SVGClipBox | NodeKind::SVGPatternBox
     )
 }

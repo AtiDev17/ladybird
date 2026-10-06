@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
 
-include!(concat!(env!("OUT_DIR"), "/dimension_units_generated.rs"));
+pub(crate) use crate::css::dimension_units::*;
 
 pub(crate) fn time_to_milliseconds(value: f64, unit: u8) -> f64 {
     value * TIME_UNIT_CANONICAL_RATIOS[usize::from(unit)] * 1000.0
@@ -504,6 +504,7 @@ impl FfiNumericType {
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiNumericTypeOperation {
     Add,
     Multiply,
@@ -512,6 +513,7 @@ pub enum FfiNumericTypeOperation {
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiNumericTypeMatch {
     Dimension,
     Percentage,
@@ -529,7 +531,6 @@ pub unsafe extern "C" fn rust_numeric_type_operate(
     first: *const FfiNumericType,
     second: *const FfiNumericType,
 ) -> FfiNumericType {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcOperationEntry);
     let first = unsafe { &*first }.to_calc();
     let result = match operation {
         FfiNumericTypeOperation::Add => first.added_to(&unsafe { &*second }.to_calc()),
@@ -551,7 +552,6 @@ pub unsafe extern "C" fn rust_numeric_type_matches(
     has_percentages_resolve_as: bool,
     percentages_resolve_as: u8,
 ) -> bool {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcOperationEntry);
     let numeric_type = unsafe { &*numeric_type }.to_calc();
     let resolve_as = resolve_as_for_value_type(has_percentages_resolve_as.then_some(percentages_resolve_as));
     match match_kind {
@@ -1083,7 +1083,6 @@ unsafe fn children_from_raw(children: *const *const CalcNode, count: usize) -> V
 /// order number, angle, flex, frequency, length, percentage, resolution, time.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_calc_node_create_numeric_dimension(kind: u8, value: f64, unit: u8) -> *const CalcNode {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeBuildEntry);
     let numeric = match kind {
         0 => CalcNumericValue::Number {
             value,
@@ -1101,14 +1100,8 @@ pub extern "C" fn rust_calc_node_create_numeric_dimension(kind: u8, value: f64, 
     handle(CalcNode::Numeric(numeric))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_calc_node_create_channel_keyword(channel: u8) -> *const CalcNode {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeBuildEntry);
-    handle(CalcNode::ChannelKeyword(channel))
-}
-
-/// Creates a variadic node: kind selects sum (0), product (1), min (2),
-/// max (3) or hypot (4).
+/// Creates a variadic node: kind selects sum (0), product (1), min (2) or
+/// max (3).
 ///
 /// # Safety
 /// `children` must point at `count` valid transferred handles.
@@ -1118,80 +1111,28 @@ pub unsafe extern "C" fn rust_calc_node_create_variadic(
     children: *const *const CalcNode,
     count: usize,
 ) -> *const CalcNode {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeBuildEntry);
     let children = unsafe { children_from_raw(children, count) };
     let node = match kind {
         0 => CalcNode::Sum(children),
         1 => CalcNode::Product(children),
         2 => CalcNode::Min(children),
         3 => CalcNode::Max(children),
-        4 => CalcNode::Hypot(children),
         _ => unreachable!("invalid variadic calc node kind {kind}"),
     };
     handle(node)
 }
 
-/// Creates a single-child node: kind selects negate (0), invert (1), abs (2),
-/// sign (3), sin (4), cos (5), tan (6), asin (7), acos (8), atan (9),
-/// sqrt (10) or exp (11).
+/// Creates a single-child node: kind selects negate (0) or invert (1).
 ///
 /// # Safety
 /// `child` must be a valid transferred handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_calc_node_create_unary(kind: u8, child: *const CalcNode) -> *const CalcNode {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeBuildEntry);
     let child = unsafe { Arc::from_raw(child) };
     let node = match kind {
         0 => CalcNode::Negate(child),
         1 => CalcNode::Invert(child),
-        2 => CalcNode::Abs(child),
-        3 => CalcNode::Sign(child),
-        4 => CalcNode::Sin(child),
-        5 => CalcNode::Cos(child),
-        6 => CalcNode::Tan(child),
-        7 => CalcNode::Asin(child),
-        8 => CalcNode::Acos(child),
-        9 => CalcNode::Atan(child),
-        10 => CalcNode::Sqrt(child),
-        11 => CalcNode::Exp(child),
         _ => unreachable!("invalid unary calc node kind {kind}"),
-    };
-    handle(node)
-}
-
-/// Creates a two-child node: kind selects atan2 (0), pow (1), log (2),
-/// mod (3) or rem (4), with the children in the C++ member order.
-///
-/// # Safety
-/// Both children must be valid transferred handles.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_node_create_binary(
-    kind: u8,
-    first: *const CalcNode,
-    second: *const CalcNode,
-) -> *const CalcNode {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeBuildEntry);
-    let first = unsafe { Arc::from_raw(first) };
-    let second = unsafe { Arc::from_raw(second) };
-    let node = match kind {
-        0 => CalcNode::Atan2 { y: first, x: second },
-        1 => CalcNode::Pow {
-            base: first,
-            exponent: second,
-        },
-        2 => CalcNode::Log {
-            value: first,
-            base: second,
-        },
-        3 => CalcNode::Mod {
-            value: first,
-            modulus: second,
-        },
-        4 => CalcNode::Rem {
-            value: first,
-            divisor: second,
-        },
-        _ => unreachable!("invalid binary calc node kind {kind}"),
     };
     handle(node)
 }
@@ -1204,7 +1145,6 @@ pub unsafe extern "C" fn rust_calc_node_create_clamp(
     center: *const CalcNode,
     max: *const CalcNode,
 ) -> *const CalcNode {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeBuildEntry);
     handle(CalcNode::Clamp {
         min: unsafe { Arc::from_raw(min) },
         center: unsafe { Arc::from_raw(center) },
@@ -1213,81 +1153,9 @@ pub unsafe extern "C" fn rust_calc_node_create_clamp(
 }
 
 /// # Safety
-/// All three children must be valid transferred handles.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_node_create_progress(
-    no_clamp: bool,
-    progress: *const CalcNode,
-    from: *const CalcNode,
-    to: *const CalcNode,
-) -> *const CalcNode {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeBuildEntry);
-    handle(CalcNode::Progress {
-        no_clamp,
-        progress: unsafe { Arc::from_raw(progress) },
-        from: unsafe { Arc::from_raw(from) },
-        to: unsafe { Arc::from_raw(to) },
-    })
-}
-
-/// # Safety
-/// Both children must be valid transferred handles.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_node_create_round(
-    strategy: u8,
-    value: *const CalcNode,
-    interval: *const CalcNode,
-) -> *const CalcNode {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeBuildEntry);
-    handle(CalcNode::Round {
-        strategy,
-        value: unsafe { Arc::from_raw(value) },
-        interval: unsafe { Arc::from_raw(interval) },
-    })
-}
-
-/// # Safety
-/// The children must be valid transferred handles (`step` may be null), and
-/// `sharing` a transferred strong style value data handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_node_create_random(
-    min: *const CalcNode,
-    max: *const CalcNode,
-    step: *const CalcNode,
-    sharing: *const std::ffi::c_void,
-) -> *const CalcNode {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeBuildEntry);
-    handle(CalcNode::Random {
-        min: unsafe { Arc::from_raw(min) },
-        max: unsafe { Arc::from_raw(max) },
-        step: if step.is_null() {
-            None
-        } else {
-            Some(unsafe { Arc::from_raw(step) })
-        },
-        sharing: unsafe { RetainedStyleValueData::from_retained_pointer(sharing.cast()) },
-    })
-}
-
-/// # Safety
-/// `value` must be a transferred strong style value data handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_node_create_non_math_function(
-    value: *const std::ffi::c_void,
-    numeric_type: *const FfiNumericType,
-) -> *const CalcNode {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeBuildEntry);
-    handle(CalcNode::NonMathFunction {
-        value: unsafe { RetainedStyleValueData::from_retained_pointer(value.cast()) },
-        numeric_type: unsafe { &*numeric_type }.to_calc(),
-    })
-}
-
-/// # Safety
 /// `node` must be a valid transferred handle; this releases it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_calc_node_release(node: *const CalcNode) {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeRetainReleaseEntry);
     drop(unsafe { Arc::from_raw(node) });
 }
 
@@ -1298,7 +1166,6 @@ pub unsafe extern "C" fn rust_calc_node_release(node: *const CalcNode) {
 /// `node` must be a valid calculation node pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_calc_node_retain(node: *const CalcNode) {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeRetainReleaseEntry);
     unsafe { Arc::increment_strong_count(node) };
 }
 
@@ -1316,7 +1183,6 @@ pub unsafe extern "C" fn rust_calc_node_determine_type(
     resolve_as_is_number: bool,
     resolve_as_base: u8,
 ) -> FfiNumericType {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeQueryEntry);
     let resolve_as = resolve_as_from_fields(has_percentages_resolve_as, resolve_as_is_number, resolve_as_base);
     let percentage_leaf_type = percentage_leaf_type_for(resolve_as);
     FfiNumericType::from_calc(unsafe { &*node }.numeric_type(&percentage_leaf_type))
@@ -1328,7 +1194,6 @@ pub unsafe extern "C" fn rust_calc_node_determine_type(
 /// `node` must be a valid calculation node pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_calc_node_contains_percentage(node: *const CalcNode) -> bool {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcNodeQueryEntry);
     unsafe { &*node }.contains_percentage()
 }
 
@@ -2634,24 +2499,20 @@ pub struct FfiCalcResolutionContext {
     /// The length resolution context as an opaque pointer (its type lives in
     /// the computed-values header), or null.
     pub length_resolution_context: *const std::ffi::c_void,
-    /// External leaf resolutions prepared by C++ before Rust evaluates.
-    pub external_resolutions: *const FfiCalcExternalResolution,
-    pub external_resolution_count: usize,
+    /// The facts of the element the calculation resolves for, or null.
+    pub element_facts: *const crate::css::absolutize::FfiElementFacts,
 }
 
-/// One external calculation leaf and the resolution C++ prepared for it.
-#[repr(u8)]
+/// One calculation leaf that needs state from outside the calculation, and its resolution.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum FfiCalcExternalResolutionKind {
+pub(crate) enum CalcExternalResolutionKind {
     NonMathFunction,
-    Channel,
     RandomSharing,
     Length,
 }
 
-#[repr(C)]
-pub struct FfiCalcExternalResolution {
-    pub kind: FfiCalcExternalResolutionKind,
+pub(crate) struct CalcExternalResolution {
+    pub kind: CalcExternalResolutionKind,
     pub source: *const std::ffi::c_void,
     pub input_value: f64,
     pub unit_or_channel: u8,
@@ -2661,20 +2522,9 @@ pub struct FfiCalcExternalResolution {
     pub resolved_style_value: *const std::ffi::c_void,
 }
 
-#[repr(C)]
-pub struct FfiCalcExternalResolutions {
-    pub resolutions: *mut FfiCalcExternalResolution,
-    pub resolution_count: usize,
-    pub storage: *mut std::ffi::c_void,
-}
-
-struct CalcExternalResolutionStorage {
-    resolutions: Box<[FfiCalcExternalResolution]>,
-}
-
-fn collect_external_resolutions(node: &CalcNode, resolutions: &mut Vec<FfiCalcExternalResolution>) {
+pub(crate) fn collect_external_resolutions(node: &CalcNode, resolutions: &mut Vec<CalcExternalResolution>) {
     let mut append = |kind, source, input_value, unit_or_channel| {
-        resolutions.push(FfiCalcExternalResolution {
+        resolutions.push(CalcExternalResolution {
             kind,
             source,
             input_value,
@@ -2687,16 +2537,13 @@ fn collect_external_resolutions(node: &CalcNode, resolutions: &mut Vec<FfiCalcEx
     };
     match node {
         CalcNode::NonMathFunction { value, .. } => append(
-            FfiCalcExternalResolutionKind::NonMathFunction,
+            CalcExternalResolutionKind::NonMathFunction,
             value.pointer().cast(),
             0.0,
             0,
         ),
-        CalcNode::ChannelKeyword(channel) => {
-            append(FfiCalcExternalResolutionKind::Channel, std::ptr::null(), 0.0, *channel);
-        }
         CalcNode::Random { sharing, .. } => append(
-            FfiCalcExternalResolutionKind::RandomSharing,
+            CalcExternalResolutionKind::RandomSharing,
             sharing.pointer().cast(),
             0.0,
             0,
@@ -2704,11 +2551,141 @@ fn collect_external_resolutions(node: &CalcNode, resolutions: &mut Vec<FfiCalcEx
         CalcNode::Numeric(CalcNumericValue::Length { value, unit })
             if crate::css::style_compute::LENGTH_UNIT_NAMES[*unit as usize].starts_with("cq") =>
         {
-            append(FfiCalcExternalResolutionKind::Length, std::ptr::null(), *value, *unit);
+            append(CalcExternalResolutionKind::Length, std::ptr::null(), *value, *unit);
         }
         _ => {}
     }
     node.for_each_child(&mut |child| collect_external_resolutions(child, resolutions));
+}
+
+/// A calculation's external leaves, resolved as far as a resolution context can, and the nodes
+/// and values the resolutions point at.
+pub(crate) struct PreparedExternalResolutions {
+    pub(crate) resolutions: Vec<CalcExternalResolution>,
+    _resolved_nodes: Vec<Arc<CalcNode>>,
+    _resolved_style_values: Vec<RetainedStyleValueData>,
+}
+
+/// Resolves the external leaves of a calculation from a resolution context's length context
+/// and element facts. anchor() is left to layout, which resolves it itself.
+#[allow(clippy::arc_with_non_send_sync)]
+fn prepare_external_resolutions(root: &CalcNode, context: &FfiCalcResolutionContext) -> PreparedExternalResolutions {
+    use crate::css::style_value::StyleValueData;
+    let mut resolutions = Vec::new();
+    collect_external_resolutions(root, &mut resolutions);
+    // A container-relative percentage basis resolves like a container-relative leaf.
+    if context.basis_kind == 3
+        && root.contains_percentage()
+        && crate::css::style_compute::LENGTH_UNIT_NAMES[context.basis_unit as usize].starts_with("cq")
+    {
+        resolutions.push(CalcExternalResolution {
+            kind: CalcExternalResolutionKind::Length,
+            source: std::ptr::null(),
+            input_value: context.basis_value,
+            unit_or_channel: context.basis_unit,
+            has_number: false,
+            number: 0.0,
+            resolved_node: std::ptr::null(),
+            resolved_style_value: std::ptr::null(),
+        });
+    }
+    let facts = unsafe { context.element_facts.as_ref() };
+    let length = unsafe {
+        context
+            .length_resolution_context
+            .cast::<crate::css::style_compute::FfiLengthResolutionContext>()
+            .as_ref()
+    };
+    let mut resolved_nodes = Vec::new();
+    let mut resolved_style_values = Vec::new();
+    for resolution in &mut resolutions {
+        match resolution.kind {
+            CalcExternalResolutionKind::NonMathFunction => {
+                let StyleValueData::TreeCountingFunction { function, .. } =
+                    (unsafe { &*resolution.source.cast::<StyleValueData>() })
+                else {
+                    continue;
+                };
+                let Some((sibling_count, sibling_index)) = facts.and_then(|facts| facts.tree_counting()) else {
+                    continue;
+                };
+                let node = Arc::new(CalcNode::Numeric(CalcNumericValue::Number {
+                    value: if *function == 0 { sibling_count } else { sibling_index } as f64,
+                    number_type: 0,
+                }));
+                resolution.resolved_node = Arc::as_ptr(&node);
+                resolved_nodes.push(node);
+            }
+            CalcExternalResolutionKind::RandomSharing => {
+                let sharing = unsafe { &*resolution.source.cast::<StyleValueData>() };
+                // When we are in the absolutization process we should absolutize the sharing options.
+                let sharing = if let Some(length) = length {
+                    match crate::css::absolutize::absolutize_with_element_facts(sharing, length, None, &[], facts) {
+                        Some(crate::css::absolutize::Absolutized::Changed(sharing)) => sharing,
+                        _ => unsafe {
+                            RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(
+                                sharing,
+                            ))
+                        },
+                    }
+                } else if facts.is_some_and(|facts| facts.has_element) || context.basis_kind != 0 {
+                    // NB: We don't want to resolve this before computation time even if it's possible.
+                    unsafe {
+                        RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(
+                            sharing,
+                        ))
+                    }
+                } else {
+                    continue;
+                };
+                let StyleValueData::RandomValueSharing { fixed_value, .. } = sharing.data() else {
+                    continue;
+                };
+                let number = match fixed_value.optional_data() {
+                    Some(StyleValueData::Number { value }) => Some(*value),
+                    Some(calculated @ StyleValueData::Calculated { .. }) => {
+                        resolve_calculated_number_without_context(calculated)
+                    }
+                    _ => None,
+                };
+                let Some(number) = number else {
+                    continue;
+                };
+                resolution.has_number = true;
+                resolution.number = number;
+                if length.is_some() {
+                    resolution.resolved_style_value = sharing.pointer().cast();
+                    resolved_style_values.push(sharing);
+                }
+            }
+            CalcExternalResolutionKind::Length => {
+                let Some(length) = length else {
+                    continue;
+                };
+                let mut length = *length;
+                if let Some(facts) = facts {
+                    facts.fill_container_bases(
+                        crate::css::style_compute::container_relative_length_unit_bit(resolution.unit_or_channel),
+                        &mut length,
+                    );
+                }
+                let result = crate::css::style_compute::absolutize_length_for_calc(
+                    resolution.input_value,
+                    resolution.unit_or_channel as usize,
+                    &length,
+                );
+                if result.handled {
+                    resolution.has_number = true;
+                    resolution.number = result.px;
+                }
+            }
+        }
+    }
+    PreparedExternalResolutions {
+        resolutions,
+        _resolved_nodes: resolved_nodes,
+        _resolved_style_values: resolved_style_values,
+    }
 }
 
 pub(crate) fn collect_unfixed_random_sharings(node: &CalcNode, sharings: &mut Vec<*const StyleValueData>) {
@@ -2727,81 +2704,18 @@ pub(crate) fn collect_unfixed_random_sharings(node: &CalcNode, sharings: &mut Ve
     node.for_each_child(&mut |child| collect_unfixed_random_sharings(child, sharings));
 }
 
-/// Returns every calculation leaf that needs C++-owned state. C++ fills the
-/// output fields once, before passing the batch back in a resolution context.
-///
-/// # Safety
-/// `root` must be a valid calculation node pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_external_resolutions(
-    root: *const CalcNode,
-    basis_kind: u8,
-    basis_value: f64,
-    basis_unit: u8,
-) -> FfiCalcExternalResolutions {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcOperationEntry);
-    let mut resolutions = Vec::new();
-    let root = unsafe { &*root };
-    collect_external_resolutions(root, &mut resolutions);
-    if basis_kind == 3
-        && root.contains_percentage()
-        && crate::css::style_compute::LENGTH_UNIT_NAMES[basis_unit as usize].starts_with("cq")
-    {
-        resolutions.push(FfiCalcExternalResolution {
-            kind: FfiCalcExternalResolutionKind::Length,
-            source: std::ptr::null(),
-            input_value: basis_value,
-            unit_or_channel: basis_unit,
-            has_number: false,
-            number: 0.0,
-            resolved_node: std::ptr::null(),
-            resolved_style_value: std::ptr::null(),
-        });
-    }
-    let storage = Box::new(CalcExternalResolutionStorage {
-        resolutions: resolutions.into_boxed_slice(),
-    });
-    let result = FfiCalcExternalResolutions {
-        resolutions: storage.resolutions.as_ptr().cast_mut(),
-        resolution_count: storage.resolutions.len(),
-        storage: std::ptr::null_mut(),
-    };
-    let storage = Box::into_raw(storage);
-    FfiCalcExternalResolutions {
-        storage: storage.cast(),
-        ..result
-    }
-}
-
 /// Returns the borrowed calculation-tree root stored in calculated style value
 /// data.
 ///
 /// # Safety
 /// `calculated` must point at live Calculated style value data.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_root_from_calculated(calculated: *const std::ffi::c_void) -> *const CalcNode {
+pub(crate) unsafe fn calc_root_from_calculated(calculated: *const std::ffi::c_void) -> *const CalcNode {
     let crate::css::style_value::StyleValueData::Calculated { rust_calculation, .. } =
         (unsafe { &*(calculated as *const crate::css::style_value::StyleValueData) })
     else {
-        unreachable!("rust_calc_root_from_calculated requires calculated value data");
+        unreachable!("calc_root_from_calculated requires calculated value data");
     };
     rust_calculation.node()
-}
-
-/// # Safety
-/// `storage` must be returned by `rust_calc_external_resolutions`. Any output
-/// handles written by C++ must each own one strong reference.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_external_resolutions_release(storage: *mut std::ffi::c_void) {
-    let storage = unsafe { Box::from_raw(storage.cast::<CalcExternalResolutionStorage>()) };
-    for resolution in &storage.resolutions {
-        if !resolution.resolved_node.is_null() {
-            drop(unsafe { Arc::from_raw(resolution.resolved_node) });
-        }
-        if !resolution.resolved_style_value.is_null() {
-            unsafe { crate::css::style_value::release_style_value(resolution.resolved_style_value.cast()) };
-        }
-    }
 }
 
 /// The resolve-as target from a calculated value's creation-time fields.
@@ -2834,6 +2748,7 @@ fn percentage_leaf_type_for(resolve_as: Option<ResolveAs>) -> CalcNumericType {
 fn with_ffi_evaluation<R>(
     resolve_as: Option<ResolveAs>,
     context: &FfiCalcResolutionContext,
+    external_resolutions: &[CalcExternalResolution],
     f: impl FnOnce(&CalcEvaluationContext, &CalcSimplifyCallbacks) -> R,
 ) -> R {
     let percentage_leaf_type = percentage_leaf_type_for(resolve_as);
@@ -2857,16 +2772,11 @@ fn with_ffi_evaluation<R>(
         }),
         _ => unreachable!("invalid percentage basis kind"),
     };
-    let external_resolutions = if context.external_resolutions.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(context.external_resolutions, context.external_resolution_count) }
-    };
     let random_base_value = |sharing: &RetainedStyleValueData| -> Option<f64> {
         external_resolutions
             .iter()
             .find(|resolution| {
-                matches!(resolution.kind, FfiCalcExternalResolutionKind::RandomSharing)
+                matches!(resolution.kind, CalcExternalResolutionKind::RandomSharing)
                     && (resolution.source == sharing.pointer().cast()
                         || resolution.resolved_style_value == sharing.pointer().cast())
             })
@@ -2877,7 +2787,7 @@ fn with_ffi_evaluation<R>(
         external_resolutions
             .iter()
             .find(|resolution| {
-                matches!(resolution.kind, FfiCalcExternalResolutionKind::Length)
+                matches!(resolution.kind, CalcExternalResolutionKind::Length)
                     && resolution.input_value.to_bits() == value.to_bits()
                     && resolution.unit_or_channel == unit
             })
@@ -2905,7 +2815,7 @@ fn with_ffi_evaluation<R>(
         external_resolutions
             .iter()
             .find(|resolution| {
-                matches!(resolution.kind, FfiCalcExternalResolutionKind::RandomSharing)
+                matches!(resolution.kind, CalcExternalResolutionKind::RandomSharing)
                     && resolution.source == sharing.pointer().cast()
             })
             .filter(|resolution| !resolution.resolved_style_value.is_null())
@@ -2921,7 +2831,7 @@ fn with_ffi_evaluation<R>(
             let resolved = external_resolutions
                 .iter()
                 .find(|resolution| {
-                    matches!(resolution.kind, FfiCalcExternalResolutionKind::NonMathFunction)
+                    matches!(resolution.kind, CalcExternalResolutionKind::NonMathFunction)
                         && resolution.source == value.pointer().cast()
                 })?
                 .resolved_node;
@@ -2931,16 +2841,8 @@ fn with_ffi_evaluation<R>(
             unsafe { Arc::increment_strong_count(resolved) };
             Some(unsafe { Arc::from_raw(resolved) })
         },
-        resolve_channel_keyword: &|channel| {
-            external_resolutions
-                .iter()
-                .find(|resolution| {
-                    matches!(resolution.kind, FfiCalcExternalResolutionKind::Channel)
-                        && resolution.unit_or_channel == channel
-                })
-                .filter(|resolution| resolution.has_number)
-                .map(|resolution| resolution.number)
-        },
+        // Relative color channels resolve through the color resolver, which supplies their values.
+        resolve_channel_keyword: &|_| None,
     };
     f(&evaluation_context, &callbacks)
 }
@@ -3508,7 +3410,27 @@ pub unsafe extern "C" fn rust_calc_resolve(
     context: *const FfiCalcResolutionContext,
     apply_censoring_and_clamping: bool,
 ) -> FfiResolvedCalc {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcOperationEntry);
+    let calculated = unsafe { &*calculated.cast::<crate::css::style_value::StyleValueData>() };
+    let context = unsafe { &*context };
+    let externals = prepare_external_resolutions(
+        unsafe { &*calc_root_from_calculated(std::ptr::from_ref(calculated).cast()) },
+        context,
+    );
+    resolve_calculated(
+        calculated,
+        context,
+        &externals.resolutions,
+        apply_censoring_and_clamping,
+    )
+}
+
+/// Resolves a calculated style value with its external leaves already resolved.
+pub(crate) fn resolve_calculated(
+    calculated: &crate::css::style_value::StyleValueData,
+    context: &FfiCalcResolutionContext,
+    external_resolutions: &[CalcExternalResolution],
+    apply_censoring_and_clamping: bool,
+) -> FfiResolvedCalc {
     use crate::css::style_value::StyleValueData;
     let StyleValueData::Calculated {
         rust_calculation,
@@ -3518,38 +3440,42 @@ pub unsafe extern "C" fn rust_calc_resolve(
         resolve_numbers_as_integers,
         accepted_ranges,
         ..
-    } = (unsafe { &*(calculated as *const StyleValueData) })
+    } = calculated
     else {
-        unreachable!("rust_calc_resolve requires calculated value data");
+        unreachable!("resolve_calculated requires calculated value data");
     };
-    let context = unsafe { &*context };
     let root = rust_calculation.node_arc();
 
     // The percentage leaf type and resolve-as target from the creation-time fields.
     let resolve_as = resolve_as_from_fields(*has_percentages_resolve_as, *resolve_as_is_number, *resolve_as_base);
-    with_ffi_evaluation(resolve_as, context, |evaluation_context, callbacks| {
-        // The calculation tree is again simplified at used value time.
-        let simplified = root.simplify(evaluation_context, callbacks);
-        match resolve_simplified_calculation(
-            &simplified,
-            evaluation_context,
-            resolve_as,
-            *resolve_numbers_as_integers,
-            accepted_ranges.as_slice(),
-            apply_censoring_and_clamping,
-        ) {
-            Some((value, numeric_type)) => FfiResolvedCalc {
-                resolved: true,
-                value,
-                numeric_type: FfiNumericType::from_calc(numeric_type),
-            },
-            None => FfiResolvedCalc {
-                resolved: false,
-                value: 0.0,
-                numeric_type: FfiNumericType::from_calc(None),
-            },
-        }
-    })
+    with_ffi_evaluation(
+        resolve_as,
+        context,
+        external_resolutions,
+        |evaluation_context, callbacks| {
+            // The calculation tree is again simplified at used value time.
+            let simplified = root.simplify(evaluation_context, callbacks);
+            match resolve_simplified_calculation(
+                &simplified,
+                evaluation_context,
+                resolve_as,
+                *resolve_numbers_as_integers,
+                accepted_ranges.as_slice(),
+                apply_censoring_and_clamping,
+            ) {
+                Some((value, numeric_type)) => FfiResolvedCalc {
+                    resolved: true,
+                    value,
+                    numeric_type: FfiNumericType::from_calc(numeric_type),
+                },
+                None => FfiResolvedCalc {
+                    resolved: false,
+                    value: 0.0,
+                    numeric_type: FfiNumericType::from_calc(None),
+                },
+            }
+        },
+    )
 }
 
 #[repr(C)]
@@ -4171,7 +4097,7 @@ pub(crate) fn absolutize_calculation_value(
     let mut resolved_nodes = Vec::new();
     let mut resolved_style_values = Vec::new();
     for external in &mut externals {
-        if matches!(external.kind, FfiCalcExternalResolutionKind::Length) {
+        if matches!(external.kind, CalcExternalResolutionKind::Length) {
             // SAFETY: The caller supplies the live context used by the enclosing absolutization.
             let length_context = unsafe {
                 &*(length_resolution_context as *const crate::css::style_compute::FfiLengthResolutionContext)
@@ -4188,7 +4114,7 @@ pub(crate) fn absolutize_calculation_value(
             external.number = result.px;
             continue;
         }
-        if matches!(external.kind, FfiCalcExternalResolutionKind::RandomSharing) {
+        if matches!(external.kind, CalcExternalResolutionKind::RandomSharing) {
             let StyleValueData::RandomValueSharing { fixed_value, .. } =
                 (unsafe { &*external.source.cast::<StyleValueData>() })
             else {
@@ -4240,13 +4166,7 @@ pub(crate) fn absolutize_calculation_value(
             resolved_style_values.push(resolved);
             continue;
         }
-        if matches!(external.kind, FfiCalcExternalResolutionKind::Channel) {
-            // Relative-color channels resolve later, once the origin color has
-            // supplied their values. They do not prevent other leaves in this
-            // calculation from being absolutized now.
-            continue;
-        }
-        if !matches!(external.kind, FfiCalcExternalResolutionKind::NonMathFunction) {
+        if !matches!(external.kind, CalcExternalResolutionKind::NonMathFunction) {
             return None;
         }
         let source = unsafe { &*external.source.cast::<StyleValueData>() };
@@ -4275,13 +4195,13 @@ pub(crate) fn absolutize_calculation_value(
         basis_value: 0.0,
         basis_unit: 0,
         length_resolution_context,
-        external_resolutions: externals.as_ptr(),
-        external_resolution_count: externals.len(),
+        element_facts: std::ptr::null(),
     };
     let resolve_as = resolve_as_from_fields(*has_percentages_resolve_as, *resolve_as_is_number, *resolve_as_base);
     Some(with_ffi_evaluation(
         resolve_as,
         &context,
+        &externals,
         |evaluation_context, callbacks| {
             let simplified = root.simplify(evaluation_context, callbacks);
             if let Some(percentage) = percentage_dimension_mix(&simplified, evaluation_context) {
@@ -4361,11 +4281,10 @@ pub(crate) fn flipped_edge_offset(
         basis_value: 0.0,
         basis_unit: 0,
         length_resolution_context: std::ptr::null(),
-        external_resolutions: std::ptr::null(),
-        external_resolution_count: 0,
+        element_facts: std::ptr::null(),
     };
     let resolve_as = resolve_as_from_fields(true, false, BASE_TYPE_LENGTH as u8);
-    let simplified = with_ffi_evaluation(resolve_as, &context, |evaluation_context, callbacks| {
+    let simplified = with_ffi_evaluation(resolve_as, &context, &[], |evaluation_context, callbacks| {
         sum.simplify(evaluation_context, callbacks)
     });
     let mut length_type = CalcNumericType::default();
@@ -4553,7 +4472,7 @@ impl CalcNode {
         }
     }
 
-    fn contains_anchor_function(&self) -> bool {
+    pub(crate) fn contains_anchor_function(&self) -> bool {
         if let CalcNode::NonMathFunction { value, .. } = self
             && matches!(value.data(), crate::css::style_value::StyleValueData::Anchor { .. })
         {
@@ -4572,7 +4491,6 @@ impl CalcNode {
 /// Both pointers must reference Calculated style value data.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_calc_equals(first: *const std::ffi::c_void, second: *const std::ffi::c_void) -> bool {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcOperationEntry);
     use crate::css::style_value::StyleValueData;
     let tree_of = |data: *const std::ffi::c_void| {
         let StyleValueData::Calculated { rust_calculation, .. } = (unsafe { &*(data as *const StyleValueData) }) else {
@@ -4583,21 +4501,6 @@ pub unsafe extern "C" fn rust_calc_equals(first: *const std::ffi::c_void, second
     let first_tree = tree_of(first);
     let second_tree = tree_of(second);
     first_tree.structurally_equals(&second_tree)
-}
-
-/// Whether a calculated style value contains an anchor() function.
-///
-/// # Safety
-/// `calculated` must point at Calculated style value data.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_contains_anchor(calculated: *const std::ffi::c_void) -> bool {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcOperationEntry);
-    let crate::css::style_value::StyleValueData::Calculated { rust_calculation, .. } =
-        (unsafe { &*(calculated as *const crate::css::style_value::StyleValueData) })
-    else {
-        unreachable!("rust_calc_contains_anchor requires calculated value data");
-    };
-    rust_calculation.node().contains_anchor_function()
 }
 
 /// The node kind codes exposed to C++ in a stable documented order.
@@ -4720,7 +4623,6 @@ fn append_reification_node(
 /// `calculated` must point at Calculated style value data.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_calc_describe_for_typed_om(calculated: *const std::ffi::c_void) -> FfiCalcReification {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcOperationEntry);
     let crate::css::style_value::StyleValueData::Calculated {
         rust_calculation,
         has_percentages_resolve_as,
@@ -4780,107 +4682,4 @@ pub unsafe extern "C" fn rust_calc_reification_release(storage: *mut std::ffi::c
     if !storage.is_null() {
         drop(unsafe { Box::from_raw(storage.cast::<CalcReificationStorage>()) });
     }
-}
-
-/// Simplifies a free-standing calculation tree: the css-values-4 algorithm
-/// over a borrowed root, returning the simplified tree as a transferred
-/// handle. This backs the C++ simplify_a_calculation_tree entry, whose
-/// callers simplify trees that are not (yet) owned by a calculated style
-/// value: parse-time math functions, interpolation sums, flipped edge
-/// offsets, and anchor fallbacks.
-///
-/// # Safety
-/// `root` must be a valid calculation node pointer and `context` a valid
-/// resolution context.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_simplify_tree(
-    root: *const CalcNode,
-    context: *const FfiCalcResolutionContext,
-    has_percentages_resolve_as: bool,
-    resolve_as_is_number: bool,
-    resolve_as_base: u8,
-) -> *const CalcNode {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcOperationEntry);
-    let context = unsafe { &*context };
-    unsafe { Arc::increment_strong_count(root) };
-    let root = unsafe { Arc::from_raw(root) };
-    let resolve_as = resolve_as_from_fields(has_percentages_resolve_as, resolve_as_is_number, resolve_as_base);
-    with_ffi_evaluation(resolve_as, context, |evaluation_context, callbacks| {
-        Arc::into_raw(root.simplify(evaluation_context, callbacks))
-    })
-}
-
-/// The outcome of absolutizing a calculation: a computed percentage (the
-/// percentage-dimension mix special case), a plain style value as a transferred
-/// strong reference (the numeric-leaf collapse), or the simplified tree as a
-/// transferred handle.
-#[repr(C)]
-pub struct FfiAbsolutizedCalc {
-    pub is_percentage: bool,
-    pub percentage_value: f64,
-    pub collapsed: *const std::ffi::c_void,
-    pub simplified: *const CalcNode,
-}
-
-/// Absolutizes a calculated value: simplifies its tree with computed-value
-/// information and detects the css-values-4 percentage-dimension mix whose
-/// dimension component is zero, which computes to a plain percentage.
-///
-/// # Safety
-/// `calculated` must point at Calculated style value data and `context` at a
-/// valid resolution context.
-#[allow(clippy::arc_with_non_send_sync)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_absolutize(
-    calculated: *const std::ffi::c_void,
-    context: *const FfiCalcResolutionContext,
-) -> FfiAbsolutizedCalc {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcOperationEntry);
-    use crate::css::style_value::StyleValueData;
-    let StyleValueData::Calculated {
-        rust_calculation,
-        has_percentages_resolve_as,
-        resolve_as_is_number,
-        resolve_as_base,
-        resolve_numbers_as_integers,
-        accepted_ranges,
-        ..
-    } = (unsafe { &*(calculated as *const StyleValueData) })
-    else {
-        unreachable!("rust_calc_absolutize requires calculated value data");
-    };
-    let context = unsafe { &*context };
-    let root = rust_calculation.node_arc();
-
-    let resolve_as = resolve_as_from_fields(*has_percentages_resolve_as, *resolve_as_is_number, *resolve_as_base);
-    with_ffi_evaluation(resolve_as, context, |evaluation_context, callbacks| {
-        let simplified = root.simplify(evaluation_context, callbacks);
-
-        if let Some(percentage) = percentage_dimension_mix(&simplified, evaluation_context) {
-            return FfiAbsolutizedCalc {
-                is_percentage: true,
-                percentage_value: percentage,
-                collapsed: std::ptr::null(),
-                simplified: std::ptr::null(),
-            };
-        }
-
-        if let Some(collapsed) =
-            collapse_absolutized_calculation(&simplified, *resolve_numbers_as_integers, accepted_ranges.as_slice())
-        {
-            return FfiAbsolutizedCalc {
-                is_percentage: false,
-                percentage_value: 0.0,
-                collapsed: Arc::into_raw(Arc::new(collapsed)).cast(),
-                simplified: std::ptr::null(),
-            };
-        }
-
-        FfiAbsolutizedCalc {
-            is_percentage: false,
-            percentage_value: 0.0,
-            collapsed: std::ptr::null(),
-            simplified: Arc::into_raw(simplified),
-        }
-    })
 }

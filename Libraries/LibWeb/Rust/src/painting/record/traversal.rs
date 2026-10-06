@@ -38,7 +38,6 @@ pub(crate) fn record_display_list(
     inputs: &RecordingInputs,
     source_recording: Option<Arc<RecordingOutput>>,
     source_items: Option<Arc<PublishedHitTestItems>>,
-    plan_from_prepared_inputs: bool,
     trace: bool,
 ) -> RecordingResult {
     scratch.begin_recording(source.frame().paintable_row_capacity());
@@ -52,7 +51,6 @@ pub(crate) fn record_display_list(
                 inputs,
                 source_recording,
                 source_items,
-                plan_from_prepared_inputs,
             )
         };
     }
@@ -74,7 +72,6 @@ fn record_display_list_impl<O: Observer>(
     inputs: &RecordingInputs,
     source_recording: Option<Arc<RecordingOutput>>,
     source_items: Option<Arc<PublishedHitTestItems>>,
-    plan_from_prepared_inputs: bool,
 ) -> RecordingResult {
     debug_assert!(
         inputs.publishes_recording || source_recording.is_none(),
@@ -113,7 +110,6 @@ fn record_display_list_impl<O: Observer>(
         source_recording,
         source_items,
         live_producer: false,
-        plan_from_prepared_inputs,
         moved_expansion: FastSet::default(),
         blocking_wheel_event_region_count: 0,
         observer: O::default(),
@@ -180,7 +176,7 @@ fn record_display_list_impl<O: Observer>(
         has_blocking_wheel_event_listeners: recorder.blocking_wheel_event_region_count > 0,
         wheel_event_listener_state_generation: inputs.wheel_event_listener_state_generation,
         is_identical_to_published_recording: false,
-        capture_log_for_verification: recorder.observer.finish(),
+        capture_log: recorder.observer.finish(),
     };
     RecordingResult {
         output,
@@ -191,13 +187,13 @@ fn record_display_list_impl<O: Observer>(
 impl<O: Observer> PaintRecorder<'_, O> {
     // SVG content below an SVG root is recorded by the root's producer; every box inside
     // shows up nested under it.
-    fn paint_svg_box(&mut self, svg_box: NodeSlotId, phase: PaintPhase) {
+    fn paint_svg_box(&mut self, svg_box: NodeSlotId) {
         self.trace_scope(Operation::Named(Some(svg_box), "svg"), Action::Record, |this| {
-            this.paint_svg_box_impl(svg_box, phase);
+            this.paint_svg_box_impl(svg_box);
         });
     }
 
-    pub(crate) fn paint_svg_box_impl(&mut self, svg_box: NodeSlotId, phase: PaintPhase) {
+    pub(crate) fn paint_svg_box_impl(&mut self, svg_box: NodeSlotId) {
         if self.is_recording_svg_resource_content() {
             let parent_to_enclosing_space = self
                 .recorder
@@ -222,7 +218,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
             return;
         }
         let before = self.list.items.len();
-        self.record_hit_test_items(svg_box, phase);
+        self.record_hit_test_items(svg_box, PaintPhase::Foreground);
         self.observer.observe(|log| {
             log.leaf(
                 Operation::Producer(svg_box, ProducerKind::HitForeground),
@@ -245,13 +241,10 @@ impl<O: Observer> PaintRecorder<'_, O> {
         self.trace_paint(Operation::Producer(svg_box, ProducerKind::DrawForeground), |this| {
             crate::painting::record::paint::paint(this, svg_box, PaintPhase::Foreground);
         });
-        self.svg_paint_descendants(svg_box, phase);
+        self.svg_paint_descendants(svg_box);
     }
 
-    fn svg_paint_descendants(&mut self, paintable: NodeSlotId, phase: PaintPhase) {
-        if phase != PaintPhase::Foreground {
-            return;
-        }
+    fn svg_paint_descendants(&mut self, paintable: NodeSlotId) {
         let mut next_child = crate::painting::paint_order::first_paint_child(self.source, paintable);
         while let Some(child) = next_child {
             next_child = crate::painting::paint_order::next_paint_sibling(self.source, child);
@@ -259,7 +252,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
             if self.has_stacking_context(child) {
                 continue;
             }
-            self.paint_svg_box(child, phase);
+            self.paint_svg_box(child);
         }
     }
 
@@ -273,8 +266,8 @@ impl<O: Observer> PaintRecorder<'_, O> {
     pub(crate) fn context_for_phase(&self, paintable: NodeSlotId, phase: PaintPhase) -> ContextRef {
         // Text fragments are content of the block container (or of a self-painting inline box).
         // They need the descendants' visual context, not the element's own visual context.
-        let foreground_paints_descendant_content =
-            node_painting::has_lines(self.source, paintable) || node_painting::is_inline(self.source, paintable);
+        let foreground_paints_descendant_content = node_painting::has_lines(self.source, paintable)
+            || node_painting::is_fragmented_inline(self.source, paintable);
         if foreground_paints_descendant_content && phase == PaintPhase::Foreground {
             self.for_descendants_context(paintable)
         } else {

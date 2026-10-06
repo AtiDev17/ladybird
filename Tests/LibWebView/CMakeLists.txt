@@ -35,6 +35,17 @@ if (APPLE)
     list(APPEND TEST_SOURCES TestProcessReaper.cpp)
 endif()
 
+if (APPLE AND NOT IOS)
+    ladybird_test(TestWebDriverMachBootstrap.cpp LibWebView LIBS LibGfx LibIPC LibURL LibWebCommon OpenSSL::Crypto OpenSSL::SSL)
+    target_sources(TestWebDriverMachBootstrap PRIVATE
+        "${LADYBIRD_SOURCE_DIR}/Services/WebDriver/BrowserConnection.cpp"
+        "${LADYBIRD_SOURCE_DIR}/Services/WebDriver/Client.cpp"
+        "${LADYBIRD_SOURCE_DIR}/Services/WebDriver/Session.cpp"
+    )
+    target_include_directories(TestWebDriverMachBootstrap PRIVATE "${LADYBIRD_SOURCE_DIR}/Services" "${CMAKE_BINARY_DIR}/Services")
+    set_tests_properties(TestWebDriverMachBootstrap PROPERTIES TIMEOUT 30)
+endif()
+
 foreach(source IN LISTS TEST_SOURCES)
     set(test_libraries LibDatabase LibWebView LibURL)
     if (source STREQUAL "TestProfile.cpp" OR source STREQUAL "TestDownloadSegmentation.cpp")
@@ -97,6 +108,13 @@ if (NOT WIN32)
         target_compile_definitions(TestAutocomplete PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
 
+    add_executable(TestFavicon TestFavicon.cpp)
+    add_dependencies(TestFavicon ${ladybird_helper_processes})
+    target_link_libraries(TestFavicon PRIVATE AK LibCore LibFileSystem LibGfx LibIPC LibMain LibRequests LibURL LibWeb LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestFavicon PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
     add_executable(TestFileDownloader TestFileDownloader.cpp)
     add_dependencies(TestFileDownloader ${ladybird_helper_processes})
     target_link_libraries(TestFileDownloader PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibThreading LibURL LibWeb LibWebView)
@@ -132,6 +150,13 @@ if (NOT WIN32)
         target_compile_definitions(TestLinkHoverStatus PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
 
+    add_executable(TestShadowTreeTooltipsAndLinks TestShadowTreeTooltipsAndLinks.cpp)
+    add_dependencies(TestShadowTreeTooltipsAndLinks ladybird_build_resource_files ${ladybird_helper_processes})
+    target_link_libraries(TestShadowTreeTooltipsAndLinks PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestShadowTreeTooltipsAndLinks PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
     add_executable(TestCompositorInputRouting TestCompositorInputRouting.cpp)
     add_dependencies(TestCompositorInputRouting ladybird_build_resource_files ${ladybird_helper_processes})
     target_link_libraries(TestCompositorInputRouting PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
@@ -150,6 +175,13 @@ if (NOT WIN32)
     target_link_libraries(TestRendererOriginClaims PRIVATE AK LibCore LibFileSystem LibGfx LibHTTP LibIPC LibMain LibURL LibWeb LibWebView)
     if (APPLE)
         target_compile_definitions(TestRendererOriginClaims PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
+    add_executable(TestImageDecoderIsolation TestImageDecoderIsolation.cpp)
+    add_dependencies(TestImageDecoderIsolation ladybird_build_resource_files ${ladybird_helper_processes})
+    target_link_libraries(TestImageDecoderIsolation PRIVATE AK LibCore LibFileSystem LibGfx LibIPC LibMain LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestImageDecoderIsolation PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
 
     add_executable(TestCrashReportSubmission TestCrashReportSubmission.cpp)
@@ -257,6 +289,9 @@ if (BUILD_TESTING AND NOT WIN32)
     add_test(NAME TestAutocomplete COMMAND $<TARGET_FILE:TestAutocomplete>)
     set_tests_properties(TestAutocomplete PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
 
+    add_test(NAME TestFavicon COMMAND $<TARGET_FILE:TestFavicon>)
+    set_tests_properties(TestFavicon PROPERTIES TIMEOUT 120 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+
     add_test(NAME TestFileDownloader COMMAND $<TARGET_FILE:TestFileDownloader>)
     set_tests_properties(TestFileDownloader PROPERTIES TIMEOUT 120 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
 
@@ -272,12 +307,17 @@ if (BUILD_TESTING AND NOT WIN32)
     add_test(NAME TestLinkHoverStatus COMMAND $<TARGET_FILE:TestLinkHoverStatus>)
     set_tests_properties(TestLinkHoverStatus PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
 
+    add_test(NAME TestShadowTreeTooltipsAndLinks COMMAND $<TARGET_FILE:TestShadowTreeTooltipsAndLinks>)
+    set_tests_properties(TestShadowTreeTooltipsAndLinks PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+
     add_test(NAME TestCompositorInputRouting COMMAND $<TARGET_FILE:TestCompositorInputRouting>)
     set_tests_properties(TestCompositorInputRouting PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestRendererCookieAccess COMMAND $<TARGET_FILE:TestRendererCookieAccess>)
     set_tests_properties(TestRendererCookieAccess PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestRendererOriginClaims COMMAND $<TARGET_FILE:TestRendererOriginClaims>)
     set_tests_properties(TestRendererOriginClaims PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+    add_test(NAME TestImageDecoderIsolation COMMAND $<TARGET_FILE:TestImageDecoderIsolation>)
+    set_tests_properties(TestImageDecoderIsolation PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestCrashReportSubmission COMMAND $<TARGET_FILE:TestCrashReportSubmission>)
     set_tests_properties(TestCrashReportSubmission PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestRequestServerClientSessions COMMAND $<TARGET_FILE:TestRequestServerClientSessions>)

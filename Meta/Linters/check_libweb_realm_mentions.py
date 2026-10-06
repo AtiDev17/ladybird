@@ -10,7 +10,6 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 LIBWEB_ROOT = pathlib.Path("Libraries/LibWeb")
 
 REALM_PATTERN = re.compile(r"JS::Realm|LibJS/Runtime/Realm\.h")
-PLATFORM_OBJECT_IMPLEMENTATION_PATTERN = re.compile(r"public\s+Bindings::PlatformObject")
 
 # This check is intentionally coarse: component-level counts cannot see an
 # intra-component swap, and it counts JS::Realm spellings rather than realm
@@ -44,10 +43,10 @@ ALLOWED_REALM_MENTIONS = {
     "CookieStore": (2, 19, "cookie-store async callbacks and promise/value materialization still thread realms"),
     "Crypto": (8, 385, "WebCrypto algorithms still use realms for buffer/key/promise materialization"),
     "DOM": (10, 33, "DOM abort plumbing and node helpers still have callback/materialization realm use"),
-    "DOMURL": (2, 8, "URLSearchParams iterator objects still materialize JS iterator results in selected realms"),
+    "DOMURL": (2, 4, "URLSearchParams iterator objects still materialize JS iterator results in selected realms"),
     "Fetch": (
         22,
-        66,
+        62,
         "Fetch bodies, headers, requests, responses, and controllers still materialize JS values/streams; the body receiver's delivery and close tasks carry the realm its stream is enqueued and closed in",
     ),
     "FileAPI": (6, 11, "File/Blob/FileReader algorithms still create streams, buffers, and events in selected realms"),
@@ -72,13 +71,13 @@ ALLOWED_REALM_MENTIONS = {
     ),
     "Streams": (
         34,
-        214,
+        212,
         "Streams algorithms still use realms for controller/read/write operations and chunk conversion",
     ),
     "TrustedTypes": (2, 9, "Trusted Types policy factory operations still use selected realms"),
     "WebAssembly": (
         12,
-        104,
+        96,
         "WebAssembly constructors/exports instantiate JS objects/functions in spec-selected realms",
     ),
     "WebAudio": (
@@ -89,7 +88,7 @@ ALLOWED_REALM_MENTIONS = {
     "WebDriver": (2, 7, "WebDriver execute/JSON conversion still materializes JS values for automation"),
     "WebGL": (72, 120, "WebGL APIs still materialize buffers, typed arrays, extensions, and wrapper objects"),
     "WebLocks": (6, 7, "Web Locks queue/callback algorithms still use callback and promise realms"),
-    "XHR": (4, 11, "XHR/FormData/FileReader-style paths still materialize JS values and events"),
+    "XHR": (4, 7, "XHR/FormData/FileReader-style paths still materialize JS values and events"),
 }
 
 
@@ -116,17 +115,11 @@ def tracked_libweb_paths():
 
 def main():
     actual = collections.defaultdict(lambda: [0, 0])
-    platform_object_implementations = []
 
     for path in tracked_libweb_paths():
-        text = (REPO_ROOT / path).read_text(encoding="utf-8", errors="ignore")
-        if path != pathlib.Path(
-            "Libraries/LibWeb/HTML/WindowProxy.h"
-        ) and PLATFORM_OBJECT_IMPLEMENTATION_PATTERN.search(text):
-            platform_object_implementations.append(path)
-
         if is_excluded(path):
             continue
+        text = (REPO_ROOT / path).read_text(encoding="utf-8", errors="ignore")
         mention_count = len(REALM_PATTERN.findall(text))
         if mention_count == 0:
             continue
@@ -136,13 +129,6 @@ def main():
         actual[component][1] += mention_count
 
     failures = []
-
-    if platform_object_implementations:
-        print("LibWeb IDL implementations must derive from Bindings::Wrappable, not Bindings::PlatformObject.")
-        print("WindowProxy is the sole exception because it is itself a spec-defined exotic JavaScript object.")
-        for path in platform_object_implementations:
-            print(f"  {path}")
-        print()
 
     for component in sorted(set(actual) | set(ALLOWED_REALM_MENTIONS)):
         actual_counts = tuple(actual.get(component, (0, 0)))
@@ -168,7 +154,7 @@ def main():
         print()
         print("If counts decreased, tighten ALLOWED_REALM_MENTIONS in this script.")
         print("If counts increased, justify the new realm use in the allowlist reason.")
-    if failures or platform_object_implementations:
+    if failures:
         return 1
 
     print("LibWeb implementation-side realm mention baseline is unchanged.")

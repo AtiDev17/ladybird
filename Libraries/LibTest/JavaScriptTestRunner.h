@@ -19,133 +19,30 @@
 #include <AK/Tuple.h>
 #include <LibCore/DirIterator.h>
 #include <LibCore/File.h>
+#include <LibGC/Root.h>
 #include <LibJS/ParserError.h>
 #include <LibJS/Runtime/Array.h>
-#include <LibJS/Runtime/GlobalObject.h>
+#include <LibJS/Runtime/Error.h>
 #include <LibJS/Runtime/JSONObject.h>
-#include <LibJS/Runtime/Reference.h>
-#include <LibJS/Runtime/TypedArray.h>
+#include <LibJS/Runtime/Object.h>
+#include <LibJS/Runtime/Realm.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibJS/Runtime/ValueInlines.h>
-#include <LibJS/Runtime/WeakMap.h>
-#include <LibJS/Runtime/WeakSet.h>
 #include <LibJS/Script.h>
 #include <LibJS/SourceTextModule.h>
+#include <LibTest/JavaScriptTestHost.h>
 #include <LibTest/Results.h>
 #include <LibTest/TestRunner.h>
 
-#define STRCAT(x, y) __STRCAT(x, y)
-#define STRSTRCAT(x, y) __STRSTRCAT(x, y)
-#define __STRCAT(x, y) x #y
-#define __STRSTRCAT(x, y) x y
-
-// Note: This is a little weird, so here's an explanation:
-//       If the vararg isn't given, the tuple initializer will simply expand to `fn, ::Test::JS::__testjs_last<1>()`
-//       and if it _is_ given (say as `A`), the tuple initializer will expand to `fn, ::Test::JS::__testjs_last<1, A>()`, which will end up being evaluated as `A`
-//       and if multiple args are given, the static_assert will be sad.
-#define __TESTJS_REGISTER_GLOBAL_FUNCTION(name, fn, ...)                                                                                        \
-    struct __TestJS_register_##fn {                                                                                                             \
-        static_assert(                                                                                                                          \
-            ::Test::JS::__testjs_count(__VA_ARGS__) <= 1,                                                                                       \
-            STRCAT(STRSTRCAT(STRCAT("Expected at most three arguments to TESTJS_GLOBAL_FUNCTION at line", __LINE__), ", in file "), __FILE__)); \
-        __TestJS_register_##fn() noexcept                                                                                                       \
-        {                                                                                                                                       \
-            ::Test::JS::s_exposed_global_functions.set(                                                                                         \
-                name,                                                                                                                           \
-                { fn, ::Test::JS::__testjs_last<1, ##__VA_ARGS__>() });                                                                         \
-        }                                                                                                                                       \
-    } __testjs_register_##fn {};
-
-#define TESTJS_GLOBAL_FUNCTION(function, exposed_name, ...)                            \
-    JS_DECLARE_NATIVE_FUNCTION(function);                                              \
-    __TESTJS_REGISTER_GLOBAL_FUNCTION(#exposed_name##_utf16, function, ##__VA_ARGS__); \
-    JS_DEFINE_NATIVE_FUNCTION(function)
-
-#define TESTJS_MAIN_HOOK()                  \
-    struct __TestJS_main_hook {             \
-        __TestJS_main_hook()                \
-        {                                   \
-            ::Test::JS::g_main_hook = hook; \
-        }                                   \
-        static void hook();                 \
-    } __testjs_common_register_##name {};   \
-    void __TestJS_main_hook::hook()
-
-#define TESTJS_PROGRAM_FLAG(flag, help_string, long_name, short_name)                      \
-    bool flag { false };                                                                   \
-    struct __TestJS_flag_hook_##flag {                                                     \
-        __TestJS_flag_hook_##flag()                                                        \
-        {                                                                                  \
-            ::Test::JS::g_extra_args.set(&(flag), { help_string, long_name, short_name }); \
-        }                                                                                  \
-    } __testjs_flag_hook_##flag;
-
-#define TEST_ROOT(path) \
-    ByteString Test::JS::g_test_root_fragment = path
-
-#define TESTJS_RUN_FILE_FUNCTION(...)                                                                            \
-    struct __TestJS_run_file {                                                                                   \
-        __TestJS_run_file()                                                                                      \
-        {                                                                                                        \
-            ::Test::JS::g_run_file = hook;                                                                       \
-        }                                                                                                        \
-        static ::Test::JS::IntermediateRunFileResult hook(ByteString const&, JS::Realm&, JS::ExecutionContext&); \
-    } __testjs_common_run_file {};                                                                               \
-    ::Test::JS::IntermediateRunFileResult __TestJS_run_file::hook(__VA_ARGS__)
-
 namespace Test::JS {
-
-namespace JS = ::JS;
-
-template<typename... Args>
-static consteval size_t __testjs_count(Args...) { return sizeof...(Args); }
-
-template<auto... Values>
-static consteval size_t __testjs_last()
-{
-    Array values { Values... };
-    return values[values.size() - 1U];
-}
 
 static constexpr auto TOP_LEVEL_TEST_NAME = "__$$TOP_LEVEL$$__";
 extern RefPtr<JS::VM> g_vm;
 extern bool g_collect_on_every_allocation;
 extern ByteString g_currently_running_test;
-struct FunctionWithLength {
-    JS::ThrowCompletionOr<JS::Value> (*function)(JS::VM&);
-    size_t length { 0 };
-};
-extern HashMap<Utf16String, FunctionWithLength> s_exposed_global_functions;
-extern ByteString g_test_root_fragment;
 extern ByteString g_test_root;
 extern int g_test_argc;
 extern char** g_test_argv;
-extern Function<void()> g_main_hook;
-extern HashMap<bool*, Tuple<ByteString, ByteString, char>> g_extra_args;
-
-struct ParserError {
-    JS::ParserError error;
-    Utf16String hint;
-};
-
-struct JSFileResult {
-    ByteString name;
-    Optional<ParserError> error {};
-    double time_taken { 0 };
-    // A failed test takes precedence over a skipped test, which both have
-    // precedence over a passed test
-    Test::Result most_severe_test_result { Test::Result::Pass };
-    Vector<Test::Suite> suites {};
-    Vector<ByteString> logged_messages {};
-};
-
-enum class RunFileHookResult {
-    RunAsNormal,
-    SkipFile,
-};
-
-using IntermediateRunFileResult = AK::Result<JSFileResult, RunFileHookResult>;
-extern IntermediateRunFileResult (*g_run_file)(ByteString const&, JS::Realm&, JS::ExecutionContext&);
 
 class TestRunner : public ::Test::TestRunner {
 public:
@@ -166,53 +63,6 @@ protected:
 
     ByteString m_common_path;
 };
-
-class TestRunnerGlobalObject final : public JS::GlobalObject {
-    JS_OBJECT(TestRunnerGlobalObject, JS::GlobalObject);
-    GC_DECLARE_ALLOCATOR(TestRunnerGlobalObject);
-
-public:
-    TestRunnerGlobalObject(JS::Realm& realm)
-        : JS::GlobalObject(realm)
-    {
-    }
-    virtual void initialize(JS::Realm&) override;
-    virtual ~TestRunnerGlobalObject() override = default;
-
-    JS_DECLARE_NATIVE_FUNCTION(report_test);
-
-    Function<void(String, JS::Value)> on_test_reported;
-};
-
-inline void TestRunnerGlobalObject::initialize(JS::Realm& realm)
-{
-    Base::initialize(realm);
-
-    define_direct_property("global"_utf16_fly_string, this, JS::Attribute::Enumerable);
-    define_native_function(realm, "__reportTest__"_utf16, report_test, 2, JS::default_attributes);
-    for (auto& entry : s_exposed_global_functions) {
-        define_native_function(
-            realm,
-            entry.key,
-            [fn = entry.value.function](auto& vm) {
-                return fn(vm);
-            },
-            entry.value.length, JS::default_attributes);
-    }
-}
-
-inline JS_DEFINE_NATIVE_FUNCTION(TestRunnerGlobalObject::report_test)
-{
-    auto const& self = as<TestRunnerGlobalObject>(vm.get_global_object());
-    if (!self.on_test_reported)
-        return JS::js_undefined();
-
-    auto test_name_value = vm.argument(0);
-    auto test_name = TRY(test_name_value.to_utf16_string(vm)).to_utf8_but_should_be_ported_to_utf16();
-    auto state_value = vm.argument(1);
-    self.on_test_reported(test_name, state_value);
-    return JS::js_undefined();
-}
 
 inline ByteBuffer load_entire_file(StringView path)
 {
@@ -322,26 +172,43 @@ inline void print_test_timings(String test_name, JS::Value state_value)
     }
 }
 
+inline void define_test_runner_globals(JS::Realm& realm, bool prints_test_timings)
+{
+    auto& global_object = realm.global_object();
+    global_object.define_direct_property("global"_utf16_fly_string, &global_object, JS::Attribute::Enumerable);
+    global_object.define_native_function(
+        realm,
+        "__reportTest__"_utf16,
+        [prints_test_timings](JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
+            if (!prints_test_timings)
+                return JS::js_undefined();
+            auto test_name = TRY(vm.argument(0).to_utf16_string(vm)).to_utf8_but_should_be_ported_to_utf16();
+            print_test_timings(test_name, vm.argument(1));
+            return JS::js_undefined();
+        },
+        2, JS::default_attributes);
+    for (auto& entry : s_exposed_global_functions) {
+        global_object.define_native_function(
+            realm,
+            entry.key,
+            [fn = entry.value.function](auto& vm) {
+                return fn(vm);
+            },
+            entry.value.length, JS::default_attributes);
+    }
+}
+
 inline JSFileResult TestRunner::run_file_test(ByteString const& test_path)
 {
     g_currently_running_test = test_path;
 
     double start_time = get_time_in_ms();
 
-    GC::Ptr<JS::Realm> realm;
-    GC::Ptr<TestRunnerGlobalObject> global_object;
-    auto root_execution_context = MUST(JS::Realm::initialize_host_defined_realm(
-        *g_vm,
-        [&](JS::Realm& realm_) -> GC::Ref<JS::Object> {
-            realm = &realm_;
-            global_object = realm->create<TestRunnerGlobalObject>(*realm);
-            if (this->needs_timings()) {
-                global_object->on_test_reported = print_test_timings;
-            }
-            return global_object.as_nonnull();
-        },
-        nullptr));
+    auto root_execution_context = MUST(JS::Realm::initialize_host_defined_realm(*g_vm, nullptr, nullptr));
     auto& global_execution_context = *root_execution_context;
+    // Nothing else keeps the realm alive while its execution context is off the stack.
+    auto realm = GC::make_root(*global_execution_context.realm);
+    define_test_runner_globals(*realm, needs_timings());
     g_vm->pop_execution_context();
 
     g_vm->heap().set_should_collect_on_every_allocation(g_collect_on_every_allocation);
@@ -420,9 +287,9 @@ inline JSFileResult TestRunner::run_file_test(ByteString const& test_path)
     // Collect logged messages
     auto user_output = MUST(realm->global_object().get("__UserOutput__"_utf16_fly_string));
 
-    auto& arr = user_output.as_array_exotic_object();
-    for (u32 i = 0; i < arr.indexed_array_like_size(); ++i) {
-        auto message = MUST(arr.get(i));
+    auto& user_output_array = as<JS::Array>(user_output.as_object());
+    for (u32 i = 0; i < user_output_array.indexed_array_like_size(); ++i) {
+        auto message = MUST(user_output_array.get(i));
         file_result.logged_messages.append(message.to_utf16_string_without_side_effects().to_utf8().to_byte_string());
     }
 
@@ -506,10 +373,9 @@ inline JSFileResult TestRunner::run_file_test(ByteString const& test_path)
                 detail_builder.append(message_string.utf16_view());
             }
 
-            if (is<JS::Error>(error_object)) {
-                auto& error_as_error = static_cast<JS::Error&>(error_object);
+            if (auto const* error_as_error = as_if<JS::Error>(error_object)) {
                 detail_builder.append('\n');
-                detail_builder.append(error_as_error.stack_string());
+                detail_builder.append(error_as_error->stack_string());
             }
 
             test_case.details = MUST(detail_builder.to_string());

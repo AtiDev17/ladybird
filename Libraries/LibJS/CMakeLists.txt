@@ -105,6 +105,10 @@ set(SOURCES
     Runtime/GeneratorPrototype.cpp
     Runtime/GlobalEnvironment.cpp
     Runtime/GlobalObject.cpp
+    Runtime/HostArray.cpp
+    Runtime/HostFunction.cpp
+    Runtime/HostModule.cpp
+    Runtime/HostObject.cpp
     Runtime/IndexedProperties.cpp
     Runtime/Intl/AbstractOperations.cpp
     Runtime/Intl/Collator.cpp
@@ -264,6 +268,7 @@ set(SOURCES
     Runtime/WeakSetPrototype.cpp
     Runtime/WrapForValidIteratorPrototype.cpp
     Script.cpp
+    ScriptCompilation.cpp
     SourceCode.cpp
     SourceTextModule.cpp
     SyntaxHighlighter.cpp

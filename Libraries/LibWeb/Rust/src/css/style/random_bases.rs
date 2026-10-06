@@ -89,23 +89,6 @@ impl RandomBaseValues {
             .map(|(_, value)| *value)
     }
 
-    /// Take a key's value as given, for a replay that reproduces what a recorded draw gave.
-    #[cfg(feature = "style-recording")]
-    pub(crate) fn set(&mut self, node: Option<StyleNodeID>, name: &[u16], element_shared: bool, value: f64) {
-        if element_shared {
-            self.document.insert(name.into(), value);
-            return;
-        }
-        let Some(node) = node else {
-            return;
-        };
-        let row = self.row_mut(node);
-        match row.iter_mut().find(|(row_name, _)| **row_name == *name) {
-            Some((_, row_value)) => *row_value = value,
-            None => row.push((name.into(), value)),
-        }
-    }
-
     /// An element's row, which may be new.
     fn row_mut(&mut self, node: StyleNodeID) -> &mut Vec<NamedBaseValue> {
         self.element_rows_exist.store(true, Ordering::Relaxed);
@@ -126,32 +109,8 @@ impl RandomBaseValues {
 }
 
 impl RetainedState {
-    /// Give an element's new style node the keys the element kept while it had none, as one buffer
-    /// of name code units with a length and a value per name.
-    pub fn set_element_random_base_values(
-        &mut self,
-        node: StyleNodeID,
-        name_lengths: &[u32],
-        name_units: &[u16],
-        value_bits: &[u64],
-    ) {
-        assert_eq!(
-            name_lengths.len(),
-            value_bits.len(),
-            "every random base value has one name"
-        );
-        let mut rest = name_units;
-        let row = name_lengths
-            .iter()
-            .zip(value_bits)
-            .map(|(&length, &bits)| {
-                let (name, after) = rest
-                    .split_at_checked(length as usize)
-                    .expect("random base value names overrun their code units");
-                rest = after;
-                (Box::from(name), f64::from_bits(bits))
-            })
-            .collect::<Vec<_>>();
+    /// Give an element's new style node the keys the element kept while it had none.
+    pub(crate) fn set_element_random_base_values(&mut self, node: StyleNodeID, row: Vec<NamedBaseValue>) {
         if !row.is_empty() {
             *self.random_base_values.row_mut(node) = row;
         }

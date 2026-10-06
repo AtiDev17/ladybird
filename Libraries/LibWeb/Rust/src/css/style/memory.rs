@@ -8,17 +8,17 @@
 //!
 //! Every byte StyleEngine retains belongs to exactly one [`MemoryCategory`], and every category
 //! belongs to one [`Tier`]. The tier decides both the reclamation rule and the budget the bytes are
-//! charged against:
+//! charged against. Authoritative input (DOM, CSSOM, browser state) is owned by other subsystems and
+//! never charged.
 //!
-//! * Tier 0 is authoritative input owned by another subsystem. It is referenced, never charged.
 //! * Tier 1 is the minimal live state required to answer current observers. It is tracked by
 //!   category but not capped or aggregated, because refusing it would mean refusing a style read.
 //! * Tier 2 is the shared semantic IR: selector programs, transpose bytecode, and the routing
 //!   registry. It can never absorb selector-result state.
 //! * Tier 3 is pure acceleration. It is strictly budgeted and fully evictable, and eviction changes
 //!   no semantic version - a later observer reconstructs from authoritative inputs.
-//! * Tier 4 is transaction scratch. Its ceiling is reported, never refused, and its capacity is
-//!   released or shrunk at transaction boundaries rather than accumulated across transactions.
+//! * Tier 4 is transaction scratch. It is tracked but never capped, and its capacity is released or
+//!   shrunk at transaction boundaries rather than accumulated across transactions.
 //!
 //! Tier 3 owners reconcile exact capacity at coarse container boundaries. Limit-crossing growth
 //! remains usable for the current loop. Its boundary closes admission for later loops, and is
@@ -30,12 +30,10 @@ use std::sync::Mutex;
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 
-/// Retained-state tier. The discriminants follow the tier numbers in the memory model.
+/// Retained-state tier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(usize)]
 pub enum Tier {
-    /// Tier 0: DOM, CSSOM, stylesheet programs, browser state.
-    Authoritative,
     /// Tier 1: compact handles and shared payloads required to answer current observers.
     Live,
     /// Tier 2: canonical selector, declaration, condition, and cascade nodes; routing registry.
@@ -46,7 +44,7 @@ pub enum Tier {
     Scratch,
 }
 
-pub const TIER_COUNT: usize = 5;
+pub const TIER_COUNT: usize = 4;
 
 impl Tier {
     #[must_use]
@@ -56,7 +54,7 @@ impl Tier {
 }
 
 macro_rules! define_memory_categories {
-    ($($variant:ident => ($tier:ident, $name:literal),)+) => {
+    ($($variant:ident => $tier:ident,)+) => {
         /// One kind of retained StyleEngine state. Categories exist so that a byte total can be
         /// attributed to the logical operator that retained it, not just to a tier.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -67,19 +65,14 @@ macro_rules! define_memory_categories {
 
         pub const MEMORY_CATEGORY_COUNT: usize = 0 $(+ { let _ = MemoryCategory::$variant; 1 })+;
 
+        #[cfg(test)]
         pub const MEMORY_CATEGORIES: [MemoryCategory; MEMORY_CATEGORY_COUNT] = [$(MemoryCategory::$variant,)+];
         static MEMORY_CATEGORY_TIERS: [Tier; MEMORY_CATEGORY_COUNT] = [$(Tier::$tier,)+];
-        static MEMORY_CATEGORY_NAMES: [&str; MEMORY_CATEGORY_COUNT] = [$($name,)+];
 
         impl MemoryCategory {
             #[must_use]
             pub fn tier(self) -> Tier {
                 MEMORY_CATEGORY_TIERS[self as usize]
-            }
-
-            #[must_use]
-            pub fn name(self) -> &'static str {
-                MEMORY_CATEGORY_NAMES[self as usize]
             }
         }
     };
@@ -87,37 +80,36 @@ macro_rules! define_memory_categories {
 
 define_memory_categories! {
     // Tier 1: reclaimed only once no observer and no live read epoch can reach the state.
-    StyleNodeMapping => (Live, "styleNodeMapping"),
-    RelationColumns => (Live, "relationColumns"),
-    MatchAnswerIdentity => (Live, "matchAnswerIdentity"),
-    ComputedGroupSet => (Live, "computedGroupSet"),
-    CustomPropertyEnvironment => (Live, "customPropertyEnvironment"),
-    ComputedFixedMetadata => (Live, "computedFixedMetadata"),
-    ComputedLonghandTable => (Live, "computedLonghandTable"),
-    StyleRecord => (Live, "styleRecord"),
-    AnimationOverlayRecord => (Live, "animationOverlayRecord"),
-    ComputedPseudoAssignment => (Live, "computedPseudoAssignment"),
+    StyleNodeMapping => Live,
+    RelationColumns => Live,
+    MatchAnswerIdentity => Live,
+    ComputedGroupSet => Live,
+    CustomPropertyEnvironment => Live,
+    ComputedFixedMetadata => Live,
+    ComputedLonghandTable => Live,
+    StyleRecord => Live,
+    AnimationOverlayRecord => Live,
+    ComputedPseudoAssignment => Live,
     // Tier 2: reclaimed on semantic detachment plus epoch retirement.
-    RuleProgram => (Program, "ruleProgram"),
-    RoutingRegistry => (Program, "routingRegistry"),
+    RuleProgram => Program,
+    RoutingRegistry => Program,
 
     // Tier 3: evictable without semantic effect, in roughly this preference order.
-    RetainedWitness => (Acceleration, "retainedWitness"),
-    FeaturePosting => (Acceleration, "featurePosting"),
-    SpecifiedValueTable => (Acceleration, "specifiedValueTable"),
-    CascadeWinnerGroup => (Acceleration, "cascadeWinnerGroup"),
-    RetainedSelectorIncidence => (Acceleration, "retainedSelectorIncidence"),
-    RetainedMatchAnswer => (Acceleration, "retainedMatchAnswer"),
-    PrefixTransitionCache => (Acceleration, "prefixTransitionCache"),
-    PrefixAnswerCache => (Acceleration, "prefixAnswerCache"),
+    RetainedWitness => Acceleration,
+    FeaturePosting => Acceleration,
+    SpecifiedValueTable => Acceleration,
+    CascadeWinnerGroup => Acceleration,
+    RetainedSelectorIncidence => Acceleration,
+    RetainedMatchAnswer => Acceleration,
+    PrefixTransitionCache => Acceleration,
+    PrefixAnswerCache => Acceleration,
     // Tier 4: released at transaction end or scratch shrink.
-    NormalizationJournal => (Scratch, "normalizationJournal"),
-    BatchScratch => (Scratch, "batchScratch"),
-    BridgeBuffer => (Scratch, "bridgeBuffer"),
-    // Appended to preserve record-replay category ordinals.
-    ParsedSubstitutionCache => (Acceleration, "parsedSubstitutionCache"),
-    SelectorQuery => (Scratch, "selectorQuery"),
-    PrefixRelation => (Acceleration, "prefixRelation"),
+    NormalizationJournal => Scratch,
+    BatchScratch => Scratch,
+    BridgeBuffer => Scratch,
+    ParsedSubstitutionCache => Acceleration,
+    SelectorQuery => Scratch,
+    PrefixRelation => Acceleration,
 }
 
 impl MemoryCategory {
@@ -168,20 +160,9 @@ fn tier3_period_index(category: MemoryCategory) -> usize {
     category as usize - MemoryCategory::RetainedWitness as usize
 }
 
-/// The sole document memory class exposed by the browser.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeviceClass {
-    ForegroundDesktop,
-}
-
 const DEVICE_CAP: u64 = 64 * MIB;
 const BASE_ALLOWANCE: u64 = MIB;
 const PER_CONNECTED_NODE: u64 = 2048;
-const SCRATCH_CAP: u64 = 32 * MIB;
-/// What one element of a broad transaction may cost in scratch. A fact batch is one row per
-/// element by construction, so the reported ceiling scales with the document rather than making
-/// every sufficiently large broad transaction appear over-limit.
-const PER_TRANSACTION_NODE: u64 = 768;
 
 /// The document-shaped terms of the budget formula.
 #[derive(Clone, Copy, Debug, Default)]
@@ -189,12 +170,6 @@ pub struct BudgetInputs {
     /// Connected styleable DOM elements in the live DOM at the read epoch. Not pseudo style nodes,
     /// not arena capacity, not retired generations.
     pub connected_element_count: u32,
-    /// The byte length of a minimal non-commoned encoding of the attached selectors, match and
-    /// transpose bytecode, routing registry, declarations, and conditions, counted once for an
-    /// explicitly shared constructed program. Excludes allocator padding, optional indexes,
-    /// results, and StyleEngine's own capacity, so acceleration overhead cannot inflate its own
-    /// allowance.
-    pub compact_style_program_bytes: u64,
 }
 
 /// Accounting belongs to one document (or the shared-program context), independently of
@@ -206,34 +181,21 @@ pub struct BudgetInputs {
 struct ChargeLedger {
     category_bytes: [u64; MEMORY_CATEGORY_COUNT],
     tier_bytes: [u64; TIER_COUNT],
-    live_bytes: u64,
-    peak_live_bytes: u64,
-    peak_scratch_bytes: u64,
 }
 
 impl ChargeLedger {
-    fn add(&mut self, category: MemoryCategory, bytes: u64, count_tier: bool) {
+    fn add(&mut self, category: MemoryCategory, bytes: u64) {
         self.category_bytes[category as usize] = self.category_bytes[category as usize]
             .checked_add(bytes)
             .expect("memory charge overflow");
-        if count_tier {
-            self.tier_bytes[category.tier().index()] = self.tier_bytes[category.tier().index()]
-                .checked_add(bytes)
-                .expect("memory charge overflow");
-        }
-        self.live_bytes = self.live_bytes.checked_add(bytes).expect("memory charge overflow");
-        self.peak_live_bytes = self.peak_live_bytes.max(self.live_bytes);
-        self.peak_scratch_bytes = self.peak_scratch_bytes.max(self.tier_bytes[Tier::Scratch.index()]);
+        self.tier_bytes[category.tier().index()] += bytes;
     }
 
-    fn release(&mut self, category: MemoryCategory, bytes: u64, count_tier: bool) {
+    fn release(&mut self, category: MemoryCategory, bytes: u64) {
         self.category_bytes[category as usize] = self.category_bytes[category as usize]
             .checked_sub(bytes)
             .expect("released uncharged memory");
-        if count_tier {
-            self.tier_bytes[category.tier().index()] -= bytes;
-        }
-        self.live_bytes -= bytes;
+        self.tier_bytes[category.tier().index()] -= bytes;
     }
 }
 
@@ -371,11 +333,7 @@ impl MemoryLease {
             ledger
                 .lock()
                 .expect("the memory ledger is never held across a panic")
-                .add(
-                    self.category,
-                    bytes,
-                    matches!(self.category.tier(), Tier::Acceleration | Tier::Scratch),
-                );
+                .add(self.category, bytes);
         }
     }
 
@@ -388,11 +346,7 @@ impl MemoryLease {
             ledger
                 .lock()
                 .expect("the memory ledger is never held across a panic")
-                .release(
-                    self.category,
-                    bytes,
-                    matches!(self.category.tier(), Tier::Acceleration | Tier::Scratch),
-                );
+                .release(self.category, bytes);
         }
         self.bytes -= bytes;
     }
@@ -414,11 +368,7 @@ impl MemoryLease {
                 .charges
                 .lock()
                 .expect("the memory ledger is never held across a panic")
-                .add(
-                    self.category,
-                    self.bytes,
-                    matches!(self.category.tier(), Tier::Acceleration | Tier::Scratch),
-                );
+                .add(self.category, self.bytes);
         }
     }
 
@@ -431,11 +381,7 @@ impl MemoryLease {
                 .expect("a charged memory lease has a ledger")
                 .lock()
                 .expect("the memory ledger is never held across a panic")
-                .release(
-                    self.category,
-                    released,
-                    matches!(self.category.tier(), Tier::Acceleration | Tier::Scratch),
-                );
+                .release(self.category, released);
             self.bytes = bytes;
         }
     }
@@ -467,7 +413,7 @@ impl Drop for ScratchCharge {
         self.ledger
             .lock()
             .expect("the memory ledger is never held across a panic")
-            .release(self.category, self.bytes, true);
+            .release(self.category, self.bytes);
     }
 }
 
@@ -475,36 +421,30 @@ impl Drop for ScratchCharge {
 pub struct MemoryController {
     inputs: BudgetInputs,
     charges: Arc<Mutex<ChargeLedger>>,
-    refusals: [u64; MEMORY_CATEGORY_COUNT],
     benefit_hits: [u64; MEMORY_CATEGORY_COUNT],
     benefit_observations: [u64; MEMORY_CATEGORY_COUNT],
     observed_hit_totals: [u64; MEMORY_CATEGORY_COUNT],
     observed_miss_totals: [u64; MEMORY_CATEGORY_COUNT],
-    last_refused_bytes: [u64; MEMORY_CATEGORY_COUNT],
     tier3_period_start_bytes: [u64; TIER3_CATEGORY_COUNT],
     tier3_admitting: [bool; MEMORY_CATEGORY_COUNT],
     tier3_quota_period_active: bool,
-    recording_policy_enabled: bool,
     #[cfg(test)]
     tier3_limit_override: Option<u64>,
 }
 
 impl MemoryController {
     #[must_use]
-    pub fn new(_device_class: DeviceClass) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inputs: BudgetInputs::default(),
             charges: Arc::new(Mutex::new(ChargeLedger::default())),
-            refusals: [0; MEMORY_CATEGORY_COUNT],
             benefit_hits: [0; MEMORY_CATEGORY_COUNT],
             benefit_observations: [0; MEMORY_CATEGORY_COUNT],
             observed_hit_totals: [0; MEMORY_CATEGORY_COUNT],
             observed_miss_totals: [0; MEMORY_CATEGORY_COUNT],
-            last_refused_bytes: [0; MEMORY_CATEGORY_COUNT],
             tier3_period_start_bytes: [0; TIER3_CATEGORY_COUNT],
             tier3_admitting: [true; MEMORY_CATEGORY_COUNT],
             tier3_quota_period_active: false,
-            recording_policy_enabled: false,
             #[cfg(test)]
             tier3_limit_override: None,
         }
@@ -514,16 +454,13 @@ impl MemoryController {
         Self {
             inputs: self.inputs,
             charges: Arc::new(Mutex::new(ChargeLedger::default())),
-            refusals: [0; MEMORY_CATEGORY_COUNT],
             benefit_hits: [0; MEMORY_CATEGORY_COUNT],
             benefit_observations: [0; MEMORY_CATEGORY_COUNT],
             observed_hit_totals: [0; MEMORY_CATEGORY_COUNT],
             observed_miss_totals: [0; MEMORY_CATEGORY_COUNT],
-            last_refused_bytes: [0; MEMORY_CATEGORY_COUNT],
             tier3_period_start_bytes: [0; TIER3_CATEGORY_COUNT],
             tier3_admitting: [true; MEMORY_CATEGORY_COUNT],
             tier3_quota_period_active: false,
-            recording_policy_enabled: self.recording_policy_enabled,
             #[cfg(test)]
             tier3_limit_override: self.tier3_limit_override,
         }
@@ -536,14 +473,6 @@ impl MemoryController {
 
     pub fn set_budget_inputs(&mut self, inputs: BudgetInputs) {
         self.inputs = inputs;
-    }
-
-    pub fn enable_recording_policy(&mut self) {
-        self.recording_policy_enabled = true;
-    }
-
-    pub fn disable_recording_policy(&mut self) {
-        self.recording_policy_enabled = false;
     }
 
     /// Start one flush interval with every Tier-3 category admitting. Loop boundaries close
@@ -665,35 +594,13 @@ impl MemoryController {
             &self.tier3_period_start_bytes,
             self.tier3_admitting,
         );
-        let overage = self
-            .bytes_in_tier(Tier::Acceleration)
-            .saturating_sub(self.tier3_limit());
         for category in TIER3_REFUSAL_CATEGORIES {
             let index = category as usize;
             if self.tier3_admitting[index] && !admitting[index] {
-                self.refusals[index] += 1;
                 self.record_benefit_lookup(category, false);
-                self.last_refused_bytes[index] = overage;
             }
         }
         self.tier3_admitting = admitting;
-    }
-
-    /// High-water accounting includes required output, retained state and scratch together.
-    #[must_use]
-    pub fn peak_live_bytes(&self) -> u64 {
-        self.charges
-            .lock()
-            .expect("the memory ledger is never held across a panic")
-            .peak_live_bytes
-    }
-
-    #[must_use]
-    pub fn peak_scratch_bytes(&self) -> u64 {
-        self.charges
-            .lock()
-            .expect("the memory ledger is never held across a panic")
-            .peak_scratch_bytes
     }
 
     /// `min(DeviceCap, BaseAllowance + NodeAllowance * ConnectedElementCount)`.
@@ -703,35 +610,9 @@ impl MemoryController {
         if let Some(limit) = self.tier3_limit_override {
             return limit;
         }
-        let limit = BASE_ALLOWANCE
+        BASE_ALLOWANCE
             .saturating_add(PER_CONNECTED_NODE.saturating_mul(u64::from(self.inputs.connected_element_count)))
-            .min(DEVICE_CAP);
-        if self.recording_policy_enabled {
-            return DEVICE_CAP;
-        }
-        limit
-    }
-
-    /// `min(DeviceScratchCap, max(4 MiB, Tier3Limit,
-    /// TransactionNodeAllowance * ConnectedElementCount))`.
-    ///
-    /// The node term accounts for a broad transaction's one fact row per element. The device
-    /// scratch ceiling makes an unusually broad transaction visible in pressure reports; it does
-    /// not refuse scratch required to complete the flush.
-    #[must_use]
-    pub fn tier4_limit(&self) -> u64 {
-        (4 * MIB)
-            .max(self.tier3_limit())
-            .max(PER_TRANSACTION_NODE.saturating_mul(u64::from(self.inputs.connected_element_count)))
-            .min(SCRATCH_CAP)
-    }
-
-    fn limit_for(&self, tier: Tier) -> Option<u64> {
-        match tier {
-            Tier::Authoritative | Tier::Live | Tier::Program => None,
-            Tier::Acceleration => Some(self.tier3_limit()),
-            Tier::Scratch => Some(self.tier4_limit()),
-        }
+            .min(DEVICE_CAP)
     }
 
     #[cfg(test)]
@@ -741,8 +622,6 @@ impl MemoryController {
             let index = category as usize;
             let projected_tier = self.bytes_in_tier(Tier::Acceleration).saturating_add(bytes);
             if !self.tier3_admitting[index] || projected_tier > self.tier3_limit() {
-                self.refusals[index] += 1;
-                self.last_refused_bytes[index] = bytes;
                 self.record_benefit_lookup(category, false);
                 return false;
             }
@@ -750,18 +629,15 @@ impl MemoryController {
             let projected = self.bytes_in_tier(Tier::Acceleration).saturating_add(bytes);
             let limit = self.tier3_limit();
             if projected > limit {
-                self.refusals[category as usize] += 1;
-                self.last_refused_bytes[category as usize] = bytes;
                 self.record_benefit_lookup(category, false);
                 return false;
             }
         }
 
-        self.last_refused_bytes[category as usize] = 0;
         self.charges
             .lock()
             .expect("the memory ledger is never held across a panic")
-            .add(category, bytes, true);
+            .add(category, bytes);
         true
     }
 
@@ -806,25 +682,17 @@ impl MemoryController {
     }
 
     /// Charge capacity that is already committed: required live state and scratch whose exact
-    /// capacity is known at a container boundary. Tier 4 remains a reported ceiling, so crossing
-    /// it changes no behavior.
+    /// capacity is known at a container boundary.
     pub fn reserve_required(&mut self, category: MemoryCategory, bytes: u64) {
-        let tier = category.tier();
         assert!(
-            tier != Tier::Authoritative,
-            "authoritative input is referenced, never charged: {}",
-            category.name()
-        );
-        assert!(
-            tier != Tier::Acceleration,
-            "acceleration state reconciles at its category boundary: {}",
-            category.name()
+            category.tier() != Tier::Acceleration,
+            "acceleration state reconciles at its category boundary: {category:?}"
         );
 
         self.charges
             .lock()
             .expect("the memory ledger is never held across a panic")
-            .add(category, bytes, self.limit_for(tier).is_some());
+            .add(category, bytes);
     }
 
     pub fn charge_scratch(&mut self, category: MemoryCategory, bytes: u64) -> ScratchCharge {
@@ -842,7 +710,7 @@ impl MemoryController {
         self.charges
             .lock()
             .expect("the memory ledger is never held across a panic")
-            .release(category, bytes, self.limit_for(category.tier()).is_some());
+            .release(category, bytes);
     }
 
     #[must_use]
@@ -860,30 +728,23 @@ impl MemoryController {
             .expect("the memory ledger is never held across a panic")
             .tier_bytes[tier.index()]
     }
-
-    /// Admission closures recorded when category growth crosses the Tier-3 limit.
-    #[must_use]
-    pub fn refusals(&self, category: MemoryCategory) -> u64 {
-        self.refusals[category as usize]
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn controller(device_class: DeviceClass, elements: u32, program_bytes: u64) -> MemoryController {
-        let mut controller = MemoryController::new(device_class);
+    fn controller(elements: u32) -> MemoryController {
+        let mut controller = MemoryController::new();
         controller.set_budget_inputs(BudgetInputs {
             connected_element_count: elements,
-            compact_style_program_bytes: program_bytes,
         });
         controller
     }
 
     #[test]
     fn loop_growth_cannot_close_admission_or_erase_peak_capacity() {
-        let mut memory = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let mut memory = controller(0);
         memory.set_tier3_limit_for_test(10);
         memory.begin_tier3_quota_period();
         let mut retained = MemoryLease::new(MemoryCategory::RetainedMatchAnswer);
@@ -894,8 +755,6 @@ mod tests {
         retained.reconcile_committed(&mut memory, 20);
         scratch.release();
         assert!(memory.is_tier3_admitting(MemoryCategory::RetainedMatchAnswer));
-        assert_eq!(memory.peak_live_bytes(), 120);
-        assert_eq!(memory.peak_scratch_bytes(), 100);
         memory.finish_evaluation_loop();
         assert!(!memory.is_tier3_admitting(MemoryCategory::RetainedMatchAnswer));
         assert_eq!(retained.bytes(), 20);
@@ -903,52 +762,14 @@ mod tests {
     }
 
     #[test]
-    fn every_category_has_a_chargeable_tier() {
-        for index in 0..MEMORY_CATEGORY_COUNT {
-            let tier = MEMORY_CATEGORY_TIERS[index];
-            assert_ne!(
-                tier,
-                Tier::Authoritative,
-                "{} must not be Tier 0",
-                MEMORY_CATEGORY_NAMES[index]
-            );
-        }
-    }
-
-    #[test]
     fn an_empty_desktop_document_gets_the_base_allowance() {
-        let controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let controller = controller(0);
         assert_eq!(controller.tier3_limit(), MIB);
-        // The 4 MiB floor beats a 1 MiB Tier-3 limit.
-        assert_eq!(controller.tier4_limit(), 4 * MIB);
-    }
-
-    #[test]
-    fn tier_four_reports_its_ceiling_without_refusing_scratch() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
-        controller.reserve_required(MemoryCategory::BatchScratch, controller.tier4_limit() + 1);
-        assert_eq!(controller.bytes_in_tier(Tier::Scratch), controller.tier4_limit() + 1);
-    }
-
-    #[test]
-    fn recording_policy_uses_the_device_cap() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
-        controller.enable_recording_policy();
-        assert_eq!(controller.tier3_limit(), DEVICE_CAP);
-    }
-
-    #[test]
-    fn ending_recording_restores_the_document_budget() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
-        let document_limit = controller.tier3_limit();
-        controller.enable_recording_policy();
-        controller.disable_recording_policy();
-        assert_eq!(controller.tier3_limit(), document_limit);
     }
 
     #[test]
     fn tier_three_pressure_closes_admission_until_the_next_period() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let mut controller = controller(0);
         controller.begin_tier3_quota_period();
         let category = MemoryCategory::FeaturePosting;
         let mut lease = MemoryLease::new(category);
@@ -965,7 +786,7 @@ mod tests {
 
     #[test]
     fn tier_three_quota_boundary_selects_a_complete_cold_overage() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let mut controller = controller(0);
         controller.set_tier3_limit_for_test(100);
         controller.begin_tier3_quota_period();
         let mut lease = MemoryLease::new(MemoryCategory::FeaturePosting);
@@ -980,7 +801,7 @@ mod tests {
 
     #[test]
     fn tier_three_boundary_keeps_working_sets_that_cannot_cover_the_overage() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let mut controller = controller(0);
         controller.set_tier3_limit_for_test(100);
         let mut answers = MemoryLease::new(MemoryCategory::RetainedMatchAnswer);
         answers.reconcile_committed(&mut controller, 50);
@@ -995,15 +816,15 @@ mod tests {
 
     #[test]
     fn the_node_coefficient_reaches_the_device_cap_where_the_model_says_it_does() {
-        let below = controller(DeviceClass::ForegroundDesktop, 32_255, 0);
+        let below = controller(32_255);
         assert!(below.tier3_limit() < 64 * MIB);
-        let at = controller(DeviceClass::ForegroundDesktop, 32_256, 0);
+        let at = controller(32_256);
         assert_eq!(at.tier3_limit(), 64 * MIB);
     }
 
     #[test]
     fn a_shrinking_tier_three_budget_preserves_existing_charges() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 10_000, 4096);
+        let mut controller = controller(10_000);
         assert!(controller.reserve(MemoryCategory::FeaturePosting, 64 * KIB));
 
         controller.set_tier3_limit_for_test(0);
@@ -1011,12 +832,11 @@ mod tests {
 
         // Existing charges survive a shrinking budget, and test admission closes for new state.
         assert!(!controller.reserve(MemoryCategory::FeaturePosting, KIB));
-        assert_eq!(controller.refusals(MemoryCategory::FeaturePosting), 1);
     }
 
     #[test]
     fn a_memory_lease_releases_optional_capacity_on_shrink_and_drop() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let mut controller = controller(0);
         {
             let mut lease = MemoryLease::new(MemoryCategory::SpecifiedValueTable);
             lease.reconcile_committed(&mut controller, 64 * KIB);
@@ -1038,7 +858,7 @@ mod tests {
 
     #[test]
     fn a_memory_lease_releases_required_capacity_on_resize_and_drop() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let mut controller = controller(0);
         {
             let mut lease = MemoryLease::new(MemoryCategory::BatchScratch);
             lease.resize_required_to(&mut controller, 64 * KIB);
@@ -1052,7 +872,7 @@ mod tests {
 
     #[test]
     fn a_scratch_charge_releases_on_drop() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let mut controller = controller(0);
         {
             let _charge = controller.charge_scratch(MemoryCategory::BatchScratch, 64 * KIB);
             assert_eq!(controller.bytes_in_category(MemoryCategory::BatchScratch), 64 * KIB);
@@ -1063,7 +883,7 @@ mod tests {
 
     #[test]
     fn a_mutation_fed_lease_updates_the_ledger_without_owner_accounting() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let mut controller = controller(0);
         {
             let mut lease = MemoryLease::new(MemoryCategory::BatchScratch);
             lease.grow_committed(64 * KIB);
@@ -1082,14 +902,14 @@ mod tests {
 
     #[test]
     fn committed_acceleration_is_dropped_at_the_next_quota_boundary() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let mut controller = controller(0);
         controller.begin_tier3_quota_period();
         let mut lease = MemoryLease::new(MemoryCategory::CascadeWinnerGroup);
         lease.grow_committed(MIB + 1);
         let bytes = lease.bytes();
         lease.reconcile_committed(&mut controller, bytes);
         controller.finish_evaluation_loop();
-        assert_eq!(controller.refusals(MemoryCategory::CascadeWinnerGroup), 1);
+        assert!(!controller.is_tier3_admitting(MemoryCategory::CascadeWinnerGroup));
         assert!(controller.finish_tier3_quota_period()[MemoryCategory::CascadeWinnerGroup as usize]);
         lease.release();
         assert_eq!(controller.bytes_in_tier(Tier::Acceleration), 0);
@@ -1097,7 +917,7 @@ mod tests {
 
     #[test]
     fn an_over_limit_steady_state_does_not_repeat_boundary_evictions() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let mut controller = controller(0);
         controller.set_tier3_limit_for_test(0);
         let mut program_values = MemoryLease::new(MemoryCategory::SpecifiedValueTable);
         program_values.reconcile_committed(&mut controller, 1);
@@ -1115,7 +935,7 @@ mod tests {
 
     #[test]
     fn discarded_committed_growth_does_not_condemn_resident_state() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let mut controller = controller(0);
         controller.set_tier3_limit_for_test(10);
         let mut resident = MemoryLease::new(MemoryCategory::FeaturePosting);
         resident.reconcile_committed(&mut controller, 10);
@@ -1132,14 +952,14 @@ mod tests {
 
     #[test]
     fn live_state_is_never_refused() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let mut controller = controller(0);
         controller.reserve_required(MemoryCategory::RelationColumns, 64 * MIB);
         assert_eq!(controller.bytes_in_category(MemoryCategory::RelationColumns), 64 * MIB);
     }
 
     #[test]
     fn released_scratch_does_not_accumulate() {
-        let mut controller = controller(DeviceClass::ForegroundDesktop, 0, 0);
+        let mut controller = controller(0);
         controller.reserve_required(MemoryCategory::BatchScratch, 3 * MIB);
         controller.release(MemoryCategory::BatchScratch, 3 * MIB);
         controller.reserve_required(MemoryCategory::BridgeBuffer, 2 * MIB);

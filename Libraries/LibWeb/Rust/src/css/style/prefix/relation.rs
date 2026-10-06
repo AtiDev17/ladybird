@@ -39,11 +39,7 @@ pub(super) struct PrefixRelationProgram {
 /// The ledger relation programs are charged to, once each however many scopes share one. It has its
 /// own lock so that building a relation never holds the dispatch pools.
 static RELATION_PROGRAM_MEMORY: std::sync::LazyLock<std::sync::Mutex<super::super::memory::MemoryController>> =
-    std::sync::LazyLock::new(|| {
-        std::sync::Mutex::new(super::super::memory::MemoryController::new(
-            super::super::memory::DeviceClass::ForegroundDesktop,
-        ))
-    });
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(super::super::memory::MemoryController::new()));
 
 /// A step in dependency order, with what an update reads of it as it runs: how it is reached, its compound and its
 /// predecessor (`u32::MAX` for none). Updates run steps in this order, so they read these one after another.
@@ -323,7 +319,7 @@ impl PrefixRelation {
         }
         assert_eq!(self.nested_capacity_bytes, self.measure_nested_capacity_bytes());
         let mut scalar = PrefixStates::new();
-        let mut counters = Counters::default();
+        let counters = Counters::default();
         let mut context = if evaluation.facts_are_composite() {
             super::PrefixTransitionContext::new_composite(&mut scalar, evaluation.facts, &[])
         } else {
@@ -333,13 +329,9 @@ impl PrefixRelation {
             if !self.live[position] {
                 continue;
             }
-            let PrefixTransitionLookup::Known(answer) = scalar.match_set_for(
-                &mut context.scratch,
-                &mut context.effects,
-                evaluation,
-                node,
-                &mut counters,
-            ) else {
+            let PrefixTransitionLookup::Known(answer) =
+                scalar.match_set_for(&mut context.scratch, &mut context.effects, evaluation, node, &counters)
+            else {
                 panic!("a complete prefix relation must have a complete scalar answer");
             };
             assert_eq!(
@@ -437,7 +429,7 @@ impl PrefixRelation {
         automaton: &PrefixAutomaton,
         evaluation: &mut PrefixEvaluation<'_, '_>,
         changed: &[StyleNodeID],
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Vec<StyleNodeID> {
         let tree = evaluation.tree;
         let mut touched = changed.to_vec();
@@ -663,7 +655,7 @@ impl PrefixRelation {
         evaluation: &mut PrefixEvaluation<'_, '_>,
         old_evaluation: &mut PrefixEvaluation<'_, '_>,
         changed_nodes: &[StyleNodeID],
-        counters: &mut Counters,
+        counters: &Counters,
     ) {
         counters.bump(Counter::PrefixRelationUpdates);
         let following_geometry = self.following_geometry_changes(automaton, old_evaluation);
@@ -1177,7 +1169,7 @@ impl PrefixAutomaton {
         &self,
         evaluation: &mut PrefixEvaluation<'_, '_>,
         root: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> PrefixRelation {
         counters.bump(Counter::PrefixRelationBuilds);
         let tree = evaluation.tree;

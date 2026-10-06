@@ -44,8 +44,7 @@ static WordSegmentKind word_segment_kind(Utf16View const& segment)
 
 static bool text_node_has_rendered_text(DOM::Text const& text)
 {
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { text.document(), false };
+    Layout::ForcedReadScope read { text.document() };
     for (auto const& line : collect_visual_lines(read, text)) {
         if (line.has_fragments)
             return true;
@@ -57,8 +56,7 @@ static bool text_node_has_rendered_text(DOM::Text const& text)
 // <br> in a paragraph with text after it, and the lines between consecutive <br>s.
 static bool is_empty_line_break(DOM::Node& node)
 {
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { node.document(), false };
+    Layout::ForcedReadScope read { node.document() };
     auto* br = as_if<HTML::HTMLBRElement>(node);
     return br && br->is_editable() && br->represents_empty_line(read);
 }
@@ -66,8 +64,7 @@ static bool is_empty_line_break(DOM::Node& node)
 // A block-level element that renders no text but hosts an empty line where the caret can sit, such as `<p><br></p>`.
 static bool is_empty_line_host(DOM::Node& node)
 {
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { node.document(), false };
+    Layout::ForcedReadScope read { node.document() };
     auto* element = as_if<DOM::Element>(node);
     if (!element || !element->is_editable())
         return false;
@@ -95,8 +92,7 @@ static bool is_empty_line_host(DOM::Node& node)
 // as DOM boundaries in the parent, immediately before and after the atomic node.
 static bool is_atomic_inline_caret_host(DOM::Node& node)
 {
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { node.document(), false };
+    Layout::ForcedReadScope read { node.document() };
     if (is<HTML::HTMLBRElement>(node))
         return false;
     auto const* layout_node = node.layout_node(read);
@@ -105,8 +101,7 @@ static bool is_atomic_inline_caret_host(DOM::Node& node)
 
 static bool boundary_visual_lines_share_line(DOM::Text const& before, DOM::Text const& after)
 {
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { before.document(), false };
+    Layout::ForcedReadScope read { before.document() };
     auto before_lines = collect_visual_lines(read, before);
     auto after_lines = collect_visual_lines(read, after);
     if (before_lines.is_empty() || !before_lines.last().has_fragments || after_lines.is_empty() || !after_lines.first().has_fragments)
@@ -118,8 +113,7 @@ static bool boundary_visual_lines_share_line(DOM::Text const& before, DOM::Text 
 
 static bool boundary_visual_lines_share_inline_context(DOM::Text const& before, DOM::Text const& after)
 {
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { before.document(), false };
+    Layout::ForcedReadScope read { before.document() };
     auto before_lines = collect_visual_lines(read, before);
     auto after_lines = collect_visual_lines(read, after);
     if (before_lines.is_empty() || !before_lines.last().has_fragments || after_lines.is_empty() || !after_lines.first().has_fragments)
@@ -177,7 +171,7 @@ DOM::Node& CaretNavigator::navigation_origin(CaretLocation const& location, Sele
 
 Optional<CSSPixels> CaretNavigator::inline_coordinate(CaretLocation const& location)
 {
-    Layout::ForcedReadScope read { *m_document, true };
+    Layout::ForcedReadScope read { *m_document };
     m_document->update_layout_if_needed_for_node(location.node, DOM::UpdateLayoutReason::CursorLineNavigation);
     if (auto* text = as_if<DOM::Text>(*location.node))
         return cursor_inline_coordinate(read, *text, location.offset, location.affinity);
@@ -208,7 +202,6 @@ Optional<CaretLocation> CaretNavigator::move_to_adjacent_caret_host(CaretLocatio
     if (!editing_host)
         return {};
 
-    Layout::ForcedReadScope read { *m_document, true };
     m_document->update_layout_if_needed_for_node(*editing_host, DOM::UpdateLayoutReason::CursorLineNavigation);
 
     auto& origin = navigation_origin(location, direction);
@@ -385,7 +378,6 @@ Optional<CaretLocation> CaretNavigator::canonical_location_for_extension(CaretLo
     auto editing_host = text->editing_host();
     if (!editing_host)
         return {};
-    Layout::ForcedReadScope read { *m_document, true };
     m_document->update_layout_if_needed_for_node(*editing_host, DOM::UpdateLayoutReason::CursorLineNavigation);
     auto target = adjacent_caret_host(*text, *editing_host, direction);
     if (!target)
@@ -458,7 +450,6 @@ Optional<CaretLocation> CaretNavigator::move_by_word(CaretLocation const& initia
     // share a rendered inline context. Punctuation and atomic inline content remain observable stops. This is editing
     // behavior rather than a direct application of the Unicode segmentation algorithm.
     auto editing_host = initial_location.node->editing_host();
-    Layout::ForcedReadScope read { *m_document, true };
     m_document->update_layout_if_needed_for_node(initial_location.node, DOM::UpdateLayoutReason::CursorLineNavigation);
 
     auto location = initial_location;
@@ -547,7 +538,6 @@ Optional<CaretLocation> CaretNavigator::move_to_editing_host_boundary(CaretLocat
     if (!editing_host)
         return {};
 
-    Layout::ForcedReadScope read { *m_document, true };
     m_document->update_layout_if_needed_for_node(*editing_host, DOM::UpdateLayoutReason::CursorLineNavigation);
 
     auto target = adjacent_caret_host(*editing_host, *editing_host, SelectionDirection::Forward);
@@ -580,7 +570,7 @@ Optional<CaretLocation> CaretNavigator::move_by_page(CaretLocation const& locati
     if (!editing_host)
         return {};
 
-    Layout::ForcedReadScope read { *m_document, true };
+    Layout::ForcedReadScope read { *m_document };
     m_document->update_layout_if_needed_for_node(*editing_host, DOM::UpdateLayoutReason::CursorLineNavigation);
     auto const* editing_host_layout_node = editing_host->layout_node(read);
     if (!editing_host_layout_node || !Painting::has_committed_box(*editing_host_layout_node))
@@ -690,7 +680,7 @@ Optional<CaretLocation> CaretNavigator::move(CaretLocation const& location, Sele
     }
 
     if (granularity == SelectionGranularity::LineBoundary) {
-        Layout::ForcedReadScope read { *m_document, true };
+        Layout::ForcedReadScope read { *m_document };
         m_document->update_layout_if_needed_for_node(location.node, DOM::UpdateLayoutReason::CursorLineNavigation);
         auto edge = direction == SelectionDirection::Forward ? Painting::CaretLineEdge::End : Painting::CaretLineEdge::Start;
         auto position = m_document->caret_position_at_line_edge(read, location.node, location.offset, location.affinity, edge);
@@ -721,8 +711,7 @@ Optional<CaretLocation> CaretNavigator::move(CaretLocation const& location, Sele
     auto editing_host = line_origin.node->editing_host();
     if (!editing_host || !preferred_inline_coordinate.has_value())
         return {};
-    // The caret moves through the lines as they render, as the navigation's own read of the render state.
-    Layout::ForcedReadScope read { *m_document, true };
+    Layout::ForcedReadScope read { *m_document };
     m_document->update_layout_if_needed_for_node(line_origin.node, DOM::UpdateLayoutReason::CursorLineNavigation);
     auto line_direction = direction == SelectionDirection::Forward ? Painting::CaretLineDirection::Next : Painting::CaretLineDirection::Previous;
     auto position = m_document->caret_position_on_adjacent_line(read, line_origin.node, line_origin.offset, line_origin.affinity, line_direction, *preferred_inline_coordinate, *editing_host);

@@ -241,10 +241,10 @@ Optional<ByteString> FontLoader::try_load_font_mime_type_essence(Fetch::Infrastr
 {
     // FIXME: This could maybe use the format() provided in @font-face as well, since often the mime type is just application/octet-stream and we have to try every format
     auto mime_type = Fetch::Infrastructure::extract_mime_type(response.header_list());
-    if (!mime_type.has_value() || !mime_type->is_font()) {
+    if (!mime_type.has_value() || !is_supported_font_mimetype(mime_type->essence())) {
         mime_type = MimeSniff::Resource::sniff(bytes, MimeSniff::SniffingConfiguration { .sniffing_context = MimeSniff::SniffingContext::Font });
     }
-    if (!mime_type.has_value())
+    if (!mime_type.has_value() || !is_supported_font_mimetype(mime_type->essence()))
         return {};
     return mime_type->essence().to_byte_string();
 }
@@ -290,22 +290,16 @@ static void append_font_feature_values(StyleScope const& style_scope, Utf16FlySt
             if (!matches_family)
                 return;
 
-            auto append = [&](FontFeatureValuesRuleKind kind, FontFeatureValueType type) {
-                values.for_each_entry(kind, [&](auto key, auto values) {
-                    Vector<u32> copy;
-                    copy.append(values.data(), values.size());
-                    font_feature_values.set({ type, Utf16FlyString::from_utf16(key) }, move(copy));
-                });
-            };
-            append(FontFeatureValuesRuleKind::Annotation, FontFeatureValueType::Annotation);
-            append(FontFeatureValuesRuleKind::Ornaments, FontFeatureValueType::Ornaments);
-            append(FontFeatureValuesRuleKind::Stylistic, FontFeatureValueType::Stylistic);
-            append(FontFeatureValuesRuleKind::Swash, FontFeatureValueType::Swash);
-            append(FontFeatureValuesRuleKind::CharacterVariant, FontFeatureValueType::CharacterVariant);
-            append(FontFeatureValuesRuleKind::Styleset, FontFeatureValueType::Styleset);
             // NB: We don't include historical-forms since it can't be referenced - it seems like it's inclusion in the syntax
             //     for @font-feature-values was a mistake and isn't supported by Chrome or Firefox. See
             //     https://github.com/w3c/csswg-drafts/issues/9926#issuecomment-2017241274
+            for (auto kind : { FontFeatureValuesRuleKind::Annotation, FontFeatureValuesRuleKind::Ornaments, FontFeatureValuesRuleKind::Stylistic, FontFeatureValuesRuleKind::Swash, FontFeatureValuesRuleKind::CharacterVariant, FontFeatureValuesRuleKind::Styleset }) {
+                values.for_each_entry(kind, [&](auto key, auto values) {
+                    Vector<u32> copy;
+                    copy.append(values.data(), values.size());
+                    font_feature_values.set({ kind, Utf16FlyString::from_utf16(key) }, move(copy));
+                });
+            }
         });
     });
 }

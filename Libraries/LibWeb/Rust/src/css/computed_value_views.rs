@@ -36,8 +36,7 @@ pub(crate) fn px_calc_resolution_context(percentage_basis: CssPixels) -> calc::F
         basis_value: percentage_basis.to_double(),
         basis_unit: crate::css::style_compute::px_length_unit(),
         length_resolution_context: std::ptr::null(),
-        external_resolutions: std::ptr::null(),
-        external_resolution_count: 0,
+        element_facts: std::ptr::null(),
     }
 }
 
@@ -103,7 +102,7 @@ impl LengthPercentageRef<'_> {
             StyleValueData::Calculated { .. } => {
                 // SAFETY: The calculated style value outlives this borrowed
                 // view, and the root query takes no other state.
-                let root = unsafe { calc::rust_calc_root_from_calculated(self.calculated_pointer()) };
+                let root = unsafe { calc::calc_root_from_calculated(self.calculated_pointer()) };
                 assert!(!root.is_null());
                 // SAFETY: The root borrows the same retained calculation.
                 unsafe { calc::rust_calc_node_contains_percentage(root) }
@@ -113,8 +112,7 @@ impl LengthPercentageRef<'_> {
     }
 
     pub(crate) fn contains_anchor_function(self) -> bool {
-        // SAFETY: The calculated style value outlives this borrowed view.
-        self.is_calculated() && unsafe { calc::rust_calc_contains_anchor(self.calculated_pointer()) }
+        matches!(self.value, StyleValueData::Calculated { rust_calculation, .. } if rust_calculation.node().contains_anchor_function())
     }
 
     pub(crate) fn to_px(self, reference: CssPixels) -> CssPixels {
@@ -711,19 +709,16 @@ impl<'a> ComputedValuesView<'a> {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn empty_cells(self) -> u8 {
         self.inherited_table().empty_cells
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn border(self) -> &'a BorderValues {
         self.native_group(STYLE_GROUP_INDEX_BORDER)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn inherited_list(self) -> &'a InheritedListValues {
         self.native_group(STYLE_GROUP_INDEX_INHERITED_LIST)
     }
@@ -751,6 +746,35 @@ impl<'a> ComputedValuesView<'a> {
         self.inherited_list().list_style_position == crate::css::css_enums::list_style_position::INSIDE
     }
 
+    /// Whether the style names an image its box paints only once the host loads it: one in its background, mask, border
+    /// image or list marker, but a gradient, which paints from the style alone.
+    pub(crate) fn names_loaded_images(self) -> bool {
+        fn names_loaded_image(value: Option<&StyleValueData>) -> bool {
+            match value {
+                None
+                | Some(
+                    StyleValueData::Keyword { .. }
+                    | StyleValueData::LinearGradient { .. }
+                    | StyleValueData::ConicGradient { .. }
+                    | StyleValueData::RadialGradient { .. },
+                ) => false,
+                Some(StyleValueData::ValueList { values, .. }) => values
+                    .as_slice()
+                    .iter()
+                    .any(|value| names_loaded_image(value.optional_data())),
+                Some(_) => true,
+            }
+        }
+        [
+            &self.background().background_image,
+            &self.mask().mask_image,
+            &self.border().border_image_source,
+            &self.inherited_list().list_style_image,
+        ]
+        .into_iter()
+        .any(|image| names_loaded_image(image.data()))
+    }
+
     /// Whether `list-style-image` names an image, which a list marker then shows instead of its
     /// marker string.
     pub(crate) fn list_style_image_is_set(self) -> bool {
@@ -767,19 +791,16 @@ impl<'a> ComputedValuesView<'a> {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn inherited_ui(self) -> &'a InheritedUIValues {
         self.native_group(STYLE_GROUP_INDEX_INHERITED_UI)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn inherited_svg(self) -> &'a InheritedSVGValues {
         self.native_group(STYLE_GROUP_INDEX_INHERITED_SVG)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn inherited_text(self) -> &'a InheritedTextValues {
         self.native_group(STYLE_GROUP_INDEX_INHERITED_TEXT)
     }
@@ -790,31 +811,26 @@ impl<'a> ComputedValuesView<'a> {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn effects(self) -> &'a EffectsValues {
         self.native_group(STYLE_GROUP_INDEX_EFFECTS)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn mask(self) -> &'a MaskValues {
         self.native_group(STYLE_GROUP_INDEX_MASK)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn text_reset(self) -> &'a TextResetValues {
         self.native_group(STYLE_GROUP_INDEX_TEXT_RESET)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn transform(self) -> &'a TransformValues {
         self.native_group(STYLE_GROUP_INDEX_TRANSFORM)
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn background(self) -> &'a BackgroundValues {
         self.native_group(STYLE_GROUP_INDEX_BACKGROUND)
     }

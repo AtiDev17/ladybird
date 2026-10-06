@@ -15,7 +15,7 @@ use super::layout_node_arena::{ShellFactory, ShellStyleChangedHost};
 use super::node_data::{NodeKind, NodeSlotId};
 use super::trace::DescribeNode;
 use super::update_layout::FfiLayoutUpdateHostCallbacks;
-use crate::css::style::fast_hash::FastMap as HashMap;
+use crate::css::style::fast_hash::{FastMap as HashMap, FastSet as HashSet};
 use crate::painting::host::FfiGeometryHostCallbacks;
 use crate::painting::paintable_rows::ChromeStateCallback;
 use std::cell::Cell;
@@ -54,9 +54,25 @@ pub(crate) struct HostTables {
     pub(crate) shells: RefCell<HashMap<NodeSlotId, NonNull<c_void>>>,
     /// Whether the document runs a layout update, which it does one at a time.
     pub(crate) update_layout_running: Cell<bool>,
+    /// Whether the host gave the rows search text highlights that it has not cleared since.
+    pub(crate) shows_search_text: Cell<bool>,
+    /// The rows the host gave layer image paint facts, which the arena drops with the row.
+    pub(crate) rows_with_layer_image_paint_facts: RefCell<HashSet<NodeSlotId>>,
+    /// The image resources the tree builds of the rounds the host was paid for owe the rows they stamped, which the
+    /// host attaches once its layout update is over.
+    pub(super) owed_images: RefCell<Vec<super::update_layout::OwedImage>>,
 }
 
 impl HostTables {
+    pub(super) fn clear_callbacks(&self) {
+        self.layout_host.set(None);
+        self.layout_update_host.set(None);
+        self.shell_factory.set(None);
+        self.shell_style_changed_host.set(None);
+        self.chrome_state_callback.set(None);
+        self.geometry_host.set(None);
+    }
+
     /// The layout node of the row `facts` describes, made by the shell factory the first time
     /// something asks for it.
     pub(crate) fn shell_of(&self, facts: ShellFacts) -> *mut c_void {
@@ -66,6 +82,10 @@ impl HostTables {
         let Some((context, factory)) = self.shell_factory.get() else {
             return std::ptr::null_mut();
         };
+        assert!(
+            !crate::stage_thread::style_layout_thread().is_current(),
+            "a layout node is made on the main thread, whose heap it is allocated from"
+        );
         // SAFETY: Registration and unregistration keep the factory context live. The factory's
         // layout node attaches itself to the table, which no borrow is held of across the call.
         unsafe { factory(context, facts.id, facts.kind) };
@@ -121,15 +141,11 @@ impl HostTables {
     }
 }
 
-/// The arena of a document's render state, first, so that a pointer to the state is also one to the arena, and the
-/// layout stage's scratch beside it.
-#[repr(C)]
+/// The arena of a document's render state, and the layout stage's scratch beside it.
 pub(crate) struct ArenaHandle {
     arena: LayoutNodeArena,
     layout_scratch: super::run_records::LayoutScratch,
 }
-
-const _: () = assert!(std::mem::offset_of!(ArenaHandle, arena) == 0);
 
 impl ArenaHandle {
     pub(crate) fn new() -> Self {
@@ -223,7 +239,7 @@ mod tests {
         host_tables.attach_shell(freed, object(8));
 
         // A walk frees the row and stamps another in its slot before its host work is applied.
-        HostCalls(&work).free_subtree(&raw mut arena, freed);
+        HostCalls(&work).free_subtree(&mut arena, freed);
         let reused = arena.allocate_for_test().slot;
         assert_eq!(reused.slot_index(), freed.slot_index());
         assert!(host_tables.shells.borrow().get(&reused).is_none());
@@ -290,7 +306,7 @@ mod tests {
 
         let host_calls = HostCalls(&work);
         super::super::layout_node_arena::prepare_subtree_for_detach(host_calls, &arena, freed);
-        host_calls.free_subtree(&raw mut arena, freed);
+        host_calls.free_subtree(&mut arena, freed);
         // The walk owes the host the observers it let go of, so they stay until the walk is over.
         assert_eq!(host_tables.image_observers(freed), object(8));
 

@@ -15,7 +15,6 @@
 #include <AK/Utf16String.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/CSS/ComputedValues.h>
-#include <LibWeb/CSS/CounterStyle.h>
 #include <LibWeb/CSS/CountersSet.h>
 #include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/PseudoElement.h>
@@ -188,7 +187,6 @@ static CSS::PseudoElement css_pseudo_element(RustFFI::FfiPseudoElement pseudo_el
         return CSS::PseudoElement::Marker;
     case RustFFI::FfiPseudoElement::Backdrop:
         return CSS::PseudoElement::Backdrop;
-    case RustFFI::FfiPseudoElement::Other:
     case RustFFI::FfiPseudoElement::None:
         VERIFY_NOT_REACHED();
     }

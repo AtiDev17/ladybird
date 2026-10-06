@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixels};
+use crate::css::css_pixels::{CssPixelPoint, CssPixelRect};
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::commands::UniqueNodeId;
 use crate::painting::ffi::FfiChromeMetrics;
@@ -19,12 +19,9 @@ use libgfx_rust::{Color, IntRect, IntSize};
 /// values from here and a new one is part of that check automatically.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct UncapturedContentInputs {
-    pub viewport_wheel_overflow_x: u8,
-    pub viewport_wheel_overflow_y: u8,
     pub root_background_source: RootBackgroundSource,
     // Scroll commands use a scrollport at the origin. Its position is compositor state.
     pub device_viewport_size: IntSize,
-    pub is_recording_async_scrolling_metadata: bool,
     pub document_id: UniqueNodeId,
     pub has_blocking_wheel_event_region_covering_viewport: bool,
     pub chrome_metrics: FfiChromeMetrics,
@@ -104,8 +101,6 @@ pub(crate) struct FocusedTextControlSelection {
 pub(crate) struct FocusedAreaOutline {
     pub image: NodeSlotId,
     pub path_bytes: Box<[u8]>,
-    pub color: Color,
-    pub width: CssPixels,
 }
 
 #[derive(Clone)]

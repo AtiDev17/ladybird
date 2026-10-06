@@ -1435,6 +1435,31 @@ void ContextState::did_deliver_rendering_opportunity(MonotonicTime frame_time)
     m_rendering_opportunity_pacer.did_deliver(frame_time);
 }
 
+bool ContextState::request_clock_tick(double maximum_frames_per_second)
+{
+    m_clock_tick_pacer.set_maximum_frames_per_second(maximum_frames_per_second);
+    return !exchange(m_clock_tick_requested, true);
+}
+
+void ContextState::did_deliver_clock_tick(MonotonicTime frame_time)
+{
+    VERIFY(m_clock_tick_requested);
+    m_clock_tick_requested = false;
+    m_clock_tick_pacer.did_deliver(frame_time);
+}
+
+Vector<Web::CompositorScrollOffset> ContextState::scroll_offsets() const
+{
+    auto scroll_nodes = m_async_scroll_tree.scroll_nodes();
+    Vector<Web::CompositorScrollOffset> scroll_offsets;
+    scroll_offsets.ensure_capacity(scroll_nodes.size());
+    for (auto const& node : scroll_nodes) {
+        if (auto offset = m_async_scroll_tree.css_scroll_offset_for_node(node.node_id, m_scroll_state_snapshot); offset.has_value())
+            scroll_offsets.unchecked_append({ node.stable_node_id, *offset });
+    }
+    return scroll_offsets;
+}
+
 Optional<Gfx::IntRect> ContextState::pending_present_frame_viewport_rect() const
 {
     if (!m_pending_present_frame.has_value())

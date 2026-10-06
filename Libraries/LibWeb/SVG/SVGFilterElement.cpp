@@ -75,7 +75,7 @@ Layout::RustFFI::FfiUtf16View view_of(Utf16View view)
 }
 
 // https://drafts.fxtf.org/filter-effects-1/#ColorInterpolationFiltersProperty
-void SVGFilterElement::push_primitives(void* sink)
+void SVGFilterElement::push_primitives(void* sink, Gfx::IntSize dest_size)
 {
     using PrimitiveKind = Layout::RustFFI::FfiSvgFilterPrimitiveKind;
 
@@ -175,17 +175,13 @@ void SVGFilterElement::push_primitives(void* sink)
             if (!image_data)
                 return IterationDecision::Continue;
 
-            // FIXME: Should we use the dest rect as the size here?
-            image_frame = image_data->default_frame({});
+            // FIXME: Use the filter primitive subregion's size once we support primitive subregions.
+            image_frame = image_data->default_frame(dest_size);
             if (!image_frame.has_value())
                 return IterationDecision::Continue;
 
-            auto src_rect = image_primitive->content_rect();
-            if (!src_rect.has_value())
-                return IterationDecision::Continue;
-
             values.kind = PrimitiveKind::Image;
-            values.image_src_rect = *src_rect;
+            values.image_src_rect = { 0, 0, image_frame->width(), image_frame->height() };
             primitive.image_frame = &image_frame.value();
             set_result(*image_primitive);
         } else if (auto* merge_primitive = as_if<SVGFEMergeElement>(node)) {

@@ -73,8 +73,7 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(Utf16View font)
         // NB: Once pending style work is settled, the canvas's installed style is current, unless it is below
         //     display:none, where style updates leave it stale. Only then is its style computed again.
         auto& document = canvas_element.document();
-        // The canvas's style is the setter's own read of the render state.
-        Layout::ForcedReadScope read { document, true };
+        Layout::ForcedReadScope read { document };
         document.update_style_for_element(DOM::AbstractElement { canvas_element }, DOM::Document::StyleUpdateMode::OnlyIfNeeded);
         auto style_record = canvas_element.style_record_identity();
         if (!style_record || has_flag(document.style_computer().style_engine().style_record_dependency_flags(read, style_record), CSS::StyleRecordDependencyFlag::InDisplayNoneSubtree))
@@ -138,10 +137,9 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(Utf16View font)
             property_initial_value(CSS::PropertyID::FontVariationSettings), // font-variation-settings
         });
 
-    CSS::FontFeatureData font_feature_data;
-
-    if (keyword_to_font_variant_caps(computed_font_variant->as_shorthand().longhand(CSS::PropertyID::FontVariantCaps)->to_keyword()) == CSS::FontVariantCaps::SmallCaps)
-        font_feature_data.font_variant_caps = CSS::FontVariantCaps::SmallCaps;
+    CSS::FontResolutionFeatureValues feature_values;
+    if (auto caps = computed_font_variant->as_shorthand().longhand(CSS::PropertyID::FontVariantCaps); caps->to_keyword() == CSS::Keyword::SmallCaps)
+        feature_values[to_underlying(CSS::FontResolutionFeatureInput::FontVariantCaps)] = caps;
 
     // https://drafts.csswg.org/css-font-loading/#font-source
     auto& font_computer = canvas_element.canvas_font_computer();
@@ -155,8 +153,7 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(Utf16View font)
             .font_slope = computed_font_style->as_font_style().to_font_slope(),
             .font_weight = computed_font_weight->as_number().number(),
             .font_width = computed_font_width->as_percentage().percentage(),
-            .font_variation_settings = {},
-            .font_feature_data = font_feature_data,
+            .feature_values = move(feature_values),
             .font_feature_values_scope = {},
         });
 }

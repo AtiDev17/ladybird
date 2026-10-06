@@ -82,12 +82,10 @@ pub fn origin_importance_rank(origin: CascadeOrigin, important: bool) -> u8 {
         (CascadeOrigin::User, false) => 1,
         (CascadeOrigin::AuthorPresentationalHint, false) => 2,
         (CascadeOrigin::Author, false) => 3,
-        (CascadeOrigin::Animation, _) => 4,
         (CascadeOrigin::Author, true) => 5,
         (CascadeOrigin::AuthorPresentationalHint, true) => 6,
         (CascadeOrigin::User, true) => 7,
         (CascadeOrigin::UserAgent, true) => 8,
-        (CascadeOrigin::Transition, _) => 9,
     }
 }
 
@@ -164,7 +162,7 @@ impl CascadePriority {
         }
     }
 
-    #[cfg(any(test, feature = "style-recording"))]
+    #[cfg(test)]
     pub(super) fn exact_output_placeholder() -> Self {
         Self::new(PriorityInputs {
             origin: CascadeOrigin::Author,
@@ -318,8 +316,6 @@ impl CascadeStratum {
             CascadeOrigin::UserAgent => 0,
             CascadeOrigin::User => 1,
             CascadeOrigin::Author | CascadeOrigin::AuthorPresentationalHint => 2,
-            CascadeOrigin::Animation => 3,
-            CascadeOrigin::Transition => 4,
         };
         Self {
             origin: origin as u8,
@@ -519,7 +515,7 @@ where
 
 define_id! {
     /// Identity of an interned winner group.
-    pub struct WinnerGroupID(pub);
+    interned pub struct WinnerGroupID(pub);
 }
 
 define_id! {
@@ -529,43 +525,19 @@ define_id! {
     default pub struct CustomDeclarationListID(pub);
 }
 
-impl InternIdentity for WinnerGroupID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
 define_id! {
     /// Identity of provenance parallel to one interned winner group.
-    struct WinnerProvenanceGroupID(pub);
-}
-
-impl InternIdentity for WinnerProvenanceGroupID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
+    interned struct WinnerProvenanceGroupID(pub);
 }
 
 define_id! {
     /// Identity of one exact priority retained by winner provenance.
-    struct CascadePriorityID(pub);
-}
-
-impl InternIdentity for CascadePriorityID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
+    interned struct CascadePriorityID(pub);
 }
 
 define_id! {
     /// Identity of one factorized sparse cascade state.
-    pub struct CascadeStateID(pub);
-}
-
-impl InternIdentity for CascadeStateID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
+    interned pub struct CascadeStateID(pub);
 }
 
 /// Whether a winner-group lookup requires topology-dependent priorities to still be current.
@@ -2739,11 +2711,10 @@ impl WinnerGroups {
 
 #[cfg(test)]
 mod tests {
-    use super::super::memory::DeviceClass;
     use super::*;
 
     fn memory() -> MemoryController {
-        MemoryController::new(DeviceClass::ForegroundDesktop)
+        MemoryController::new()
     }
 
     fn inputs(origin: CascadeOrigin, important: bool) -> PriorityInputs {
@@ -2847,22 +2818,18 @@ mod tests {
         let normal_user = CascadePriority::new(inputs(CascadeOrigin::User, false));
         let hint = CascadePriority::new(inputs(CascadeOrigin::AuthorPresentationalHint, false));
         let normal_author = CascadePriority::new(inputs(CascadeOrigin::Author, false));
-        let animation = CascadePriority::new(inputs(CascadeOrigin::Animation, false));
         let important_author = CascadePriority::new(inputs(CascadeOrigin::Author, true));
         let important_user = CascadePriority::new(inputs(CascadeOrigin::User, true));
         let important_ua = CascadePriority::new(inputs(CascadeOrigin::UserAgent, true));
-        let transition = CascadePriority::new(inputs(CascadeOrigin::Transition, false));
 
         let ladder = [
             normal_ua,
             normal_user,
             hint,
             normal_author,
-            animation,
             important_author,
             important_user,
             important_ua,
-            transition,
         ];
         assert!(ladder.windows(2).all(|pair| pair[0] < pair[1]));
 
@@ -3630,7 +3597,7 @@ mod tests {
 
     #[test]
     fn a_cascade_state_column_is_evictable_without_semantic_effect() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut groups = WinnerGroups::new();
         let node = StyleNodeID::element(1);
         let current = WinnerGroupKey::current(node, ProgramVersion(1));

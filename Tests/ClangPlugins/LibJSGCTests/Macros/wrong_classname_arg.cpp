@@ -7,7 +7,6 @@
 // RUN: %clang++ -Xclang -verify %plugin_opts% -c %s -o %t 2>&1
 
 #include <LibJS/Runtime/PrototypeObject.h>
-#include <LibWeb/Bindings/PlatformObject.h>
 #include <LibWeb/Bindings/Wrappable.h>
 
 // An incorrect first argument for JS_PROTOTYPE_OBJECT is a compile error, so that is not tested
@@ -17,19 +16,16 @@ class TestCellClass : JS::Cell {
     GC_CELL(bad, JS::Cell);
 };
 
+// expected-error@+1 {{TestObjectClass derives from the engine type JS::Object, which only LibJS may subclass; use a host class instead}}
 class TestObjectClass : JS::Object {
     // expected-error@+1 {{Expected first argument of JS_OBJECT macro invocation to be TestObjectClass}}
     JS_OBJECT(bad, JS::Object);
 };
 
+// expected-error@+1 {{TestEnvironmentClass derives from the engine type JS::Environment, which only LibJS may subclass; use a host class instead}}
 class TestEnvironmentClass : JS::Environment {
     // expected-error@+1 {{Expected first argument of JS_ENVIRONMENT macro invocation to be TestEnvironmentClass}}
     JS_ENVIRONMENT(bad, JS::Environment);
-};
-
-class TestPlatformClass : Web::Bindings::PlatformObject {
-    // expected-error@+1 {{Expected first argument of WEB_PLATFORM_OBJECT macro invocation to be TestPlatformClass}}
-    WEB_NON_IDL_PLATFORM_OBJECT(bad, Web::Bindings::PlatformObject);
 };
 
 class TestWrappableClass : Web::Bindings::Wrappable {

@@ -34,6 +34,7 @@
 #include <LibJS/Runtime/ExecutionContext.h>
 #include <LibJS/Runtime/InterpreterStack.h>
 #include <LibJS/Runtime/Promise.h>
+#include <LibJS/Runtime/PromiseJob.h>
 #include <LibJS/Runtime/Value.h>
 
 namespace JS {
@@ -466,7 +467,7 @@ public:
         run_queued_promise_jobs_impl();
     }
 
-    void enqueue_promise_job(GC::Ref<GC::Function<ThrowCompletionOr<Value>()>> job, GC::Ptr<Realm>);
+    void enqueue_promise_job(PromiseJob, GC::Ptr<Realm>);
 
     void run_queued_finalization_registry_cleanup_jobs();
     void enqueue_finalization_registry_cleanup_job(FinalizationRegistry&);
@@ -488,7 +489,7 @@ public:
     ScriptOrModule get_active_script_or_module() const;
 
     // 16.2.1.10 HostLoadImportedModule ( referrer, moduleRequest, hostDefined, payload ), https://tc39.es/ecma262/#sec-HostLoadImportedModule
-    Function<void(ImportedModuleReferrer, ModuleRequest const&, GC::Ptr<GraphLoadingState::HostDefined>, ImportedModulePayload)> host_load_imported_module;
+    Function<void(ImportedModuleReferrer, ModuleRequest const&, GC::Ptr<GC::Cell> load_state, ImportedModulePayload)> host_load_imported_module;
 
     Function<HashMap<PropertyKey, Value>(SourceTextModule&)> host_get_import_meta_properties;
     Function<void(Object*, SourceTextModule const&)> host_finalize_import_meta;
@@ -500,7 +501,7 @@ public:
     Function<void(Promise&, Promise::RejectionOperation)> host_promise_rejection_tracker;
     Function<ThrowCompletionOr<Value>(JobCallback&, Value, ReadonlySpan<Value>)> host_call_job_callback;
     Function<void(FinalizationRegistry&)> host_enqueue_finalization_registry_cleanup_job;
-    Function<void(GC::Ref<GC::Function<ThrowCompletionOr<Value>()>>, GC::Ptr<Realm>)> host_enqueue_promise_job;
+    Function<void(PromiseJob, GC::Ptr<Realm>)> host_enqueue_promise_job;
     Function<GC::Ref<JobCallback>(FunctionObject&)> host_make_job_callback;
     Function<GC::Ptr<PrimitiveString>(Object const&)> host_get_code_for_eval;
     Function<ThrowCompletionOr<void>(Realm&, ReadonlySpan<Utf16String>, Utf16View, Utf16View, CompilationType, ReadonlySpan<Value>, Value)> host_ensure_can_compile_strings;
@@ -578,7 +579,7 @@ private:
         size_t type_error_realm_override_depth { 0 };
     };
 
-    void load_imported_module(ImportedModuleReferrer, ModuleRequest const&, GC::Ptr<GraphLoadingState::HostDefined>, ImportedModulePayload);
+    void load_imported_module(ImportedModuleReferrer, ModuleRequest const&, GC::Ptr<GC::Cell> load_state, ImportedModulePayload);
     ThrowCompletionOr<void> link_and_eval_module(CyclicModule&);
     ThrowCompletionOr<void> link_and_eval_module(SourceTextModule&);
 
@@ -628,7 +629,7 @@ private:
     // GlobalSymbolRegistry, https://tc39.es/ecma262/#table-globalsymbolregistry-record-fields
     HashMap<Utf16String, GC::Ref<Symbol>> m_global_symbol_registry;
 
-    Vector<GC::Ref<GC::Function<ThrowCompletionOr<Value>()>>> m_promise_jobs;
+    Vector<PromiseJob> m_promise_jobs;
 
     Vector<GC::Ref<FinalizationRegistry>> m_finalization_registry_cleanup_jobs;
 

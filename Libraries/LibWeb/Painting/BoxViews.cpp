@@ -6,10 +6,8 @@
 
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
-#include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
-#include <LibWeb/DOM/InvalidationJournal.h>
 #include <LibWeb/DOM/Position.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
@@ -31,7 +29,6 @@
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/SVG/SVGFilterElement.h>
-#include <LibWebCommon/CSS/SystemColor.h>
 
 namespace Web::Painting {
 
@@ -45,14 +42,6 @@ void set_paint_viewport_scrollbars(bool enabled)
 bool should_paint_viewport_scrollbars()
 {
     return g_paint_viewport_scrollbars;
-}
-
-static bool body_background_is_propagated_to_root(Layout::BegunRead const& read, Layout::NodeWithStyle const& layout_node)
-{
-    if (!layout_node.is_body())
-        return false;
-    auto const* html_element = layout_node.document().html_element();
-    return html_element && html_element->should_use_body_background_properties(read);
 }
 
 GC::Ptr<SVG::SVGFilterElement> resolve_svg_filter_reference(CSS::ComputedValuesFFI::ComputedStyleValueHandle const& url_value, Layout::NodeWithStyle const& layout_node)
@@ -245,7 +234,7 @@ bool is_paintable_with_lines(Layout::Node const& node)
     }
 }
 
-bool is_inline_paintable(Layout::Node const& node)
+static bool is_inline_paintable(Layout::Node const& node)
 {
     return has_committed_box(node) && node.is_fragmented_inline();
 }
@@ -273,7 +262,7 @@ Compositing::ContextRef accumulated_visual_context_for_descendants(Layout::Node 
     return row.has_value() ? row->accumulated_visual_context_for_descendants : Compositing::ContextRef {};
 }
 
-Compositing::SpatialNodeIndex enclosing_scroll_node_index(Layout::Node const& node)
+static Compositing::SpatialNodeIndex enclosing_scroll_node_index(Layout::Node const& node)
 {
     auto row = committed_row(node);
     return row.has_value() ? row->enclosing_scroll_node_index : Compositing::VISUAL_VIEWPORT_NODE_INDEX;
@@ -589,9 +578,6 @@ Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(Layout::Begu
     auto area_computed_values = area_element->computed_style();
     if (!area_computed_values || area_computed_values->outline_style() != CSS::OutlineStyle::Auto)
         return outline;
-    auto outline_data = Painting::outline_data(*layout_node, *area_computed_values);
-    if (!outline_data.has_value())
-        return outline;
     auto path = area_element->shape_path(absolute_rect(*layout_node).size());
     if (!path.has_value())
         return outline;
@@ -599,43 +585,7 @@ Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(Layout::Begu
     outline.image = committed_row_slot(*layout_node);
     outline.path_bytes = path_bytes.data();
     outline.path_byte_count = path_bytes.size();
-    outline.color = outline_data->color;
-    outline.width = outline_data->width;
     return outline;
-}
-
-static Optional<CSS::BorderData> border_data_for_outline(Layout::Node const& layout_node, Color outline_color, CSS::OutlineStyle outline_style, CSSPixels outline_width)
-{
-    CSS::LineStyle line_style;
-    if (outline_style == CSS::OutlineStyle::Auto) {
-        line_style = CSS::LineStyle::Solid;
-        outline_color = CSS::KeywordStyleValue::create(CSS::Keyword::Accentcolor)->to_color(CSS::ColorResolutionContext::for_layout_node_with_style(*static_cast<Layout::NodeWithStyle const*>(&layout_node))).value();
-        outline_width = 2;
-    } else {
-        line_style = CSS::keyword_to_line_style(CSS::to_keyword(outline_style)).value_or(CSS::LineStyle::None);
-    }
-
-    if (outline_color.alpha() == 0 || line_style == CSS::LineStyle::None || outline_width == 0)
-        return {};
-
-    return CSS::BorderData {
-        .color = outline_color,
-        .line_style = line_style,
-        .width = outline_width,
-    };
-}
-
-Optional<CSS::BorderData> outline_data(Layout::Node const& node, CSS::ComputedValues const& computed_values)
-{
-    if (!has_committed_box(node))
-        return {};
-
-    // The `auto` outline is the UA focus ring; like native controls, it is only shown while the window has focus.
-    auto navigable = node.document().navigable();
-    if (computed_values.outline_style() == CSS::OutlineStyle::Auto && (!navigable || !navigable->is_focused()))
-        return {};
-
-    return border_data_for_outline(node, computed_values.outline_color(), computed_values.outline_style(), computed_values.outline_width());
 }
 
 CSSPixelRect transform_reference_box(Layout::Node const& node)
@@ -658,7 +608,7 @@ CSSPixelRect transform_rect_to_viewport(Layout::Node const& node, CSSPixelRect c
     return (result * (1.f / pixel_ratio)).to_type<CSSPixels>();
 }
 
-Optional<CSSPixelPoint> transform_point_to_local(Layout::Node const& node, CSSPixelPoint position)
+static Optional<CSSPixelPoint> transform_point_to_local(Layout::Node const& node, CSSPixelPoint position)
 {
     auto row = committed_row(node);
     if (!row.has_value())
@@ -736,7 +686,7 @@ DOM::NodeIdentity node_identity_of(Layout::RustFFI::FfiNodeIdentity identity)
 void push_highlight_pseudo_styles(DOM::Element const& element)
 {
     if (auto* arena = const_cast<DOM::Document&>(element.document()).layout_node_arena_if_created())
-        Layout::RustFFI::render_state_sync_highlight_pseudo_styles(arena->host(), element.style_node_id().value(), element.style_record_identity(CSS::PseudoElement::Selection).value(), element.style_record_identity(CSS::PseudoElement::SearchText).value());
+        Layout::RustFFI::render_state_sync_highlight_pseudo_styles(arena->host(), element.style_node_id().value(), element.style_record_identity(CSS::PseudoElement::Selection).value(), element.style_record_identity(CSS::PseudoElement::SearchText).value(), element.style_record_identity(CSS::PseudoElement::SearchTextCurrent).value());
 }
 
 class BoxViewRepaintAccess {
@@ -747,91 +697,52 @@ public:
     }
 };
 
-DOM::NodeIdentity journal_identity_of(Layout::Node const& node)
+void mark_box(Layout::Node const& node, Layout::RustFFI::FfiBoxMarks marks)
 {
-    auto identity = node.dom_node_identity();
-    if (!identity.binds(node))
-        return {};
-    return identity;
+    Layout::RustFFI::render_state_mark_row_box(node.document_host(), Layout::Node::slot_id(&node), marks);
+    BoxViewRepaintAccess::set_document_needs_repaint(const_cast<DOM::Document&>(node.document()), display_list_invalidation_of(marks));
+}
+
+Layout::RustFFI::FfiBoxMarks repaint_marks(InvalidateDisplayList should_invalidate_display_list)
+{
+    Layout::RustFFI::FfiBoxMarks marks {};
+    marks.repaint = should_invalidate_display_list != InvalidateDisplayList::No;
+    marks.repaint_hit_testing = should_invalidate_display_list == InvalidateDisplayList::PaintCommandsAndHitTestList;
+    return marks;
+}
+
+InvalidateDisplayList display_list_invalidation_of(Layout::RustFFI::FfiBoxMarks marks)
+{
+    if (marks.repaint_hit_testing || marks.repaint_subtree || marks.has_dom_paint_facts)
+        return InvalidateDisplayList::PaintCommandsAndHitTestList;
+    return marks.repaint ? InvalidateDisplayList::PaintCommands : InvalidateDisplayList::No;
 }
 
 void set_needs_repaint(Layout::Node const& node, InvalidateDisplayList should_invalidate_display_list)
 {
-    if (!has_committed_box(node))
-        return;
-    if (auto identity = journal_identity_of(node))
-        const_cast<DOM::Document&>(node.document()).invalidation_journal().note_needs_repaint(identity, should_invalidate_display_list);
-    else
-        apply_repaint_damage(node, should_invalidate_display_list);
-}
-
-void apply_repaint_damage(Layout::Node const& node, InvalidateDisplayList should_invalidate_display_list)
-{
-    if (!has_committed_box(node))
-        return;
-    auto const& read = node.held_read();
-
-    auto& document = const_cast<DOM::Document&>(node.document());
-    if (should_invalidate_display_list != InvalidateDisplayList::No) {
-        Layout::RustFFI::render_state_repaint(node.document_host(), committed_row_slot(node), should_invalidate_display_list == InvalidateDisplayList::PaintCommandsAndHitTestList);
-
-        // The root element paints the body's propagated background, so a body repaint must also refresh the
-        // root's cached background. Changes to the propagation source are handled during paint preparation.
-        if (body_background_is_propagated_to_root(read, as<Layout::NodeWithStyle>(node))) {
-            if (auto const* document_element = document.document_element()) {
-                if (auto const* document_element_layout_node = document_element->unsafe_layout_node(read))
-                    apply_paint_cache_invalidation(*document_element_layout_node, PaintCacheInvalidation::PaintAndHitTest);
-            }
-        }
-    }
-    BoxViewRepaintAccess::set_document_needs_repaint(document, should_invalidate_display_list);
-}
-
-void request_document_repaint(Layout::Node const& node, InvalidateDisplayList should_invalidate_display_list)
-{
     if (has_committed_box(node))
-        BoxViewRepaintAccess::set_document_needs_repaint(const_cast<DOM::Document&>(node.document()), should_invalidate_display_list);
+        mark_box(node, repaint_marks(should_invalidate_display_list));
 }
 
-void apply_text_repaint_damage(Layout::TextNode const& node, InvalidateDisplayList should_invalidate_display_list)
+void request_document_repaint(DOM::Document const& document, InvalidateDisplayList should_invalidate_display_list)
 {
-    if (auto* containing_block = node.containing_block())
-        apply_repaint_damage(*containing_block, should_invalidate_display_list);
-
-    if (should_invalidate_display_list != InvalidateDisplayList::No)
-        Layout::RustFFI::render_state_invalidate_nearest_self_painting_inline_paint_cache(node.document_host(), Layout::Node::slot_id(&node));
+    BoxViewRepaintAccess::set_document_needs_repaint(const_cast<DOM::Document&>(document), should_invalidate_display_list);
 }
 
 void set_needs_repaint_in_subtree(Layout::Node const& node)
 {
     if (!has_committed_box(node))
         return;
-    if (auto identity = journal_identity_of(node)) {
-        const_cast<DOM::Document&>(node.document()).invalidation_journal().note_needs_repaint_in_subtree(identity);
-        return;
-    }
-    apply_subtree_repaint_damage(node);
-    apply_repaint_damage(node, InvalidateDisplayList::PaintCommandsAndHitTestList);
+    Layout::RustFFI::FfiBoxMarks marks {};
+    marks.repaint_subtree = true;
+    mark_box(node, marks);
 }
 
-void apply_subtree_repaint_damage(Layout::Node const& node)
+static void invalidate_propagated_text_decoration_caches(Layout::Node const& node)
 {
-    if (!has_committed_box(node))
-        return;
-    Layout::RustFFI::render_state_repaint_subtree(node.document_host(), committed_row_slot(node));
-}
-
-void invalidate_propagated_text_decoration_caches(Layout::Node const& node)
-{
-    if (auto identity = journal_identity_of(node))
-        const_cast<DOM::Document&>(node.document()).invalidation_journal().note_propagated_text_decoration_caches_invalidation(identity);
-    else
-        apply_paint_cache_invalidation(node, PaintCacheInvalidation::PropagatedTextDecorations);
-}
-
-void apply_paint_cache_invalidation(Layout::Node const& node, PaintCacheInvalidation invalidation)
-{
-    Layout::RustFFI::render_state_invalidate_paint_cache(node.document_host(), committed_row_slot(node), invalidation == PaintCacheInvalidation::PropagatedTextDecorations);
+    Layout::RustFFI::FfiBoxMarks marks {};
+    marks.propagated_text_decorations = true;
+    mark_box(node, marks);
 }
 
 void repaint_after_style_change(Layout::Node const& node, CSS::RequiredInvalidationAfterStyleChange const& invalidation)

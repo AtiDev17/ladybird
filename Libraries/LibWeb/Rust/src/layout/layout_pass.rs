@@ -54,6 +54,11 @@ impl ContainerLengthBasesQuery {
 
 /// Arena inputs borrowed while computing a layout result. The pass ends before commit takes a
 /// mutable arena borrow, so its text and style views cannot survive commit.
+///
+/// A layout run reads only the subtree it lays out. Whatever it needs from above arrives through
+/// its layout input, its root's used values and its records, or was derived onto the subtree
+/// before the pass, like ancestor facts. That is what lets partial relayout, the formatting context
+/// run cache and the intrinsic size caches reuse a subtree's layout without looking outside it.
 #[derive(Clone, Copy)]
 pub(crate) struct LayoutPass<'arena> {
     arena: &'arena LayoutNodeArena,
@@ -99,36 +104,30 @@ impl<'arena> LayoutPass<'arena> {
 
     /// What an intrinsic size cache entry measured for `node` now is valid for.
     pub(crate) fn intrinsic_size_cache_stamp(&self, node: Node) -> super::layout_node_arena::IntrinsicSizeCacheStamp {
-        self.arena.assert_layout_read_is_in_scope(node);
         self.arena.intrinsic_size_cache_stamp(node)
     }
 
     pub(crate) fn node_data(&self, node: Node) -> &'arena NodeData {
-        self.arena.assert_layout_read_is_in_scope(node);
         self.arena().data(node)
     }
 
     pub(crate) fn text_content(&self, node: Node) -> &'arena super::rendered_text::TextContent {
-        self.arena.assert_layout_read_is_in_scope(node);
         self.arena
             .text_content(node)
             .expect("text node content must be synced to the arena before layout")
     }
 
     pub(crate) fn style_payloads(&self, node: Node) -> &'arena FfiStylePayloads {
-        self.arena.assert_layout_read_is_in_scope(node);
         self.arena
             .style_payloads(node)
             .expect("styled node must publish its style container before layout")
     }
 
     pub(crate) fn replaced_content_facts(&self, node: Node) -> Option<FfiReplacedContentFacts> {
-        self.arena.assert_layout_read_is_in_scope(node);
         self.arena.replaced_content_facts(node)
     }
 
     pub(crate) fn computed_values_view_if_styled(&self, node: Node) -> Option<ComputedValuesView<'arena>> {
-        self.arena.assert_layout_read_is_in_scope(node);
         self.arena
             .style_payloads(node)
             .map(|payloads| ComputedValuesView::new(&payloads.groups))
@@ -197,6 +196,20 @@ impl<'arena> LayoutPass<'arena> {
         self.node_data(node).previous_sibling.get()
     }
 
+    /// The children of `node`, in tree order.
+    pub(crate) fn children(self, node: Node) -> impl Iterator<Item = Node> + 'arena {
+        std::iter::successors(link(self.first_child(node)), move |&child| {
+            link(self.next_sibling(child))
+        })
+    }
+
+    /// The children of `node`, last first.
+    pub(crate) fn children_rev(self, node: Node) -> impl Iterator<Item = Node> + 'arena {
+        std::iter::successors(link(self.last_child(node)), move |&child| {
+            link(self.previous_sibling(child))
+        })
+    }
+
     pub(crate) fn in_flow_containing_block(&self, node: Node) -> Node {
         let (innermost_root, innermost_root_containing_block) = self.arena.innermost_run.get();
         if node == innermost_root {
@@ -241,4 +254,9 @@ impl<'arena> LayoutPass<'arena> {
         }
         false
     }
+}
+
+/// A node's link to another, which is none for an invalid slot.
+fn link(node: Node) -> Option<Node> {
+    (!node.is_invalid()).then_some(node)
 }

@@ -14,6 +14,7 @@ use crate::painting::dump::{
     format_float_like_ak, push_affine_transform, push_float_like_ak, push_float_point, push_float_rect,
     push_float_size, push_int_point, push_int_rect, push_int_size,
 };
+use crate::painting::paint_read::PaintRead;
 #[cfg(test)]
 use crate::painting::visual_context::VisualContextTree;
 use crate::painting::visual_context::VisualContextTreeDump;
@@ -28,12 +29,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::Write;
 
-/// Mints the main thread token for this module's FFI entry points; only this module can make one.
-pub(crate) struct MainThreadFfiEntry {
-    _private: (),
-}
-
-const MAIN_THREAD_FFI_ENTRY: MainThreadFfiEntry = MainThreadFfiEntry { _private: () };
+crate::stage::main_thread_ffi_entries!();
 
 /// What a display list dump asks the document. The fields are private: the callbacks are reached
 /// only through the methods below, which take the main thread token.
@@ -127,11 +123,7 @@ impl VisualContextNodeOwners {
                     owners.effect.insert(effect.0, slot);
                 }
             });
-            let mut child = arena.node_first_child_if_live(slot);
-            while let Some(current) = child {
-                pending.push(current);
-                child = arena.node_next_sibling_if_live(current);
-            }
+            pending.extend(arena.children(slot));
         }
         owners
     }
@@ -155,7 +147,7 @@ impl VisualContextNodeOwners {
 /// fills through `layout_arena_paint_push_bytes`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn painting_dump(
-    host: *const crate::render_state::DocumentHost,
+    host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     viewport: NodeSlotId,
     visual_context_tree: *const c_void,
@@ -165,9 +157,8 @@ pub unsafe extern "C" fn painting_dump(
     callbacks: FfiPaintingDumpCallbacks,
 ) {
     assert!(!display_list.is_null());
-    assert!(!host.is_null(), "document host is null");
     // SAFETY: Guaranteed by the entry point's contract.
-    let main_thread = unsafe { crate::stage::from_ffi_entry(&MAIN_THREAD_FFI_ENTRY, &*host) };
+    let main_thread = unsafe { main_thread(host) };
     let visual_context_tree = unsafe { libcompositing_rust::ffi::tree_from_handle(visual_context_tree) };
     let command_runs = unsafe { libcompositing_rust::ffi::ffi_slice(command_runs, command_run_count) };
     // SAFETY: Guaranteed by the caller.

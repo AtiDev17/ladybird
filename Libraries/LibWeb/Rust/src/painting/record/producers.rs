@@ -11,12 +11,10 @@
 
 use super::assemble::{AssemblyEvent, AssemblyHost, OutputPosition, ProducerOutcome, ScopeAction, ScopePlan};
 use super::order_tree::ProducerKind;
-use super::trace::{Action, Observer, Operation, producer_name};
-use super::verify::LoggedCapture;
+use super::trace::{Action, Observer, Operation};
 use super::{PaintPhase, PaintRecorder};
 use crate::css::css_pixels::CssPixelRect;
 use crate::layout::node_data::{NodeFlag, NodeSlotId};
-use crate::painting::display_list::builder::CommandRange;
 use crate::painting::display_list::commands::ContextRef;
 use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::paint_order_plan::{PaintScope, PaintScopePlan};
@@ -142,7 +140,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
     }
 
     fn record_svg_box_foreground(&mut self, owner: NodeSlotId) {
-        self.paint_svg_box_impl(owner, PaintPhase::Foreground);
+        self.paint_svg_box_impl(owner);
         self.recorder.set_accumulated_visual_context(ContextRef::default());
     }
 
@@ -168,21 +166,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
 
 impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
     fn plan_scope(&mut self, scope: PaintScope) -> ScopePlan {
-        let use_prepared_inputs = self.plan_from_prepared_inputs;
-        let plan = PaintScopePlan::build(
-            self.source,
-            scope,
-            self.inputs.should_paint_overlay,
-            use_prepared_inputs,
-        );
-        if use_prepared_inputs && crate::painting::record::verify::enabled_by_environment() {
-            let canonical = PaintScopePlan::build(self.source, scope, self.inputs.should_paint_overlay, false);
-            assert!(
-                plan.items == canonical.items
-                    && plan.establishes_stacking_context == canonical.establishes_stacking_context,
-                "prepared paint-order inputs of {scope:?} are stale"
-            );
-        }
+        let plan = PaintScopePlan::build(self.source, scope, self.inputs.should_paint_overlay);
         let active = !plan.establishes_stacking_context || self.stacking_context_paints(scope.owner);
         ScopePlan {
             active,
@@ -232,23 +216,8 @@ impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
             }
         }
         let end = self.output_position();
-        self.observer.observe(|log| {
-            log.end(end.bytes == start.bytes && end.hits == start.hits);
-            log.command_byte_captures.push(LoggedCapture {
-                start: start.bytes,
-                length: end.bytes - start.bytes,
-                owner,
-                label: producer_name(kind),
-                copied: false,
-            });
-            log.hit_test_item_captures.push(LoggedCapture {
-                start: start.hits,
-                length: end.hits - start.hits,
-                owner,
-                label: producer_name(kind),
-                copied: false,
-            });
-        });
+        self.observer
+            .observe(|log| log.end(end.bytes == start.bytes && end.hits == start.hits));
         debug_assert!(
             self.recorder.is_producer_boundary(),
             "a producer ends at a closed group boundary without ambient state"
@@ -275,37 +244,12 @@ impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
             .source_items
             .as_ref()
             .expect("clean output is copied from a published recording");
-        let destination = self.output_position();
-        if !bytes.is_empty() {
-            self.recorder.append_cached_command_range_verbatim(
-                &frame.display_list,
-                CommandRange {
-                    offset: bytes.start,
-                    size: bytes.end - bytes.start,
-                },
-            );
-        }
+        self.recorder.append_cached_commands(&frame.display_list, bytes);
         if !hits.is_empty() {
             self.list
                 .append_copies_of(&items.items[hits.start as usize..hits.end as usize]);
         }
         self.blocking_wheel_event_region_count += blocking_wheel_event_regions;
-        self.observer.observe(|log| {
-            log.command_byte_captures.push(LoggedCapture {
-                start: destination.bytes,
-                length: bytes.end - bytes.start,
-                owner: NodeSlotId::INVALID,
-                label: "copied output",
-                copied: true,
-            });
-            log.hit_test_item_captures.push(LoggedCapture {
-                start: destination.hits,
-                length: hits.end - hits.start,
-                owner: NodeSlotId::INVALID,
-                label: "copied output",
-                copied: true,
-            });
-        });
     }
 
     fn damaged_rows(&mut self) -> Vec<NodeSlotId> {

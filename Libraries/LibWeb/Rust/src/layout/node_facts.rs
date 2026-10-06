@@ -479,7 +479,7 @@ pub(crate) fn has_ancestor_fact(data: &NodeData, fact: AncestorFact) -> bool {
 
 /// The construction facts a test row is built with, as the word the style mirror publishes them in.
 #[cfg(test)]
-pub(crate) fn construction_fact_word(facts: &FfiNodeConstructionFacts) -> u32 {
+pub(crate) fn construction_fact_word(facts: &super::node_data::NodeConstructionFacts) -> u32 {
     use crate::css::style::bridge::element_construction_fact as fact;
     [
         (fact::IS_HTML_INPUT_ELEMENT, facts.is_html_input_element),
@@ -536,6 +536,18 @@ pub(crate) fn containing_block_establishment_flag(is_fixed_position: bool) -> No
 pub(crate) trait NodeShape {
     fn kind(&self) -> NodeKind;
     fn flags(&self) -> u32;
+}
+
+impl<T: NodeShape> NodeShape for &T {
+    #[inline]
+    fn kind(&self) -> NodeKind {
+        (**self).kind()
+    }
+
+    #[inline]
+    fn flags(&self) -> u32 {
+        (**self).flags()
+    }
 }
 
 impl NodeShape for NodeData {
@@ -602,7 +614,6 @@ pub(crate) fn kind_is_box(kind: NodeKind) -> bool {
             | NodeKind::BreakNode
             | NodeKind::InlineNode
             | NodeKind::Node
-            | NodeKind::NodeWithStyle
             | NodeKind::GeneratedTextNode
             | NodeKind::TextNode
     )
@@ -634,17 +645,24 @@ pub(crate) fn kind_is_replaced_box(kind: NodeKind) -> bool {
             | NodeKind::ImageBox
             | NodeKind::NavigableContainerViewport
             | NodeKind::RadioButton
-            | NodeKind::ReplacedBox
             | NodeKind::SVGSVGBox
             | NodeKind::VideoBox
+    )
+}
+
+/// Whether the kind names an SVG resource box (a mask, clip path or pattern), which is laid out on behalf of an element
+/// that references it rather than at its own place in the tree.
+pub(crate) fn kind_is_svg_resource_box(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::SVGMaskBox | NodeKind::SVGClipBox | NodeKind::SVGPatternBox
     )
 }
 
 pub(crate) fn kind_is_svg_box(kind: NodeKind) -> bool {
     matches!(
         kind,
-        NodeKind::SVGBox
-            | NodeKind::SVGClipBox
+        NodeKind::SVGClipBox
             | NodeKind::SVGGeometryBox
             | NodeKind::SVGGraphicsBox
             | NodeKind::SVGImageBox
@@ -869,11 +887,7 @@ impl<'pass> NodeFacts<'pass> {
     pub(crate) fn has_box_model_metrics(&self) -> bool {
         !matches!(
             self.data().kind.get(),
-            NodeKind::Unset
-                | NodeKind::Node
-                | NodeKind::NodeWithStyle
-                | NodeKind::GeneratedTextNode
-                | NodeKind::TextNode
+            NodeKind::Unset | NodeKind::Node | NodeKind::GeneratedTextNode | NodeKind::TextNode
         )
     }
 
@@ -1307,7 +1321,6 @@ mod node_facts_tests {
             NodeKind::ListItemMarkerBox
         )));
         assert!(!super::node_can_have_children(&data_with_kind(NodeKind::ImageBox)));
-        assert!(!super::node_can_have_children(&data_with_kind(NodeKind::ReplacedBox)));
         assert!(!super::node_can_have_children(&data_with_kind(
             NodeKind::NavigableContainerViewport
         )));
@@ -1433,7 +1446,7 @@ mod node_facts_tests {
 /// `host` must be a live document host, on its document's thread, and `natural_size` writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_take_changed_document_svg_root_natural_size(
-    host: *const crate::render_state::DocumentHost,
+    host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     natural_size: *mut crate::painting::host::FfiNaturalSize,
 ) -> bool {

@@ -4,14 +4,14 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::painting::paint_read::{GeometryRead, PaintRead};
+use crate::painting::paint_read::{GeometryRead, PaintRead, PaintRow};
 use crate::painting::record::trace::Observer;
 
 use super::{PaintPhase, PaintRecorder};
 use crate::css::css_enums;
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
 use crate::layout::node_data::{DomPaintFact, NodeKind, NodeSlotId};
-use crate::layout::node_facts;
+use crate::layout::node_facts::{self, NodeShape};
 use crate::painting::display_list::commands::ContextRef;
 use crate::painting::fragment_ownership;
 use crate::painting::hit_test::*;
@@ -47,27 +47,19 @@ pub(crate) struct HitTestFacts {
     pub(crate) svg_path_winding_rule: WindingRule,
 }
 
-pub(crate) fn hit_test_facts(
-    arena: &impl PaintRead,
-    paintable: NodeSlotId,
-    inputs: &crate::painting::record::RecordingInputs,
-) -> HitTestFacts {
-    let Some(style) = arena.node_style_if_live(paintable) else {
+pub(crate) fn hit_test_facts(arena: &impl PaintRead, paintable: NodeSlotId) -> HitTestFacts {
+    let Some(row) = arena.node(paintable) else {
         return HitTestFacts::default();
     };
-    let wheel_axes = crate::painting::chrome_geometry::wheel_scrollable_axes(
-        arena,
-        paintable,
-        inputs.uncaptured.viewport_wheel_overflow_x,
-        inputs.uncaptured.viewport_wheel_overflow_y,
-    );
-    let svg_path = arena
-        .node_kind_if_live(paintable)
-        .is_some_and(node_painting::is_svg_path);
+    let Some(style) = row.style() else {
+        return HitTestFacts::default();
+    };
+    let wheel_axes = crate::painting::chrome_geometry::wheel_scrollable_axes(arena, paintable);
+    let svg_path = node_painting::is_svg_path(row.kind());
     let svg = style.inherited_svg();
     HitTestFacts {
         visible_for_hit_testing: arena.paintable_row_is_populated(paintable)
-            && !arena.node_has_dom_paint_fact(paintable, DomPaintFact::Inert)
+            && row.dom_paint_facts() & DomPaintFact::Inert as u8 == 0
             && style.inherited_ui().pointer_events != css_enums::pointer_events::NONE,
         has_resizer: crate::painting::chrome_geometry::has_resizer(arena, paintable),
         could_be_scrolled_horizontally: wheel_axes.horizontal,
@@ -109,7 +101,7 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
         if self.is_recording_svg_resource_content() {
             return;
         }
-        if node_painting::is_inline(self.source, paintable) {
+        if node_painting::is_fragmented_inline(self.source, paintable) {
             self.record_inline_hit_test_items(paintable, phase);
         } else if node_painting::has_lines(self.source, paintable) {
             self.record_base_hit_test_items(paintable, phase);
@@ -145,7 +137,7 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
             let rect = paintable_geometry::absolute_border_box_rect(self.source, paintable);
             let radii = self.border_radii(paintable);
             let context = self.data(paintable).accumulated_visual_context;
-            self.append_box(paintable, paintable, rect, context, radii);
+            self.append_box(paintable, rect, context, radii);
             return;
         }
         let facts = self.paintable_facts(paintable);
@@ -307,7 +299,7 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
             }
             let rect = CssPixelRect::from(piece.border_box_rect).translated_by(root_position);
             let radii = self.piece_border_radii(paintable, piece);
-            self.append_box(paintable, paintable, rect, context, radii);
+            self.append_box(paintable, rect, context, radii);
         }
     }
 
@@ -376,12 +368,13 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
     // A text node has no style of its own, so its parent both decides whether the fragment can be hit and is what an
     // event dispatched from it resolves against. Returns that node, or None when the fragment is not hit-testable.
     fn forced_break_node_is_caret_target(&self, break_node: NodeSlotId) -> bool {
-        if self.source.node_kind_if_live(break_node) != Some(NodeKind::BreakNode)
-            || self.source.node_has_dom_paint_fact(break_node, DomPaintFact::Inert)
-        {
+        let Some(row) = self.source.node(break_node) else {
+            return false;
+        };
+        if row.kind() != NodeKind::BreakNode || row.dom_paint_facts() & DomPaintFact::Inert as u8 != 0 {
             return false;
         }
-        let Some(style) = self.source.node_style_if_live(break_node) else {
+        let Some(style) = row.style() else {
             return false;
         };
         if style.visibility() != css_enums::visibility::VISIBLE
@@ -390,31 +383,23 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
             return false;
         }
         self.source
-            .node_parent_if_live(break_node)
-            .and_then(|parent| self.source.node_style_if_live(parent))
+            .node_style_if_live(row.parent())
             .is_none_or(|parent_style| parent_style.effects().opacity != 0.0)
     }
 
     fn hit_node_for_text_fragment(&mut self, fragment: &FragmentRecord) -> Option<NodeSlotId> {
         let node = fragment.layout_node;
-        if fragment.is_block_ellipsis || !node_facts::kind_is_text(self.source.node_kind_if_live(node)?) {
+        let row = self.source.node(node)?;
+        if fragment.is_block_ellipsis || !node_facts::kind_is_text(row.kind()) {
             return None;
         }
-        let parent = self.source.node_parent_if_live(node)?;
-        let parent_visible = self
-            .source
-            .node_style_if_live(parent)
-            .is_none_or(|style| style.visibility() == css_enums::visibility::VISIBLE);
-        if !parent_visible {
-            return None;
-        }
+        let parent = row.parent();
         let parent_style = self.source.node_style_if_live(parent)?;
-        if parent_style.effects().opacity == 0.0
+        if parent_style.visibility() != css_enums::visibility::VISIBLE
+            || parent_style.effects().opacity == 0.0
             || parent_style.inherited_ui().pointer_events == css_enums::pointer_events::NONE
+            || row.dom_paint_facts() & DomPaintFact::Inert as u8 != 0
         {
-            return None;
-        }
-        if self.source.node_has_dom_paint_fact(node, DomPaintFact::Inert) {
             return None;
         }
         // Resolving the hit needs a committed paintable row; without one there is nothing to resolve against.
@@ -463,16 +448,17 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
     fn append_box(
         &mut self,
         paintable_box: NodeSlotId,
-        target: NodeSlotId,
         rect: CssPixelRect,
         context: ContextRef,
         border_radii: BorderRadii,
     ) {
         let caret_line_index = paintable_geometry::committed_containing_line_box_index(self.source, paintable_box);
-        let can_produce_caret_position = (self.is_atomic_inline(target) || self.is_replaced_box(target)) && {
-            let negative_z = crate::painting::style_queries::effective_z_index(self.source, target).unwrap_or(0) < 0;
-            !negative_z && self.node_has_dom_node(target)
-        };
+        let can_produce_caret_position = (self.is_atomic_inline(paintable_box) || self.is_replaced_box(paintable_box))
+            && {
+                let negative_z =
+                    crate::painting::style_queries::effective_z_index(self.source, paintable_box).unwrap_or(0) < 0;
+                !negative_z && self.node_has_dom_node(paintable_box)
+            };
         let block_container = self.block_container_of_paintable(paintable_box);
         let item = HitTestItem {
             rect,
@@ -481,7 +467,7 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
             block_container,
             border_radii,
             can_produce_caret_position,
-            ..self.base_hit_test_item(HitTestItemKind::Box, target, context)
+            ..self.base_hit_test_item(HitTestItemKind::Box, paintable_box, context)
         };
         self.list.append(item);
     }

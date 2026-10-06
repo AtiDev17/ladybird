@@ -23,31 +23,27 @@
 //! reference counted or freed.
 
 use std::alloc::{Layout, alloc, dealloc};
-#[cfg(feature = "style-replay")]
-use std::cell::RefCell;
 use std::ffi::c_void;
 use std::hash::Hasher;
 use std::sync::OnceLock;
-#[cfg(feature = "style-replay")]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::abort_on_panic;
 pub use crate::css::computed_value_types::{
-    AlignmentValues, AnchorValues, AnimationValues, BackgroundValues, BorderLayoutFacts, BorderValues, BoxValues,
-    ComputedAspectRatio, ComputedClipEdge, ComputedColorOrAuto, ComputedContainIntrinsicSize, ComputedCursor,
-    ComputedFilter, ComputedFilterOperation, ComputedFlexBasis, ComputedGap, ComputedGridArea, ComputedGridPlacement,
+    AlignmentValues, AnchorValues, AnimationValues, BackgroundValues, BorderValues, BoxValues, ComputedAspectRatio,
+    ComputedClipEdge, ComputedColorOrAuto, ComputedContainIntrinsicSize, ComputedCursor, ComputedFilter,
+    ComputedFilterOperation, ComputedFlexBasis, ComputedGap, ComputedGridArea, ComputedGridPlacement,
     ComputedGridPlacementKind, ComputedGridTrackBreadth, ComputedGridTrackEntry, ComputedGridTrackEntryKind,
     ComputedGridTrackList, ComputedLengthBox, ComputedLengthPercentageOrAuto, ComputedOverflowClipMargin,
     ComputedOverflowClipMarginSide, ComputedPositionTryFallback, ComputedResolvedTransform, ComputedSize,
     ComputedSizeKind, ComputedStyleValueHandle, ComputedSvgDash, ComputedSvgPaint, ComputedTextIndent,
     ComputedTextUnderlineOffset, ComputedTextUnderlinePosition, ComputedVerticalAlign, ContentValues, EffectsValues,
-    FontValues, GRID_NO_INDEX, GridValues, InheritedListValues, InheritedSVGValues, InheritedTextLayoutFacts,
-    InheritedTextValues, InheritedUIValues, MaskValues, MiscResetValues, RetainedComputedCursorList,
-    RetainedComputedFilterOperationList, RetainedComputedResolvedTransformList, RetainedComputedShadowList,
-    RetainedComputedSvgDashList, RetainedGridAreaList, RetainedGridNameIndexList, RetainedGridTrackEntryList,
-    RetainedPositionAreaList, RetainedPositionTryFallbackList, RetainedTextDecorationLineList, SVGResetValues,
-    SizingValues, SurroundValues, TextResetValues, TransformValues,
+    FontValues, GRID_NO_INDEX, GridValues, InheritedListValues, InheritedSVGValues, InheritedTextValues,
+    InheritedUIValues, MaskValues, MiscResetValues, RetainedComputedCursorList, RetainedComputedFilterOperationList,
+    RetainedComputedResolvedTransformList, RetainedComputedShadowList, RetainedComputedSvgDashList,
+    RetainedGridAreaList, RetainedGridNameIndexList, RetainedGridTrackEntryList, RetainedPositionAreaList,
+    RetainedPositionTryFallbackList, RetainedTextDecorationLineList, SVGResetValues, SizingValues, SurroundValues,
+    TextResetValues, TransformValues,
 };
 use crate::css::retained_fly_string::{RetainedUtf16FlyString, RetainedUtf16FlyStringList};
 use crate::css::style::fast_hash::{FastHasher, fast_hasher};
@@ -56,62 +52,6 @@ use crate::css::style_value::{retained_list_drop, retained_list_partial_eq};
 
 /// Reference count value marking an intentionally leaked payload.
 pub const STYLE_GROUP_STATIC_REFCOUNT: usize = usize::MAX;
-
-#[cfg(feature = "style-replay")]
-static REPLAY_STYLE_GROUPS: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "style-replay")]
-thread_local! {
-    static REPLAY_STYLE_GROUP_SIZES: RefCell<Vec<Option<usize>>> = const { RefCell::new(Vec::new()) };
-}
-
-#[cfg(feature = "style-replay")]
-pub fn enable_style_group_replay() {
-    REPLAY_STYLE_GROUPS.store(true, Ordering::Relaxed);
-}
-
-#[cfg(feature = "style-replay")]
-pub fn register_replay_style_group(identity: u32, retained_bytes: usize) -> *const c_void {
-    let pointer = identity as usize + 1;
-    REPLAY_STYLE_GROUP_SIZES.with(|sizes| {
-        let mut sizes = sizes.borrow_mut();
-        let index = identity as usize;
-        if sizes.len() <= index {
-            sizes.resize(index + 1, None);
-        }
-        // Every replay publication registers its complete payload set before the graph consumes it.
-        // Group identities from another graph may therefore safely overwrite this dense scratch table.
-        sizes[index] = Some(retained_bytes);
-    });
-    pointer as *const c_void
-}
-
-fn replay_style_group_size(pointer: *const c_void) -> Option<usize> {
-    #[cfg(feature = "style-replay")]
-    return (pointer as usize)
-        .checked_sub(1)
-        .and_then(|identity| REPLAY_STYLE_GROUP_SIZES.with(|sizes| sizes.borrow().get(identity).copied().flatten()));
-    #[cfg(not(feature = "style-replay"))]
-    {
-        let _ = pointer;
-        None
-    }
-}
-
-pub(crate) fn replay_style_group_identity(pointer: *const c_void) -> Option<u32> {
-    #[cfg(feature = "style-replay")]
-    return u32::try_from((pointer as usize).checked_sub(1)?).ok();
-    #[cfg(not(feature = "style-replay"))]
-    let _ = pointer;
-    #[cfg(not(feature = "style-replay"))]
-    None
-}
-
-pub(crate) fn replaying_style_groups() -> bool {
-    #[cfg(feature = "style-replay")]
-    return REPLAY_STYLE_GROUPS.load(Ordering::Relaxed);
-    #[cfg(not(feature = "style-replay"))]
-    false
-}
 
 /// Layout of the inherited box style value group.
 ///
@@ -1227,6 +1167,7 @@ impl GridValues {
 /// Selects the Rust payload type for a computed-value style group.
 #[repr(u8)]
 #[derive(Clone, Copy)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum StyleGroupLifecycle {
     Font,
     InheritedTable,
@@ -1642,9 +1583,6 @@ pub(crate) fn style_group_affects_layout(group_index: usize) -> bool {
 pub(crate) fn style_group_payloads_equal(group_index: usize, a: *const c_void, b: *const c_void) -> bool {
     assert!(!a.is_null());
     assert!(!b.is_null());
-    if replaying_style_groups() {
-        return a == b;
-    }
     // SAFETY: Published style-group payloads remain live for the call and both use the registered
     // group type at `group_index`.
     unsafe { payloads_equal(vtable(group_index), a, b) }
@@ -1658,11 +1596,6 @@ pub(crate) fn style_group_payloads_hash(group_index: usize, payload: *const c_vo
     assert!(!payload.is_null());
     let mut hasher = fast_hasher();
     hasher.write_usize(group_index);
-    if replaying_style_groups() {
-        // Replay compares payloads by address, so under replay the address is the content.
-        hasher.write_usize(payload as usize);
-        return hasher.finish();
-    }
     // SAFETY: Published style-group payloads remain live for the call and use the registered
     // group type at `group_index`.
     unsafe { payload_content_hash(vtable(group_index), payload, &mut hasher) };
@@ -1717,9 +1650,6 @@ unsafe fn payload_holds_image_values(table: &StyleGroupVTable, payload: *const c
 /// the list-style image. Nearly every style holds none, and a record answers that with one flag
 /// instead of materializing its layers to find out.
 pub(crate) fn style_group_payloads_hold_image_values(payloads: &[*const c_void]) -> bool {
-    if replaying_style_groups() {
-        return false;
-    }
     payloads.iter().enumerate().any(|(group_index, &payload)| {
         // SAFETY: Published style-group payloads remain live for the call and use the registered
         // group type at `group_index`.
@@ -1734,9 +1664,6 @@ pub(crate) fn default_group_payload(group_index: usize) -> *const c_void {
 /// Retains one reference to a payload, mirroring StyleStructRef::ref():
 /// intentionally leaked payloads are never counted.
 pub(crate) fn retain_group_payload(group_index: usize, payload: *const c_void) {
-    if replaying_style_groups() {
-        return;
-    }
     let refcount = refcount_of(payload, payload_align(vtable(group_index)));
     if refcount.load(Ordering::Relaxed) == STYLE_GROUP_STATIC_REFCOUNT {
         return;
@@ -1745,9 +1672,6 @@ pub(crate) fn retain_group_payload(group_index: usize, payload: *const c_void) {
 }
 
 pub(crate) fn retained_group_payload_bytes(group_index: usize, payload: *const c_void) -> usize {
-    if replaying_style_groups() {
-        return replay_style_group_size(payload).expect("replay style-group size was not registered");
-    }
     let table = vtable(group_index);
     let refcount = refcount_of(payload, payload_align(table));
     if refcount.load(Ordering::Relaxed) == STYLE_GROUP_STATIC_REFCOUNT {
@@ -1911,7 +1835,6 @@ pub unsafe extern "C" fn rust_style_group_registry_register(
 /// `source` must be a valid payload of the same group type.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_group_clone(group_index: usize, source: *const c_void) -> *mut c_void {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::StyleGroupCloneEntry);
     unsafe { clone_group_payload(group_index, source) }
 }
 
@@ -1923,40 +1846,6 @@ pub(crate) unsafe fn clone_group_payload(group_index: usize, source: *const c_vo
     payload
 }
 
-/// Retains one reference to each style-group payload in `payloads`.
-///
-/// # Safety
-/// `payloads` must point at `group_count` valid payloads in style group index
-/// order.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_groups_retain(payloads: *const *const c_void, group_count: usize) {
-    unsafe {
-        assert!(!payloads.is_null(), "style group payload array is null");
-        for group_index in 0..group_count {
-            let payload = *payloads.add(group_index);
-            assert!(!payload.is_null(), "style group payload is null");
-            retain_group_payload(group_index, payload);
-        }
-    };
-}
-
-/// Releases one reference to each style-group payload in `payloads`.
-///
-/// # Safety
-/// `payloads` must point at `group_count` valid payloads in style group index
-/// order, each with an outstanding reference.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_groups_release(payloads: *const *const c_void, group_count: usize) {
-    unsafe {
-        assert!(!payloads.is_null(), "style group payload array is null");
-        for group_index in 0..group_count {
-            let payload = *payloads.add(group_index);
-            assert!(!payload.is_null(), "style group payload is null");
-            release_group_payload(group_index, payload);
-        }
-    };
-}
-
 /// Destroys and deallocates a payload whose reference count has reached zero.
 ///
 /// # Safety
@@ -1964,7 +1853,6 @@ pub unsafe extern "C" fn rust_style_groups_release(payloads: *const *const c_voi
 /// references, and must not be a static default payload.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_group_free(group_index: usize, payload: *mut c_void) {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::StyleGroupFreeEntry);
     unsafe {
         let table = vtable(group_index);
         debug_assert!(refcount_of(payload, payload_align(table)).load(Ordering::Relaxed) == 0);
@@ -1975,16 +1863,12 @@ pub unsafe extern "C" fn rust_style_group_free(group_index: usize, payload: *mut
 }
 
 pub(crate) fn release_group_payload(group_index: usize, payload: *const c_void) {
-    if replaying_style_groups() {
-        return;
-    }
     let table = vtable(group_index);
     let refcount = refcount_of(payload, payload_align(table));
     if refcount.load(Ordering::Relaxed) == STYLE_GROUP_STATIC_REFCOUNT {
         return;
     }
     if refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
-        crate::css::style::record_replay::invalidate_pointer(payload as usize);
         // SAFETY: The count reached zero, so this reference was the last one.
         unsafe {
             destruct(table, payload.cast_mut());
@@ -2124,8 +2008,7 @@ impl StyleGroupMasks {
         PROPERTY_DEPENDENCY_MASKS.get()
     }
 
-    /// The registered groups, or none for a process that registered none: an engine of a test or a
-    /// replay, which takes the registered ones once the recording names them.
+    /// The registered groups, or none for a process that registered none: an engine of a test.
     pub(crate) fn registered_or_none() -> &'static Self {
         Self::registered().unwrap_or(&UNREGISTERED_STYLE_GROUPS)
     }
@@ -2139,33 +2022,6 @@ impl StyleGroupMasks {
             .copied()
             .unwrap_or(0)
     }
-}
-
-#[cfg(feature = "style-replay")]
-pub fn register_replay_property_dependency_masks(first_property: u16, masks: &[u32], output_masks: &[u32]) {
-    assert_eq!(masks.len(), output_masks.len());
-    if let Some(existing) = PROPERTY_DEPENDENCY_MASKS.get() {
-        assert_eq!(existing.first_property, first_property);
-        assert_eq!(existing.masks, masks);
-        assert_eq!(existing.output_masks, output_masks);
-        return;
-    }
-    PROPERTY_DEPENDENCY_MASKS
-        .set(StyleGroupMasks {
-            first_property,
-            masks: masks.to_vec().leak(),
-            output_masks: output_masks.to_vec().leak(),
-        })
-        .unwrap_or_else(|_| unreachable!("property dependency masks were checked above"));
-}
-
-#[cfg(feature = "style-recording")]
-/// The computed style groups which may change when one longhand's specified winner changes.
-///
-/// The mapping comes from the C++ group builders which own the remaining cross-property
-/// computation rules. Missing coverage stays typed so callers can widen to every group.
-pub(crate) fn computed_group_dependency_mask(property: u16) -> Option<u32> {
-    Some(StyleGroupMasks::registered()?.dependencies(property)).filter(|mask| *mask != 0)
 }
 
 /// The computed style group which directly owns one longhand's output.
@@ -2541,8 +2397,7 @@ unsafe fn free_scratch_payload(table: &StyleGroupVTable, scratch: *mut c_void) {
 /// `values` must hold one valid data entry per registered descriptor
 /// of the group, in registration order; `parent_payload` must be a valid
 /// payload of the group or null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_build_style_group(
+pub(crate) unsafe fn build_style_group(
     group_index: usize,
     values: *const FfiGroupValueEntry,
     count: usize,
@@ -2664,8 +2519,7 @@ pub(crate) unsafe fn build_group_payload_with_rust_fill(
 /// # Safety
 /// The value pointers must be valid StyleValueData or null, and
 /// `parent_payload` a valid inherited box payload or null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_build_inherited_box_group(
+pub(crate) unsafe fn build_inherited_box_group(
     group_index: usize,
     visibility: *const c_void,
     direction: *const c_void,
@@ -3577,8 +3431,8 @@ impl FontValues {
 /// # Safety
 /// The value pointers must identify valid StyleValueData, and
 /// `parent_payload` must identify an alignment payload or be null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_build_alignment_group(
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn rust_build_alignment_group(
     group_index: usize,
     webkit_box_orient: *const c_void,
     flex_direction: *const c_void,
@@ -3675,8 +3529,8 @@ pub(crate) unsafe fn build_svg_reset_group_payload(
 /// `text_decoration_lines` must address `text_decoration_line_count` valid
 /// enum codes, a non-null thickness must identify valid StyleValueData, and
 /// `parent_payload` must identify a text reset payload or be null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_build_text_reset_group(
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn rust_build_text_reset_group(
     group_index: usize,
     text_decoration_lines: *const u8,
     text_decoration_line_count: usize,
@@ -3731,8 +3585,8 @@ pub unsafe extern "C" fn rust_build_text_reset_group(
 /// # Safety
 /// Each value pointer must address valid StyleValueData, and `parent_payload`
 /// must be a valid surround payload or null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_build_surround_group(
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn rust_build_surround_group(
     group_index: usize,
     top: *const c_void,
     right: *const c_void,
@@ -3826,8 +3680,8 @@ pub unsafe extern "C" fn rust_build_surround_group(
 /// `values` must point at a fully initialized box payload whose ownership
 /// transfers to this call, and `parent_payload` must be a valid box payload
 /// or null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_build_box_group(
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn rust_build_box_group(
     group_index: usize,
     values: *const BoxValues,
     parent_payload: *const c_void,
@@ -3852,8 +3706,8 @@ pub unsafe extern "C" fn rust_build_box_group(
 /// `values` must point at a fully initialized grid payload whose ownership
 /// transfers to this call, and `parent_payload` must be a valid grid payload
 /// or null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_build_grid_group(
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn rust_build_grid_group(
     group_index: usize,
     values: *const GridValues,
     parent_payload: *const c_void,
@@ -3911,8 +3765,8 @@ pub(crate) fn copy_grid_placements(source: &GridValues, target: &mut GridValues)
 /// # Safety
 /// Each value pointer must address valid StyleValueData, and `parent_payload`
 /// must be a valid sizing payload or null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_build_sizing_group(
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn build_sizing_group(
     group_index: usize,
     width: *const c_void,
     min_width: *const c_void,
@@ -3953,8 +3807,7 @@ pub unsafe extern "C" fn rust_build_sizing_group(
 /// # Safety
 /// The value pointers must be valid StyleValueData or null, and
 /// `parent_payload` a valid inherited table payload or null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_build_inherited_table_group(
+pub(crate) unsafe fn build_inherited_table_group(
     group_index: usize,
     border_collapse: *const c_void,
     caption_side: *const c_void,

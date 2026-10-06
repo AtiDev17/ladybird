@@ -19,22 +19,13 @@ use crate::css::style_value::{
     RetainedGridTrackEntryList, RetainedNumericRangeList, RetainedShapePoint, RetainedShapePointList,
     RetainedStyleValueData, RetainedStyleValueDataList, StyleValueData,
 };
+use crate::css::value_codes::*;
 
 pub(crate) const ANIMATION_TYPE_DISCRETE: u8 = 0;
 pub(crate) const ANIMATION_TYPE_BY_COMPUTED_VALUE: u8 = 1;
 const ANIMATION_TYPE_REPEATABLE_LIST: u8 = 2;
 const ANIMATION_TYPE_CUSTOM: u8 = 3;
 pub(crate) const ANIMATION_TYPE_NONE: u8 = 4;
-const VALUE_TYPE_ANGLE: u8 = 2;
-const VALUE_TYPE_FLEX: u8 = 15;
-const VALUE_TYPE_FREQUENCY: u8 = 21;
-const VALUE_TYPE_INTEGER: u8 = 24;
-const VALUE_TYPE_LENGTH: u8 = 25;
-const VALUE_TYPE_NUMBER: u8 = 27;
-const VALUE_TYPE_PERCENTAGE: u8 = 31;
-const VALUE_TYPE_RATIO: u8 = 33;
-const VALUE_TYPE_RESOLUTION: u8 = 35;
-const VALUE_TYPE_TIME: u8 = 38;
 const TRANSFORM_FUNCTION_MATRIX: u8 = 0;
 const TRANSFORM_FUNCTION_MATRIX_3D: u8 = 1;
 const TRANSFORM_FUNCTION_PERSPECTIVE: u8 = 2;
@@ -64,24 +55,6 @@ const BASIC_SHAPE_INSET: u8 = 0;
 const BASIC_SHAPE_CIRCLE: u8 = 3;
 const BASIC_SHAPE_ELLIPSE: u8 = 4;
 const BASIC_SHAPE_POLYGON: u8 = 5;
-const COLOR_TYPE_RGB: u8 = 0;
-const COLOR_TYPE_A98_RGB: u8 = 1;
-const COLOR_TYPE_DISPLAY_P3: u8 = 2;
-const COLOR_TYPE_DISPLAY_P3_LINEAR: u8 = 3;
-const COLOR_TYPE_HSL: u8 = 4;
-const COLOR_TYPE_HWB: u8 = 5;
-const COLOR_TYPE_LAB: u8 = 6;
-const COLOR_TYPE_LCH: u8 = 7;
-const COLOR_TYPE_OKLAB: u8 = 8;
-const COLOR_TYPE_OKLCH: u8 = 9;
-const COLOR_TYPE_SRGB: u8 = 10;
-const COLOR_TYPE_SRGB_LINEAR: u8 = 11;
-const COLOR_TYPE_PROPHOTO_RGB: u8 = 12;
-const COLOR_TYPE_REC2020: u8 = 13;
-const COLOR_TYPE_XYZ_D50: u8 = 14;
-const COLOR_TYPE_XYZ_D65: u8 = 15;
-const COLOR_SYNTAX_LEGACY: u8 = 0;
-const COLOR_SYNTAX_MODERN: u8 = 1;
 
 #[derive(Clone, Copy)]
 struct NumericRangeOverride {
@@ -125,8 +98,8 @@ pub struct FfiAnimationValueResult {
 ///
 /// # Safety
 /// The descriptor and its control-point slice must remain valid during the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_from_easing(descriptor: &FfiEasingDescriptor) -> *const StyleValueData {
+#[cfg(test)]
+pub(crate) unsafe fn style_value_from_easing(descriptor: &FfiEasingDescriptor) -> *const StyleValueData {
     use crate::css::style_value::{RetainedLinearEasingStop, RetainedLinearEasingStopList};
     let retain = |value| unsafe { RetainedStyleValueData::from_retained_pointer(Arc::into_raw(Arc::new(value))) };
     let mut stops = Vec::new();
@@ -785,6 +758,7 @@ impl AnimationKeyframePlan {
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiCompositeOperation {
     Replace,
     Add,
@@ -7077,7 +7051,7 @@ pub(crate) struct PublishedAnimationDeclarations {
 /// and `value` must be a live style value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_substitute_compositor_keyframe_value(
-    host: *const crate::render_state::DocumentHost,
+    host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     style_node: u32,
     pseudo_kind: u8,
@@ -7087,7 +7061,6 @@ pub unsafe extern "C" fn rust_substitute_compositor_keyframe_value(
     value: *const StyleValueData,
 ) -> *const StyleValueData {
     // SAFETY: Guaranteed by the caller.
-    let host = unsafe { crate::css::style::engine_calls::document_host(host) };
     crate::css::style::engine_calls::with_engine(read, host, |engine| {
         let Some(node) = crate::css::style::tree::StyleNodeID::from_raw(style_node) else {
             return std::ptr::null();
@@ -7404,9 +7377,8 @@ pub(crate) fn animation_preparation_matches(
 /// `computed` must point to a live batch. Its range of sampled effects must be readable. On a cache miss both storage pointers must be live, unconsumed results from their
 /// producing calls. `underlying_longhand_table` and `overlay` must point at live values, and the
 /// overlay must be uniquely owned for the duration of the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_evaluate_animations(computed: *const FfiComputedAnimationBatch) -> usize {
-    crate::css::ffi_stats::rust_style_ffi_note_animation_evaluation();
+pub(crate) unsafe fn evaluate_animations(computed: *const FfiComputedAnimationBatch) -> usize {
+    crate::css::ffi_stats::note_animation_evaluation();
     let computed = unsafe { &*computed };
     assert!(!computed.underlying_longhand_table.is_null());
     assert!(!computed.overlay.is_null());
@@ -7598,7 +7570,7 @@ pub unsafe extern "C" fn rust_interpolate_scalar_style_value(
 }
 
 /// Test-only bridge for exercising Rust-owned style value composition without constructing an
-/// animation batch. Production animation evaluation uses `rust_evaluate_animations`.
+/// animation batch. Production animation evaluation uses `evaluate_animations`.
 ///
 /// # Safety
 /// `underlying` and `animated` must point at live `StyleValueData` allocations.
@@ -7944,7 +7916,7 @@ mod tests {
                 interval_count: 4,
                 step_position: 1,
             };
-            let value = unsafe { Arc::from_raw(rust_style_value_from_easing(&descriptor)) };
+            let value = unsafe { Arc::from_raw(style_value_from_easing(&descriptor)) };
             assert_eq!(
                 crate::css::serialize::serialize_style_value_to_utf16(&value).unwrap(),
                 expected.encode_utf16().collect::<Vec<_>>()
@@ -8293,5 +8265,206 @@ mod tests {
         assert!(result.handled);
         let value = unsafe { Arc::from_raw(result.value) };
         assert!(matches!(&*value, StyleValueData::Calculated { .. }));
+    }
+
+    fn parsed(property: u16, source: &str) -> Arc<StyleValueData> {
+        use crate::css::css_tokenizer::{TokenizerInput, tokenize_for_parser};
+        use crate::css::parser::component_value::consume_a_list_of_component_values;
+        use crate::css::parser::value_parser::{ParseContext, ParseOutcome, parse_css_value};
+        let units: Vec<_> = source.encode_utf16().collect();
+        let values = consume_a_list_of_component_values(tokenize_for_parser(TokenizerInput::Utf16(&units))).unwrap();
+        // All fields are scalars or nullable pointers.
+        let context: ParseContext = unsafe { std::mem::zeroed() };
+        let ParseOutcome::Parsed(value) = parse_css_value(&context, property, &values) else {
+            panic!("invalid test value {source}");
+        };
+        value
+    }
+
+    // The value a handled interpolation or composition produced, serialized; nothing where it declined to combine.
+    fn serialized(result: FfiAnimationValueResult) -> Option<String> {
+        assert!(result.handled);
+        (!result.value.is_null()).then(|| {
+            let value = unsafe { Arc::from_raw(result.value) };
+            String::from_utf16(&crate::css::serialize::serialize_style_value_to_utf16(&value).unwrap()).unwrap()
+        })
+    }
+
+    #[test]
+    fn interpolates_and_adds_structured_values() {
+        use crate::css::property_metadata::property_id;
+        for (property, from, to, halfway, sum) in [
+            (
+                property_id::TEXT_INDENT,
+                "2px hanging",
+                "6px hanging",
+                "4px hanging",
+                "8px hanging",
+            ),
+            (property_id::BACKGROUND_POSITION_X, "4px", "8px", "6px", "12px"),
+            (
+                property_id::OBJECT_POSITION,
+                "4px 8px",
+                "8px 16px",
+                "6px 12px",
+                "12px 24px",
+            ),
+            (
+                property_id::CLIP,
+                "rect(1px, 2px, 3px, 4px)",
+                "rect(3px, 6px, 9px, 12px)",
+                "rect(2px, 4px, 6px, 8px)",
+                "rect(4px, 8px, 12px, 16px)",
+            ),
+            (
+                property_id::BORDER_IMAGE_SLICE,
+                "1 2 3 4 fill",
+                "3 6 9 12 fill",
+                "2 4 6 8 fill",
+                "4 8 12 16 fill",
+            ),
+            (
+                property_id::BORDER_TOP_LEFT_RADIUS,
+                "2px 4px",
+                "6px 8px",
+                "4px 6px",
+                "8px 12px",
+            ),
+            (
+                property_id::BACKGROUND_SIZE,
+                "4px 8px",
+                "8px 16px",
+                "6px 12px",
+                "12px 24px",
+            ),
+            (
+                property_id::FONT_VARIATION_SETTINGS,
+                "\"wght\" 100",
+                "\"wght\" 300",
+                "\"wght\" 200",
+                "\"wght\" 400",
+            ),
+        ] {
+            let (from, to) = (parsed(property, from), parsed(property, to));
+            assert_eq!(
+                serialized(interpolate_value(None, property, &from, &to, 0.5)).as_deref(),
+                Some(halfway)
+            );
+            assert_eq!(
+                serialized(composite_scalar_value(&from, &to, FfiCompositeOperation::Add)).as_deref(),
+                Some(sum)
+            );
+        }
+    }
+
+    #[test]
+    fn declines_to_interpolate_unlike_structured_values() {
+        use crate::css::property_metadata::property_id;
+        for (property, from, to) in [
+            (property_id::BORDER_IMAGE_SLICE, "1 2 3 4 fill", "3 6 9 12"),
+            (property_id::FONT_VARIATION_SETTINGS, "\"wght\" 100", "\"slnt\" 300"),
+        ] {
+            let (from, to) = (parsed(property, from), parsed(property, to));
+            assert_eq!(serialized(interpolate_value(None, property, &from, &to, 0.5)), None);
+        }
+    }
+
+    #[test]
+    fn clamps_extrapolated_structured_values() {
+        use crate::css::property_metadata::property_id;
+        let property = property_id::BORDER_IMAGE_SLICE;
+        let (from, to) = (parsed(property, "1 2 3 4 fill"), parsed(property, "3 6 9 12 fill"));
+        assert_eq!(
+            serialized(interpolate_value(None, property, &from, &to, -1.0)).as_deref(),
+            Some("0 fill")
+        );
+
+        let result = interpolate_value(
+            None,
+            property_id::MARGIN_TOP,
+            &border_radius_rect([(1.0, 1.0); 4]),
+            &border_radius_rect([(3.0, 3.0); 4]),
+            -1.0,
+        );
+        assert_eq!(serialized(result).as_deref(), Some("0px"));
+    }
+
+    // Corner radii, horizontal and vertical, from the top left corner clockwise.
+    fn border_radius_rect(corners: [(f64, f64); 4]) -> Arc<StyleValueData> {
+        let px = |value| {
+            RetainedStyleValueData::from_owned(StyleValueData::Length {
+                value,
+                unit: crate::css::style_compute::px_length_unit(),
+            })
+        };
+        let [top_left, top_right, bottom_right, bottom_left] = corners.map(|(horizontal, vertical)| {
+            RetainedStyleValueData::from_owned(StyleValueData::BorderRadius {
+                is_elliptical: horizontal != vertical,
+                horizontal_radius: px(horizontal),
+                vertical_radius: px(vertical),
+            })
+        });
+        Arc::new(StyleValueData::BorderRadiusRect {
+            top_left,
+            top_right,
+            bottom_right,
+            bottom_left,
+        })
+    }
+
+    #[test]
+    fn interpolates_and_adds_border_radius_rects() {
+        let from = border_radius_rect([(1.0, 2.0), (2.0, 3.0), (3.0, 4.0), (4.0, 5.0)]);
+        let to = border_radius_rect([(3.0, 4.0), (4.0, 5.0), (5.0, 6.0), (6.0, 7.0)]);
+        let property = crate::css::property_metadata::property_id::MARGIN_TOP;
+        assert_eq!(
+            serialized(interpolate_value(None, property, &from, &to, 0.5)).as_deref(),
+            Some("2px 3px 4px 5px / 3px 4px 5px 6px")
+        );
+        assert_eq!(
+            serialized(composite_scalar_value(&from, &to, FfiCompositeOperation::Add)).as_deref(),
+            Some("4px 6px 8px 10px / 6px 8px 10px 12px")
+        );
+    }
+
+    #[test]
+    fn compares_gradients_by_value() {
+        use crate::css::property_metadata::property_id::BACKGROUND_IMAGE;
+        let radial = "radial-gradient(farthest-corner, currentcolor, red)";
+        assert!(parsed(BACKGROUND_IMAGE, radial) == parsed(BACKGROUND_IMAGE, radial));
+        assert!(
+            parsed(BACKGROUND_IMAGE, "radial-gradient(50px 30px, red, blue)")
+                != parsed(BACKGROUND_IMAGE, "radial-gradient(50px 40px, red, blue)")
+        );
+        let legacy = "conic-gradient(rgb(255, 0, 0), rgb(0, 0, 255))";
+        assert!(parsed(BACKGROUND_IMAGE, legacy) == parsed(BACKGROUND_IMAGE, legacy));
+        assert!(
+            parsed(BACKGROUND_IMAGE, legacy) != parsed(BACKGROUND_IMAGE, "conic-gradient(rgb(255 0 0), rgb(0 0 255))")
+        );
+    }
+
+    #[test]
+    fn resolves_halfway_superellipses_to_a_bevel() {
+        let property = crate::css::property_metadata::property_id::CORNER_TOP_LEFT_SHAPE;
+        let (from, to) = (
+            parsed(property, "superellipse(-infinity)"),
+            parsed(property, "superellipse(infinity)"),
+        );
+        let result = interpolate_value(None, property, &from, &to, 0.5);
+        assert!(result.handled);
+        let value = unsafe { Arc::from_raw(result.value) };
+        let text = crate::css::serialize::serialize_resolved_style_value_to_utf16(&value).unwrap();
+        assert_eq!(String::from_utf16(&text).unwrap(), "bevel");
+    }
+
+    #[test]
+    fn adds_opacities_up_to_one() {
+        let opacity = || {
+            Arc::new(StyleValueData::OpacityValue {
+                value: retained_number(0.75),
+            })
+        };
+        let result = composite_scalar_value(&opacity(), &opacity(), FfiCompositeOperation::Add);
+        assert_eq!(serialized(result).as_deref(), Some("1"));
     }
 }

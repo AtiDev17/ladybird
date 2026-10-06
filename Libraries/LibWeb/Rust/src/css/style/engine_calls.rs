@@ -4,28 +4,26 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-//! The writes and reads the host makes of a document's style engine that the boundary generator does not write for
-//! it. A write is a change the document's render state applies to the engine in the order the host made them; a read
-//! is a question the host waits for the answer to. Each entry takes the document host, never the engine, and owns
-//! what it hands over: borrowed arrays are copied, and the host's objects are referenced, as the entry queues the
+//! The writes and reads the host makes of a document's style engine that the [`super::boundary`] table does not list.
+//! A write is a change the document's render state applies to the engine in the order the host made them; a read is a
+//! closure the host runs on the render state and waits for. Each entry takes the document host, never the engine, and
+//! owns what it hands over: borrowed arrays are copied, and the host's objects are referenced, as the entry queues the
 //! change.
 
+use super::StyleEngine;
 use super::atoms::{AtomKey, AtomLease};
 use super::bridge::{
     FfiDemandedPseudoElement, FfiElementArrival, FfiElementDeclarationDelta, FfiElementStyleInput,
     FfiLocalFeatureDelta, FfiPseudoElementRecordDemand, FfiRecordDemand, FfiRecordDemandAnswer, FfiStateDelta,
-    FfiStyleInputTransaction, FfiTreeDelta, borrow, write_recording_element_style_inputs, write_recording_state_deltas,
-    write_recording_tree_deltas,
+    FfiStyleInputTransaction, FfiTreeDelta, borrow,
 };
 use super::font_resolution::{FontResolverHost, PublishedFontFaces};
 use super::inputs::RetainedCustomPropertyData;
 use super::instrumentation::Counter;
 use super::publication::RecordDemand;
-use super::random_bases::{NamedBaseValue, ParkedBaseValues};
-use super::record_replay::EventKind;
+use super::random_bases::ParkedBaseValues;
 use super::tree::{StyleNodeID, TreeScopeID};
 use super::{HashMap, StyleAtomID};
-use super::{StyleEngine, StyleEngineHandle};
 use crate::css::transition::{FfiTransitionAction, FfiTransitionInput, TransitionDecision};
 use crate::render_state::{ArenaChange, BegunRead, DocumentHost};
 use std::ffi::c_void;
@@ -70,9 +68,6 @@ pub(crate) enum EngineWrite {
         kind: super::bridge::FfiElementDeclarationKind,
         properties: Box<[crate::css::declaration_block::DeclaredProperty]>,
     },
-    /// A benchmark marker the page set, which a recording of the engine's calls keeps in their order.
-    #[cfg(feature = "style-recording")]
-    BenchmarkMarker(Box<[u16]>),
     /// An element's inline declaration block, or none.
     InlineStyle {
         node: StyleNodeID,
@@ -120,6 +115,11 @@ pub(crate) enum EngineWrite {
         slot: super::animations::AnimationSlot,
         effects: Box<[super::effect_descriptions::PublishedEffect]>,
     },
+    /// The timing the host sampled each of an element's own effects with, by identity, where it sampled without asking.
+    AnimationEffectTimings {
+        node: StyleNodeID,
+        timings: super::animations::SampledEffectTimings,
+    },
 }
 
 /// An input transaction the host recorded, owned.
@@ -134,6 +134,12 @@ pub(crate) struct InputTransaction {
 }
 
 impl EngineWrite {
+    /// Whether the write may move a fact the host knows of the render state. What a text spells never does: it stages
+    /// no style input and touches no layout box.
+    pub(crate) fn may_move_facts(&self) -> bool {
+        !matches!(self, Self::TextData { .. })
+    }
+
     pub(crate) fn apply(self, engine: &mut StyleEngine) {
         match self {
             Self::PublishFontFaces {
@@ -163,19 +169,31 @@ impl EngineWrite {
                 data,
                 identity,
             } => engine.set_pseudo_element_custom_property_data(node, pseudo, data, identity),
-            Self::MintStyleNodes(nodes) => mint_style_nodes(engine, &nodes),
-            Self::ApplyTransaction(transaction) => apply_input_transaction(engine, &transaction),
-            Self::ElementParts { node, pairs } => set_element_parts(engine, node, &pairs),
+            Self::MintStyleNodes(nodes) => engine.mint_style_nodes(&nodes),
+            Self::ApplyTransaction(transaction) => engine.apply_transaction_batch(
+                &transaction.tree,
+                (&transaction.arrivals, &transaction.arrival_custom_state_atoms),
+                &transaction.features,
+                &transaction.states,
+                &transaction.declarations,
+                &transaction.element_style_inputs,
+            ),
+            Self::ElementParts { node, pairs } => engine.set_element_parts(node, &pairs),
             Self::TextData { node, data } => {
-                engine.record_boundary_call(EventKind::SetTextData, |payload| {
-                    payload.write_u32(node);
-                    payload.write_u16_slice(&data.to_utf16());
-                });
                 if let Some(node) = StyleNodeID::from_raw(node) {
                     engine.set_text_data(node, data);
                 }
             }
-            Self::ElementLanguage { node, language, text } => set_element_language(engine, node, language, &text),
+            Self::ElementLanguage { node, language, text } => {
+                if language != 0 && !text.is_empty() {
+                    // A range is not a name, so `:lang()` compares against the tag itself. It is recorded once per
+                    // language rather than once per element.
+                    engine.set_element_language_text(StyleAtomID(language), &text);
+                }
+                if let Some(node) = StyleNodeID::from_raw(node) {
+                    engine.set_element_language(node, StyleAtomID(language));
+                }
+            }
             Self::PresentationalHints { node, kind, properties } => {
                 super::bridge::register_element_declared_properties(engine, node, kind, &properties, &[]);
             }
@@ -187,10 +205,11 @@ impl EngineWrite {
             Self::AnimationEffectDescriptions { node, slot, effects } => {
                 engine.animation_effect_descriptions.set(node, slot, effects);
             }
-            #[cfg(feature = "style-recording")]
-            Self::BenchmarkMarker(name) => {
-                if engine.recording_id().is_some() {
-                    engine.record_boundary_call(EventKind::BenchmarkMarker, |payload| payload.write_u16_slice(&name));
+            Self::AnimationEffectTimings { node, timings } => {
+                for (identity, timing) in timings {
+                    engine
+                        .animation_effect_descriptions
+                        .keep_timing(node, 0, identity, timing);
                 }
             }
             Self::InlineStyle { node, data } => {
@@ -204,11 +223,8 @@ impl EngineWrite {
             }
             Self::AdoptAtom(lease) => {
                 let atom = match lease.key() {
-                    // SAFETY: The lease retains the fly string the raw identity names.
-                    AtomKey::Raw(raw) => unsafe { super::bridge::intern_atom(engine, raw) },
-                    AtomKey::Qualified(namespace, name) => {
-                        super::bridge::operations::intern_qualified_atom(engine, namespace.0, name.0)
-                    }
+                    AtomKey::Raw(raw) => engine.intern_atom(raw).0,
+                    AtomKey::Qualified(namespace, name) => engine.intern_qualified_atom(namespace, name).0,
                 };
                 // The engine took a reference of its own, so the global atom stays the one the lease held.
                 assert_eq!(atom, lease.atom().0, "a document adopts the atom its host interned");
@@ -219,9 +235,7 @@ impl EngineWrite {
             }
             Self::UnparkRandomBaseValues { node, slot } => {
                 let row = std::mem::take(&mut *slot.lock().expect("a parked row is never poisoned"));
-                if !row.is_empty() {
-                    unpark_random_base_values(engine, node, &row);
-                }
+                engine.set_element_random_base_values(node, row);
             }
             Self::NoteCustomPropertyEnvironment {
                 identity,
@@ -250,13 +264,8 @@ impl EngineWrite {
                 absorbs_any,
                 absorbed,
             } => {
-                let engine_absorbed = super::bridge::operations::absorb_element_style_input(
-                    engine,
-                    node.raw(),
-                    reaction,
-                    inherited_style_groups,
-                    absorbs_any,
-                );
+                let engine_absorbed =
+                    engine.absorb_element_style_input(node, reaction, inherited_style_groups, absorbs_any);
                 // A fold that merges nothing into the reaction answers the same as none.
                 debug_assert!(
                     engine_absorbed == absorbed
@@ -271,83 +280,6 @@ impl EngineWrite {
             }
         }
     }
-}
-
-// The writes a style replay makes as well, each kept apart so that a replay reaches no more of the engine's writes than
-// it replays.
-
-fn mint_style_nodes(engine: &mut StyleEngine, nodes: &[u32]) {
-    engine.mint_style_nodes(nodes);
-    engine.record_boundary_call(EventKind::MintStyleNodes, |payload| payload.write_u32_slice(nodes));
-}
-
-fn apply_input_transaction(engine: &mut StyleEngine, transaction: &InputTransaction) {
-    engine.apply_transaction_batch(
-        &transaction.tree,
-        (&transaction.arrivals, &transaction.arrival_custom_state_atoms),
-        &transaction.features,
-        &transaction.states,
-        &transaction.declarations,
-        &transaction.element_style_inputs,
-    );
-    engine.record_boundary_call(EventKind::ApplyTransaction, |payload| {
-        write_recording_tree_deltas(&transaction.tree, payload);
-        payload.write_raw_slice(&transaction.arrivals);
-        payload.write_u32_slice(&transaction.arrival_custom_state_atoms);
-        payload.write_raw_slice(&transaction.features);
-        write_recording_state_deltas(&transaction.states, payload);
-        payload.write_raw_slice(&transaction.declarations);
-        write_recording_element_style_inputs(&transaction.element_style_inputs, payload);
-    });
-}
-
-/// Gives `node` the random base values of `row`, as one buffer of name code units with a length and a value per name,
-/// which a replay reads as it was recorded.
-fn unpark_random_base_values(engine: &mut StyleEngine, node: StyleNodeID, row: &[NamedBaseValue]) {
-    let name_lengths = row
-        .iter()
-        .map(|(name, _)| u32::try_from(name.len()).expect("a random caching key's name fits in u32"))
-        .collect::<Vec<_>>();
-    let name_units = row
-        .iter()
-        .flat_map(|(name, _)| name.iter().copied())
-        .collect::<Vec<_>>();
-    let value_bits = row.iter().map(|&(_, value)| value.to_bits()).collect::<Vec<_>>();
-    super::bridge::operations::set_element_random_base_values(
-        engine,
-        node.raw(),
-        &name_lengths,
-        &name_units,
-        &value_bits,
-    );
-}
-
-fn set_element_parts(engine: &mut StyleEngine, node: StyleNodeID, pairs: &[(StyleAtomID, StyleNodeID)]) {
-    engine.set_element_parts(node, pairs);
-    engine.record_boundary_call(EventKind::SetElementParts, |payload| {
-        payload.write_u32(node.raw());
-        payload.write_length(pairs.len());
-        for (name, host) in pairs {
-            payload.write_u32(name.0);
-            payload.write_u32(host.raw());
-        }
-    });
-}
-
-fn set_element_language(engine: &mut StyleEngine, node: u32, language: u32, text: &[u16]) {
-    if language != 0 && !text.is_empty() {
-        // A range is not a name, so `:lang()` compares against the tag itself. It is recorded once per
-        // language rather than once per element.
-        engine.set_element_language_text(StyleAtomID(language), text);
-    }
-    if let Some(node) = StyleNodeID::from_raw(node) {
-        engine.set_element_language(node, StyleAtomID(language));
-    }
-    engine.record_boundary_call(EventKind::SetElementLanguage, |payload| {
-        payload.write_u32(node);
-        payload.write_u32(language);
-        payload.write_u16_slice(text);
-    });
 }
 
 /// A copy of the input transaction `transaction` describes.
@@ -403,10 +335,8 @@ impl EngineWrite {
 /// # Safety
 ///
 /// `host` must be a live document host, on the document's thread.
-pub(super) unsafe fn queue(host: *const DocumentHost, write: EngineWrite) {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    unsafe { &*host }.queue_change(ArenaChange::Engine(write));
+pub(super) unsafe fn queue(host: &DocumentHost, write: EngineWrite) {
+    host.queue_change(ArenaChange::Engine(write));
 }
 
 /// A copy of the `count` values at `values`.
@@ -428,7 +358,7 @@ unsafe fn owned<T: Copy>(values: *const T, count: usize) -> Box<[T]> {
 /// `FontCascadeMemo`, and `feature_values_shadow_scopes` must point at `feature_values_shadow_scope_count` scopes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_publish_font_faces(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     snapshot: *const c_void,
     memo: *const c_void,
     feature_values_shadow_scopes: *const u32,
@@ -446,8 +376,7 @@ pub unsafe extern "C" fn style_engine_publish_font_faces(
         font_faces,
         feature_values_shadow_scopes,
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, write) };
+    host.queue_change(ArenaChange::Engine(write));
 }
 
 /// Keeps the custom-property environment an element now holds, named by `identity`: for the element's animation
@@ -458,7 +387,7 @@ pub unsafe extern "C" fn style_engine_publish_font_faces(
 /// `host` must be a live document host, and `data` null or a live `Web::CSS::CustomPropertyData`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_set_element_custom_property_data(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     node: u32,
     data: *const c_void,
     identity: u64,
@@ -469,8 +398,6 @@ pub unsafe extern "C" fn style_engine_set_element_custom_property_data(
     let Some(node) = StyleNodeID::from_raw(node) else {
         return;
     };
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
     host.engine_memo().held.borrow_mut().follow_element(node, data);
     // SAFETY: Guaranteed by the caller.
     let data = (!data.is_null()).then(|| unsafe { RetainedCustomPropertyData::retain(data) });
@@ -491,7 +418,7 @@ pub unsafe extern "C" fn style_engine_set_element_custom_property_data(
 /// `host` must be a live document host, and `data` null or a live `Web::CSS::CustomPropertyData`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_set_pseudo_element_custom_property_data(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     node: u32,
     pseudo: u8,
     data: *const c_void,
@@ -500,8 +427,6 @@ pub unsafe extern "C" fn style_engine_set_pseudo_element_custom_property_data(
     let Some(node) = StyleNodeID::from_raw(node) else {
         return;
     };
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
     host.engine_memo()
         .held
         .borrow_mut()
@@ -523,9 +448,9 @@ pub unsafe extern "C" fn style_engine_set_pseudo_element_custom_property_data(
 /// # Safety
 /// `host` must be a live document host, and `raw` the raw identity of a live `AK::Utf16FlyString`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn document_host_intern_atom(host: *const DocumentHost, raw: usize) -> u32 {
+pub unsafe extern "C" fn document_host_intern_atom(host: &DocumentHost, raw: usize) -> u32 {
     // SAFETY: Guaranteed by the caller.
-    unsafe { adopt(host, AtomLease::acquire_raw(raw)) }
+    adopt(host, unsafe { AtomLease::acquire_raw(raw) })
 }
 
 /// Interns `name` qualified by `namespace` for the document, as [`document_host_intern_atom`] does a name.
@@ -533,40 +458,28 @@ pub unsafe extern "C" fn document_host_intern_atom(host: *const DocumentHost, ra
 /// # Safety
 /// `host` must be a live document host.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn document_host_intern_qualified_atom(
-    host: *const DocumentHost,
-    namespace: u32,
-    name: u32,
-) -> u32 {
-    // SAFETY: Guaranteed by the caller.
-    unsafe {
-        adopt(
-            host,
-            AtomLease::acquire_qualified(StyleAtomID(namespace), StyleAtomID(name)),
-        )
-    }
+pub unsafe extern "C" fn document_host_intern_qualified_atom(host: &DocumentHost, namespace: u32, name: u32) -> u32 {
+    adopt(
+        host,
+        AtomLease::acquire_qualified(StyleAtomID(namespace), StyleAtomID(name)),
+    )
 }
 
 /// Queues the engine's adoption of the atom `lease` holds, and answers the atom.
-///
-/// # Safety
-/// `host` must be a live document host.
-unsafe fn adopt(host: *const DocumentHost, lease: AtomLease) -> u32 {
+fn adopt(host: &DocumentHost, lease: AtomLease) -> u32 {
     let atom = lease.atom().0;
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, EngineWrite::AdoptAtom(lease)) };
+    host.queue_change(ArenaChange::Engine(EngineWrite::AdoptAtom(lease)));
     atom
 }
 
-/// Records what a custom property's name atom spells, and the fly string it is. The fly string is retained and never
-/// recorded: a replay has no strings, and names its entries by atom alone.
+/// Records what a custom property's name atom spells, and the fly string it is, which the engine retains.
 ///
 /// # Safety
 /// `host` must be a live document host, `raw` a live `AK::Utf16FlyString` raw representation, and `text` must name
 /// `length` code units.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_note_custom_property_name(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     name: u32,
     raw: usize,
     text: *const u16,
@@ -583,8 +496,7 @@ pub unsafe extern "C" fn style_engine_note_custom_property_name(
         // SAFETY: Guaranteed by the caller.
         text: unsafe { owned(text, length) },
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, write) };
+    host.queue_change(ArenaChange::Engine(write));
 }
 
 /// Makes the `count` identities at `nodes`, which the host minted, live.
@@ -592,9 +504,10 @@ pub unsafe extern "C" fn style_engine_note_custom_property_name(
 /// # Safety
 /// `host` must be a live document host, and `nodes` must point at `count` readable `u32` values.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_mint_style_nodes(host: *const DocumentHost, nodes: *const u32, count: usize) {
+pub unsafe extern "C" fn style_engine_mint_style_nodes(host: &DocumentHost, nodes: *const u32, count: usize) {
     // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, EngineWrite::MintStyleNodes(owned(nodes, count))) };
+    let nodes = unsafe { owned(nodes, count) };
+    host.queue_change(ArenaChange::Engine(EngineWrite::MintStyleNodes(nodes)));
 }
 
 /// Applies the host's input transaction.
@@ -602,14 +515,10 @@ pub unsafe extern "C" fn style_engine_mint_style_nodes(host: *const DocumentHost
 /// # Safety
 /// `host` must be a live document host, and each pointer of `transaction` must cover its stated count.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_apply_transaction(
-    host: *const DocumentHost,
-    transaction: &FfiStyleInputTransaction,
-) {
+pub unsafe extern "C" fn style_engine_apply_transaction(host: &DocumentHost, transaction: &FfiStyleInputTransaction) {
     // SAFETY: Guaranteed by the caller.
     let write = EngineWrite::ApplyTransaction(Box::new(unsafe { input_transaction(transaction) }));
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, write) };
+    host.queue_change(ArenaChange::Engine(write));
 }
 
 /// Records the parts the element exposes, each with the shadow host at `hosts` it is exposed to.
@@ -618,7 +527,7 @@ pub unsafe extern "C" fn style_engine_apply_transaction(
 /// `host` must be a live document host, and `names` and `hosts` must each point at `count` readable values.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_set_element_parts(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     node: u32,
     names: *const u32,
     hosts: *const u32,
@@ -627,8 +536,7 @@ pub unsafe extern "C" fn style_engine_set_element_parts(
     // SAFETY: Guaranteed by the caller.
     let (names, hosts) = unsafe { (borrow(names, count), borrow(hosts, count)) };
     if let Some((node, pairs)) = element_parts(node, names, hosts) {
-        // SAFETY: Guaranteed by the caller.
-        unsafe { queue(host, EngineWrite::ElementParts { node, pairs }) };
+        host.queue_change(ArenaChange::Engine(EngineWrite::ElementParts { node, pairs }));
     }
 }
 
@@ -637,11 +545,10 @@ pub unsafe extern "C" fn style_engine_set_element_parts(
 /// # Safety
 /// `host` must be a live document host, and the caller transfers one reference to the live string `data`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_set_text_data(host: *const DocumentHost, node: u32, data: usize) {
+pub unsafe extern "C" fn style_engine_set_text_data(host: &DocumentHost, node: u32, data: usize) {
     // SAFETY: Guaranteed by the caller.
     let data = unsafe { ak::Utf16String::from_raw_owned(data) };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, EngineWrite::TextData { node, data }) };
+    host.queue_change(ArenaChange::Engine(EngineWrite::TextData { node, data }));
 }
 
 /// Records the language the element resolves to, and the tag a `:lang()` range compares against.
@@ -650,7 +557,7 @@ pub unsafe extern "C" fn style_engine_set_text_data(host: *const DocumentHost, n
 /// `host` must be a live document host, and `text` must point at `text_length` readable code units.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_set_element_language(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     node: u32,
     language: u32,
     text: *const u16,
@@ -658,108 +565,7 @@ pub unsafe extern "C" fn style_engine_set_element_language(
 ) {
     // SAFETY: Guaranteed by the caller.
     let text = unsafe { borrow(text, text_length) };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, EngineWrite::element_language(node, language, text)) };
-}
-
-/// Replays the recorded identities a host minted onto the replay engine `engine`.
-///
-/// # Safety
-/// `engine` must be a live replay engine.
-pub unsafe fn replay_mint_style_nodes(engine: StyleEngineHandle, nodes: &[u32]) {
-    // SAFETY: Guaranteed by the caller.
-    mint_style_nodes(unsafe { engine.get_mut() }, nodes);
-}
-
-/// Replays a recorded input transaction onto the replay engine `engine`.
-///
-/// # Safety
-/// `engine` must be a live replay engine, and each pointer of `transaction` must cover its stated count.
-pub unsafe fn replay_apply_transaction(engine: StyleEngineHandle, transaction: &FfiStyleInputTransaction) {
-    // SAFETY: Guaranteed by the caller.
-    unsafe { apply_input_transaction(engine.get_mut(), &input_transaction(transaction)) };
-}
-
-/// Replays the recorded parts of an element onto the replay engine `engine`.
-///
-/// # Safety
-/// `engine` must be a live replay engine.
-pub unsafe fn replay_set_element_parts(engine: StyleEngineHandle, node: u32, names: &[u32], hosts: &[u32]) {
-    if let Some((node, pairs)) = element_parts(node, names, hosts) {
-        // SAFETY: Guaranteed by the caller.
-        set_element_parts(unsafe { engine.get_mut() }, node, &pairs);
-    }
-}
-
-/// Replays the recorded language of an element onto the replay engine `engine`.
-///
-/// # Safety
-/// `engine` must be a live replay engine.
-pub unsafe fn replay_set_element_language(engine: StyleEngineHandle, node: u32, language: u32, text: &[u16]) {
-    // SAFETY: Guaranteed by the caller.
-    set_element_language(
-        unsafe { engine.get_mut() },
-        node,
-        language,
-        if language == 0 { &[] } else { text },
-    );
-}
-
-/// A read of a document's style engine the host's style code makes.
-pub(crate) enum StyleQuery {
-    /// The nodes whose style depends on the viewport.
-    ViewportDependentNodes,
-    /// The record of an element or one of its pseudo-elements the host reads before the next style update.
-    RecordDemand { node: StyleNodeID, demand: RecordDemand },
-    /// The engine's id of the native rule the host names by `identity`.
-    NativeRuleId(u64),
-    /// The engine's counter at `index`.
-    Counter(usize),
-    /// The end of the transaction the host took last, which answers the identities it released.
-    EndTransaction,
-}
-
-/// The answer to a [`StyleQuery`].
-pub(crate) enum StyleAnswer {
-    Number(u64),
-    Nodes(Vec<u32>),
-    RecordDemand(FfiRecordDemandAnswer),
-    Counter(Option<(&'static str, u64)>),
-}
-
-impl StyleQuery {
-    pub(crate) fn answer(self, engine: &mut StyleEngine) -> StyleAnswer {
-        match self {
-            Self::EndTransaction => StyleAnswer::Nodes(super::bridge::end_style_transaction(engine)),
-            Self::ViewportDependentNodes => {
-                StyleAnswer::Nodes(engine.computed_group_sets.viewport_dependent_nodes(|environment| {
-                    engine.custom_property_environments.reads_viewport(environment)
-                }))
-            }
-            Self::RecordDemand { node, demand } => {
-                StyleAnswer::RecordDemand(super::bridge::answer_record_demand(engine, node, demand))
-            }
-            Self::NativeRuleId(identity) => {
-                StyleAnswer::Number(engine.native_rule_id(identity).map_or(0, |id| u64::from(id.0) + 1))
-            }
-            Self::Counter(index) => {
-                let retired = engine.computed_group_sets.retired_animation_overlay_records();
-                engine
-                    .counters
-                    .set(Counter::RetiredAnimationOverlayRecords, retired as u64);
-                let counter = engine.counters().iter().nth(index);
-                engine.record_boundary_call(EventKind::Counter, |payload| {
-                    payload.write_u64(u64::try_from(index).expect("counter index exceeds u64"));
-                    payload.write_bool(counter.is_some());
-                    if let Some((name, value)) = counter {
-                        payload.write_bytes(name.as_bytes());
-                        payload.write_u64(value);
-                    }
-                });
-                StyleAnswer::Counter(counter)
-            }
-        }
-    }
+    host.queue_change(ArenaChange::Engine(EngineWrite::element_language(node, language, text)));
 }
 
 /// The document host `host` names.
@@ -785,33 +591,10 @@ pub(crate) fn with_engine_and_arena<R>(
     host: &DocumentHost,
     call: impl FnOnce(&mut StyleEngine, &crate::layout::LayoutNodeArena) -> R,
 ) -> R {
-    crate::render_state::ask(read, host, crate::render_state::EngineCall(call)).0
-}
-
-/// Asks the style engine of `host`'s document `query`, in `read`.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-pub(crate) unsafe fn ask_engine(host: *const DocumentHost, read: &BegunRead, query: StyleQuery) -> StyleAnswer {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    crate::render_state::ask(read, unsafe { &*host }, query)
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-unsafe fn ask_engine_number(
-    host: *const DocumentHost,
-    read: &crate::render_state::BegunRead,
-    query: StyleQuery,
-) -> u64 {
-    // SAFETY: Guaranteed by the caller.
-    let StyleAnswer::Number(number) = (unsafe { ask_engine(host, read, query) }) else {
-        unreachable!("the question is answered with a number");
-    };
-    number
+    host.ask(read, |state| {
+        let (engine, arena) = state.engine_and_arena();
+        call(engine, arena)
+    })
 }
 
 /// The custom-property environment an element holds, or null.
@@ -820,15 +603,11 @@ unsafe fn ask_engine_number(
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_element_custom_property_data(
-    host: *const DocumentHost,
-    node: u32,
-) -> *const c_void {
+pub unsafe extern "C" fn style_engine_element_custom_property_data(host: &DocumentHost, node: u32) -> *const c_void {
     let Some(node) = StyleNodeID::from_raw(node) else {
         return std::ptr::null();
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { document_host(host) }.engine_memo().held.borrow().element(node)
+    host.engine_memo().held.borrow().element(node)
 }
 
 /// The custom-property environment one of an element's synthetic pseudo-elements holds, or null.
@@ -838,19 +617,14 @@ pub unsafe extern "C" fn style_engine_element_custom_property_data(
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_pseudo_element_custom_property_data(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     node: u32,
     pseudo: u8,
 ) -> *const c_void {
     let Some(node) = StyleNodeID::from_raw(node) else {
         return std::ptr::null();
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { document_host(host) }
-        .engine_memo()
-        .held
-        .borrow()
-        .pseudo_element(node, pseudo)
+    host.engine_memo().held.borrow().pseudo_element(node, pseudo)
 }
 
 /// Which of an element's synthetic pseudo-elements hold a custom-property environment, as a bit set by kind.
@@ -859,19 +633,11 @@ pub unsafe extern "C" fn style_engine_pseudo_element_custom_property_data(
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_pseudo_elements_with_custom_property_data(
-    host: *const DocumentHost,
-    node: u32,
-) -> u64 {
+pub unsafe extern "C" fn style_engine_pseudo_elements_with_custom_property_data(host: &DocumentHost, node: u32) -> u64 {
     let Some(node) = StyleNodeID::from_raw(node) else {
         return 0;
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { document_host(host) }
-        .engine_memo()
-        .held
-        .borrow()
-        .pseudo_element_kinds(node)
+    host.engine_memo().held.borrow().pseudo_element_kinds(node)
 }
 
 /// The nodes whose style depends on the viewport, handed to `append` one by one.
@@ -881,15 +647,16 @@ pub unsafe extern "C" fn style_engine_pseudo_elements_with_custom_property_data(
 /// `host` must be a live document host, on its document's thread, and `append` must take each node synchronously.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_viewport_dependent_nodes(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     context: *mut c_void,
     append: unsafe extern "C" fn(*mut c_void, u32),
 ) {
-    // SAFETY: Guaranteed by the caller.
-    let StyleAnswer::Nodes(nodes) = (unsafe { ask_engine(host, read, StyleQuery::ViewportDependentNodes) }) else {
-        unreachable!("viewport dependent nodes are answered with nodes");
-    };
+    let nodes = with_engine(read, host, |engine| {
+        engine
+            .computed_group_sets
+            .viewport_dependent_nodes(|environment| engine.custom_property_environments.reads_viewport(environment))
+    });
     for node in nodes {
         // SAFETY: Guaranteed by the caller.
         unsafe { append(context, node) };
@@ -903,15 +670,11 @@ pub unsafe extern "C" fn style_engine_viewport_dependent_nodes(
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_park_element_random_base_values(
-    host: *const DocumentHost,
-    node: u32,
-) -> *const c_void {
+pub unsafe extern "C" fn style_engine_park_element_random_base_values(host: &DocumentHost, node: u32) -> *const c_void {
     let Some(node) = StyleNodeID::from_raw(node) else {
         return std::ptr::null();
     };
-    // SAFETY: Guaranteed by the caller.
-    if !unsafe { document_host(host) }.element_random_base_values_may_exist() {
+    if !host.element_random_base_values_may_exist() {
         return std::ptr::null();
     }
     let slot = ParkedBaseValues::default();
@@ -936,7 +699,7 @@ pub unsafe extern "C" fn style_engine_park_element_random_base_values(
 /// [`style_engine_park_element_random_base_values`] answered.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_unpark_element_random_base_values(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     node: u32,
     slot: *const c_void,
 ) {
@@ -945,8 +708,7 @@ pub unsafe extern "C" fn style_engine_unpark_element_random_base_values(
     let Some(node) = StyleNodeID::from_raw(node) else {
         return;
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { queue(host, EngineWrite::UnparkRandomBaseValues { node, slot }) };
+    host.queue_change(ArenaChange::Engine(EngineWrite::UnparkRandomBaseValues { node, slot }));
 }
 
 /// Lets go of a slot of random base values the element that held it no longer needs.
@@ -967,7 +729,7 @@ pub unsafe extern "C" fn style_engine_release_random_base_values(slot: *const c_
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_answer_record_demand(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     node: u32,
     demand: FfiRecordDemand,
@@ -983,7 +745,7 @@ pub unsafe extern "C" fn style_engine_answer_record_demand(
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_answer_pseudo_element_record_demand(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     node: u32,
     demand: FfiPseudoElementRecordDemand,
@@ -997,7 +759,7 @@ pub unsafe extern "C" fn style_engine_answer_pseudo_element_record_demand(
 ///
 /// `host` must be a live document host, on its document's thread.
 unsafe fn ask_record_demand(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     node: u32,
     demand: RecordDemand,
@@ -1005,13 +767,9 @@ unsafe fn ask_record_demand(
     let Some(node) = StyleNodeID::from_raw(node) else {
         return FfiRecordDemandAnswer::default();
     };
-    // SAFETY: Guaranteed by the caller.
-    let StyleAnswer::RecordDemand(answer) =
-        (unsafe { ask_engine(host, read, StyleQuery::RecordDemand { node, demand }) })
-    else {
-        unreachable!("a record demand is answered with a record");
-    };
-    answer
+    with_engine(read, host, |engine| {
+        super::bridge::answer_record_demand(engine, node, demand)
+    })
 }
 
 /// What a style record's values depend on.
@@ -1021,12 +779,10 @@ unsafe fn ask_record_demand(
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_style_record_dependency_flags(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     style_record: u64,
 ) -> u8 {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
     let memo = &host.engine_memo().dependency_flags;
     if let Some(flags) = memo.get(style_record) {
         return flags;
@@ -1053,12 +809,10 @@ pub unsafe extern "C" fn style_engine_style_record_dependency_flags(
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_style_record_custom_property_environment(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     style_record: u64,
 ) -> u64 {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
     let memo = &host.engine_memo().record_environments;
     if let Some(environment) = memo.get(style_record) {
         return environment;
@@ -1097,10 +851,14 @@ pub(crate) struct EngineMemo {
 }
 
 impl EngineMemo {
-    /// Follows `change`, a write the host queued for the engine.
-    pub(crate) fn follow(&self, change: &super::bridge::StyleChange) {
-        self.deferred.borrow_mut().follow(change);
+    /// Follows `change`, a write the host queued for the engine, as the host makes it.
+    pub(crate) fn follow(&self, change: &super::boundary::StyleChange) {
         self.baselines.borrow_mut().follow(change);
+    }
+
+    /// Follows `queued`, a write the host queued for the engine, as it joins the writes the engine applies next.
+    pub(crate) fn follow_queued(&self, queued: crate::render_state::QueuedStyleChange<'_>) {
+        self.deferred.borrow_mut().follow(queued);
     }
 }
 
@@ -1220,7 +978,7 @@ impl DeferredInputs {
     }
 
     /// Folds the input `node` owes into the reaction the host is about to apply to it, as
-    /// [`super::StyleEngineState::absorb_element_style_input`] does, where the host knows the answer: `None` where an
+    /// [`super::StyleEngine::absorb_element_style_input`] does, where the host knows the answer: `None` where an
     /// input it cannot name may move it.
     fn absorb(
         &mut self,
@@ -1259,11 +1017,12 @@ impl DeferredInputs {
         Some(u32::from(reaction | owed_reaction) | (u32::from(inherited_style_groups | owed_groups) << 8))
     }
 
-    /// Follows `change`, which the host queues for the engine.
-    pub(crate) fn follow(&mut self, change: &super::bridge::StyleChange) {
-        use super::bridge::StyleChange;
+    /// Follows `queued`, in the order the engine applies the writes the host queues: a write held behind the drain of a
+    /// style transaction's reactions reaches the engine after the drain's.
+    fn follow(&mut self, queued: crate::render_state::QueuedStyleChange<'_>) {
+        use super::boundary::StyleChange;
         use super::transaction::{STYLE_REACTION_PUBLISHED_STYLE, STYLE_REACTION_RECOMPUTE_STYLE};
-        let (node, reaction, groups) = match *change {
+        let (node, reaction, groups) = match *queued.change() {
             StyleChange::RecordDerivedElementStyleInput {
                 node,
                 reaction,
@@ -1272,10 +1031,8 @@ impl DeferredInputs {
             StyleChange::RecordContainerQueryInput { node } => {
                 (node, STYLE_REACTION_PUBLISHED_STYLE | STYLE_REACTION_RECOMPUTE_STYLE, 0)
             }
-            StyleChange::ConsumeElementStyleInput { node } => {
-                if let Some(node) = StyleNodeID::from_raw(node)
-                    && let Ok(index) = self.search(node)
-                {
+            StyleChange::ConsumeElementStyleInput { node: Some(node) } => {
+                if let Ok(index) = self.search(node) {
                     self.inputs.remove(index);
                 }
                 return;
@@ -1302,17 +1059,17 @@ impl DeferredInputs {
                 return;
             }
             StyleChange::RecordSizeContainerQueryDependents { .. }
-            | StyleChange::EvaluateSizeContainersNeedingEvaluationAfterLayout {} => {
+            | StyleChange::EvaluateSizeContainersNeedingEvaluationAfterLayout => {
                 self.add_unnamed((STYLE_REACTION_PUBLISHED_STYLE | STYLE_REACTION_RECOMPUTE_STYLE, 0));
                 return;
             }
-            StyleChange::Flush {} => {
+            StyleChange::Flush => {
                 self.add_unnamed(Self::ALL);
                 return;
             }
             _ => return,
         };
-        let Some(node) = StyleNodeID::from_raw(node) else {
+        let Some(node) = node else {
             return;
         };
         if reaction == 0 {
@@ -1379,20 +1136,11 @@ pub(crate) fn known_style_record_view(
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_transition_baseline(
-    host: *const DocumentHost,
-    node: u32,
-    pseudo_kind: u8,
-) -> u64 {
+pub unsafe extern "C" fn style_engine_transition_baseline(host: &DocumentHost, node: u32, pseudo_kind: u8) -> u64 {
     let Some(node) = StyleNodeID::from_raw(node) else {
         return 0;
     };
-    // SAFETY: Guaranteed by the caller.
-    unsafe { document_host(host) }
-        .engine_memo()
-        .baselines
-        .borrow()
-        .get(node, pseudo_kind)
+    host.engine_memo().baselines.borrow().get(node, pseudo_kind)
 }
 
 /// Whether the engine has a style transaction pending, which the host knows without asking where it wrote nothing
@@ -1402,14 +1150,10 @@ pub unsafe extern "C" fn style_engine_transition_baseline(
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_has_pending_transaction(host: *const DocumentHost, read: &BegunRead) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    match host.known_facts() {
+pub unsafe extern "C" fn style_engine_has_pending_transaction(host: &DocumentHost, read: &BegunRead) -> bool {
+    match host.known_engine_facts() {
         Some(facts) => facts.has_pending_style_transaction,
-        None => with_engine(read, host, |engine| {
-            super::bridge::operations::has_pending_transaction(engine)
-        }),
+        None => with_engine(read, host, |engine| engine.has_pending_transaction()),
     }
 }
 
@@ -1420,18 +1164,35 @@ pub unsafe extern "C" fn style_engine_has_pending_transaction(host: *const Docum
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_has_deferred_element_style_inputs(
-    host: *const DocumentHost,
-    read: &BegunRead,
-) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    match host.known_facts() {
+pub unsafe extern "C" fn style_engine_has_deferred_element_style_inputs(host: &DocumentHost, read: &BegunRead) -> bool {
+    match host.known_engine_facts() {
         Some(facts) => facts.has_deferred_element_style_inputs,
-        None => with_engine(read, host, |engine| {
-            super::bridge::operations::has_deferred_element_style_inputs(engine)
-        }),
+        None => with_engine(read, host, |engine| engine.has_deferred_element_style_inputs()),
     }
+}
+
+/// Whether the engine defers a style input for `node`, which the host knows without asking where no job runs and the
+/// writes it queued since its last job name every input they defer.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_has_deferred_element_style_input(
+    host: &DocumentHost,
+    read: &BegunRead,
+    node: u32,
+) -> bool {
+    let Some(style_node) = StyleNodeID::from_raw(node) else {
+        return false;
+    };
+    if host.knows_engine_between_jobs() {
+        let deferred = host.engine_memo().deferred.borrow();
+        if !deferred.may_owe_unnamed() {
+            return deferred.search(style_node).is_ok();
+        }
+    }
+    with_engine(read, host, |engine| engine.has_deferred_element_style_input(style_node))
 }
 
 /// The synthetic pseudo-elements `node` has rules for, as a C++ record's pseudo-style mask, or no bits when the engine
@@ -1443,17 +1204,29 @@ pub unsafe extern "C" fn style_engine_has_deferred_element_style_inputs(
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_published_pseudo_style_mask(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &BegunRead,
     node: u32,
 ) -> u64 {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    host.transaction_pseudo_style_mask(node).unwrap_or_else(|| {
-        with_engine(read, host, |engine| {
-            super::bridge::operations::published_pseudo_style_mask(engine, node)
-        })
-    })
+    host.transaction_pseudo_styles(node).map_or_else(
+        || {
+            with_engine(read, host, |engine| {
+                StyleNodeID::from_raw(node).map_or(0, |node| engine.published_pseudo_style_mask(node))
+            })
+        },
+        |styles| styles.mask,
+    )
+}
+
+/// The synthetic pseudo-elements `node` has rules for that settling its pseudo-elements over the composition of its
+/// record leaves alone, where the style transaction the host drains composes its row on the host, and none otherwise.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_inert_pseudo_kinds(host: &DocumentHost, node: u32) -> u64 {
+    host.transaction_pseudo_styles(node).map_or(0, |styles| styles.inert)
 }
 
 /// Whether a size container waits for layout to be evaluated, which the host knows without asking where it wrote
@@ -1464,15 +1237,13 @@ pub unsafe extern "C" fn style_engine_published_pseudo_style_mask(
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_has_size_containers_needing_evaluation_after_layout(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &BegunRead,
 ) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
-    match host.known_facts() {
+    match host.known_engine_facts() {
         Some(facts) => facts.has_size_containers_needing_evaluation_after_layout,
         None => with_engine(read, host, |engine| {
-            super::bridge::operations::has_size_containers_needing_evaluation_after_layout(engine)
+            engine.has_size_containers_needing_evaluation_after_layout()
         }),
     }
 }
@@ -1485,22 +1256,47 @@ pub unsafe extern "C" fn style_engine_has_size_containers_needing_evaluation_aft
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_attribute_value_text_requirements_version(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &BegunRead,
 ) -> u64 {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
     match host.known_selector_attribute_value_text_requirements_version() {
         Some(version) => super::inputs::with_attr_names_read(version),
-        None => with_engine(read, host, |engine| {
-            super::bridge::operations::attribute_value_text_requirements_version(engine)
-        }),
+        None => with_engine(read, host, |engine| engine.attribute_value_text_requirements_version()),
     }
+}
+
+/// Whether the host knows that nothing reads what the values of the attribute name `name` spell: no selector of the
+/// engine, by `name` or the other forms the host published with it, and no `attr()`, by `local_name` if it has one.
+/// The host knows what the selectors read where it queued no rule since its last job; what `attr()`s read is the
+/// process's. Where it does not know, the host hands the engine each value's text, which the engine keeps only where
+/// something reads it.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread, and `local_name` null or `local_name_length` code
+/// units.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_attribute_value_text_is_known_unread(
+    host: &DocumentHost,
+    name: u32,
+    any_namespace: u32,
+    folded_name: u32,
+    folded_local: u32,
+    local_name: *const u16,
+    local_name_length: usize,
+) -> bool {
+    let attr_may_read = !local_name.is_null()
+        // SAFETY: Guaranteed by the caller.
+        && crate::css::parser::arbitrary_substitution::attr_may_read_name(unsafe {
+            std::slice::from_raw_parts(local_name, local_name_length)
+        });
+    let keys = [name, any_namespace, folded_name, folded_local].map(StyleAtomID);
+    !attr_may_read && host.known_selectors_read_value_text_of(&keys) == Some(false)
 }
 
 /// Folds the style input `node` owes into the reaction the host is about to apply to it, where the reaction covers it,
 /// and answers the merged reaction in the low byte and the merged inherited style groups in the next, or zero, as
-/// [`super::StyleEngineState::absorb_element_style_input`] does. The host answers where it knows the answer, and the
+/// [`super::StyleEngine::absorb_element_style_input`] does. The host answers where it knows the answer, and the
 /// engine folds the input the same as it applies the host's writes.
 ///
 /// # Safety
@@ -1508,20 +1304,19 @@ pub unsafe extern "C" fn style_engine_attribute_value_text_requirements_version(
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_absorb_element_style_input(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &BegunRead,
     node: u32,
     reaction: u8,
     inherited_style_groups: u8,
     absorbs_any: bool,
 ) -> u32 {
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { document_host(host) };
     let Some(style_node) = StyleNodeID::from_raw(node) else {
         return 0;
     };
-    // A job of the engine, or a frame in flight, moves what it defers beside what the host knows.
-    let known = host.knows_engine_between_jobs().then(|| {
+    // A job of the engine, or a frame in flight, moves what it defers beside what the host knows, and a fold held
+    // behind the drain of a style transaction's reactions reaches the engine after the drain's writes.
+    let known = (host.knows_engine_between_jobs() && !host.holds_style_writes()).then(|| {
         host.engine_memo()
             .deferred
             .borrow_mut()
@@ -1529,13 +1324,7 @@ pub unsafe extern "C" fn style_engine_absorb_element_style_input(
     });
     let Some(Some(absorbed)) = known else {
         return with_engine(read, host, |engine| {
-            super::bridge::operations::absorb_element_style_input(
-                engine,
-                node,
-                reaction,
-                inherited_style_groups,
-                absorbs_any,
-            )
+            engine.absorb_element_style_input(style_node, reaction, inherited_style_groups, absorbs_any)
         });
     };
     // The engine folds what the host did, and an input the host knows nothing of that folding merges nothing into the
@@ -1589,13 +1378,13 @@ impl<T: Copy> Memo<T> {
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_native_rule_id(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     identity: u64,
 ) -> u32 {
-    // SAFETY: Guaranteed by the caller.
-    let id = unsafe { ask_engine_number(host, read, StyleQuery::NativeRuleId(identity)) };
-    u32::try_from(id).expect("a native rule id fits 32 bits")
+    with_engine(read, host, |engine| {
+        engine.native_rule_id(identity).map_or(0, |id| id.0 + 1)
+    })
 }
 
 /// The name of the engine's counter at `index`, with its length and value written out, or null past the last one.
@@ -1605,16 +1394,19 @@ pub unsafe extern "C" fn style_engine_native_rule_id(
 /// `host` must be a live document host, on its document's thread, and the out pointers writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_counter(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     index: usize,
     out_value: *mut u64,
     out_name_length: *mut usize,
 ) -> *const u8 {
-    // SAFETY: Guaranteed by the caller.
-    let StyleAnswer::Counter(counter) = (unsafe { ask_engine(host, read, StyleQuery::Counter(index)) }) else {
-        unreachable!("a counter is answered with a counter");
-    };
+    let counter = with_engine(read, host, |engine| {
+        let retired = engine.computed_group_sets.retired_animation_overlay_records();
+        engine
+            .counters
+            .set(Counter::RetiredAnimationOverlayRecords, retired as u64);
+        engine.counters().iter().nth(index)
+    });
     let Some((name, value)) = counter else {
         return std::ptr::null();
     };
@@ -1628,8 +1420,9 @@ pub unsafe extern "C" fn style_engine_counter(
 
 /// Decides what each property `input` prepared does to the transitions of its target, as the target's style changes
 /// from the record `before` to the record `after` it installed. Writes the values each decision compared into its
-/// property, and the decision into `actions`. The render owner reads the transform reference box of the target's
-/// element's box as it decides.
+/// property, and the decision into `actions`. The style transaction the host drains decided the step beside the row of
+/// an element whose step nothing but the engine's records decides; any other the render owner decides, reading the
+/// transform reference box of the target's element's box as it does.
 ///
 /// # Safety
 ///
@@ -1637,14 +1430,14 @@ pub unsafe extern "C" fn style_engine_counter(
 /// writable storage for one action per property.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn style_engine_decide_transitions(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     before: u64,
     after: u64,
     input: *const FfiTransitionInput,
     actions: *mut FfiTransitionAction,
 ) {
-    crate::css::ffi_stats::rust_style_ffi_note_transition_decision();
+    crate::css::ffi_stats::note_transition_decision();
     // SAFETY: Guaranteed by the caller.
     let input = unsafe { &*input };
     if input.property_count == 0 {
@@ -1664,12 +1457,18 @@ pub unsafe extern "C" fn style_engine_decide_transitions(
         element: (input.target_pseudo_kind == u8::MAX)
             .then(|| StyleNodeID::from_raw(input.target_node))
             .flatten(),
-        element_box: crate::layout::node_data::NodeSlotId {
-            index: input.element_box_slot,
-        },
     };
-    // SAFETY: As above.
-    with_engine_and_arena(read, unsafe { document_host(host) }, |engine, arena| {
-        decision.decide(engine, arena, properties, actions);
+    if decision.element.is_some()
+        && host.answer_decided_transition_step(input.target_node, &decision, properties, actions)
+    {
+        return;
+    }
+    let element_box = crate::layout::node_data::NodeSlotId {
+        index: input.element_box_slot,
+    };
+    with_engine_and_arena(read, host, |engine, arena| {
+        let reference_box =
+            crate::painting::ffi::committed_transform_reference_box(&arena.paintable_rows(), element_box);
+        decision.decide(engine, reference_box, properties, actions);
     });
 }

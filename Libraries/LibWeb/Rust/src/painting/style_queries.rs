@@ -15,8 +15,8 @@ use crate::css::css_string::CssString;
 use crate::css::serialize::{StringUnits, with_fly_string_units};
 use crate::css::style_value::StyleValueData;
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
-use crate::layout::node_facts;
-use crate::painting::paint_read::PaintRead;
+use crate::layout::node_facts::{self, NodeShape};
+use crate::painting::paint_read::{PaintRead, PaintRow};
 
 const SEPARATOR_COMMA: u8 = 1;
 
@@ -184,10 +184,9 @@ pub(crate) fn has_layout_containment(arena: &impl PaintRead, node: NodeSlotId, s
 }
 
 pub(crate) fn is_scroll_container(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    let Some(kind) = arena.node_kind_if_live(node) else {
-        return false;
-    };
-    node_facts::kind_and_style_make_scroll_container(kind, arena.node_style_if_live(node))
+    arena
+        .node(node)
+        .is_some_and(|row| node_facts::kind_and_style_make_scroll_container(row.kind(), row.style()))
 }
 
 pub(crate) fn has_style_containment(style: ComputedValuesView<'_>) -> bool {
@@ -203,35 +202,8 @@ pub(crate) fn has_paint_containment(arena: &impl PaintRead, node: NodeSlotId, st
     contained && containment_applies_to_display(arena, node, style)
 }
 
-fn kind_is_svg_box(kind: NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::SVGBox
-            | NodeKind::SVGClipBox
-            | NodeKind::SVGGeometryBox
-            | NodeKind::SVGGraphicsBox
-            | NodeKind::SVGImageBox
-            | NodeKind::SVGMaskBox
-            | NodeKind::SVGPatternBox
-            | NodeKind::SVGTextBox
-            | NodeKind::SVGTextPathBox
-    )
-}
-
-fn kind_is_svg_graphics_box(kind: NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::SVGGeometryBox
-            | NodeKind::SVGGraphicsBox
-            | NodeKind::SVGImageBox
-            | NodeKind::SVGMaskBox
-            | NodeKind::SVGTextBox
-            | NodeKind::SVGTextPathBox
-    )
-}
-
 pub(crate) fn kind_is_svg_element_box(kind: NodeKind) -> bool {
-    kind_is_svg_box(kind) || matches!(kind, NodeKind::SVGSVGBox | NodeKind::SVGForeignObjectBox)
+    node_facts::kind_is_svg_box(kind) || matches!(kind, NodeKind::SVGSVGBox | NodeKind::SVGForeignObjectBox)
 }
 
 pub(crate) fn node_is_root_element(arena: &impl PaintRead, node: NodeSlotId) -> bool {
@@ -316,9 +288,10 @@ pub(crate) fn inline_establishes_absolute_position_containing_block(style: Compu
 }
 
 pub(crate) fn establishes_positioning_containing_blocks(arena: &impl PaintRead, node: NodeSlotId) -> (bool, bool) {
-    let Some(kind) = arena.node_kind_if_live(node) else {
+    let Some(row) = arena.node(node) else {
         return (false, false);
     };
+    let kind = row.kind();
     if !node_facts::kind_is_box(kind) {
         return (false, false);
     }
@@ -327,7 +300,7 @@ pub(crate) fn establishes_positioning_containing_blocks(arena: &impl PaintRead, 
         return (true, true);
     }
 
-    let Some(style) = arena.node_style_if_live(node) else {
+    let Some(style) = row.style() else {
         return (false, false);
     };
     if style_establishes_fixed_positioning_containing_block(arena, node, style) {
@@ -372,18 +345,20 @@ pub(crate) fn has_css_transform(arena: &impl PaintRead, node: NodeSlotId, style:
 }
 
 pub(crate) fn is_atomic_inline(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    arena.node_is_atomic_inline(node)
+    arena.node(node).is_some_and(PaintRow::is_atomic_inline)
 }
 
 pub(crate) fn is_transformable(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    let Some(kind) = arena.node_kind_if_live(node) else {
+    let Some(row) = arena.node(node) else {
         return false;
     };
+    let kind = row.kind();
     if kind_is_svg_element_box(kind) {
         if matches!(kind, NodeKind::SVGClipBox | NodeKind::SVGPatternBox) {
             return true;
         }
-        let is_renderable = (kind_is_svg_graphics_box(kind) && kind != NodeKind::SVGMaskBox)
+        let is_renderable = (crate::layout::svg_formatting_context::kind_is_svg_graphics_box(kind)
+            && kind != NodeKind::SVGMaskBox)
             || matches!(kind, NodeKind::SVGSVGBox | NodeKind::SVGForeignObjectBox);
         if !is_renderable {
             return false;
@@ -401,18 +376,19 @@ pub(crate) fn is_transformable(arena: &impl PaintRead, node: NodeSlotId) -> bool
         return true;
     }
 
-    let is_dom_element =
-        !has_flag(arena, node, NodeFlag::Anonymous) && !node_facts::kind_is_text(kind) && kind != NodeKind::Viewport;
-    let is_element_or_pseudo_element = is_dom_element || arena.node_is_generated_for_pseudo_element(node);
+    let is_dom_element = !node_facts::has_flag(&row, NodeFlag::Anonymous)
+        && !node_facts::kind_is_text(kind)
+        && kind != NodeKind::Viewport;
+    let is_element_or_pseudo_element = is_dom_element || row.generated_for() != 0;
     if is_element_or_pseudo_element && node_facts::kind_is_box(kind) {
-        let Some(style) = arena.node_style_if_live(node) else {
+        let Some(style) = row.style() else {
             return false;
         };
         let display = style.display();
         if display.is_table_column() || display.is_table_column_group() {
             return false;
         }
-        if display.is_inline_outside() && !is_atomic_inline(arena, node) {
+        if display.is_inline_outside() && !row.is_atomic_inline() {
             return false;
         }
         return true;
@@ -500,12 +476,15 @@ fn outline_style_to_line_style(style: u8) -> u8 {
     }
 }
 
+// `auto` lets us do whatever we want for the outline. 2px of the accent color seems reasonable.
+pub(crate) fn auto_outline_width() -> CssPixels {
+    CssPixels::from_integer(2)
+}
+
 pub(crate) fn outline_geometry(style: ComputedValuesView<'_>) -> Option<OutlineGeometry> {
     let misc = style.misc_reset();
     let (line_style, width) = if misc.outline_style == outline_style::AUTO {
-        // `auto` lets us do whatever we want for the outline. 2px of the accent
-        // colour seems reasonable.
-        (line_style::SOLID, CssPixels::from_integer(2))
+        (line_style::SOLID, auto_outline_width())
     } else {
         (outline_style_to_line_style(misc.outline_style), misc.outline_width)
     };
@@ -549,16 +528,16 @@ pub(crate) fn outline_offset(arena: &impl PaintRead, node: NodeSlotId) -> CssPix
 }
 
 pub(crate) fn is_text_decoration_propagation_boundary(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    let Some(kind) = arena.node_kind_if_live(node) else {
+    let Some(row) = arena.node(node) else {
         return false;
     };
     // NB: Anonymous wrappers must stay transparent to propagation so an element's own decorations still reach
     //     its text. The principal box of a pseudo-element is not a wrapper and must be checked like any other
     //     element, and a table wrapper carries the float and position of the table it wraps, so it is the only
     //     box where an out-of-flow table is observable.
-    if has_flag(arena, node, NodeFlag::Anonymous)
-        && !arena.node_is_generated_for_pseudo_element(node)
-        && kind != NodeKind::TableWrapper
+    if node_facts::has_flag(&row, NodeFlag::Anonymous)
+        && row.generated_for() == 0
+        && row.kind() != NodeKind::TableWrapper
     {
         return false;
     }
@@ -566,10 +545,7 @@ pub(crate) fn is_text_decoration_propagation_boundary(arena: &impl PaintRead, no
     // https://drafts.csswg.org/css-text-decor-4/#decorating-box
     // NOTE: Note that text decorations are not propagated to any out-of-flow descendants, nor to the contents
     //       of atomic inline-level descendants such as inline blocks and inline tables.
-    if arena.node_is_out_of_flow_if_live(node) {
-        return true;
-    }
-    is_atomic_inline(arena, node)
+    row.is_out_of_flow() || row.is_atomic_inline()
 }
 
 pub(crate) fn z_index(arena: &impl PaintRead, node: NodeSlotId) -> Option<i32> {
@@ -589,7 +565,7 @@ pub(crate) fn effective_z_index(arena: &impl PaintRead, paintable: NodeSlotId) -
 // style changes that do not relayout (z-index, for one) are never stale here.
 
 pub(crate) fn is_positioned(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    arena.node_is_positioned(node)
+    arena.node(node).is_some_and(PaintRow::is_positioned)
 }
 
 pub(crate) fn position(arena: &impl PaintRead, node: NodeSlotId) -> u8 {
@@ -605,7 +581,7 @@ pub(crate) fn is_sticky_position(style: ComputedValuesView<'_>) -> bool {
 }
 
 pub(crate) fn is_floating(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    arena.node_is_floating(node)
+    arena.node(node).is_some_and(PaintRow::is_floating)
 }
 
 pub(crate) fn is_invisible_for_line_clamp(arena: &impl PaintRead, node: NodeSlotId) -> bool {
@@ -663,11 +639,12 @@ pub(crate) fn is_replaced_box(arena: &impl PaintRead, node: NodeSlotId) -> bool 
 }
 
 pub(crate) fn establishes_stacking_context(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    let Some(kind) = arena.node_kind_if_live(node) else {
+    let Some(row) = arena.node(node) else {
         return false;
     };
+    let kind = row.kind();
 
-    if kind_is_svg_box(kind) {
+    if node_facts::kind_is_svg_box(kind) {
         return false;
     }
 
@@ -675,12 +652,12 @@ pub(crate) fn establishes_stacking_context(arena: &impl PaintRead, node: NodeSlo
         return true;
     }
 
-    let flags = arena.node_flags_if_live(node);
+    let flags = row.flags();
     if flags & NodeFlag::Anonymous as u32 == 0 && flags & NodeFlag::IsHtmlHtmlElement as u32 != 0 {
         return true;
     }
 
-    let Some(style) = arena.node_style_if_live(node) else {
+    let Some(style) = row.style() else {
         return false;
     };
     let box_values = style.box_values();

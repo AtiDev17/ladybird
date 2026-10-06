@@ -88,10 +88,6 @@ impl<'pass> SizingContext<'pass> {
         self.callbacks.first_child(node)
     }
 
-    fn next_sibling(&self, node: Node) -> Node {
-        self.callbacks.next_sibling(node)
-    }
-
     fn has_children(&self, node: Node) -> bool {
         !self.callbacks.first_child(node).is_invalid()
     }
@@ -137,10 +133,8 @@ impl<'pass> SizingContext<'pass> {
                             return true;
                         }
                     }
-                    let mut child = self.first_child(node);
-                    while !child.is_invalid() {
+                    for child in self.callbacks.children(node) {
                         pending.push(child);
-                        child = self.next_sibling(child);
                     }
                 }
                 false
@@ -1482,23 +1476,7 @@ impl<'pass> SizingContext<'pass> {
     pub(crate) fn resolve_box_model_metrics_against_inline_basis(&self, node: Node, containing_inline_size: CssPixels) {
         let style = self.style(node);
         let used = self.used(node);
-        used.margin_left.set(style.margin_left().to_px(containing_inline_size));
-        used.border_left.set(style.border_left_width());
-        used.padding_left
-            .set(style.padding_left().to_px(containing_inline_size));
-        used.margin_right
-            .set(style.margin_right().to_px(containing_inline_size));
-        used.border_right.set(style.border_right_width());
-        used.padding_right
-            .set(style.padding_right().to_px(containing_inline_size));
-        used.margin_top.set(style.margin_top().to_px(containing_inline_size));
-        used.border_top.set(style.border_top_width());
-        used.padding_top.set(style.padding_top().to_px(containing_inline_size));
-        used.padding_bottom
-            .set(style.padding_bottom().to_px(containing_inline_size));
-        used.border_bottom.set(style.border_bottom_width());
-        used.margin_bottom
-            .set(style.margin_bottom().to_px(containing_inline_size));
+        used.resolve_box_model(&style, containing_inline_size);
     }
 
     pub(crate) fn dimension_empty_atomic_root(
@@ -1508,40 +1486,13 @@ impl<'pass> SizingContext<'pass> {
         constraints: ContainingBlockConstraints,
         layout_mode: LayoutMode,
     ) {
-        if layout_mode == LayoutMode::Normal && !self.purpose.is_measurement() {
-            match fc_run_cache::fc_run_cache_mode_from_environment() {
-                fc_run_cache::FcRunCacheMode::Enabled if self.try_reuse_empty_atomic_root_metrics(node) => return,
-                fc_run_cache::FcRunCacheMode::Shadow => {
-                    self.dimension_empty_atomic_root_with_shadow_comparison(node, available_space, constraints);
-                    return;
-                }
-                _ => {}
-            }
+        if layout_mode == LayoutMode::Normal
+            && !self.purpose.is_measurement()
+            && self.try_reuse_empty_atomic_root_metrics(node)
+        {
+            return;
         }
         self.dimension_empty_atomic_root_fresh(node, available_space, constraints, layout_mode);
-    }
-
-    #[cold]
-    fn dimension_empty_atomic_root_with_shadow_comparison(
-        &self,
-        node: Node,
-        available_space: AvailableSpace,
-        constraints: ContainingBlockConstraints,
-    ) {
-        let used = self.used(node);
-        let initial = used_values::UsedValuesCellState::capture(used);
-        let reused = self.try_reuse_empty_atomic_root_metrics(node);
-        let cached = used_values::UsedValuesCellState::capture(used);
-        initial.apply_to_record(used);
-        self.dimension_empty_atomic_root_fresh(node, available_space, constraints, LayoutMode::Normal);
-        if reused {
-            assert_eq!(
-                cached,
-                used_values::UsedValuesCellState::capture(used),
-                "empty atomic sizing shadow diverged for slot {}",
-                node.slot_index()
-            );
-        }
     }
 
     fn try_reuse_empty_atomic_root_metrics(&self, node: Node) -> bool {
@@ -2670,18 +2621,13 @@ impl<'pass> SizingContext<'pass> {
 
     pub(crate) fn table_box_inside_wrapper(&self, wrapper: Node) -> Node {
         fn find(context: &SizingContext, parent: Node) -> Option<Node> {
-            let mut child = context.first_child(parent);
-            while !child.is_invalid() {
+            context.callbacks.children(parent).find_map(|child| {
                 let facts = context.facts(child);
                 if facts.is_box() && facts.display().is_table_inside() {
                     return Some(child);
                 }
-                if let Some(table) = find(context, child) {
-                    return Some(table);
-                }
-                child = context.next_sibling(child);
-            }
-            None
+                find(context, child)
+            })
         }
 
         find(self, wrapper).expect("table wrapper must contain a table box")

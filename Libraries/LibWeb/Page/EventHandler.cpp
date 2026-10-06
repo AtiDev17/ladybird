@@ -339,7 +339,7 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
 
     auto viewport_position = document->visual_viewport()->map_to_layout_viewport(visual_viewport_position);
 
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
     document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
 
     if (!has_committed_root_box())
@@ -459,7 +459,7 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
         return EventResult::Dropped;
 
     auto viewport_position = document->visual_viewport()->map_to_layout_viewport(visual_viewport_position);
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
     document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseMove);
 
     if (!has_committed_root_box())
@@ -672,7 +672,7 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
         return EventResult::Dropped;
 
     auto viewport_position = document->visual_viewport()->map_to_layout_viewport(visual_viewport_position);
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
     document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseUp);
 
     if (!has_committed_root_box())
@@ -887,7 +887,7 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
             ? Compositing::SnapSelectionStrategy::Type::Direction
             : Compositing::SnapSelectionStrategy::Type::EndPosition);
 
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
     document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseWheel);
 
     if (!has_committed_root_box())
@@ -1117,7 +1117,7 @@ EventResult EventHandler::dispatch_synthetic_pinch_wheel_event(CSSPixelPoint vis
     if (!document || !document->is_fully_active())
         return EventResult::Dropped;
 
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
     document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseWheel);
 
     if (!has_committed_root_box())
@@ -1161,7 +1161,7 @@ EventResult EventHandler::handle_mouseleave()
     if (!m_navigable->active_document()->is_fully_active())
         return EventResult::Dropped;
 
-    Layout::ForcedReadScope read { *m_navigable->active_document(), false };
+    Layout::ForcedReadScope read { *m_navigable->active_document() };
     m_navigable->active_document()->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseMove);
 
     if (!has_committed_root_box())
@@ -1194,7 +1194,7 @@ void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_posit
         return;
 
     auto viewport_position = document->visual_viewport()->map_to_layout_viewport(visual_viewport_position);
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
     document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseMove);
 
     if (!has_committed_root_box())
@@ -1343,8 +1343,7 @@ EventHandler::KeyboardScrollSnapshot EventHandler::keyboard_scroll_snapshot() co
     auto document = m_navigable->active_document();
     if (!document || !document->is_fully_active() || !m_navigable->is_top_level_traversable())
         return {};
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
 
     KeyboardScrollSnapshot snapshot;
     snapshot.scroll_target = scroll_target_for_key_input();
@@ -1653,15 +1652,14 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         auto scroll_target = scroll_target_for_key_input();
         if (!scroll_target)
             return false;
-        Layout::ForcedReadScope read { *document, false };
+        Layout::ForcedReadScope read { *document };
         document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleKeyDown);
         auto* scroll_target_layout_node = scroll_target->layout_node(read);
         return scroll_target_layout_node
             && Painting::wheel_scroll_along_containing_block_chain(*scroll_target_layout_node, delta_x, delta_y, scroll_kind) != nullptr;
     };
     auto perform_scroll_step_for_key_input = [&](CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type strategy_type) {
-        // The scroll step reads the target's box as the key's own read of the render state.
-        Layout::ForcedReadScope read { *document, false };
+        Layout::ForcedReadScope read { *document };
         document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleKeyDown);
         Layout::Node* target = nullptr;
         if (auto scroll_target = scroll_target_for_key_input())
@@ -1771,7 +1769,7 @@ EventResult EventHandler::handle_drag_and_drop_event(DragEvent::Type type, CSSPi
     auto& document = *m_navigable->active_document();
     auto viewport_position = document.visual_viewport()->map_to_layout_viewport(visual_viewport_position);
 
-    Layout::ForcedReadScope read { document, false };
+    Layout::ForcedReadScope read { document };
     document.update_layout(DOM::UpdateLayoutReason::EventHandlerHandleDragAndDrop);
 
     if (!has_committed_root_box())
@@ -2521,8 +2519,7 @@ Optional<EventHandler::Target> EventHandler::target_for_mouse_position(CSSPixelP
     auto document = m_navigable->active_document();
     if (!document)
         return {};
-    // Hit testing is the input's own read of the document's render state.
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
 
     if (auto result = document->hit_test(read, position); result.has_value()) {
         return Target {
@@ -2641,7 +2638,7 @@ void EventHandler::run_mousedown_default_actions(Layout::BegunRead const& read, 
 
 Optional<Painting::CaretPosition> EventHandler::prepare_mouse_selection(DOM::Document& document, CSSPixelPoint visual_viewport_position)
 {
-    Layout::ForcedReadScope read { document, false };
+    Layout::ForcedReadScope read { document };
     document.update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
     if (!has_committed_root_box())
         return {};
@@ -2703,7 +2700,7 @@ bool EventHandler::select_word_for_dictionary_lookup(CSSPixelPoint visual_viewpo
     if (!document)
         return false;
 
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
     document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
     if (!has_committed_root_box())
         return false;
@@ -2821,7 +2818,7 @@ void EventHandler::finish_selection_from_preserved_mousedown(DOM::Document& docu
     if (!m_mousedown_visual_viewport_position.has_value() || *m_mousedown_visual_viewport_position != visual_viewport_position)
         return;
 
-    Layout::ForcedReadScope read { document, false };
+    Layout::ForcedReadScope read { document };
     document.update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseUp);
     if (!has_committed_root_box())
         return;
@@ -2890,7 +2887,7 @@ void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCo
     GC::Ref<DOM::Document> document = *m_navigable->active_document();
 
     // NB: Event dispatches above may have run JS that invalidated layout.
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
     document->update_layout(DOM::UpdateLayoutReason::EventHandlerShowContextMenu);
 
     // AD-HOC: Retarget the user-agent context menu now that layout has potentially changed.
@@ -3742,11 +3739,25 @@ void EventHandler::report_hovered_node_to_client(GC::Ptr<DOM::Node> target)
 {
     auto& page = m_navigable->page();
 
-    HTML::HTMLElement const* hovered_title_element = nullptr;
-    if (target)
-        hovered_title_element = target->enclosing_html_element_with_attribute(HTML::AttributeNames::title);
-    if (hovered_title_element && hovered_title_element->title().has_value()) {
-        page.client().page_did_enter_tooltip_area(hovered_title_element->title()->to_byte_string());
+    // https://html.spec.whatwg.org/multipage/dom.html#the-title-attribute
+    // User agents should inform the user when elements have advisory information, otherwise the information would not
+    // be discoverable.
+    // https://html.spec.whatwg.org/multipage/rendering.html#the-title-attribute-2
+    // User agents are expected to expose the advisory information of elements upon user request, and to make the user
+    // aware of the presence of such information.
+    // On interactive graphical systems where the user can use a pointing device, this could take the form of a
+    // tooltip.
+    // NB: Text under the pointer has no advisory information of its own, so the element the text is in supplies it.
+    Utf16String advisory_information;
+    if (target) {
+        auto const* element = as_if<DOM::Element>(*target);
+        if (!element)
+            element = target->flat_tree_parent_element();
+        if (element)
+            advisory_information = element->advisory_information();
+    }
+    if (!advisory_information.is_empty()) {
+        page.client().page_did_enter_tooltip_area(advisory_information.to_byte_string());
         page.set_is_in_tooltip_area(true);
     } else if (page.is_in_tooltip_area()) {
         page.client().page_did_leave_tooltip_area();

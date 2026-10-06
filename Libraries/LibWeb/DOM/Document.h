@@ -55,6 +55,7 @@
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/Painting/DisplayListRecording.h>
 #include <LibWeb/Painting/FlexboxInspectorOverlay.h>
 #include <LibWeb/Painting/Forward.h>
 #include <LibWeb/Painting/GridInspectorOverlay.h>
@@ -71,6 +72,12 @@
 #include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebCommon/HTML/VisibilityState.h>
+
+namespace Web::Compositor {
+
+struct FlightPresentation;
+
+}
 
 namespace Web::CSS {
 
@@ -203,7 +210,6 @@ enum class UpdateLayoutReason {
 }
 
 [[nodiscard]] Utf16View to_string(UpdateLayoutReason);
-[[nodiscard]] bool reason_is_script_api(UpdateLayoutReason);
 
 #define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASONS(X) \
     X(AnchorNamesUnregisteredByElementRemoval)       \
@@ -326,6 +332,10 @@ public:
     GC::Ptr<Range> find_in_page_active_match() const { return m_find_in_page_active_match; }
     void set_find_in_page_active_match(GC::Ptr<Range>);
     void collapse_find_in_page_active_match_if_its_text_changed();
+    Vector<GC::Ref<Range>> const& find_in_page_highlighted_matches() const { return m_find_in_page_highlighted_matches; }
+    void set_find_in_page_highlighted_matches(Vector<GC::Ref<Range>>);
+    void remove_find_in_page_highlighted_matches_whose_text_changed();
+    void recompute_search_text_paint_states(Layout::BegunRead const&);
 
     WebIDL::ExceptionOr<Utf16String> cookie();
     WebIDL::ExceptionOr<void> set_cookie(Utf16View);
@@ -400,7 +410,6 @@ public:
     GC::Ptr<Node const> inspected_node() const { return m_inspected_node; }
 
     void set_highlighted_node(GC::Ptr<Node>, Optional<CSS::PseudoElement>);
-    GC::Ptr<Node const> highlighted_node() const { return m_highlighted_node; }
     Layout::Node* highlighted_layout_node(Layout::BegunRead const& read);
     Layout::Node const* highlighted_layout_node(Layout::BegunRead const& read) const { return const_cast<Document*>(this)->highlighted_layout_node(read); }
     void set_flexbox_highlighted_node(GC::Ptr<Node>, Painting::FlexboxInspectorOverlayOptions);
@@ -467,7 +476,6 @@ public:
     Color background_color(Layout::BegunRead const& read) const;
     Color canvas_background_color(Layout::BegunRead const& read) const;
     CSS::PreferredColorScheme canvas_color_scheme(Layout::BegunRead const& read) const;
-    CSS::ImageRendering background_image_rendering(Layout::BegunRead const& read) const;
 
     Optional<Color> normal_link_color() const;
     void set_normal_link_color(Optional<Color>);
@@ -505,6 +513,26 @@ public:
     bool let_style_update_fly(Layout::RustFFI::FfiFlightBlocker blocker);
     // Seals the first round of a rendering update's layout for the frame its style flies in.
     void seal_first_layout_round(Layout::BegunRead const&);
+    // Brings the style up to date, and lets the first round of the rendering update's layout fly beside the event loop
+    // where `blocker` is none and the layout is not up to date. The next layout update takes it in. Answers whether the
+    // round flies.
+    bool let_layout_fly(Layout::RustFFI::FfiFlightBlocker blocker);
+    // Takes in the layout round that flew, as the frame it flew in left the document, and answers whether that laid the
+    // document out: no other round runs, so what was written since the round flew is the next layout update's.
+    bool take_flown_layout_in();
+    // While one lives, the document reads as the layout that flew left it: the writes made since wait behind those made
+    // meanwhile, and its layout is up to date as of the frame.
+    class [[nodiscard]] LayoutAsItFlew {
+        AK_MAKE_NONCOPYABLE(LayoutAsItFlew);
+        AK_MAKE_NONMOVABLE(LayoutAsItFlew);
+
+    public:
+        explicit LayoutAsItFlew(Document&);
+        ~LayoutAsItFlew();
+
+    private:
+        GC::Ref<Document> m_document;
+    };
     void note_throttled_animation_style_update() { m_has_throttled_animation_style_update = true; }
     void note_animations_that_can_skip_per_frame_style_updates();
     void flush_throttled_animation_style_update();
@@ -541,6 +569,7 @@ public:
     [[nodiscard]] u64 partial_layout_count() const;
     [[nodiscard]] u64 full_layout_count() const;
     [[nodiscard]] bool layout_is_up_to_date() const;
+    [[nodiscard]] bool layout_is_known_stale() const;
     void clear_devtools_layout_inspection_data();
     void prepare_for_rendering(Layout::BegunRead const& read);
     void update_paint_and_hit_testing_properties_if_needed();
@@ -555,9 +584,12 @@ public:
     }
     [[nodiscard]] bool is_running_update_layout() const;
 
-    // The marks the DOM side has made on this document's layout and paint state but not written there yet.
-    [[nodiscard]] InvalidationJournal& invalidation_journal() { return *m_invalidation_journal; }
-    void drain_invalidation_journal(Layout::BegunRead const&) const;
+    // The selection changed, or lost its range, so the selection states of the boxes it paints through are stale. They
+    // are found again at the next read of the paint state: the selection may change beside a frame in flight, which
+    // holds the boxes.
+    void note_selection_changed();
+    // Writes the selection and find-in-page match states left stale to the paint state.
+    void update_highlight_states_if_needed(Layout::BegunRead const&);
     // What layout has told this document and the document has not acted on yet.
     [[nodiscard]] CommitMessages& commit_messages() { return *m_commit_messages; }
 
@@ -574,6 +606,7 @@ public:
     Layout::Viewport* unsafe_layout_node(Layout::BegunRead const& read);
     bool has_committed_viewport_box() const;
 
+    bool has_paint_state() const { return !!m_paint_state; }
     Painting::DocumentPaintState& paint_state();
     Painting::DocumentPaintState const& paint_state() const;
     // Whether the last layout committed a box whose `content-visibility` is `auto`.
@@ -1039,6 +1072,7 @@ public:
 
     void register_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, IntersectionObserver::IntersectionObserver&);
     void unregister_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, IntersectionObserver::IntersectionObserver&);
+    bool has_intersection_observation_targets() const;
 
     void register_resize_observer(Badge<ResizeObserver::ResizeObserver>, ResizeObserver::ResizeObserver&);
     bool has_resize_observers() const { return !m_resize_observers.is_empty(); }
@@ -1232,7 +1266,7 @@ public:
     void register_svg_pattern_element(Badge<SVG::SVGPatternElement>, SVG::SVGPatternElement&);
     void unregister_svg_pattern_element(Badge<SVG::SVGPatternElement>, SVG::SVGPatternElement&);
     void republish_svg_patterns_inheriting_from(Utf16FlyString const& id);
-    void schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason);
+    void schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope);
     bool can_compute_client_rects_without_accumulated_visual_contexts_update(Layout::Node const&) const;
     void schedule_accumulated_visual_context_update(Layout::BegunRead const& read, Element&, AccumulatedVisualContextUpdateScope);
     void schedule_accumulated_visual_context_update(Layout::Node const&, AccumulatedVisualContextUpdateScope);
@@ -1304,6 +1338,9 @@ public:
     void set_top_layer_needs_layout_zone_rebuild() { m_top_layer_needs_layout_zone_rebuild = true; }
 
     OrderedHashTable<GC::Ref<Element>> const& top_layer_elements() const { return m_top_layer_elements; }
+    // Only a member of the top layer, or an element whose membership changed since the top layer boxes were built, can
+    // have a box placed in the top layer.
+    bool may_have_boxes_placed_in_top_layer() const { return !m_top_layer_elements.is_empty() || !m_elements_with_pending_top_layer_membership_change.is_empty(); }
     bool top_layer_pending_removals_contains(GC::Ref<Element> element) const { return m_top_layer_pending_removals.contains(element); }
 
     // AD-HOC: These lists are managed dynamically instead of being generated as needed.
@@ -1363,16 +1400,16 @@ public:
         set_needs_repaint(should_invalidate_display_list);
     }
 
-    // A repaint mark the journal holds applies its damage when the journal drains, but the frame that drains it has to
-    // be asked for when the mark is made.
-    void request_frame_for_pending_repaint(Badge<InvalidationJournal>) { request_frame_for_pending_repaint(); }
-
     // Records the document's display list in step with the host, once a recording in flight has been taken in.
     RefPtr<Compositing::DisplayList> record_display_list(Layout::BegunRead const& read, HTML::PaintConfig, Compositing::DisplayListResourceStorage&, Painting::PaintCommandCacheMode);
     // Starts recording the document's display list as the document is now, beside the event loop where `blocker` is
-    // none, and makes the display list of a recording that has landed and stands.
-    Optional<Painting::DisplayListRecording> start_display_list_recording(Layout::BegunRead const& read, HTML::PaintConfig, Painting::PaintCommandCacheMode, Layout::RustFFI::FfiFlightBlocker);
-    RefPtr<Compositing::DisplayList> finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const&, Compositing::DisplayListResourceStorage&);
+    // none, taking `flight`, if any, to present its frame with, and makes the display list of a recording that has
+    // landed.
+    Optional<Painting::DisplayListRecording> start_display_list_recording(Layout::BegunRead const& read, HTML::PaintConfig, Painting::PaintCommandCacheMode, Layout::RustFFI::FfiFlightBlocker, Optional<Compositor::FlightPresentation>* flight = nullptr);
+    RefPtr<Compositing::DisplayList> finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const&, Compositing::DisplayListResourceStorage&, Painting::HitTestListStands = Painting::HitTestListStands::Yes);
+    // Takes in `display_list`, which `recording` published: the paint command cache source, and the hit-test list it made,
+    // read in `hit_test_list_read`, where that still stands for the document's boxes. Where none does, nothing is read.
+    void adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const&, NonnullRefPtr<Compositing::DisplayList>, Compositing::DisplayListResourceStorage&);
     Optional<Painting::HitTestQuery> prepare_hit_test_query(Layout::BegunRead const& read);
     Optional<Painting::HitTestResult> hit_test(Layout::BegunRead const& read, CSSPixelPoint);
     Optional<Painting::CaretPosition> caret_position_from_point(Layout::BegunRead const& read, CSSPixelPoint);
@@ -1562,6 +1599,10 @@ protected:
     void initialize_document();
 
 private:
+    // Whether the first round of a rendering update's layout may be sealed: list items that wait to be renumbered and top
+    // layer work are the layout update's to do first.
+    bool may_seal_first_layout_round() const;
+    Layout::RustFFI::FfiLayoutUpdateInputs first_layout_round_inputs() const;
     // Whether nothing this document has pending could change layout geometry: style, layout and every input
     // that feeds them are settled.
     [[nodiscard]] bool is_clean_for_layout_geometry_read(Layout::BegunRead const& read) const;
@@ -1580,9 +1621,6 @@ private:
 
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
     void request_frame_for_pending_repaint();
-
-    // ^JS::Object
-    virtual bool is_dom_document() const final { return true; }
 
     // ^HTML::GlobalEventHandlers
     virtual GC::Ptr<EventTarget> global_event_handlers_to_event_target(Utf16FlyString const&) final { return *this; }
@@ -1604,7 +1642,7 @@ private:
     Layout::RustFFI::FfiLayoutUpdateHostCallbacks layout_update_host_callbacks();
 
     void process_pending_list_item_renumbers();
-    bool reconcile_stale_list_item_counters_after_tree_build(Layout::BegunRead const& read);
+    bool reconcile_stale_list_item_counters_after_tree_build(ReadonlySpan<Layout::RustFFI::FfiNodeIdentity> rebuilt_roots);
     enum class LayoutTreeChanged : u8 {
         No,
         Yes,
@@ -1671,7 +1709,6 @@ private:
     GC::Ref<DOM::EventTarget> m_relevant_global_event_target;
 
     RefPtr<Layout::NodeArena> m_layout_node_arena;
-    NonnullOwnPtr<InvalidationJournal> m_invalidation_journal;
     NonnullOwnPtr<CommitMessages> m_commit_messages;
     OwnPtr<Painting::DocumentPaintState> m_paint_state;
     NonnullRefPtr<Painting::ChromeWidgetRegistry> m_chrome_widget_registry;
@@ -1832,6 +1869,7 @@ private:
     bool m_is_decoded_svg { false };
 
     bool m_needs_animated_style_update { false };
+    bool m_reads_layout_as_it_flew { false };
     GC::WeakHashSet<Animations::KeyframeEffect> m_effects_needing_animated_style_update;
     GC::WeakHashSet<Animations::KeyframeEffect> m_effects_needing_animated_style_update_after_current_update;
     bool m_is_updating_animated_style { false };
@@ -1921,7 +1959,13 @@ private:
 
     // https://html.spec.whatwg.org/multipage/interaction.html#fip-active-match
     GC::Ptr<Range> m_find_in_page_active_match;
+    bool m_selection_states_are_stale { false };
+    bool m_search_text_states_are_stale { false };
     Utf16String m_find_in_page_active_match_text;
+    Vector<GC::Ref<Range>> m_find_in_page_highlighted_matches;
+    Vector<Utf16String> m_find_in_page_highlighted_match_texts;
+    u64 m_find_in_page_highlighted_matches_dom_tree_version { 0 };
+    u64 m_find_in_page_highlighted_matches_character_data_version { 0 };
 
     struct HighlightStyleObservability {
         bool observable { false };

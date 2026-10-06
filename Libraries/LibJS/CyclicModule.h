@@ -36,7 +36,7 @@ public:
     virtual ThrowCompletionOr<void> link(VM& vm) override final;
     virtual ThrowCompletionOr<GC::Ref<PromiseCapability>> evaluate(VM& vm) override final;
 
-    virtual PromiseCapability& load_requested_modules(GC::Ptr<GraphLoadingState::HostDefined>) override;
+    virtual PromiseCapability& load_requested_modules(GC::Ptr<GC::Cell> host_defined) override;
 
     ModuleStatus status() const { return m_status; }
     void set_status(ModuleStatus status) { m_status = status; }
@@ -46,7 +46,7 @@ public:
     Vector<LoadedModuleRequest>& loaded_modules() { return m_loaded_modules; }
 
 protected:
-    CyclicModule(Realm& realm, StringView filename, bool has_top_level_await, Vector<ModuleRequest> requested_modules, Script::HostDefined* host_defined);
+    CyclicModule(Realm& realm, StringView filename, bool has_top_level_await, Vector<ModuleRequest> requested_modules, GC::Ptr<GC::Cell> host_defined);
 
     virtual void visit_edges(Cell::Visitor&) override;
     virtual size_t external_memory_size() const override;

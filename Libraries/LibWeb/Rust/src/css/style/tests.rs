@@ -32,6 +32,26 @@ fn native_rules(source: &str) -> std::rc::Rc<crate::css::rule::NativeRuleList> {
     }
 }
 
+impl StyleEngine {
+    /// Read one answer the preceding style transaction published, as a cascade over it would.
+    pub(super) fn consume_published_match_answer(&mut self, node: StyleNodeID) -> Option<Vec<RuleMatch>> {
+        let retained = &mut self.retained;
+        let mut traversal = retained.batch_matching_traversal.take();
+        let effects = match traversal.as_mut() {
+            Some(traversal) => &mut traversal.answer_effects,
+            None => &mut retained.published_match_answers.answer_effects,
+        };
+        let mut effects = std::mem::take(effects);
+        let result = retained.consume_published_match_answer_in_traversal(&mut effects, node, traversal.as_deref());
+        match traversal.as_mut() {
+            Some(traversal) => traversal.answer_effects = effects,
+            None => retained.published_match_answers.answer_effects = effects,
+        }
+        retained.batch_matching_traversal = traversal;
+        result
+    }
+}
+
 #[test]
 fn native_selector_publication_and_replacement_outlive_the_source() {
     use super::bridge::{BoundScopeChain, publish_style_rule, publish_style_rule_selectors};
@@ -802,10 +822,10 @@ fn retained_winners_construct_a_source_free_cascade_store() {
     commit_test_setup(&mut engine);
     let matches = vec![concrete_rule_match(&engine, nodes[1], rule, 0, None)];
     engine.matches_for_cascade(matches, false, Some(nodes[1]));
-    engine.state.retained.published_match_answers.push(
+    engine.retained.published_match_answers.push(
         published_match_answer(nodes[1].raw(), None, 1),
-        &mut engine.state.retained.memory,
-        &mut engine.counters,
+        &mut engine.retained.memory,
+        &engine.retained.counters,
     );
     engine.published_match_answers.sort();
 
@@ -869,8 +889,8 @@ fn repaired_selector_truth_deltas_do_not_depend_on_retained_order() {
 
 #[test]
 fn verification_gates_only_execute_checks() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
-    let _: () = verify_style_answer_patch(&mut engine.state, &mut engine.counters, |_| {});
+    let mut engine = StyleEngine::new();
+    let _: () = verify_style_answer_patch(&mut engine.retained, |_| {});
     let _: () = verify_cascade_winners(&engine, |_| {});
     let _: () = verify_style_plan_provenance(&engine, |_| {});
     let _: () = verify_published_style_transaction(&engine, |_| {});
@@ -900,12 +920,12 @@ fn retained_answer_delta_memo_accounts_its_tuple_capacity() {
 
 #[test]
 fn published_match_answer_accounting_stays_exact_incrementally() {
-    let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
-    let mut counters = Counters::new();
+    let mut memory = MemoryController::new();
+    let counters = Counters::new();
     let mut answers = PublishedMatchAnswers::default();
 
     let mut push_and_verify = |answer| {
-        answers.push(answer, &mut memory, &mut counters);
+        answers.push(answer, &mut memory, &counters);
         assert_eq!(answers.memory.bytes(), answers.recompute_capacity_bytes());
         assert_eq!(
             memory.bytes_in_category(MemoryCategory::BatchScratch),
@@ -955,7 +975,7 @@ fn publish_current_cascade_as_computed(engine: &mut StyleEngine, node: StyleNode
 
 #[test]
 fn flat_tree_descendant_collection_follows_shadow_and_slot_relations() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 7];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<_> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -975,20 +995,17 @@ fn flat_tree_descendant_collection_follows_shadow_and_slot_relations() {
     engine.tree.set_first_element_child(*assigned, Some(*assigned_child));
     engine.tree.set_parent(*assigned_child, Some(*assigned));
     engine
-        .state
         .retained
         .tree
-        .set_shadow_root(*host, *shadow_root, &mut engine.state.retained.memory);
+        .set_shadow_root(*host, *shadow_root, &mut engine.retained.memory);
     engine
-        .state
         .retained
         .tree
-        .set_assigned_slot(*assigned, Some(*slot), &mut engine.state.retained.memory);
+        .set_assigned_slot(*assigned, Some(*slot), &mut engine.retained.memory);
     engine
-        .state
         .retained
         .tree
-        .set_assigned_nodes(*slot, &[*assigned], &mut engine.state.retained.memory);
+        .set_assigned_nodes(*slot, &[*assigned], &mut engine.retained.memory);
 
     let mut descendants = Vec::new();
     engine.for_each_flat_tree_descendant(*host, |node| descendants.push(node));
@@ -999,7 +1016,7 @@ fn flat_tree_descendant_collection_follows_shadow_and_slot_relations() {
 
 #[test]
 fn size_container_dependents_are_found_along_the_flat_tree() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 7];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<_> = raw.iter().filter_map(|&raw| StyleNodeID::from_raw(raw)).collect();
@@ -1017,7 +1034,7 @@ fn size_container_dependents_are_found_along_the_flat_tree() {
     engine.tree.set_parent(slot, Some(wrapper));
     engine.tree.set_first_element_child(assigned, Some(assigned_child));
     engine.tree.set_parent(assigned_child, Some(assigned));
-    let retained = &mut engine.state.retained;
+    let retained = &mut engine.retained;
     retained.tree.set_shadow_root(host, shadow_root, &mut retained.memory);
     retained
         .tree
@@ -1035,7 +1052,7 @@ fn size_container_dependents_are_found_along_the_flat_tree() {
     engine.record_size_container_query_dependents(host);
 
     assert_eq!(engine.size_query_container_scan_visits(true), 4);
-    let recorded = &engine.state.retained.row_inputs_moved;
+    let recorded = &engine.retained.row_inputs_moved;
     assert!(recorded.containers_moved(slot));
     assert!(recorded.containers_moved(assigned_child));
     assert!(!recorded.containers_moved(unassigned));
@@ -1093,9 +1110,9 @@ fn selector_truth_changes_consolidate_by_semantic_key() {
         node,
         rule: Some((rule, entry)),
     });
-    let mut counters = Counters::new();
+    let counters = Counters::new();
 
-    changes.consolidate(&mut counters);
+    changes.consolidate(&counters);
 
     assert_eq!(
         changes.deltas.as_slice(),
@@ -1116,7 +1133,7 @@ fn exact_tree_routing_is_reserved_for_incremental_changes() {
 
 #[test]
 fn an_evicted_prefix_answer_is_a_typed_missing_key() {
-    let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+    let mut memory = MemoryController::new();
     let mut answers = PrefixAnswerCache::default();
     let mut catalog = MatchAnswerCatalog::default();
     let contribution_key = PrefixContributionKey {
@@ -1176,7 +1193,7 @@ fn an_evicted_prefix_answer_is_a_typed_missing_key() {
 
 #[test]
 fn prefix_answer_keys_compare_content_after_hash_collisions() {
-    let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+    let mut memory = MemoryController::new();
     let mut answers = PrefixAnswerCache::default();
     let mut catalog = MatchAnswerCatalog::default();
     let mut effects = AnswerEffects::default();
@@ -1295,7 +1312,7 @@ fn retained_answer_test_programs() -> SelectorPrograms {
 fn retained_answer_rule_queries_preserve_shared_nodes_and_query_boundaries() {
     let mut catalog = MatchAnswerCatalog::default();
     let mut answers = RetainedMatchAnswers::default();
-    let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+    let mut memory = MemoryController::new();
     let programs = retained_answer_test_programs();
     let mut expected = Vec::new();
     for index in 1..=128 {
@@ -1356,7 +1373,7 @@ fn retained_answer_rule_queries_preserve_shared_nodes_and_query_boundaries() {
 fn cascade_input_catalog_entries_follow_retained_column_lifetimes() {
     let mut catalog = MatchAnswerCatalog::default();
     let mut answers = RetainedMatchAnswers::default();
-    let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+    let mut memory = MemoryController::new();
     let node = StyleNodeID::element(1);
 
     for _ in 0..128 {
@@ -1378,7 +1395,7 @@ fn cascade_input_catalog_entries_follow_retained_column_lifetimes() {
 fn retained_match_answer_payloads_are_evictable_without_losing_identity() {
     assert_eq!(size_of::<RetainedRuleMatch>(), 20);
 
-    let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+    let mut memory = MemoryController::new();
     let mut answers = RetainedMatchAnswers::default();
     let mut catalog = MatchAnswerCatalog::default();
     let node = StyleNodeID::element(1);
@@ -1450,7 +1467,7 @@ fn retained_match_answer_payloads_are_evictable_without_losing_identity() {
 
 #[test]
 fn selector_incidence_crossing_pressure_stays_until_the_boundary() {
-    let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+    let mut memory = MemoryController::new();
     memory.set_tier3_limit_for_test(0);
     memory.begin_tier3_quota_period();
     let mut incidences = RetainedSelectorIncidences::default();
@@ -1556,7 +1573,7 @@ fn retained_answer_verifier_rejects_a_dropped_selector_truth_row() {
 #[test]
 fn retained_match_answer_pressure_preserves_existing_rows() {
     let programs = retained_answer_test_programs();
-    let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+    let mut memory = MemoryController::new();
     let mut answers = RetainedMatchAnswers::default();
     let mut catalog = MatchAnswerCatalog::default();
     let replaced_node = StyleNodeID::element(1);
@@ -1654,7 +1671,7 @@ fn retained_match_answer_pressure_preserves_existing_rows() {
 #[test]
 fn retained_match_answer_replacement_releases_the_displaced_identity() {
     let programs = retained_answer_test_programs();
-    let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+    let mut memory = MemoryController::new();
     let mut answers = RetainedMatchAnswers::default();
     let mut catalog = MatchAnswerCatalog::default();
     let node = StyleNodeID::element(1);
@@ -1719,7 +1736,7 @@ fn retained_match_answer_replacement_releases_the_displaced_identity() {
 #[test]
 fn shared_retained_match_answer_lives_until_its_last_column_owner_forgets() {
     let programs = retained_answer_test_programs();
-    let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+    let mut memory = MemoryController::new();
     let mut answers = RetainedMatchAnswers::default();
     let mut catalog = MatchAnswerCatalog::default();
     let first_node = StyleNodeID::element(1);
@@ -1808,7 +1825,7 @@ fn retained_match_answer_replacement_does_not_create_pressure() {
     assert!(matches!(engine.retained_match_answer(nodes[1]), Lookup::Known(_)));
     assert_eq!(engine.counters.get(Counter::Tier3BenefitEvictions), 0);
     assert_eq!(engine.counters.get(Counter::RetainedMatchAnswerRefusals), 0);
-    assert_eq!(engine.memory.refusals(MemoryCategory::RetainedMatchAnswer), 0);
+    assert!(engine.memory.is_tier3_admitting(MemoryCategory::RetainedMatchAnswer));
 }
 
 #[test]
@@ -1827,21 +1844,18 @@ fn failed_posting_rebuild_does_not_condemn_resident_postings() {
         Lookup::Missing(_)
     ));
     engine
-        .state
         .retained
         .memory
-        .set_tier3_limit_for_test(engine.state.retained.memory.bytes_in_tier(memory::Tier::Acceleration));
+        .set_tier3_limit_for_test(engine.retained.memory.bytes_in_tier(memory::Tier::Acceleration));
 
     engine.record_environment_change();
     engine.take_style_transaction_nodes(nodes[0], |_| {});
-    assert!(engine.memory.refusals(MemoryCategory::FeaturePosting) > 0);
+    assert!(!engine.memory.is_tier3_admitting(MemoryCategory::FeaturePosting));
     assert!(matches!(engine.facts.postings().lookup(resident_key), Lookup::Known(_)));
-    let refusals = engine.memory.refusals(MemoryCategory::FeaturePosting);
 
     engine.record_environment_change();
     engine.take_style_transaction_nodes(nodes[0], |_| {});
     assert!(matches!(engine.facts.postings().lookup(resident_key), Lookup::Known(_)));
-    assert_eq!(engine.memory.refusals(MemoryCategory::FeaturePosting), refusals);
 }
 
 #[test]
@@ -1868,7 +1882,7 @@ fn an_evicted_feature_posting_is_missing_instead_of_empty() {
 
 #[test]
 fn part_names_are_derived_from_their_host_pairs() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw_nodes = [0; 3];
     engine.allocate_style_nodes(&mut raw_nodes);
     let element = StyleNodeID::from_raw(raw_nodes[0]).unwrap();
@@ -1890,7 +1904,7 @@ fn part_names_are_derived_from_their_host_pairs() {
 
 #[test]
 fn a_planned_node_never_returns_to_a_remaining_posting() {
-    let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+    let mut memory = MemoryController::new();
     let mut postings = FeaturePostings::new();
     let key = SelectorPostingKey::Class(StyleAtomID(1));
     let nodes = [
@@ -2005,7 +2019,7 @@ fn a_planned_node_never_returns_to_a_remaining_posting() {
 
 #[test]
 fn routing_phases_share_remaining_postings_for_one_transaction() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let guard = StyleAtomID(200);
     let also = StyleAtomID(201);
     let target = StyleAtomID(202);
@@ -2083,6 +2097,37 @@ fn routing_phases_share_remaining_postings_for_one_transaction() {
         engine.memory().bytes_in_category(MemoryCategory::BatchScratch),
         engine.cascade_compaction_scratch.capacity_bytes()
     );
+}
+
+#[test]
+fn a_transaction_taken_inside_a_cold_matching_batch_retires_it() {
+    // The host holds a cold matching batch open while it applies a transaction's reactions, and
+    // takes the transaction they fed back inside it. One that reaches a selector changed the facts
+    // the batch was read from, so the batch is retired before the transaction begins its own.
+    let (mut engine, nodes) = linear_document();
+    let guard = StyleAtomID(200);
+    let target = StyleAtomID(201);
+    add_guard_target_rule(&mut engine, guard, target);
+    add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(target));
+    for &node in &nodes {
+        set_atom_feature(&mut engine, node, LocalFeatureKey::TagName, StyleAtomID(100));
+    }
+    discard_transaction(&mut engine);
+    let scratch_before = engine.memory().bytes_in_category(MemoryCategory::BatchScratch);
+
+    assert!(engine.begin_cold_matching_batch(nodes[0]));
+    assert!(engine.match_element(nodes[1]).unwrap().is_empty());
+    add_feature(&mut engine, nodes[0], LocalFeatureKey::Class(guard));
+    engine.take_style_transaction(nodes[0], |_, _, _| {});
+    engine.end_cold_matching_batch();
+    assert_eq!(
+        engine.memory().bytes_in_category(MemoryCategory::BatchScratch),
+        scratch_before
+    );
+
+    assert!(engine.begin_cold_matching_batch(nodes[0]));
+    assert_eq!(engine.match_element(nodes[1]).unwrap().len(), 1);
+    engine.end_cold_matching_batch();
 }
 
 #[test]
@@ -2233,7 +2278,7 @@ fn relations(parent: Option<u32>, previous: Option<u32>, next: Option<u32>) -> T
 
 #[test]
 fn a_departed_following_sibling_anchor_widens_when_its_old_next_sibling_relocated() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 4];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2274,7 +2319,7 @@ fn a_departed_following_sibling_anchor_widens_when_its_old_next_sibling_relocate
 
 #[test]
 fn sibling_only_tree_staging_does_not_recompute_the_sibling_subtree_depth() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 4];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<_> = raw.into_iter().map(|raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2297,7 +2342,7 @@ fn sibling_only_tree_staging_does_not_recompute_the_sibling_subtree_depth() {
 
 #[test]
 fn depth_recompute_membership_is_sparse_for_high_node_identities() {
-    let engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let engine = StyleEngine::new();
     let relations = Some(TreeRelations::detached(TreeScopeID::DOCUMENT));
     let low_rows = [
         (StyleNodeID::element(1), None, relations),
@@ -2318,7 +2363,7 @@ fn depth_recompute_membership_is_sparse_for_high_node_identities() {
 
 #[test]
 fn wrapping_existing_children_recomputes_depth_from_the_arriving_parent() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 4];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<_> = raw.into_iter().map(|raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2352,7 +2397,7 @@ fn wrapping_existing_children_recomputes_depth_from_the_arriving_parent() {
 
 #[test]
 fn reparenting_between_equal_depth_parents_still_visits_the_subtree() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 5];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<_> = raw.into_iter().map(|raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2378,7 +2423,7 @@ fn reparenting_between_equal_depth_parents_still_visits_the_subtree() {
 
 #[test]
 fn reparenting_below_a_sibling_only_staged_parent_recomputes_depth() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 7];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<_> = raw.into_iter().map(|raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2411,7 +2456,7 @@ fn reparenting_below_a_sibling_only_staged_parent_recomputes_depth() {
 
 #[test]
 fn moving_back_after_an_intermediate_tree_apply_restores_depth() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 5];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<_> = raw.into_iter().map(|raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2445,7 +2490,7 @@ fn moving_back_after_an_intermediate_tree_apply_restores_depth() {
 
 /// Builds `root -> [a, b, c]` through the same delta path C++ drives.
 pub(super) fn linear_document() -> (StyleEngine, Vec<StyleNodeID>) {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 4];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2473,10 +2518,9 @@ fn a_node_scoped_acknowledgement_leaves_other_inputs_queued() {
         add_feature(&mut engine, node, LocalFeatureKey::Class(StyleAtomID(200)));
     }
     engine
-        .state
         .host
         .journal
-        .acknowledge_node(nodes[1], &mut engine.state.retained.memory);
+        .acknowledge_node(nodes[1], &mut engine.retained.memory);
     assert_eq!(engine.host.journal.len(), 1);
     assert_eq!(
         engine.host.journal.pending_old(InputKey::LocalFeature(
@@ -2589,7 +2633,7 @@ fn attach_shadow_tree(
 }
 
 fn nested_document() -> (StyleEngine, Vec<StyleNodeID>) {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 4];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2699,7 +2743,7 @@ fn add_has_descendant_rule(engine: &mut StyleEngine, anchor: StyleAtomID, witnes
 
 #[test]
 fn a_nested_arrival_routes_relational_facts_from_the_outer_subtree() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 3];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2749,7 +2793,7 @@ fn add_has_sibling_rule(engine: &mut StyleEngine, anchor: StyleAtomID, witness: 
 
 #[test]
 fn a_batch_of_arrivals_routes_a_following_sibling_anchor_once() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 6];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2776,7 +2820,7 @@ fn a_batch_of_arrivals_routes_a_following_sibling_anchor_once() {
 
 #[test]
 fn a_batch_of_departures_routes_a_following_sibling_anchor_once() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 6];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2816,7 +2860,7 @@ fn a_batch_of_departures_routes_a_following_sibling_anchor_once() {
 
 #[test]
 fn an_arrival_within_the_adjacent_reach_routes_the_anchor() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 4];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2844,7 +2888,7 @@ fn an_arrival_within_the_adjacent_reach_routes_the_anchor() {
 
 #[test]
 fn an_arrival_beyond_the_adjacent_reach_routes_no_anchor() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 4];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2866,7 +2910,7 @@ fn an_arrival_beyond_the_adjacent_reach_routes_no_anchor() {
 
 #[test]
 fn a_departed_subtree_routes_sibling_subtree_anchors_above_its_parent() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 5];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2893,7 +2937,7 @@ fn a_departed_subtree_routes_sibling_subtree_anchors_above_its_parent() {
 #[test]
 fn reparented_witnesses_reach_the_destination_without_fact_changes() {
     for axis in [RelativeAxis::Descendant, RelativeAxis::Child] {
-        let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+        let mut engine = StyleEngine::new();
         let mut raw = [0_u32; 4];
         engine.allocate_style_nodes(&mut raw);
         let nodes: Vec<_> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2950,7 +2994,7 @@ fn reparented_witnesses_reach_the_destination_without_fact_changes() {
 
 #[test]
 fn a_retained_witness_carries_an_anchor_through_its_lifecycle() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 4];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -2974,7 +3018,6 @@ fn a_retained_witness_carries_an_anchor_through_its_lifecycle() {
     assert!(engine.begin_cold_matching_batch(nodes[0]));
     assert!(!engine.match_element(nodes[1]).unwrap().is_empty());
     let (key, retained) = engine
-        .state
         .retained
         .pending_witness_effects
         .iter()
@@ -2984,13 +3027,13 @@ fn a_retained_witness_carries_an_anchor_through_its_lifecycle() {
         })
         .expect("matching must produce a positive witness effect");
     assert!(matches!(
-        engine.state.retained.relational_witnesses.lookup(key),
+        engine.retained.relational_witnesses.lookup(key),
         Lookup::Missing(_)
     ));
     engine.match_element(nodes[2]).unwrap();
     engine.end_cold_matching_batch();
-    assert!(engine.state.retained.pending_witness_effects.is_empty());
-    assert!(matches!(engine.state.retained.relational_witnesses.lookup(key), Lookup::Known(&node) if node == retained));
+    assert!(engine.retained.pending_witness_effects.is_empty());
+    assert!(matches!(engine.retained.relational_witnesses.lookup(key), Lookup::Known(&node) if node == retained));
 
     // A second witness appearing cannot flip an anchor that is already true, so the retained
     // witness answers for it and nothing is routed.
@@ -3039,7 +3082,7 @@ fn a_retained_witness_carries_an_anchor_through_its_lifecycle() {
 
 #[test]
 fn a_retained_witness_absorbs_arrivals_into_a_watched_sequence() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 5];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -3080,7 +3123,7 @@ fn a_retained_witness_absorbs_arrivals_into_a_watched_sequence() {
 
 #[test]
 fn an_element_landing_between_an_anchor_and_its_adjacent_witness_routes_it() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 4];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -3784,10 +3827,9 @@ fn an_evicted_retained_match_answer_falls_back_to_cold_matching() {
     engine.remember_retained_match_answer(nodes[1], &exact_answer);
     engine.remember_cascade_input(nodes[1], &compact_answer);
     engine
-        .state
         .retained
         .retained_match_answers
-        .evict(&mut engine.state.retained.match_answers);
+        .evict(&mut engine.retained.match_answers);
     assert!(matches!(
         engine.retained_match_answer(nodes[1]),
         Lookup::Missing(gap) if gap == nodes[1]
@@ -3870,10 +3912,9 @@ fn an_evicted_answer_payload_repairs_to_its_retained_identity() {
     engine.remember_retained_match_answer(nodes[1], &exact_answer);
     engine.remember_cascade_input(nodes[1], &compact_answer);
     engine
-        .state
         .retained
         .retained_match_answers
-        .evict(&mut engine.state.retained.match_answers);
+        .evict(&mut engine.retained.match_answers);
 
     engine.set_rule_conditions_hold(losing_rule, false);
     let repairs_before = engine.counters().get(Counter::PublishedMatchAnswerIdentityRepairs);
@@ -3956,7 +3997,7 @@ fn a_changed_exact_cascade_is_still_published_for_recomputation() {
 /// A styled root, and arriving under it a parent with 38 children: the parent is the last node,
 /// allocated after its children so that preorder and node identity disagree.
 fn root_with_arriving_parent_of_children() -> (StyleEngine, [u32; 40]) {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 40];
     engine.allocate_style_nodes(&mut raw);
     let node = |index: usize| StyleNodeID::from_raw(raw[index]).unwrap();
@@ -4036,11 +4077,7 @@ fn a_pass_given_up_gives_back_what_moved_under_the_rows_it_did_not_reach() {
     // What the host recorded beside the style inputs it owes the parent and two of its children.
     engine.record_container_query_input(node(39));
     engine.record_container_query_input(node(1));
-    engine
-        .state
-        .retained
-        .row_inputs_moved
-        .note_parent_display_moved(node(2));
+    engine.retained.row_inputs_moved.note_parent_display_moved(node(2));
     let mut first_wave = Vec::new();
     engine.take_style_transaction(node(0), |_, _, reactions| {
         first_wave.extend(reactions.iter().map(|reaction| reaction.style_node));
@@ -4051,7 +4088,7 @@ fn a_pass_given_up_gives_back_what_moved_under_the_rows_it_did_not_reach() {
     // The next transaction drives the children over their moved containers and parent display, as
     // this one would have, and in full: what else moved under them only this one saw. The parent's
     // row was given to the host, with what moved under it.
-    let owed = &engine.state.retained.row_inputs_moved;
+    let owed = &engine.retained.row_inputs_moved;
     assert!(owed.containers_moved(node(1)));
     assert!(owed.parent_display_moved(node(2)));
     assert!(!owed.containers_moved(node(39)));
@@ -4150,15 +4187,10 @@ fn an_exact_unchanged_custom_state_cascade_stops_before_style_recomputation() {
     engine.set_rule_declared_properties_with_values(second_rule, &[(1, false, value)]);
     discard_transaction(&mut engine);
     engine
-        .state
         .retained
         .facts
-        .set_custom_states(nodes[1], &[], &mut engine.state.retained.memory);
-    engine
-        .state
-        .retained
-        .facts
-        .apply_staged(&mut engine.state.retained.memory);
+        .set_custom_states(nodes[1], &[], &mut engine.retained.memory);
+    engine.retained.facts.apply_staged(&mut engine.retained.memory);
 
     let old_answer = engine.match_element_for_cascade(nodes[1]).unwrap();
     assert_eq!(old_answer.len(), 1);
@@ -4199,39 +4231,35 @@ fn retained_answer_patching_evaluates_narrow_affected_rules_directly() {
     engine.remember_retained_match_answer(nodes[1], &exact_answer);
     engine.remember_cascade_input(nodes[1], &compact_answer);
     let matching_program = engine
-        .state
         .retained
         .program
         .rule_version(matching_rule)
         .selector_program
         .unwrap();
     let unrelated_program = engine
-        .state
         .retained
         .program
         .rule_version(unrelated_rule)
         .selector_program
         .unwrap();
-    let mut patch = engine
-        .state
-        .prepare_retained_answer_patch(RetainedAnswerPatchSelection {
-            affected: vec![
-                RetainedAnswerPatchSelectionRule {
-                    rule: matching_rule,
-                    program: matching_program,
-                    evaluate: true,
-                },
-                RetainedAnswerPatchSelectionRule {
-                    rule: unrelated_rule,
-                    program: unrelated_program,
-                    evaluate: true,
-                },
-            ],
-            always_emit: false,
-            orders_shifted: false,
-            requires_full_match: false,
-            ..Default::default()
-        });
+    let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
+        affected: vec![
+            RetainedAnswerPatchSelectionRule {
+                rule: matching_rule,
+                program: matching_program,
+                evaluate: true,
+            },
+            RetainedAnswerPatchSelectionRule {
+                rule: unrelated_rule,
+                program: unrelated_program,
+                evaluate: true,
+            },
+        ],
+        always_emit: false,
+        orders_shifted: false,
+        requires_full_match: false,
+        ..Default::default()
+    });
     let feature_tests_before = engine.counters().get(Counter::LocalFeatureTests);
 
     assert_eq!(
@@ -4264,11 +4292,7 @@ fn retained_answer_patching_applies_complete_signed_deltas_without_matching() {
     remove_feature(&mut engine, nodes[1], LocalFeatureKey::Class(target));
     let program = engine.program.rule_version(rule).selector_program.unwrap();
     // Match-input preparation follows fact commit, as it does in a style transaction.
-    engine
-        .state
-        .retained
-        .facts
-        .apply_staged(&mut engine.state.retained.memory);
+    engine.retained.facts.apply_staged(&mut engine.retained.memory);
     let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
         affected: vec![RetainedAnswerPatchSelectionRule {
             rule,
@@ -4432,11 +4456,7 @@ fn recycled_selector_entries_keep_delta_answers_canonical() {
         _ => panic!("initial cascade input must be retained"),
     };
     add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(second));
-    engine
-        .state
-        .retained
-        .facts
-        .apply_staged(&mut engine.state.retained.memory);
+    engine.retained.facts.apply_staged(&mut engine.retained.memory);
 
     let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
         affected: vec![RetainedAnswerPatchSelectionRule {
@@ -4476,10 +4496,9 @@ fn recycled_selector_entries_keep_delta_answers_canonical() {
     let mut cold = patched;
     cold.sort_unstable();
     let cold_identity = engine
-        .state
         .retained
         .match_answers
-        .intern_prepared(cold, &engine.state.retained.programs);
+        .intern_prepared(cold, &engine.retained.programs);
     assert_eq!(patched_identity, cold_identity);
 }
 
@@ -4518,11 +4537,7 @@ fn retained_answer_patching_matches_only_unresolved_rules_after_signed_deltas() 
     engine.remember_cascade_input(nodes[1], &compact_answer);
     add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(delta_target));
     add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(second_delta_target));
-    engine
-        .state
-        .retained
-        .facts
-        .apply_staged(&mut engine.state.retained.memory);
+    engine.retained.facts.apply_staged(&mut engine.retained.memory);
     let mut patch = engine.prepare_retained_answer_patch(RetainedAnswerPatchSelection {
         affected: vec![
             RetainedAnswerPatchSelectionRule {
@@ -4840,10 +4855,9 @@ fn already_planned_routes_attribute_their_extent() {
     assert!(engine.already_planned_selector_truth.as_slice().is_empty());
     engine.resolve_already_planned_selector_truth(&regions, None);
     engine
-        .state
         .retained
         .selector_truth_changes
-        .consolidate(&mut engine.counters);
+        .consolidate(&engine.retained.counters);
     assert!(engine.selector_truth_changes.deltas.as_slice().is_empty());
     assert!(engine.selector_truth_changes.refreshes.as_slice().is_empty());
 
@@ -5450,7 +5464,7 @@ fn pseudo_winner_deltas_update_only_their_sparse_cascade_row() {
 
 #[test]
 fn held_pseudo_styles_without_witnesses_force_a_recompute() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw_nodes = [0; 1];
     engine.allocate_style_nodes(&mut raw_nodes);
     let node = StyleNodeID::from_raw(raw_nodes[0]).unwrap();
@@ -5474,12 +5488,11 @@ fn held_pseudo_styles_without_witnesses_force_a_recompute() {
     let version = engine.program.version();
     assert!(engine.winner_groups.set_pseudo(node, target, state, version));
     engine
-        .state
         .retained
         .computed_group_sets
         .observe_pseudo_retained_cascade_state(
             computed::ComputedStyleTarget::new(node, pseudo_kind),
-            Some((engine.state.retained.winner_groups.generation(), state)),
+            Some((engine.retained.winner_groups.generation(), state)),
         );
     assert!(engine.pseudo_cascade_states_are_unchanged(node));
 
@@ -5491,7 +5504,7 @@ fn held_pseudo_styles_without_witnesses_force_a_recompute() {
 #[test]
 fn assigned_marker_and_backdrop_winners_without_retained_states_force_a_recompute() {
     for pseudo_kind in [1_u8, 5_u8] {
-        let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+        let mut engine = StyleEngine::new();
         let mut raw_nodes = [0; 1];
         engine.allocate_style_nodes(&mut raw_nodes);
         let node = StyleNodeID::from_raw(raw_nodes[0]).unwrap();
@@ -5501,12 +5514,12 @@ fn assigned_marker_and_backdrop_winners_without_retained_states_force_a_recomput
         engine
             .computed_group_sets
             .record_pseudo_kind_for_test(node, pseudo_kind);
-        assert!(engine.state.retained.winner_groups.set_pseudo(
-            node,
-            target,
-            state,
-            engine.state.retained.program.version()
-        ));
+        assert!(
+            engine
+                .retained
+                .winner_groups
+                .set_pseudo(node, target, state, engine.retained.program.version())
+        );
 
         assert!(
             !engine.pseudo_cascade_states_are_unchanged(node),
@@ -5929,31 +5942,27 @@ fn an_alternate_ancestor_witness_keeps_a_candidate_out_of_the_plan() {
 }
 
 fn test_prefix_relation(engine: &mut StyleEngine, root: StyleNodeID) -> (Arc<RuleDispatch>, prefix::PrefixRelation) {
-    for node in engine.state.retained.tree.preorder(root) {
-        engine.state.retained.facts.ensure_row(node);
+    for node in engine.retained.tree.preorder(root) {
+        engine.retained.facts.ensure_row(node);
     }
-    engine
-        .state
-        .retained
-        .facts
-        .apply_staged(&mut engine.state.retained.memory);
+    engine.retained.facts.apply_staged(&mut engine.retained.memory);
     let (_, dispatch) = engine.prepare_scope_program(TreeScopeID::DOCUMENT);
     let mut workspace = MatchScratch::default();
-    let facts = engine.state.retained.facts.primary();
-    let mut evaluator = MatchEvaluator::new(&engine.state.retained.tree, facts)
+    let facts = engine.retained.facts.primary();
+    let mut evaluator = MatchEvaluator::new(&engine.retained.tree, facts)
         .with_match_workspace(&mut workspace, MatchEvaluationSide::Current);
     let mut evaluation = PrefixEvaluation::new(
         dispatch.prefixes(),
-        &engine.state.retained.tree,
+        &engine.retained.tree,
         facts,
-        &engine.state.retained.programs,
+        &engine.retained.programs,
         &mut evaluator,
         None,
         None,
     );
     let relation = dispatch
         .prefixes()
-        .build_relation(&mut evaluation, root, &mut engine.counters);
+        .build_relation(&mut evaluation, root, &engine.retained.counters);
     (dispatch, relation)
 }
 
@@ -5991,7 +6000,7 @@ fn update_test_prefix_relation(
         None,
     );
     let mut changed = changed.to_vec();
-    let mut counters = Counters::default();
+    let counters = Counters::default();
     if let Some(root) = geometry_root {
         let mut geometry_nodes: Vec<_> = (0..old_facts.row_count())
             .filter_map(|row| {
@@ -6002,7 +6011,7 @@ fn update_test_prefix_relation(
         geometry_nodes.extend(engine.tree.preorder(root));
         geometry_nodes.sort_unstable();
         geometry_nodes.dedup();
-        changed.extend(relation.update_geometry(dispatch.prefixes(), &mut evaluation, &geometry_nodes, &mut counters));
+        changed.extend(relation.update_geometry(dispatch.prefixes(), &mut evaluation, &geometry_nodes, &counters));
         changed.sort_unstable();
         changed.dedup();
     }
@@ -6011,7 +6020,7 @@ fn update_test_prefix_relation(
         &mut evaluation,
         &mut old_evaluation,
         &changed,
-        &mut counters,
+        &counters,
     );
     counters
 }
@@ -6091,7 +6100,7 @@ fn prefix_completion_reuses_positive_and_negative_relation_answers() {
         None,
         None,
     );
-    let mut counters = Counters::default();
+    let counters = Counters::default();
     let mut states = PrefixStates::new();
     let mut context = super::prefix::PrefixTransitionContext::new(&mut states, facts);
     assert!(!states.complete_nodes_with_budget(
@@ -6100,7 +6109,7 @@ fn prefix_completion_reuses_positive_and_negative_relation_answers() {
         &mut evaluation,
         nodes.iter().copied(),
         0,
-        &mut counters
+        &counters
     ));
     relation.install_answers(&mut states);
     states.relation = Some(Box::new(relation));
@@ -6113,7 +6122,7 @@ fn prefix_completion_reuses_positive_and_negative_relation_answers() {
             &mut evaluation,
             nodes.iter().copied(),
             budget,
-            &mut counters
+            &counters
         ));
         assert_eq!(counters.get(Counter::PrefixCompoundsEvaluated), 0);
         assert_eq!(counters.get(Counter::PrefixTransitionMemoMisses), 0);
@@ -6201,7 +6210,7 @@ fn prefix_relations_share_program_predicates_without_merging_their_paths() {
 
 #[test]
 fn prefix_relation_reuses_local_facts_without_sharing_position() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0; 65];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<_> = raw.into_iter().map(|raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -6318,7 +6327,7 @@ fn prefix_relation_reuses_local_facts_without_sharing_position() {
 #[test]
 fn prefix_relation_local_fact_cache_separates_predicates_and_tracks_changes() {
     for negate in [false, true] {
-        let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+        let mut engine = StyleEngine::new();
         let mut raw = [0; 65];
         engine.allocate_style_nodes(&mut raw);
         let nodes: Vec<_> = raw.into_iter().map(|raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -7084,7 +7093,7 @@ fn covered_prefix_changes_forget_only_the_covered_subtree() {
 
 #[test]
 fn selective_matching_completes_a_bounded_prefix_transition_window() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = vec![0_u32; PREFIX_TRANSITION_CACHE_COMPLETION_BUDGET + 3];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -7163,8 +7172,8 @@ fn a_prefix_upquery_retains_every_transition_on_its_ancestor_chain() {
         assert!(nodes.iter().all(|&node| states.has_transition(node)));
     }
 
-    let mut caches = engine.state.retained.prefix_caches.borrow_mut();
-    caches.states.make_scratch(&mut engine.state.retained.memory);
+    let mut caches = engine.retained.prefix_caches.borrow_mut();
+    caches.states.make_scratch(&mut engine.retained.memory);
     assert!(matches!(caches.states.lookup_mut(scope_program), Lookup::Known(_)));
     caches.states.release();
     assert!(matches!(
@@ -7287,11 +7296,10 @@ fn shared_retained_answer_completion_reuses_compact_cascade_state() {
 
         assert_eq!(second.cascade_input, Some(cascade_input));
         assert!(second.matches.is_none());
-        engine.state.retained.published_match_answers.push(
-            second,
-            &mut engine.state.retained.memory,
-            &mut engine.counters,
-        );
+        engine
+            .retained
+            .published_match_answers
+            .push(second, &mut engine.retained.memory, &engine.retained.counters);
         engine.published_match_answers.sort();
         let materialized = engine.consume_published_match_answer(nodes[3]).unwrap();
         assert_eq!(materialized.len(), if declarations_overlap { 1 } else { 10 });
@@ -7340,7 +7348,6 @@ fn closure_identity_stop_declines_stale_pseudo_rows() {
     // The node's pseudo-element row goes stale while its element row stays current: the retained
     // answer no longer vouches for the node's rows, so the closure completes it instead.
     engine
-        .state
         .retained
         .batch_matching_traversal
         .as_mut()
@@ -7409,7 +7416,7 @@ fn closure_identity_stop_verification_is_observer_only() {
 
 #[test]
 fn gated_prefix_answers_publish_complete_node_specific_winners() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 4];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -7472,7 +7479,7 @@ fn gated_prefix_answers_publish_complete_node_specific_winners() {
 
 #[test]
 fn an_undecided_container_verdict_has_not_moved() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 3];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().filter_map(|&raw| StyleNodeID::from_raw(raw)).collect();
@@ -7515,17 +7522,13 @@ fn an_undecided_container_verdict_has_not_moved() {
         held: None,
     }];
     assert_eq!(engine.published_container_verdicts.get(&nodes[2]), Some(&undecided));
-    engine.refresh_winners_whose_container_verdicts_moved(
-        false,
-        publication::WinnerRepublication::for_flush(),
-        &mut Counters::default(),
-    );
+    engine.refresh_winners_whose_container_verdicts_moved(false, publication::WinnerRepublication::for_flush());
     assert_eq!(engine.published_container_verdicts.get(&nodes[2]), Some(&undecided));
 }
 
 #[test]
 fn retained_prefix_convergence_amortizes_missing_subtrees() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let node_count = 2 * PREFIX_TRANSITION_CACHE_COMPLETION_BUDGET + 4;
     let mut raw = vec![0_u32; node_count];
     engine.allocate_style_nodes(&mut raw);
@@ -8012,7 +8015,7 @@ fn positional_answers_stay_cold_equivalent_across_sequence_mutations() {
     let class_item = StyleAtomID(200);
     let class_theme = StyleAtomID(201);
 
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = vec![0_u32; 11];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -8256,7 +8259,7 @@ fn positional_test_overflow_refuses_admission_without_erasing_answers() {
     let tag = StyleAtomID(100);
     let class_item = StyleAtomID(200);
 
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = vec![0_u32; 2 + CHILDREN];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -8320,7 +8323,7 @@ fn positional_test_overflow_refuses_admission_without_erasing_answers() {
 
 #[test]
 fn consecutive_departures_reconstruct_one_old_sibling_sequence() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 5];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -8372,7 +8375,7 @@ fn consecutive_departures_reconstruct_one_old_sibling_sequence() {
 
 #[test]
 fn converging_departure_routes_are_folded_before_exact_tree_evaluation() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 5];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -8416,7 +8419,7 @@ fn converging_departure_routes_are_folded_before_exact_tree_evaluation() {
 
 #[test]
 fn a_departed_sibling_reaches_only_the_following_sibling_forest() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 8];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -8468,7 +8471,7 @@ fn a_departed_sibling_reaches_only_the_following_sibling_forest() {
 
 #[test]
 fn a_stationary_general_sibling_ignores_its_new_immediate_neighbour() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 3];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<_> = raw.into_iter().map(|raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -8512,7 +8515,7 @@ fn a_stationary_general_sibling_ignores_its_new_immediate_neighbour() {
 
 #[test]
 fn a_stationary_predecessor_is_not_a_moved_place() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 3];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<_> = raw.into_iter().map(|raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -8555,7 +8558,7 @@ fn a_stationary_predecessor_is_not_a_moved_place() {
 
 #[test]
 fn an_arriving_adjacent_sibling_that_fails_its_compound_changes_nothing() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 3];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<_> = raw.into_iter().map(|raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -8709,7 +8712,7 @@ fn a_general_sibling_fact_miss_is_batched_before_matching_restarts() {
 
 #[test]
 fn a_descendant_fact_miss_is_batched_before_matching_restarts() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 65];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -8792,7 +8795,7 @@ fn a_broad_matching_batch_shares_facts_between_element_asks() {
 
 #[test]
 fn an_empty_shadow_tree_prepares_rules_for_its_host() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 3];
     engine.allocate_style_nodes(&mut raw);
     let [root, host, shadow_root] = raw.map(|raw| StyleNodeID::from_raw(raw).unwrap());
@@ -8831,7 +8834,7 @@ fn an_empty_shadow_tree_prepares_rules_for_its_host() {
 
 #[test]
 fn a_broad_matching_batch_includes_shadow_scope_roots() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 4];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -8866,7 +8869,7 @@ fn a_broad_matching_batch_includes_shadow_scope_roots() {
 
 #[test]
 fn departing_scope_roots_are_removed_from_the_reverse_scope_index() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 2];
     engine.allocate_style_nodes(&mut raw);
     let first_root = StyleNodeID::from_raw(raw[0]).unwrap();
@@ -8891,7 +8894,7 @@ fn departing_scope_roots_are_removed_from_the_reverse_scope_index() {
 
 #[test]
 fn an_element_arriving_and_departing_in_one_transaction_is_forgotten() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 1];
     engine.allocate_style_nodes(&mut raw);
     let node = StyleNodeID::from_raw(raw[0]).unwrap();
@@ -8915,7 +8918,7 @@ fn an_element_arriving_and_departing_in_one_transaction_is_forgotten() {
 
 #[test]
 fn independent_sibling_paths_request_their_fact_ranges_together() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 5];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -9055,7 +9058,7 @@ fn a_positional_fact_miss_is_batched_before_matching_restarts() {
 /// retry takes and doubles so a scan that really reads its whole sequence still converges.
 #[test]
 fn a_sibling_fact_request_is_taken_a_doubling_window_at_a_time() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 65];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -9098,7 +9101,7 @@ fn a_sibling_fact_request_is_taken_a_doubling_window_at_a_time() {
 
 #[test]
 fn duplicate_fact_requests_share_one_window_per_matching_pass() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 65];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -9849,7 +9852,7 @@ fn a_departed_node_routes_from_retained_facts_without_being_published() {
 
 #[test]
 fn a_shadow_root_routes_without_being_published_as_a_style_output() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 2];
     engine.allocate_style_nodes(&mut raw);
     let host = StyleNodeID::from_raw(raw[0]).unwrap();
@@ -9915,7 +9918,7 @@ fn exact_planning_carries_preorder_topology_into_matching() {
 
 #[test]
 fn sequence_routing_rejects_children_outside_the_positional_compound() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 8];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -9988,7 +9991,7 @@ fn ancestor_requirement_scratch_is_released_after_document_matching() {
 
 #[test]
 fn identical_sheet_sets_share_a_scope_program() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 7];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -10124,8 +10127,8 @@ fn identical_sheet_sets_share_a_scope_program() {
 #[test]
 fn equivalent_documents_share_only_semantically_identical_dispatch_topology() {
     let make_engine = |atom| {
-        let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
-        engine.programs = selector::SelectorPrograms::for_replay();
+        let mut engine = StyleEngine::new();
+        engine.programs = selector::SelectorPrograms::shared_across_documents();
         let program = engine
             .programs
             .add(test_selector_program(".target", &[("target", atom)]));
@@ -10165,7 +10168,7 @@ fn equivalent_documents_share_only_semantically_identical_dispatch_topology() {
 
 #[test]
 fn equivalent_sheet_programs_share_dispatch_topology() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let selector_program = engine
         .programs
         .add(test_selector_program(".target", &[("target", StyleAtomID(200))]));
@@ -10216,7 +10219,7 @@ fn equivalent_sheet_programs_share_dispatch_topology() {
 
 #[test]
 fn extending_a_scope_dispatch_skips_empty_selector_programs() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let base = engine
         .programs
         .add(test_selector_program(".base", &[("base", StyleAtomID(200))]));
@@ -10311,7 +10314,7 @@ fn a_scope_dispatch_can_extend_a_finished_prefix_template() {
 
 #[test]
 fn document_author_sheets_keep_independent_shadow_scope_programs() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let independent_scope = TreeScopeID(1);
     let document_style_scope = TreeScopeID(2);
     engine.set_tree_scope_uses_document_sheets(document_style_scope);
@@ -10341,7 +10344,7 @@ fn document_author_sheets_keep_independent_shadow_scope_programs() {
 
 #[test]
 fn changing_one_scope_keeps_an_equivalent_scopes_ranked_program() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let selector_program = engine
         .programs
         .add(test_selector_program(".target", &[("target", StyleAtomID(200))]));
@@ -10587,7 +10590,7 @@ fn local_routes_for_one_exact_entry_are_compared_once() {
 
 #[test]
 fn rule_activation_exactly_matches_a_refused_prefix_chain() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = vec![0_u32; 36];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<_> = raw.into_iter().map(|raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -10779,7 +10782,7 @@ fn kinds_of(transaction: &StyleTransaction) -> Vec<InputKind> {
 }
 
 fn authoring_engine() -> (StyleEngine, SheetID, RuleID) {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
     engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
     let rule = engine.append_rule(sheet, None, RuleKind::Style);
@@ -10793,7 +10796,7 @@ fn authoring_engine() -> (StyleEngine, SheetID, RuleID) {
 
 #[test]
 fn repeated_selector_replacement_reuses_program_and_route_storage() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
     engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
     let rule = engine.append_rule(sheet, None, RuleKind::Style);
@@ -10804,11 +10807,7 @@ fn repeated_selector_replacement_reuses_program_and_route_storage() {
             .programs
             .add_with_status(test_selector_program(".target", &[("target", StyleAtomID(index + 1))]));
         engine.selector_programs_need_sweep |= inserted;
-        engine
-            .state
-            .retained
-            .programs
-            .settle_memory(&mut engine.state.retained.memory);
+        engine.retained.programs.settle_memory(&mut engine.retained.memory);
         engine.add_routing_rule(rule, program);
         let mut version = engine.program.rule_version(rule);
         version.selector_program = Some(program);
@@ -10827,7 +10826,7 @@ fn repeated_selector_replacement_reuses_program_and_route_storage() {
 
 #[test]
 fn adding_a_live_selector_program_keeps_existing_routing() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
     engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
 
@@ -10837,11 +10836,7 @@ fn adding_a_live_selector_program_keeps_existing_routing() {
             .programs
             .add_with_status(test_selector_program(".target", &[("target", StyleAtomID(index + 1))]));
         engine.selector_programs_need_sweep |= inserted;
-        engine
-            .state
-            .retained
-            .programs
-            .settle_memory(&mut engine.state.retained.memory);
+        engine.retained.programs.settle_memory(&mut engine.retained.memory);
         engine.add_routing_rule(rule, program);
         let mut version = engine.program.rule_version(rule);
         version.selector_program = Some(program);
@@ -10856,7 +10851,7 @@ fn adding_a_live_selector_program_keeps_existing_routing() {
 
 #[test]
 fn detachment_routing_rebuild_excludes_retired_rules() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let retained_sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
     let detached_sheet = engine.add_sheet(StyleSheetObjectID(2), CascadeOrigin::Author);
     engine.attach_sheet(retained_sheet, TreeScopeID::DOCUMENT);
@@ -10958,7 +10953,7 @@ fn rule_metadata_commits_at_the_transaction_barrier() {
 
 #[test]
 fn container_query_gating_invalidates_committed_scope_dispatch() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let program = engine
         .programs
         .add(test_selector_program(".target", &[("target", StyleAtomID(200))]));
@@ -11101,7 +11096,7 @@ fn rewriting_a_rule_to_its_current_contents_journals_nothing() {
 
 #[test]
 fn reordering_a_sheet_is_a_cascade_change_not_a_selector_change() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let first = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
     let second = engine.add_sheet(StyleSheetObjectID(2), CascadeOrigin::Author);
     engine.attach_sheet(first, TreeScopeID::DOCUMENT);
@@ -11128,7 +11123,7 @@ fn reordering_a_sheet_is_a_cascade_change_not_a_selector_change() {
 
 #[test]
 fn sheet_attachment_commits_at_the_transaction_barrier() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let first = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
     let second = engine.add_sheet(StyleSheetObjectID(2), CascadeOrigin::Author);
     engine.attach_sheet(first, TreeScopeID::DOCUMENT);
@@ -11151,7 +11146,7 @@ fn sheet_attachment_commits_at_the_transaction_barrier() {
 
 #[test]
 fn sheet_order_inputs_only_name_sheets_whose_position_changed() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let user_agent = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::UserAgent);
     let first = engine.add_sheet(StyleSheetObjectID(2), CascadeOrigin::Author);
     let second = engine.add_sheet(StyleSheetObjectID(3), CascadeOrigin::Author);
@@ -11203,7 +11198,7 @@ fn edits_to_a_temporarily_detached_sheet_keep_their_rule_inputs() {
 
 #[test]
 fn rule_changes_share_one_sheet_attachment_decision_per_transaction() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
     engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
 
@@ -11228,7 +11223,7 @@ fn rule_changes_share_one_sheet_attachment_decision_per_transaction() {
 
 #[test]
 fn deleting_a_group_rule_journals_every_identity_it_took_with_it() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
     engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
     let media = engine.append_rule(sheet, None, RuleKind::Media);
@@ -11247,7 +11242,7 @@ fn deleting_a_group_rule_journals_every_identity_it_took_with_it() {
 
 #[test]
 fn rule_existence_commits_at_the_transaction_barrier() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
     engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
     discard_transaction(&mut engine);
@@ -11269,7 +11264,7 @@ fn rule_existence_commits_at_the_transaction_barrier() {
 
 #[test]
 fn inserting_and_deleting_an_unobserved_rule_cancels_out() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
     engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
     discard_transaction(&mut engine);
@@ -11287,7 +11282,7 @@ fn inserting_and_deleting_an_unobserved_rule_cancels_out() {
 
 #[test]
 fn publishing_an_implicit_layer_order_does_not_edit_the_program() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let version = engine.program.version();
 
     engine.set_layer_order(TreeScopeID::DOCUMENT, &[CascadeLayerID::UNLAYERED]);
@@ -11301,7 +11296,7 @@ fn publishing_an_implicit_layer_order_does_not_edit_the_program() {
 
 #[test]
 fn allocating_an_unattached_sheet_does_not_edit_the_program() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let version = engine.program.version();
 
     engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
@@ -11442,12 +11437,12 @@ fn answer_transitions_refuse_equality_removals_and_winning_additions() {
 
 #[test]
 fn native_atom_reclamation_does_not_claim_a_cpp_memo_reference() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
-    let native = bridge::intern_native_atom(&mut engine, 0x1000);
-    let shared = bridge::intern_native_atom(&mut engine, 0x1001);
+    let mut engine = StyleEngine::new();
+    let native = engine.atoms.intern_raw(0x1000);
+    let shared = engine.atoms.intern_raw(0x1001);
     assert_eq!(engine.intern_atom(0x1001), shared);
     for raw in 0x2000..0x2100 {
-        bridge::intern_native_atom(&mut engine, raw);
+        engine.atoms.intern_raw(raw);
     }
     engine.sweep_style_atoms();
     assert!(
@@ -11468,7 +11463,7 @@ fn native_atom_reclamation_does_not_claim_a_cpp_memo_reference() {
 
 #[test]
 fn releasing_a_flush_transaction_does_not_reclaim_atoms() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     for raw in 0x1000..0x1100 {
         engine.intern_atom(raw);
     }
@@ -11518,66 +11513,6 @@ fn atom_sweep_waits_for_an_active_matching_traversal() {
 }
 
 #[test]
-fn replay_forces_a_recorded_atom_sweep_without_reclaims() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
-    engine.host.replay_atom_sweep = Some(ReplayAtomSweep::Reclaim(Vec::new()));
-
-    engine.sweep_style_atoms();
-
-    assert_eq!(engine.counters().get(Counter::AtomSweeps), 1);
-    assert!(engine.host.style_atoms_swept);
-}
-
-#[test]
-fn replay_skips_an_atom_sweep_the_recording_skipped() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
-    for raw in 0x1000..0x1100 {
-        engine.intern_atom(raw);
-    }
-    assert!(engine.retained.atoms.should_sweep());
-    engine.host.replay_atom_sweep = Some(ReplayAtomSweep::Skip);
-
-    engine.sweep_style_atoms();
-
-    assert_eq!(engine.counters().get(Counter::AtomSweeps), 0);
-    assert!(!engine.host.style_atoms_swept);
-    assert!(engine.host.replay_atom_sweep.is_none());
-}
-
-#[test]
-fn replay_ffi_reclaims_the_non_empty_recorded_atom_set() {
-    let (mut engine, nodes) = linear_document();
-    for &node in &nodes {
-        set_atom_feature(&mut engine, node, LocalFeatureKey::TagName, StyleAtomID(100));
-    }
-    let reclaimable = engine.intern_atom(0x1000);
-    let recorded = [reclaimable.0];
-    let engine_pointer = crate::css::style::StyleEngineHandle::from_raw(&raw mut engine);
-    unsafe {
-        bridge::style_engine_set_replay_atom_sweep(engine_pointer, true, recorded.as_ptr(), recorded.len());
-    }
-
-    let computation_inputs = bridge::FfiDocumentStyleComputationInputs {
-        viewport_width: 800.0,
-        viewport_height: 600.0,
-        root_font_size: 16.0,
-        device_pixels_per_css_pixel: 2.0,
-        ..Default::default()
-    };
-    let output = unsafe {
-        bridge::style_engine_take_style_transaction_for_replay(engine_pointer, nodes[0].raw(), computation_inputs)
-    };
-
-    assert_eq!(engine.document_style_computation_inputs, computation_inputs);
-
-    assert!(output.style_atoms_swept);
-    assert_eq!(output.reclaimed_style_atom_count, 1);
-    let reclaimed = unsafe { *output.reclaimed_style_atoms };
-    assert_eq!(reclaimed.atom, reclaimable.0);
-    assert_eq!(reclaimed.raw, 0x1000);
-}
-
-#[test]
 fn attribute_names_keep_all_noted_forms_live() {
     let (mut engine, nodes) = linear_document();
     let name = engine.intern_atom(0x1000);
@@ -11614,7 +11549,7 @@ fn attribute_names_keep_all_noted_forms_live() {
 
 #[test]
 fn qualified_attribute_programs_keep_local_name_forms_live() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let namespace = engine.intern_atom(0x1000);
     let local_name = engine.intern_atom(0x1001);
     let qualified_name = engine.intern_qualified_atom(namespace, local_name);
@@ -11720,6 +11655,49 @@ fn engine_atom_sweeps_preserve_roots_and_purge_reused_identities() {
             .iter()
             .any(|matched| matched.rule == new_rule)
     );
+}
+
+#[test]
+fn engine_keeps_handed_attribute_value_text_only_where_a_selector_reads_the_name() {
+    let (mut engine, _) = linear_document();
+    let name = engine.intern_atom(0x1000);
+    let before_rule = engine.intern_atom(0x1001);
+    let after_rule = engine.intern_atom(0x1002);
+    engine.note_attribute_name_forms(name, index::AttributeNameForms::default());
+    let text = [u16::from(b'n'), u16::from(b'e'), u16::from(b'w')];
+    let hand_over = |engine: &mut StyleEngine, value| {
+        super::boundary::StyleChange::SetAttributeValueText {
+            name,
+            value,
+            text: text.into(),
+        }
+        .apply(engine);
+    };
+
+    // The host hands over the text where it does not know whether anything reads the name.
+    hand_over(&mut engine, before_rule);
+    assert!(!engine.has_attribute_value_text(before_rule));
+
+    let mut builder = selector::SelectorProgramBuilder::new();
+    let (value_offset, value_length) = builder.push_literal(&text[..2]);
+    let prefix = builder.push_feature(selector::FeatureTest::Attribute(selector::AttributeTest {
+        name,
+        any_namespace: false,
+        folded: name,
+        fold_in_namespace: StyleAtomID::NONE,
+        operator: selector::AttributeOperator::Prefix,
+        value_atom: StyleAtomID::NONE,
+        value_offset,
+        value_length,
+        case: selector::AttributeCase::Sensitive,
+    }));
+    let compound = builder.push_compound(&[prefix]);
+    builder.push_entry(compound);
+    engine.note_attribute_value_text_names(&builder.finish());
+    assert!(engine.attribute_name_requires_value_text(name));
+
+    hand_over(&mut engine, after_rule);
+    assert!(engine.has_attribute_value_text(after_rule));
 }
 
 #[test]
@@ -11852,7 +11830,7 @@ fn engine_atom_reuse_replaces_catalog_text_and_name_forms() {
 
 #[test]
 fn engine_atom_reuse_replaces_custom_property_names() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let old_name = engine.intern_atom(0x1000);
     unsafe {
         engine.note_custom_property_name(old_name, 0, &[u16::from(b'-'), u16::from(b'-'), u16::from(b'o')]);
@@ -11892,7 +11870,7 @@ fn engine_atom_reuse_replaces_custom_property_names() {
 #[test]
 fn owed_element_style_inputs_fold_into_covering_reactions() {
     use super::transaction::{STYLE_REACTION_INHERITED_STYLE, STYLE_REACTION_RECOMPUTE_STYLE};
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw_nodes = [0; 1];
     engine.allocate_style_nodes(&mut raw_nodes);
     let node = StyleNodeID::from_raw(raw_nodes[0]).unwrap();
@@ -11924,7 +11902,7 @@ fn owed_element_style_inputs_fold_into_covering_reactions() {
 
 #[test]
 fn held_style_records_outlive_engine_assignments_and_release_on_retirement() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw_nodes = [0; 2];
     engine.allocate_style_nodes(&mut raw_nodes);
     let [first, second] = raw_nodes.map(|node| StyleNodeID::from_raw(node).unwrap());
@@ -11979,7 +11957,7 @@ fn held_style_records_outlive_engine_assignments_and_release_on_retirement() {
 
 #[test]
 fn records_left_unreachable_under_a_lease_are_reclaimed_once_it_drops() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw_node = [0];
     engine.allocate_style_nodes(&mut raw_node);
     let target = computed::ComputedStyleTarget::new(StyleNodeID::from_raw(raw_node[0]).unwrap(), u8::MAX);
@@ -12022,7 +12000,7 @@ fn records_left_unreachable_under_a_lease_are_reclaimed_once_it_drops() {
 
 #[test]
 fn relational_routing_checks_an_absent_anchor_posting_once() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 128];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<StyleNodeID> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -12269,7 +12247,7 @@ fn a_reissued_identity_has_no_replaced_content_input() {
 
 #[test]
 fn a_text_node_holds_its_published_characters_until_its_identity_is_reissued() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 1];
     engine.allocate_text_style_nodes(&mut raw);
     let text = StyleNodeID::from_raw(raw[0]).unwrap();
@@ -12296,7 +12274,7 @@ fn a_text_node_holds_its_published_characters_until_its_identity_is_reissued() {
 
 #[test]
 fn inheritance_parent_keeps_the_dom_parent_of_nodes_outside_the_flat_tree() {
-    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut engine = StyleEngine::new();
     let mut raw = [0_u32; 7];
     engine.allocate_style_nodes(&mut raw);
     let nodes: Vec<_> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -12315,7 +12293,7 @@ fn inheritance_parent_keeps_the_dom_parent_of_nodes_outside_the_flat_tree() {
     engine.tree.set_parent(*slot, Some(*wrapper));
     engine.tree.set_first_element_child(*slot, Some(*fallback));
     engine.tree.set_parent(*fallback, Some(*slot));
-    let retained = &mut engine.state.retained;
+    let retained = &mut engine.retained;
     retained.tree.set_shadow_root(*host, *shadow_root, &mut retained.memory);
     retained
         .tree
@@ -12324,7 +12302,7 @@ fn inheritance_parent_keeps_the_dom_parent_of_nodes_outside_the_flat_tree() {
         .tree
         .set_assigned_nodes(*slot, &[*assigned], &mut retained.memory);
 
-    let tree = &engine.state.retained.tree;
+    let tree = &engine.retained.tree;
     // A slotted element inherits from its slot, and a shadow tree's top-level element from the host.
     assert_eq!(tree.inheritance_parent(*assigned), Some(*slot));
     assert_eq!(tree.inheritance_parent(*wrapper), Some(*host));

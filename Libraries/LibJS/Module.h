@@ -63,22 +63,14 @@ struct GraphLoadingState : public Cell {
     GC_DECLARE_ALLOCATOR(GraphLoadingState);
 
 public:
-    struct HostDefined : Cell {
-        GC_CELL(HostDefined, Cell);
-        GC_DECLARE_ALLOCATOR(HostDefined);
-
-    public:
-        virtual ~HostDefined() = default;
-    };
-
     GC::Ptr<PromiseCapability> promise_capability; // [[PromiseCapability]]
     bool is_loading { false };                     // [[IsLoading]]
     size_t pending_module_count { 0 };             // [[PendingModulesCount]]
     HashTable<GC::Ptr<CyclicModule>> visited;      // [[Visited]]
-    GC::Ptr<HostDefined> host_defined;             // [[HostDefined]]
+    GC::Ptr<GC::Cell> host_defined;                // [[HostDefined]]
 
 private:
-    GraphLoadingState(GC::Ptr<PromiseCapability> promise_capability, bool is_loading, size_t pending_module_count, HashTable<GC::Ptr<CyclicModule>> visited, GC::Ptr<HostDefined> host_defined)
+    GraphLoadingState(GC::Ptr<PromiseCapability> promise_capability, bool is_loading, size_t pending_module_count, HashTable<GC::Ptr<CyclicModule>> visited, GC::Ptr<GC::Cell> host_defined)
         : promise_capability(move(promise_capability))
         , is_loading(is_loading)
         , pending_module_count(pending_module_count)
@@ -105,7 +97,7 @@ public:
 
     GC::Ptr<ModuleEnvironment> environment() { return m_environment; }
 
-    Script::HostDefined* host_defined() const { return m_host_defined; }
+    GC::Ptr<GC::Cell> host_defined() const { return m_host_defined; }
 
     GC::Ref<Object> get_module_namespace(VM& vm);
 
@@ -120,10 +112,10 @@ public:
     virtual ThrowCompletionOr<u32> inner_module_linking(VM& vm, GC::RootVector<GC::Ref<Module>>& stack, u32 index);
     virtual ThrowCompletionOr<u32> inner_module_evaluation(VM& vm, GC::RootVector<GC::Ref<Module>>& stack, u32 index);
 
-    virtual PromiseCapability& load_requested_modules(GC::Ptr<GraphLoadingState::HostDefined>) = 0;
+    virtual PromiseCapability& load_requested_modules(GC::Ptr<GC::Cell> host_defined) = 0;
 
 protected:
-    Module(Realm&, ByteString filename, Script::HostDefined* host_defined = nullptr);
+    Module(Realm&, ByteString filename, GC::Ptr<GC::Cell> host_defined = nullptr);
 
     virtual void visit_edges(Cell::Visitor&) override;
     virtual size_t external_memory_size() const override;
@@ -142,10 +134,10 @@ private:
     // destroy the VM but keep the modules this should not happen. Because VM
     // stores modules with a RefPtr we cannot just store the VM as that leads to
     // cycles.
-    GC::Ptr<Realm> m_realm;                          // [[Realm]]
-    GC::Ptr<ModuleEnvironment> m_environment;        // [[Environment]]
-    GC::Ptr<Object> m_namespace;                     // [[Namespace]]
-    Script::HostDefined* m_host_defined { nullptr }; // [[HostDefined]]
+    GC::Ptr<Realm> m_realm;                   // [[Realm]]
+    GC::Ptr<ModuleEnvironment> m_environment; // [[Environment]]
+    GC::Ptr<Object> m_namespace;              // [[Namespace]]
+    GC::Ptr<GC::Cell> m_host_defined;         // [[HostDefined]]
 
     // Needed for potential lookups of modules.
     ByteString m_filename;

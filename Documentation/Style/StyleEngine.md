@@ -1088,8 +1088,6 @@ Tier4Limit = min(
 
 The scratch cap is 32 MiB and the transaction node allowance is 768 bytes. The multiplier on `Tier3Limit` is 1, not 2, so transaction scratch cannot dominate the document's total style footprint; the 4 MiB floor matters most on small documents. Tier 4 is a **reported ceiling**, not a refusable cap: scratch charges cannot be refused because the flush must complete. The limit makes an over-limit transaction visible in the pressure report but changes no allocation or planning decision.
 
-During an active capture (and its replay), the memory policy pins the Tier-3 limit to the device cap so recorded eviction decisions are reproducible; ordinary builds never run that policy.
-
 Accounting uses one plain-integer ledger per document or shared-program context, mutated through exclusive borrows. Leases share only the accounting lifetime, so destroying an outliving query or shared program still releases its charge. Ledger operations never select admission or refuse required capacity. Peak charged live bytes and peak scratch bytes remain available after temporary charges are released. Required output and node workspace is reserved before computation. Output capacity is reconciled at vector growth; computation scratch capacity is sampled every 256 published elements and reconciled after the loop, before release. Its high-water observation reports accounted capacity at those points, not an allocator-level peak.
 
 Byte accounting happens at arena, slab, vector-capacity, bitmap, and hash-table allocation boundaries: operators update aggregate counters when capacity changes, not on every lookup.
@@ -1239,7 +1237,7 @@ The engine likewise mints process-global `StyleAtomID` values for selector-menti
 
 **Relation columns** are stored on the Rust side, keyed by `StyleNodeID`, and maintained from the journalled tree deltas within the same transaction that reports the mutation, so transpose traversal, impact-region membership, and sibling-sequence scans run entirely inside the evaluator. Two deliberate exceptions bypass per-node journalling: initial bulk load links the whole arriving tree directly (safe because the root arrival forces whole-document evaluation), and shadow host/root registration is applied directly at registration time.
 
-**Forward transfer.** C++ mutation helpers append element facts to retained input buffers rather than crossing FFI immediately. One flat immutable transaction per flush submits six pointer-free fixed-width row arrays (tree relations, element arrivals, local features, state, element declarations, and element style inputs) plus the arrival custom-state atom arena in a single call. Namespace, language, directionality, heading level, custom states, and slot-ness ride the element-arrival rows. Program, sheet, rule, layer, and topology changes still cross as individual generated boundary calls as they happen and are journalled engine-side into the same normalization journal.
+**Forward transfer.** C++ mutation helpers append element facts to retained input buffers rather than crossing FFI immediately. One flat immutable transaction per flush submits six pointer-free fixed-width row arrays (tree relations, element arrivals, local features, state, element declarations, and element style inputs) plus the arrival custom-state atom arena in a single call. Namespace, language, directionality, heading level, custom states, and slot-ness ride the element-arrival rows. Program, sheet, rule, layer, and topology changes still cross as individual boundary calls as they happen and are journalled engine-side into the same normalization journal.
 
 **There is no reverse fact-fetch protocol.** The engine never asks C++ for a fact it lacks: C++ pushes every fact it owns eagerly as deltas, the engine stages them, and evaluation reads old/new values through a transaction-local fact view over retained pre-images plus the resident fact store. A broad plan holds an immutable shared view of the resident primary columns and allocates only the transaction-specific overlays and indexes it needs; it does not clone the complete fact store or cross the boundary. The one reverse direction that exists is an enumeration callback for flat-tree descendants not represented by an engine-owned child list.
 
@@ -1247,7 +1245,7 @@ The engine likewise mints process-global `StyleAtomID` values for selector-menti
 
 ### 13.1 Module layout
 
-The C++ side of the boundary is `Libraries/LibWeb/CSS/StyleEngineBridge.*` (the FFI surface; regular boundary calls, their recording frames, and replay decoders are generated from a single boundary specification at build time) and `Libraries/LibWeb/CSS/StyleEngineInput.*` (input collection and transaction assembly). The engine lives in `Libraries/LibWeb/Rust/src/css/style/`:
+The C++ side of the boundary is `Libraries/LibWeb/CSS/StyleEngineBridge.*` (the FFI surface; the regular boundary calls are one row each in the table of `boundary.rs`) and `Libraries/LibWeb/CSS/StyleEngineInput.*` (input collection and transaction assembly). The engine lives in `Libraries/LibWeb/Rust/src/css/style/`:
 
 ```text
 mod.rs                engine root: modes, top-level state, public entry points
@@ -1284,8 +1282,8 @@ order.rs              hierarchical order-maintenance tokens
 tree.rs               style-node tree relations and identities
 fast_hash.rs          deterministic hashing aliases (fixed-seed foldhash)
 instrumentation.rs    counters and the wild ledger
-record_replay.rs      capture/replay event stream (see StyleEngineTesting.md)
-bridge.rs             Rust side of the generated FFI boundary
+bridge.rs             Rust side of the FFI boundary
+boundary.rs           the host's plain writes and reads, one table row each
 tests.rs, differential_tests.rs  in-crate unit and differential suites
 ```
 
@@ -1387,7 +1385,7 @@ The engine maintains a large counter ledger (`instrumentation.rs`), exposed to C
 * Candidate enumeration: posting entries enumerated, region-membership checks, exact checks, rejections.
 * Matching and stopping: retained-answer patch stops, cascade compaction counts, cold-batch rows evaluated and missing.
 * Tier-3 memory decisions: admission closures per category and benefit-guided boundary evictions.
-* Bytes by tier and category, plus the pressure snapshot (limits, admission closures, evictions) exposed over FFI and printed by the replay accounting report.
+* Bytes by tier and category.
 * Style records and interned states created, reused, reclaimed; reaction and recomputation counts on the C++ ledger (the amplification triage numbers).
 
 The doctrine over any future counter: ratios with a zero denominator report the raw numerator and `not applicable`, never an invented zero, and every plan decision made against an estimate should leave behind the observation that would have corrected it.
@@ -1488,6 +1486,5 @@ The engine's correctness claim (every path produces results identical to full re
 * **The exact cold evaluator is the reference implementation.** It is plain by design, free of the incremental path's caches, and is both the eviction fallback and the oracle every other path is checked against.
 * **In-crate unit and differential suites** (`tests.rs`, `differential_tests.rs`) exercise operators directly, including differential comparison of incremental against cold evaluation.
 * **Verify modes** re-derive incremental answers through the cold path at runtime and compare, observer-only: verification never mutates engine state, never disables the fast path it checks, and treats an incomplete comparison as a failure.
-* **Record/replay** captures the complete engine input stream of a real browsing session and replays it deterministically; digests over published outputs make any divergence, down to one changed identity, a hard failure.
 
 Commands, workflows, and debugging guidance for all of these are in [StyleEngineTesting.md](StyleEngineTesting.md).

@@ -10,8 +10,6 @@
 #include <LibJS/Runtime/PrototypeObject.h>
 #include <LibWeb/Bindings/Wrappable.h>
 
-// Note: Using WEB_PLATFORM_OBJECT() on a class that doesn't inherit from Web::Bindings::PlatformObject
-//       is a compilation error, so that is not tested here.
 // Note: It's pretty hard to have the incorrect type in a JS::PrototypeObject, since the base name would
 //       have a comma in it, and wouldn't be passable as the basename without a typedef.
 
@@ -25,11 +23,13 @@ class CellWithEnvironmentMacro : JS::Cell {
     JS_ENVIRONMENT(CellWithEnvironmentMacro, JS::Cell);
 };
 
+// expected-error@+1 {{ObjectWithCellMacro derives from the engine type JS::Object, which only LibJS may subclass; use a host class instead}}
 class ObjectWithCellMacro : JS::Object {
     // expected-error@+1 {{Invalid GC-CELL-like macro invocation; expected JS_OBJECT}}
     GC_CELL(ObjectWithCellMacro, JS::Object);
 };
 
+// expected-error@+1 {{ObjectWithEnvironmentMacro derives from the engine type JS::Object, which only LibJS may subclass; use a host class instead}}
 class ObjectWithEnvironmentMacro : JS::Object {
     // expected-error@+1 {{Invalid GC-CELL-like macro invocation; expected JS_OBJECT}}
     JS_ENVIRONMENT(ObjectWithEnvironmentMacro, JS::Object);
@@ -40,6 +40,7 @@ class WrappableWithCellMacro : Web::Bindings::Wrappable {
     GC_CELL(WrappableWithCellMacro, Web::Bindings::Wrappable);
 };
 
+// expected-error@+1 {{ObjectWithWrappableMacro derives from the engine type JS::Object, which only LibJS may subclass; use a host class instead}}
 class ObjectWithWrappableMacro : JS::Object {
     // expected-error@+1 {{Invalid GC-CELL-like macro invocation; expected JS_OBJECT}}
     WEB_NON_IDL_WRAPPABLE(ObjectWithWrappableMacro, JS::Object);
@@ -53,6 +54,7 @@ class CellWithPrototypeMacro : Cell {
     JS_PROTOTYPE_OBJECT(CellWithPrototypeMacro, Cell, Cell);
 };
 
+// expected-error@+1 {{ObjectWithPrototypeMacro derives from the engine type JS::Object, which only LibJS may subclass; use a host class instead}}
 class ObjectWithPrototypeMacro : Object {
     // expected-error@+1 {{Invalid GC-CELL-like macro invocation; expected JS_OBJECT}}
     JS_PROTOTYPE_OBJECT(ObjectWithPrototypeMacro, Object, Object);

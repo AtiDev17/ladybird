@@ -195,9 +195,6 @@ static Compositing::RustFFI::FfiVisualContextTreeInputs visual_context_tree_inpu
     inputs.visual_viewport_offset_x = offset.x();
     inputs.visual_viewport_offset_y = offset.y();
     inputs.visual_viewport_scale = visual_viewport.scale();
-    auto viewport_overflow = overflow_values_applied_to_viewport_for_wheel_scrolling(document);
-    inputs.viewport_wheel_overflow_x = static_cast<u8>(to_underlying(viewport_overflow.x));
-    inputs.viewport_wheel_overflow_y = static_cast<u8>(to_underlying(viewport_overflow.y));
     return inputs;
 }
 
@@ -320,20 +317,10 @@ void rust_update_visual_viewport_transform(Layout::BegunRead const& read, DOM::D
     Layout::RustFFI::render_state_update_visual_viewport_transform(document.layout_node_arena().host(), &read, visual_context_tree_inputs(document));
 }
 
-bool rust_refresh_scroll_state(Layout::BegunRead const& read, DOM::Document& document, Compositing::ScrollStateSnapshot& snapshot, ForceScrollStateRefresh force)
-{
-    return Layout::RustFFI::render_state_refresh_scroll_state(
-        document.layout_node_arena().host(), &read, force == ForceScrollStateRefresh::Yes, document.page().client().device_pixels_per_css_pixel(),
-        &snapshot, [](void* sink, Gfx::FloatPoint const* offsets, size_t count) {
-            static_cast<Compositing::ScrollStateSnapshot*>(sink)->assign_device_offsets({ offsets, count });
-        });
-}
-
 // Describes the row in the slot as its layout node describes itself, for a dump or a trace.
 static void push_debug_description(DOM::Document const& document, Compositing::RustFFI::NodeSlotId slot, void* description_sink)
 {
-    // The box a dump describes is the dump's own read of the render state.
-    Layout::ForcedReadScope read { document, false };
+    Layout::ForcedReadScope read { document };
     auto const* layout_node = const_cast<DOM::Document&>(document).layout_node_arena().node_if_live(read, slot);
     VERIFY(layout_node);
     auto description = layout_node->debug_description();
@@ -434,7 +421,7 @@ static void dump_layout_tree(Layout::Node const& root, size_t initial_indent, bo
             auto serialized_url = content_document->url().serialize();
             push_bytes_to_dump_sink(url_sink, serialized_url.bytes());
             // The nested document's tree is the dump's own read of that document's render state.
-            Layout::ForcedReadScope read { *content_document, false };
+            Layout::ForcedReadScope read { *content_document };
             return { .has_document = true, .layout_root = const_cast<Layout::Viewport*>(content_document->layout_node(read)) }; },
         .svg_as_image_layout_root = [](void* document, Layout::RustFFI::FfiNodeIdentity node) -> void* {
             auto const* image_element = as_if<HTML::HTMLImageElement>(node_identity_of(node).resolve(*static_cast<DOM::Document*>(document)).ptr());
@@ -444,7 +431,7 @@ static void dump_layout_tree(Layout::Node const& root, size_t initial_indent, bo
             if (!svg_image_data)
                 return nullptr;
             // The image's tree is the dump's own read of its document's render state.
-            Layout::ForcedReadScope read { svg_image_data->svg_document(), false };
+            Layout::ForcedReadScope read { svg_image_data->svg_document() };
             return const_cast<Layout::Viewport*>(svg_image_data->svg_document().unsafe_layout_node(read)); },
         .dump_nested_layout_tree = [](void*, void* layout_root, size_t indent, bool interactive, void* output_sink) { dump_layout_tree(*static_cast<Layout::Node const*>(layout_root), indent, interactive, output_sink, Layout::RustFFI::layout_arena_paint_push_bytes); },
         .append_text = append_text,
@@ -459,10 +446,13 @@ void dump_layout_tree(StringBuilder& builder, Layout::Node const& root, bool int
 
 namespace {
 
+// What a recording's publication adds its resources to, and what an SVG-as-image render is found and cut from: the
+// document's host, through which a layout node of the recording is reached, and the tree the recording was cut from.
 struct RecordingPublishContext {
     Compositing::DisplayListResourceStorage& resource_storage;
-    GC::Ref<DOM::Document const> document;
+    Layout::RustFFI::DocumentHost* host;
     Layout::BegunRead const& read;
+    Compositing::AccumulatedVisualContextTree const& visual_context_tree;
 };
 
 static Layout::RustFFI::FfiRecordingPublishCallbacks recording_publish_callbacks(RecordingPublishContext& context)
@@ -477,19 +467,21 @@ static Layout::RustFFI::FfiRecordingPublishCallbacks recording_publish_callbacks
             context.resource_storage.add_image_frame(*static_cast<Gfx::DecodedImageFrame const*>(frame)); },
         .resolve_vector_image_display_list = [](void* context_pointer, Layout::RustFFI::FfiVectorImageRenderRequest const* request) -> u64 {
             auto& context = *static_cast<RecordingPublishContext*>(context_pointer);
-            auto const& document = *context.document;
             auto empty_display_list = [&] {
-                return context.resource_storage.add_display_list(Compositing::DisplayList::create(document.paint_state().visual_context_tree(document)), document.paint_state().visual_context_tree(document)).value();
+                return context.resource_storage.add_display_list(Compositing::DisplayList::create(context.visual_context_tree), context.visual_context_tree).value();
             };
-            auto const* layout_node = static_cast<Layout::NodeWithStyle const*>(Layout::RustFFI::render_state_node_shell_if_live(document_host(document), &context.read, request->owner));
+            auto const* layout_node = static_cast<Layout::NodeWithStyle const*>(Layout::RustFFI::render_state_node_shell_if_live(context.host, &context.read, request->owner));
             if (!layout_node)
                 return empty_display_list();
             GC::Ptr<HTML::DecodedImageData> decoded_image_data;
+            // A recording that lands after its boxes' elements were removed may draw a box whose element is gone.
             if (request->is_replaced_content) {
-                if (layout_node->kind() == Layout::RustFFI::NodeKind::ImageBox)
-                    decoded_image_data = static_cast<Layout::Box const&>(*layout_node).image_provider().decoded_image_data();
-                else if (layout_node->kind() == Layout::RustFFI::NodeKind::SVGImageBox)
-                    decoded_image_data = as<SVG::SVGImageElement>(*layout_node->dom_node()).decoded_image_data();
+                if (layout_node->kind() == Layout::RustFFI::NodeKind::ImageBox) {
+                    if (auto const* image_provider = static_cast<Layout::Box const&>(*layout_node).image_provider_if_any())
+                        decoded_image_data = image_provider->decoded_image_data();
+                } else if (auto const* image = as_if<SVG::SVGImageElement>(layout_node->dom_node())) {
+                    decoded_image_data = image->decoded_image_data();
+                }
             } else if (auto const* observer = layer_image_observer(*layout_node, request->list, request->computed_index)) {
                 decoded_image_data = observer->decoded_image_data();
             }
@@ -505,20 +497,6 @@ static Layout::RustFFI::FfiRecordingPublishCallbacks recording_publish_callbacks
             auto& context = *static_cast<RecordingPublishContext*>(context_pointer);
             context.resource_storage.add_video_sink(Compositing::VideoSinkResourceId { resource_id }, Media::VideoSinkHandle { sink_handle }); },
     };
-}
-
-static void take_recording_trace_if_pending(Layout::BegunRead const& read, DOM::Document& document)
-{
-    struct TraceContext {
-        GC::Ref<DOM::Document const> document;
-        StringBuilder trace;
-    } context { document, {} };
-    bool has_pending_trace = Layout::RustFFI::render_state_take_recording_trace(
-        document_host(document), &read, &context,
-        [](void* context_pointer, Compositing::RustFFI::NodeSlotId slot, void* description_sink) { push_debug_description(*static_cast<TraceContext*>(context_pointer)->document, slot, description_sink); },
-        [](void* context_pointer, u8 const* bytes, size_t byte_count) { static_cast<TraceContext*>(context_pointer)->trace.append(StringView { bytes, byte_count }); });
-    if (has_pending_trace)
-        document.paint_state().append_recording_trace(MUST(context.trace.to_string()));
 }
 
 // The platform default font at an overlay label's CSS size and at that size in device pixels, kept alive for the
@@ -542,7 +520,21 @@ static OverlayLabelFonts overlay_label_fonts(float css_size, double device_pixel
 
 }
 
-Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRead const& read, DOM::Document& document, Compositing::AccumulatedVisualContextTree visual_context_tree, NonnullRefPtr<Compositing::DisplayList> placeholder_display_list, PaintCommandCacheMode cache_mode, HTML::PaintConfig const& config, InspectorOverlayInputs const& overlay_inputs, Layout::RustFFI::FfiFlightBlocker blocker)
+void take_recording_trace_if_pending(Layout::BegunRead const& read, DOM::Document& document)
+{
+    struct TraceContext {
+        GC::Ref<DOM::Document const> document;
+        StringBuilder trace;
+    } context { document, {} };
+    bool has_pending_trace = Layout::RustFFI::render_state_take_recording_trace(
+        document_host(document), &read, &context,
+        [](void* context_pointer, Compositing::RustFFI::NodeSlotId slot, void* description_sink) { push_debug_description(*static_cast<TraceContext*>(context_pointer)->document, slot, description_sink); },
+        [](void* context_pointer, u8 const* bytes, size_t byte_count) { static_cast<TraceContext*>(context_pointer)->trace.append(StringView { bytes, byte_count }); });
+    if (has_pending_trace)
+        document.paint_state().append_recording_trace(MUST(context.trace.to_string()));
+}
+
+Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRead const& read, DOM::Document& document, Compositing::AccumulatedVisualContextTree visual_context_tree, NonnullRefPtr<Compositing::DisplayList> placeholder_display_list, PaintCommandCacheMode cache_mode, HTML::PaintConfig const& config, InspectorOverlayInputs const& overlay_inputs, Layout::RustFFI::FfiFlightBlocker blocker, Optional<Compositor::FlightPresentation>* flight)
 {
     auto* host = document_host(document);
     auto device_pixels_per_css_pixel = document.page().client().device_pixels_per_css_pixel();
@@ -607,7 +599,6 @@ Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRe
     inputs.force_dark_foreground_threshold = config.force_dark_foreground_threshold;
     inputs.force_dark_background_threshold = config.force_dark_background_threshold;
     inputs.should_paint_overlay = config.paint_overlay;
-    inputs.is_recording_async_scrolling_metadata = true;
     inputs.document_id = document.unique_id().value();
     inputs.has_blocking_wheel_event_region_covering_viewport = wheel_event_region_state.has_blocking_wheel_event_region_covering_viewport;
     inputs.wheel_event_listener_state_generation = document.page().wheel_event_listener_state_generation();
@@ -644,7 +635,7 @@ Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRe
         // NB: The container's document is laid out ahead of the document of the navigable it hosts, and its box is read
         //     as it last laid it out, as the embedding document's own read.
         if (auto container_element = document.navigable()->container()) {
-            Layout::ForcedReadScope container_read { container_element->document(), false };
+            Layout::ForcedReadScope container_read { container_element->document() };
             if (auto const* container_node = container_element->unsafe_layout_node(container_read)) {
                 auto container_scheme = container_node->color_scheme();
                 if (container_scheme == CSS::PreferredColorScheme::Auto)
@@ -660,61 +651,77 @@ Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRe
         inputs.background_color = document.background_color(read);
     }
     reconcile_navigable_container_paint_facts(read, document);
-    // The recording copies what it reads of the overlay arrays and buffers, which live until here.
-    auto start = Layout::RustFFI::render_state_record_display_list(host, &read, viewport_row_slot(read, document), inputs, blocker);
-    if (start == Layout::RustFFI::FfiRecordingStart::NothingToRecord)
-        return {};
-    return DisplayListRecording {
+    Optional<Compositing::DisplayList::AsyncScrollingMetadata> async_scrolling_metadata;
+    if (auto navigable = document.navigable()) {
+        async_scrolling_metadata = Compositing::DisplayList::AsyncScrollingMetadata {
+            .viewport_rect = device_viewport_rect.to_type<int>(),
+            .wheel_event_listener_state_generation = navigable->page().wheel_event_listener_state_generation(),
+            .has_blocking_wheel_event_listeners = wheel_event_region_state.has_blocking_wheel_event_listeners,
+            .has_blocking_wheel_event_region_covering_viewport = wheel_event_region_state.has_blocking_wheel_event_region_covering_viewport,
+            .device_pixels_per_css_pixel = device_pixels_per_css_pixel,
+        };
+    }
+    DisplayListRecording recording {
         .visual_context_tree = move(visual_context_tree),
         .placeholder_display_list = move(placeholder_display_list),
         .cache_mode = cache_mode,
-        .in_flight = start == Layout::RustFFI::FfiRecordingStart::InFlight,
-        .device_viewport_rect = device_viewport_rect,
-        .wheel_event_region_state = wheel_event_region_state,
+        .in_flight = false,
+        .async_scrolling_metadata = async_scrolling_metadata,
+        .paint_command_cache_source = document.paint_state().display_list_used_as_paint_command_cache_source(),
     };
+    // A recording that flies takes the presentation it presents its frame with, which the landing gives back.
+    Layout::RustFFI::FfiPresentation ffi_presentation {};
+    if (flight && flight->has_value()) {
+        (*flight)->sealed->recording = recording;
+        ffi_presentation = { .presenter = (*flight)->presenter.ptr(), .sealed = (*flight)->sealed.ptr() };
+    }
+    // The recording copies what it reads of the overlay arrays and buffers, which live until here.
+    auto start = Layout::RustFFI::render_state_record_display_list(host, &read, viewport_row_slot(read, document), inputs, blocker, &ffi_presentation);
+    if (flight && flight->has_value() && !ffi_presentation.presenter) {
+        auto taken = flight->release_value();
+        (void)taken.presenter.leak_ptr();
+        (void)taken.sealed.leak_ptr();
+    }
+    if (start == Layout::RustFFI::FfiRecordingStart::NothingToRecord)
+        return {};
+    recording.in_flight = start == Layout::RustFFI::FfiRecordingStart::InFlight;
+    return recording;
 }
 
 RefPtr<Compositing::DisplayList> finish_rust_display_list_recording(Layout::BegunRead const& read, DOM::Document& document, DisplayListRecording const& recording, Compositing::DisplayListResourceStorage& resource_storage)
 {
-    auto* host = document_host(document);
-    auto const& placeholder_display_list = *recording.placeholder_display_list;
-    auto device_viewport_rect = recording.device_viewport_rect;
-    auto wheel_event_region_state = recording.wheel_event_region_state;
-    RecordingPublishContext publish_context { resource_storage, document, read };
+    RecordingPublishContext publish_context { resource_storage, document_host(document), read, recording.visual_context_tree };
     auto rust_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
     Layout::RustFFI::FfiPresentedRecording presented {};
-    Layout::RustFFI::render_state_publish_recording(host, &read, recording_publish_callbacks(publish_context), &presented);
+    Layout::RustFFI::render_state_publish_recording(publish_context.host, &read, recording_publish_callbacks(publish_context), &presented);
     take_recording_trace_if_pending(read, document);
-    if (presented.has_blocking_wheel_event_listeners)
-        wheel_event_region_state.has_blocking_wheel_event_listeners = true;
-    auto stamp_async_scrolling_metadata_with_current_viewport_rect = [&](Compositing::DisplayList& display_list) {
-        if (auto navigable = document.navigable()) {
-            display_list.set_async_scrolling_metadata({
-                .viewport_rect = device_viewport_rect.to_type<int>(),
-                .wheel_event_listener_state_generation = navigable->page().wheel_event_listener_state_generation(),
-                .has_blocking_wheel_event_listeners = wheel_event_region_state.has_blocking_wheel_event_listeners,
-                .has_blocking_wheel_event_region_covering_viewport = wheel_event_region_state.has_blocking_wheel_event_region_covering_viewport,
-                .device_pixels_per_css_pixel = navigable->page().client().device_pixels_per_css_pixel(),
-            });
-        }
+    auto display_list = display_list_of_published_recording(recording, presented);
+    if (rust_painting_timing_enabled())
+        dbgln("PAINT_RECORD rust={} µs commands={} bytes", rust_timer.elapsed_time().to_microseconds(), display_list->command_bytes().size());
+    return display_list;
+}
+
+NonnullRefPtr<Compositing::DisplayList> display_list_of_published_recording(DisplayListRecording const& recording, Layout::RustFFI::FfiPresentedRecording const& presented)
+{
+    auto stamp_async_scrolling_metadata = [&](Compositing::DisplayList& display_list) {
+        auto metadata = recording.async_scrolling_metadata;
+        if (!metadata.has_value())
+            return;
+        metadata->has_blocking_wheel_event_listeners |= presented.has_blocking_wheel_event_listeners;
+        display_list.set_async_scrolling_metadata(*metadata);
     };
 
     if (presented.is_identical_to_published_recording) {
-        if (auto* source = document.paint_state().display_list_used_as_paint_command_cache_source()) {
-            if (rust_painting_timing_enabled())
-                dbgln("PAINT_RECORD rust={} µs identical to the previous recording", rust_timer.elapsed_time().to_microseconds());
-            stamp_async_scrolling_metadata_with_current_viewport_rect(*source);
-            return *source;
+        if (auto source = recording.paint_command_cache_source) {
+            stamp_async_scrolling_metadata(*source);
+            return source.release_nonnull();
         }
     }
 
     auto display_list = Compositing::DisplayList::share_rust_command_storage(recording.visual_context_tree, presented.display_list);
-    if (rust_painting_timing_enabled())
-        dbgln("PAINT_RECORD rust={} µs commands={} bytes", rust_timer.elapsed_time().to_microseconds(), display_list->command_bytes().size());
-
-    if (auto color = placeholder_display_list.surface_clear_color(); color.has_value())
+    if (auto color = recording.placeholder_display_list->surface_clear_color(); color.has_value())
         display_list->set_surface_clear_color(*color);
-    stamp_async_scrolling_metadata_with_current_viewport_rect(*display_list);
+    stamp_async_scrolling_metadata(*display_list);
     return display_list;
 }
 

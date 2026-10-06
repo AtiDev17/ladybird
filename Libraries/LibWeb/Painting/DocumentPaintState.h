@@ -12,6 +12,7 @@
 #include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibCompositing/Scrolling/ScrollState.h>
+#include <LibGC/Ptr.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Layout/NodeArena.h>
@@ -58,7 +59,7 @@ public:
 
     void recompute_selection_states(Layout::BegunRead const& read, DOM::Document&, DOM::Range&);
     void reset_selection_states(Layout::BegunRead const& read, DOM::Document&);
-    void recompute_search_text_states(Layout::BegunRead const& read, DOM::Document&, DOM::Range&);
+    void recompute_search_text_states(Layout::BegunRead const& read, DOM::Document&, GC::Ptr<DOM::Range> active_match, Vector<GC::Ref<DOM::Range>> const& highlighted_matches);
     void reset_search_text_states();
 
     void invalidate_all_cached_paint(DOM::Document&);
@@ -71,7 +72,6 @@ public:
     Compositing::AccumulatedVisualContextTree visual_context_tree(DOM::Document const&) const;
     // Passive access for consumers of an already settled recording.
     Compositing::AccumulatedVisualContextTree visual_context_tree_without_update(Layout::BegunRead const& read, DOM::Document const&) const;
-    u64 visual_context_tree_structural_epoch(Layout::BegunRead const& read, DOM::Document const&) const;
     u64 visual_context_tree_structural_epoch_without_update(Layout::BegunRead const& read) const;
 
     void set_display_list_used_as_paint_command_cache_source(RefPtr<Compositing::DisplayList> display_list, Compositing::DisplayListResourceSet referenced_resources)

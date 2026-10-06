@@ -604,12 +604,6 @@ impl CustomPropertyStore {
         Self::animation_overlay(animated, base)
     }
 
-    /// The store this one's chain goes on in, which may skip the environment it inherits from
-    /// once that one's few values were absorbed into this one.
-    pub(crate) fn parent(&self) -> Option<&Arc<CustomPropertyStore>> {
-        self.parent.as_ref()
-    }
-
     pub(crate) fn get(&self, name_raw: usize) -> Option<&CustomPropertyEntry> {
         self.own_values
             .get(&name_raw)
@@ -3914,7 +3908,6 @@ pub unsafe extern "C" fn rust_custom_property_store_create(
     parent: *const c_void,
     inheritance_parent: *const c_void,
 ) -> *const c_void {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CustomPropertyStoreLifecycleEntry);
     let entries = if entry_count == 0 {
         &[]
     } else {
@@ -3978,7 +3971,6 @@ pub unsafe extern "C" fn rust_custom_property_store_create_animation_overlay(
     entry_count: usize,
     base: *const c_void,
 ) -> *const c_void {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CustomPropertyStoreLifecycleEntry);
     let entries = if entry_count == 0 {
         &[]
     } else {
@@ -4009,21 +4001,7 @@ pub unsafe extern "C" fn rust_custom_property_store_create_animation_overlay(
 /// not already been released.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_custom_property_store_destroy(store: *const c_void) {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CustomPropertyStoreLifecycleEntry);
     drop(unsafe { Arc::from_raw(store.cast::<CustomPropertyStore>()) });
-}
-
-/// Which names a store declares that the registry registers with a syntax, whose values its
-/// element's lengths compute.
-#[repr(u8)]
-pub enum FfiRegisteredValueDeclarations {
-    None,
-    /// Every registered value parses as declared, so the lengths it reads are known before it is
-    /// computed.
-    Parsed,
-    /// A registered value substitutes, so the container-relative lengths it reads are known only
-    /// once it is substituted.
-    Substituted,
 }
 
 /// Hands every custom property a store declares itself to `callback`, in declaration order, with

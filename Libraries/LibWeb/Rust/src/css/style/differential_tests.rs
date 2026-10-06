@@ -23,7 +23,6 @@ use super::index::FeatureValue;
 use super::index::LocalFeatureKey;
 use super::index::StyleAtomID;
 use super::instrumentation::Counters;
-use super::memory::DeviceClass;
 use super::partial_view::Lookup;
 use super::program::CascadeOrigin;
 use super::program::DeclarationBlockID;
@@ -94,7 +93,7 @@ struct Workload {
 
 impl Workload {
     fn new(seed: u64) -> Self {
-        let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+        let mut engine = StyleEngine::new();
         let mut raw = vec![0; 1 + CONTAINERS + CONTAINERS * CHILDREN];
         engine.allocate_style_nodes(&mut raw);
         let nodes: Vec<_> = raw.iter().map(|&raw| StyleNodeID::from_raw(raw).unwrap()).collect();
@@ -370,7 +369,7 @@ fn batch_matches(
         .match_node_collecting_requests(
             node,
             &mut matches,
-            &mut Counters::new(),
+            &Counters::new(),
             BatchMatchState {
                 match_workspace: scratch,
                 witness_effects: None,
@@ -651,7 +650,10 @@ fn budget_histories_preserve_answers_winners_and_records_across_mutations() {
             workload.engine.end_cold_matching_batch();
         }
         assert_eq!(warm_answers, pressured_answers, "step {step}");
-        saw_pressure |= pressured.engine.memory.refusals(MemoryCategory::RetainedMatchAnswer) > 0;
+        saw_pressure |= !pressured
+            .engine
+            .memory
+            .is_tier3_admitting(MemoryCategory::RetainedMatchAnswer);
         saw_retention_difference |= warm.engine.memory.bytes_in_tier(Tier::Acceleration)
             != pressured.engine.memory.bytes_in_tier(Tier::Acceleration);
         assert_eq!(warm.mutate(&mut warm_rng), pressured.mutate(&mut pressured_rng));
@@ -683,7 +685,7 @@ fn incomplete_answer_batches_preserve_pending_lookups_and_release_ownership() {
             })
             .collect();
         for &node in &nodes {
-            let state = &mut workload.engine.state.retained;
+            let state = &mut workload.engine.retained;
             state.retained_match_answers.forget(&mut state.match_answers, node);
             state.winner_groups.remove(node);
         }
@@ -711,7 +713,14 @@ fn incomplete_answer_batches_preserve_pending_lookups_and_release_ownership() {
                 normalized_rows(workload.engine.consume_published_match_answer(nodes[index]).unwrap()),
                 expected[index]
             );
-            assert!(workload.engine.published_match_answer_signature(nodes[index]).is_some());
+            assert!(
+                super::RetainedState::published_answer_lookup(
+                    &workload.engine.published_match_answers,
+                    workload.engine.batch_matching_traversal.as_deref(),
+                    nodes[index],
+                )
+                .is_some_and(|(_, answer)| answer.cascade_input.is_some())
+            );
             let key = WinnerGroupKey::current(nodes[index], workload.engine.program.version());
             assert!(matches!(workload.engine.winner_groups.lookup(key), Lookup::Missing(_)));
             assert!(matches!(
@@ -720,14 +729,11 @@ fn incomplete_answer_batches_preserve_pending_lookups_and_release_ownership() {
             ));
         }
         if discard {
-            workload
-                .engine
-                .state
-                .discard_published_match_answers(&mut workload.engine.counters);
+            workload.engine.discard_published_match_answers();
             assert_eq!(workload.engine.match_answers.pending_reference_count(), 0);
             assert_eq!(workload.engine.winner_groups.pending_reference_count(), 0);
             for &node in &nodes[..2] {
-                assert!(workload.engine.state.current_published_answer(node).is_none());
+                assert!(workload.engine.current_published_answer(node).is_none());
                 assert!(workload.engine.retained_match_answers.answer_identity(node).is_none());
             }
         } else {
@@ -735,7 +741,7 @@ fn incomplete_answer_batches_preserve_pending_lookups_and_release_ownership() {
             //     installing the pending prefix before this completion call resumes it.
             let node = nodes[2];
             let node_index = workload.nodes.iter().position(|&candidate| candidate == node).unwrap();
-            let state = &mut workload.engine.state.retained;
+            let state = &mut workload.engine.retained;
             state.facts.set_tag(node, tag_atom(node), &mut state.memory);
             for &class in &workload.classes[node_index] {
                 state.facts.set_class(node, class_atom(class), true, &mut state.memory);

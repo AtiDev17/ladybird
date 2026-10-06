@@ -19,37 +19,21 @@ from Generators.libweb_bindings.includes import GeneratedIncludes
 from Generators.libweb_bindings.iterables import write_async_iterator_prototype_declaration
 from Generators.libweb_bindings.iterables import write_iterator_prototype_declaration
 from Generators.libweb_bindings.named_and_indexed_properties import interface_supports_named_properties
-from Generators.libweb_bindings.named_and_indexed_properties import write_legacy_platform_object_hook_declarations
+from Generators.libweb_bindings.named_and_indexed_properties import write_legacy_platform_object_function_declarations
 from Generators.libweb_bindings.named_and_indexed_properties import write_named_properties_object_declaration
 from Generators.libweb_bindings.namespaces import write_namespace_declaration
 from Generators.libweb_bindings.overload_resolution import operation_callback_names
+from Generators.libweb_bindings.wrappers import LOCATION_WRAPPER_HOOKS
+from Generators.libweb_bindings.wrappers import create_wrapper_function_name
+from Generators.libweb_bindings.wrappers import cross_origin_property_function_declarations
+from Generators.libweb_bindings.wrappers import interface_has_cross_origin_properties
 from Generators.libweb_bindings.wrappers import interface_needs_wrapper
-from Generators.libweb_bindings.wrappers import wrapper_base_class_name
-from Generators.libweb_bindings.wrappers import wrapper_class_name
+from Generators.libweb_bindings.wrappers import wrapper_host_class_name
 from Utils.webidl_parser import Interface
 
 
 def interface_is_location_object(interface: Interface) -> bool:
     return interface.name == "Location"
-
-
-def interface_has_cross_origin_property_descriptor_map(interface: Interface) -> bool:
-    return interface.name in ("Location", "Window")
-
-
-def interface_requires_custom_prototype(interface: Interface) -> bool:
-    return (
-        "Global" in interface.extended_attributes
-        or interface.indexed_property_getter is not None
-        or interface.named_property_getter is not None
-        or interface.named_property_setter is not None
-        or interface.named_property_deleter is not None
-        or interface.indexed_property_setter is not None
-        or interface.maplike is not None
-        or interface.setlike is not None
-        or (interface.iterable is not None and interface.iterable.key_type is not None)
-        or interface.async_iterable is not None
-    )
 
 
 def write_declaration(
@@ -69,101 +53,37 @@ def write_declaration(
     operation_callbacks = operation_callback_names(interface)
 
     if interface_needs_wrapper(interface):
+        includes.add("LibJS/HostObjectABI.h")
+        includes.add("LibJS/Runtime/HostObject.h")
         includes.add("LibWeb/Bindings/PlatformObject.h")
-        base_class = wrapper_base_class_name(context, interface)
-        if interface_has_cross_origin_property_descriptor_map(interface):
-            includes.add("LibWeb/HTML/CrossOrigin/CrossOriginPropertyDescriptorMap.h")
         impl_type = fully_qualified_name_for_interface(interface)
         if interface.parent_name:
             parent_interface = context.interfaces.get(interface.parent_name)
             if parent_interface is not None:
                 includes.add_binding(parent_interface.implemented_name)
-        # Wrappers that carry native-side state (such as a cross-origin property
-        # descriptor map) are reached via concrete-type downcasts from other
-        # modules, e.g. LibWeb's native tests. That requires their typeinfo to be
-        # exported from the shared library, otherwise UBSan's vptr checks fail to
-        # link against a hidden typeinfo symbol.
-        export_macro = "WEB_API " if interface_has_cross_origin_property_descriptor_map(interface) else ""
+        out.write(f"extern WEB_API JSHostClass const {wrapper_host_class_name(interface)};\n")
+        if interface_is_location_object(interface):
+            out.write(f"extern JSHostObjectHooks const {LOCATION_WRAPPER_HOOKS};\n")
         out.write(
-            f"""class {export_macro}{wrapper_class_name(interface)} : public {base_class} {{
-    WEB_PLATFORM_OBJECT({wrapper_class_name(interface)}, {base_class});
-    GC_DECLARE_ALLOCATOR({wrapper_class_name(interface)});
-
-public:
-    {wrapper_class_name(interface)}(JS::Realm&, GC::Ref<{impl_type}>);
-    virtual ~{wrapper_class_name(interface)}() override;
-
-    virtual StringView class_name() const override {{ return "{interface.name}"sv; }}
-    virtual void initialize(JS::Realm&) override;
+            f"""
+GC::Ref<JS::HostObject> {create_wrapper_function_name(interface)}(JS::Realm&, GC::Ref<{impl_type}>);
 """
         )
-        if "Global" in interface.extended_attributes:
-            out.write("    virtual JS::ThrowCompletionOr<bool> internal_set_prototype_of(JS::Object*) override;\n")
-        if interface_has_cross_origin_property_descriptor_map(interface):
-            out.write(
-                """
-    HTML::CrossOriginPropertyDescriptorMap const& cross_origin_property_descriptor_map() const { return m_cross_origin_property_descriptor_map; }
-    HTML::CrossOriginPropertyDescriptorMap& cross_origin_property_descriptor_map() { return m_cross_origin_property_descriptor_map; }
-
-    static GC::Ref<JS::NativeFunction> create_cross_origin_method(JS::Realm&, Utf16FlyString const& property);
-"""
-            )
-            if not interface_is_location_object(interface):
-                out.write(
-                    "    static GC::Ref<JS::NativeFunction> create_cross_origin_getter(JS::Realm&, Utf16FlyString const& property);\n"
-                )
-            out.write(
-                "    static GC::Ref<JS::NativeFunction> create_cross_origin_setter(JS::Realm&, Utf16FlyString const& property);\n"
-            )
+        if interface_has_cross_origin_properties(interface):
+            out.write("\n")
+            for declaration in cross_origin_property_function_declarations(interface):
+                out.write(f"{declaration};\n")
         if interface_is_location_object(interface):
-            out.write(
-                """
+            out.write("void initialize_location_object(JS::Realm&, JS::HostObject& location_wrapper);\n")
+        out.write("\n")
 
-    void initialize_location_object(JS::Realm&);
-"""
-            )
-        if interface.name == "DOMException":
-            out.write(
-                """    virtual JS::ErrorData* error_data() override;
-    virtual JS::ErrorData const* error_data() const override;
-"""
-            )
-        if interface_is_location_object(interface):
-            out.write(
-                """
-    virtual JS::ThrowCompletionOr<JS::Object*> internal_get_prototype_of() const override;
-    virtual JS::ThrowCompletionOr<bool> internal_set_prototype_of(JS::Object*) override;
-    virtual JS::ThrowCompletionOr<bool> internal_is_extensible() const override;
-    virtual JS::ThrowCompletionOr<bool> internal_prevent_extensions() override;
-    virtual JS::ThrowCompletionOr<Optional<JS::PropertyDescriptor>> internal_get_own_property(JS::PropertyKey const&) const override;
-    virtual bool is_cacheable_for_property_absence() const override { return false; }
-    virtual JS::ThrowCompletionOr<bool> internal_define_own_property(JS::PropertyKey const&, JS::PropertyDescriptor&, Optional<JS::PropertyDescriptor>* precomputed_get_own_property = nullptr) override;
-    virtual JS::ThrowCompletionOr<JS::Value> internal_get(JS::PropertyKey const&, JS::Value receiver, JS::CacheableGetPropertyMetadata*, PropertyLookupPhase) const override;
-    virtual JS::ThrowCompletionOr<bool> internal_set(JS::PropertyKey const&, JS::Value, JS::Value receiver, JS::CacheableSetPropertyMetadata*, PropertyLookupPhase) override;
-    virtual JS::ThrowCompletionOr<bool> internal_delete(JS::PropertyKey const&) override;
-    virtual JS::ThrowCompletionOr<GC::RootVector<JS::Value>> internal_own_property_keys() const override;
-"""
-            )
-
-        write_legacy_platform_object_hook_declarations(out, interface)
-
-        out.write("\nprotected:\n")
-        out.write(f"    {impl_type}& impl();\n")
-        out.write(f"    {impl_type} const& impl() const;\n")
-
-        if interface_has_cross_origin_property_descriptor_map(interface):
-            out.write("    virtual void visit_edges(JS::Cell::Visitor&) override;\n")
-
-        if interface_has_cross_origin_property_descriptor_map(interface):
-            out.write("\nprivate:\n")
-            out.write("    HTML::CrossOriginPropertyDescriptorMap m_cross_origin_property_descriptor_map;\n")
-        out.write("};\n\n")
+        write_legacy_platform_object_function_declarations(out, interface)
 
     out.write(
         f"""struct {interface.constructor_class} {{
 public:
     static void initialize(JS::Realm&, JS::NativeFunction&);
-    static JS::ThrowCompletionOr<GC::Ref<JS::Object>> construct(InterfaceConstructor&, JS::FunctionObject&);
+    static JS::ThrowCompletionOr<GC::Ref<JS::Object>> construct(JS::HostFunction&, JS::FunctionObject&);
 
 private:
 """
@@ -171,7 +91,7 @@ private:
     if len(interface.constructors) > 1:
         for overload_index, _ in enumerate(interface.constructors):
             out.write(
-                f"    static JS::ThrowCompletionOr<GC::Ref<JS::Object>> construct{overload_index}(InterfaceConstructor&, JS::FunctionObject&);\n"
+                f"    static JS::ThrowCompletionOr<GC::Ref<JS::Object>> construct{overload_index}(JS::HostFunction&, JS::FunctionObject&);\n"
             )
     for operations in overload_resolution.operation_overload_sets(interface, static=True).values():
         operation = operations[0]
@@ -191,39 +111,24 @@ private:
 
 """
     )
-    if interface_requires_custom_prototype(interface):
-        out.write(
-            f"""class {interface.prototype_class} : public JS::Object {{
-    JS_OBJECT({interface.prototype_class}, JS::Object);
-    GC_DECLARE_ALLOCATOR({interface.prototype_class});
-
-public:
-    static void define_unforgeable_attributes(JS::Realm&, JS::Object&);
-
-    explicit {interface.prototype_class}(JS::Realm&);
-    virtual void initialize(JS::Realm&) override;
-    virtual ~{interface.prototype_class}() override;
-"""
-        )
-        if "Global" in interface.extended_attributes:
-            out.write("    virtual JS::ThrowCompletionOr<bool> internal_set_prototype_of(JS::Object*) override;\n")
-        out.write(
-            """
-private:
-"""
-        )
-    else:
-        out.write(
-            f"""struct {interface.prototype_class} {{
+    out.write(
+        f"""struct {interface.prototype_class} {{
 public:
     static void initialize(JS::Realm&, JS::Object&);
-    static void define_unforgeable_attributes(JS::Realm&, JS::Object&);
-
+"""
+    )
+    # NB: The unforgeable attributes of a [Global] interface live on the global object, which its global mixin defines.
+    if "Global" not in interface.extended_attributes:
+        out.write("    static void define_unforgeable_attributes(JS::Realm&, JS::Object&);\n")
+    out.write(
+        """
 private:
 """
-        )
-        if interface_has_cross_origin_property_descriptor_map(interface):
-            out.write(f"    friend class {wrapper_class_name(interface)};\n\n")
+    )
+    if interface_is_location_object(interface):
+        for declaration in cross_origin_property_function_declarations(interface):
+            out.write(f"    friend {declaration};\n")
+        out.write("\n")
     for attribute in interface.regular_attributes:
         if "FIXME" in attribute.extended_attributes:
             continue

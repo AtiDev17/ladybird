@@ -91,7 +91,7 @@ namespace Web::Bindings {
 
 static void resolve_image_bitmap_promise(JS::Realm& realm, WebIDL::Promise& promise, GC::Ref<HTML::ImageBitmap> image_bitmap)
 {
-    // Force the wrapper through JS::Object here. Passing GC::Ref<PlatformObject>
+    // Force the wrapper through JS::Object here. Passing GC::Ref<JS::HostObject>
     // directly can select JS::Value's generic Cell constructor and produce an
     // untagged cell value instead of an object value.
     auto wrapper = Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, image_bitmap);
@@ -749,7 +749,7 @@ WebIDL::ExceptionOr<i32> WindowOrWorkerGlobalScopeMixin::run_timer_initializatio
             [&](GC::Root<WebIDL::CallbackType> const& callback) {
                 auto this_value = [&]() -> JS::Value {
                     if (auto* window = as_if<Window>(this_impl()))
-                        return window->window();
+                        return &window->window()->object();
                     return Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, GC::Ref { this_impl() });
                 }();
                 (void)WebIDL::invoke_callback(*callback, this_value, WebIDL::ExceptionBehavior::Report, arguments);
@@ -1656,7 +1656,7 @@ void WindowOrWorkerGlobalScopeMixin::report_an_exception(JS::Value exception, Om
     //    0, and errorInfo[colno] to 0.
     script_or_module.visit(
         [&](GC::Ref<JS::Script> const& js_script) {
-            if (as<ClassicScript>(js_script->host_defined())->muted_errors() == ClassicScript::MutedErrors::Yes) {
+            if (as<ClassicScript>(script_from_host_defined(js_script->host_defined()))->muted_errors() == ClassicScript::MutedErrors::Yes) {
                 error_info.error = JS::js_null();
                 error_info.message = "Script error."_utf16;
                 error_info.filename = Utf16String {};

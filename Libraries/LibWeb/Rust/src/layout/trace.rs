@@ -146,7 +146,6 @@ impl LayoutTrace {
         self.scope("", Some(root), || {
             let context = match fc_type {
                 FormattingContextType::Block => "block",
-                FormattingContextType::Inline => "inline",
                 FormattingContextType::Flex => "flex",
                 FormattingContextType::Grid => "grid",
                 FormattingContextType::Table => "table",
@@ -196,17 +195,16 @@ pub(crate) fn name_layout_trace_owners(main_thread: &MainThread, read: &crate::r
     let Some(host) = main_thread.host() else {
         return;
     };
+    // Only a trace that began registered the callback, so the host knows a document never traced has nothing to name.
+    let Some(describe) = host.host_tables().layout_trace_describe_node.get() else {
+        return;
+    };
     // SAFETY: The host is live for the token's entry.
     let owners =
         unsafe { super::shell_reads::read_arena(host, read, (), |arena, ()| arena.layout_trace.unnamed_owners(arena)) };
     if owners.is_empty() {
         return;
     }
-    let describe = host
-        .host_tables()
-        .layout_trace_describe_node
-        .get()
-        .expect("a layout trace names its boxes through the callback it began with");
     let names = owners
         .into_iter()
         .map(|owner| {
@@ -251,10 +249,7 @@ impl LayoutNodeArena {
 /// `host` must be a live document host, on its document's thread. The callback must remain valid until tracing stops
 /// and must synchronously describe the live row it is handed without mutating layout.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_begin_layout_trace(host: *const DocumentHost, describe_node: DescribeNode) {
-    assert!(!host.is_null(), "document host is null");
-    // SAFETY: Guaranteed by the caller.
-    let host = unsafe { &*host };
+pub unsafe extern "C" fn render_state_begin_layout_trace(host: &DocumentHost, describe_node: DescribeNode) {
     host.host_tables().layout_trace_describe_node.set(Some(describe_node));
     // SAFETY: As above.
     unsafe { super::layout_changes::queue(host, super::layout_changes::LayoutChange::BeginLayoutTrace) };
@@ -266,7 +261,7 @@ pub unsafe extern "C" fn render_state_begin_layout_trace(host: *const DocumentHo
 /// supplied bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_take_layout_trace(
-    host: *const DocumentHost,
+    host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     context: *mut c_void,
     append_text: AppendText,

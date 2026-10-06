@@ -34,6 +34,8 @@
 
 namespace Web::Compositor {
 
+class CompositorConnectionFrameSink;
+
 class WEB_API CompositorConnection final
     : public IPC::ConnectionToServer<CompositorWebContentClientEndpoint, CompositorWebContentServerEndpoint>
     , public CompositorWebContentClientEndpoint {
@@ -41,6 +43,10 @@ class WEB_API CompositorConnection final
 
 public:
     explicit CompositorConnection(NonnullOwnPtr<IPC::Transport>);
+    virtual ~CompositorConnection() override;
+
+    // Takes the frames of this connection's contexts from any thread.
+    NonnullRefPtr<CompositorFrameSink> frame_sink() const;
 
     void set_parent_context(Web::CompositorContextId, Optional<Web::CompositorContextId>);
     void stop_presenting_to_client(Web::CompositorContextId);
@@ -80,6 +86,8 @@ public:
     bool read_webgl_buffer_sub_data(Compositing::CanvasId, Compositing::WebGL::GLenum target, Compositing::WebGL::GLintptr offset, Compositing::WebGL::GLintptr size, Core::AnonymousBuffer const& data);
 
     void ensure_video_presentation_channel();
+    // Offers the Compositor the process's render clock, which it delivers display ticks to from then on.
+    void attach_render_clock();
     Function<void(Web::PageId page_id, Web::MouseEvent)> on_mouse_event;
     Function<void(Web::PageId page_id, Web::KeyEvent)> on_key_event;
     Function<void()> on_compositor_lost;
@@ -106,9 +114,9 @@ private:
 
     bool can_send_message_to_compositor() const;
     void merge_async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates);
-    bool post_resource_additions_in_batches(Web::CompositorContextId, Compositing::DisplayListResourceTransaction&);
-    bool post_display_list_update(Web::CompositorContextId, CompositorFrame::DisplayListUpdate&);
     Optional<PendingScreenshot> take_screenshot(Compositing::ScreenshotRequestId);
+
+    NonnullRefPtr<CompositorConnectionFrameSink> m_frame_sink;
 
     HashMap<Compositing::ScreenshotRequestId, PendingScreenshot> m_screenshots;
     // What the compositor process scrolled since the last rendering update adopted it, per context.

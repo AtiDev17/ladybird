@@ -1371,7 +1371,7 @@ static WebIDL::ExceptionOr<void> serialize_viewed_array_buffer(JS::VM& vm, Struc
         //    [[ByteOffset]]: value.[[ByteOffset]], [[ArrayLength]]: value.[[ArrayLength]] }.
         data_holder.encode(ValueTag::ArrayBufferView);
         TRY(structured_serialize_internal(vm, data_holder, buffer, for_storage, memory, allow_shared_array_buffers)); // [[ArrayBufferSerialized]]
-        data_holder.encode(view.element_name().to_utf16_string());                                                    // [[Constructor]]
+        data_holder.encode(Utf16String::from_utf8(JS::typed_array_element_name(view.kind())));                        // [[Constructor]]
         serialize_byte_length(view.byte_length());
         data_holder.encode(view.byte_offset());
         serialize_byte_length(view.array_length());
@@ -1624,12 +1624,13 @@ public:
                 copied_list.ensure_capacity(map->map_size() * 2);
 
                 // 2. For each Record { [[Key]], [[Value]] } entry of value.[[MapData]]:
-                for (auto entry : *map) {
+                MUST(map->for_each_entry([&](JS::Value key, JS::Value value) -> JS::ThrowCompletionOr<void> {
                     // 1. Let copiedEntry be a new Record { [[Key]]: entry.[[Key]], [[Value]]: entry.[[Value]] }.
                     // 2. If copiedEntry.[[Key]] is not the special value empty, append copiedEntry to copiedList.
-                    copied_list.append(entry.key);
-                    copied_list.append(entry.value);
-                }
+                    copied_list.append(key);
+                    copied_list.append(value);
+                    return {};
+                }));
 
                 encode(static_cast<u64>(map->map_size()));
 
@@ -1650,10 +1651,11 @@ public:
                 copied_list.ensure_capacity(set->set_size());
 
                 // 2. For each entry of value.[[SetData]]:
-                for (auto entry : *set) {
+                MUST(set->for_each_value([&](JS::Value entry) -> JS::ThrowCompletionOr<void> {
                     // 1. If entry is not the special value empty, append entry to copiedList.
                     copied_list.append(entry);
-                }
+                    return {};
+                }));
 
                 encode(static_cast<u64>(set->set_size()));
 
@@ -2004,18 +2006,17 @@ public:
             } else {
                 auto array_length = TRY(deserialize_byte_length());
 
-                GC::Ptr<JS::TypedArrayBase> typed_array;
+                Optional<JS::TypedArrayBase::Kind> kind;
 #define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, Type) \
     if (constructor_name == #ClassName##sv)                                         \
-        typed_array = JS::ClassName::create(realm, 0, array_buffer);
+        kind = JS::TypedArrayBase::Kind::ClassName;
                 JS_ENUMERATE_TYPED_ARRAYS
 #undef __JS_ENUMERATE
-#undef CREATE_TYPED_ARRAY
 
-                if (!typed_array)
+                if (!kind.has_value())
                     return data_clone_error_from_serialization_error(realm, AK::Error::from_string_literal("Unknown ArrayBufferView constructor"));
 
-                auto element_size = typed_array->element_size();
+                auto element_size = JS::typed_array_element_size(*kind);
 
                 // Reject combinations a real typed array could not produce.
                 auto consistent_slots = byte_length.is_auto() == array_length.is_auto() && byte_offset % element_size == 0;
@@ -2027,10 +2028,7 @@ public:
                 if (!consistent_slots || !length_fits_buffer(array_length, element_size))
                     return data_clone_error_from_serialization_error(realm, AK::Error::from_string_literal("ArrayBufferView does not fit its ArrayBuffer"));
 
-                typed_array->set_array_length(array_length);
-                typed_array->set_byte_length(byte_length);
-                typed_array->set_byte_offset(byte_offset);
-                value = typed_array;
+                value = JS::TypedArrayBase::create_from_slots(realm, *kind, array_buffer, move(array_length), move(byte_length), byte_offset);
             }
             break;
         }

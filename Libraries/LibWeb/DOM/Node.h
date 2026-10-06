@@ -47,6 +47,12 @@ enum class LayoutUpdatePropagation : u8;
 
 }
 
+namespace Web::Layout::RustFFI {
+
+struct FfiBoxMarks;
+
+}
+
 namespace Web::Bindings {
 
 struct GetRootNodeOptions;
@@ -214,9 +220,7 @@ public:
     bool recompute_editable_subtree_flag();
     void recompute_editable_subtree_flags_and_repaint();
     // Brings the editing-host and empty-text stamps of the boxes in the subtree to the nodes' editability.
-    void apply_editability_to_boxes(Badge<InvalidationJournal>, Layout::BegunRead const&);
 
-    virtual bool is_dom_node() const final { return true; }
     virtual bool is_html_element() const { return false; }
     virtual bool is_html_html_element() const { return false; }
     virtual bool is_html_anchor_element() const { return false; }
@@ -344,7 +348,6 @@ public:
 
     HTML::HTMLHyperlinkElementUtils const* enclosing_link_element() const;
     HTML::HTMLElement const* enclosing_html_element() const;
-    HTML::HTMLElement const* enclosing_html_element_with_attribute(Utf16FlyString const&) const;
 
     Utf16String child_text_content() const;
 
@@ -448,6 +451,9 @@ public:
     }
 
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
+    // Queues `marks` for the node's box, which the render state finds as it applies them: the marks may be made beside a
+    // frame in flight, which holds the boxes.
+    void mark_box(Layout::RustFFI::FfiBoxMarks);
     // The facts about this node that a box built for it paints (inertness, editability, and so on) may have changed.
     void publish_dom_paint_facts();
     void set_needs_layout_update(SetNeedsLayoutReason);
@@ -473,7 +479,6 @@ public:
     // Which narrower rebuild a layout tree update mark made for `reason` permits.
     static u8 layout_tree_update_reuse_reason(SetNeedsLayoutTreeUpdateReason);
 
-    [[nodiscard]] bool needs_pseudo_element_layout_tree_update() const { return layout_tree_update_reuse_reasons() & PseudoElementChange; }
     [[nodiscard]] bool may_reuse_layout_node_for_child_list_insertion() const { return layout_tree_update_reuse_reasons() & ChildListInsertion; }
 
     [[nodiscard]] bool child_needs_layout_tree_update() const;

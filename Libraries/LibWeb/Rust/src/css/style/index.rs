@@ -192,8 +192,6 @@ impl StateSet {
 pub struct AttributeFact {
     pub name: StyleAtomID,
     pub value: StyleAtomID,
-    pub text_offset: u32,
-    pub text_length: u32,
 }
 
 /// The other names one attribute-name atom answers to.
@@ -608,17 +606,7 @@ impl StyleNodeFacts {
             source.classes_of(source_row),
         ));
         let attribute_start = u32::try_from(self.attributes.len()).expect("attribute payload offset overflow");
-        for &attribute in source.attributes_of(source_row) {
-            let (text_offset, text_length) = match source.local_text_of(attribute) {
-                Some(text) => self.push_text(text),
-                None => (u32::MAX, 0),
-            };
-            self.attributes.push(AttributeFact {
-                text_offset,
-                text_length,
-                ..attribute
-            });
-        }
+        self.attributes.extend_from_slice(source.attributes_of(source_row));
         self.attribute_handles.push(PayloadHandle {
             offset: attribute_start,
             length: u32::try_from(self.attributes.len()).expect("attribute payload overflow") - attribute_start,
@@ -671,13 +659,6 @@ impl StyleNodeFacts {
             rare_facts.custom_states.slice(&source.custom_states),
             rare_facts.parts.slice(&source.parts),
         );
-    }
-
-    /// Append UTF-16 text whose value has no atom and return its batch-local range.
-    pub fn push_text(&mut self, text: &[u16]) -> (u32, u32) {
-        let offset = u32::try_from(self.text.len()).expect("text payload overflow");
-        self.text.extend_from_slice(text);
-        (offset, u32::try_from(text.len()).expect("text payload overflow"))
     }
 
     fn map_row(&mut self, node: StyleNodeID, row: u32) {
@@ -750,6 +731,7 @@ impl StyleNodeFacts {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn stale_rows(&self) -> u32 {
         if self.primary { 0 } else { self.stale_rows }
     }
@@ -885,13 +867,12 @@ impl StyleNodeFacts {
             stale_payload_bytes +=
                 old_attribute_handle.map_or(0, |old| size_of_val(old.slice(&self.attributes)) as u64);
             let offset = u32::try_from(self.attributes.len()).expect("fact payload offset overflow");
-            self.attributes
-                .extend(facts.attributes.iter().map(|&(name, value)| AttributeFact {
-                    name,
-                    value,
-                    text_offset: u32::MAX,
-                    text_length: 0,
-                }));
+            self.attributes.extend(
+                facts
+                    .attributes
+                    .iter()
+                    .map(|&(name, value)| AttributeFact { name, value }),
+            );
             self.attribute_handles[row] = PayloadHandle {
                 offset,
                 length: u32::try_from(facts.attributes.len()).expect("fact payload length overflow"),
@@ -1013,14 +994,6 @@ impl StyleNodeFacts {
             .get(self.language_of(row).0 as usize)
             .and_then(Option::as_deref)
             .unwrap_or_default()
-    }
-
-    /// Set the language tag of the row just pushed, appending it to the batch's text.
-    pub fn set_row_language_tag(&mut self, tag: &[u16]) {
-        let offset = u32::try_from(self.text.len()).expect("fact text space exhausted");
-        self.text.extend_from_slice(tag);
-        let row = self.language_text.len() - 1;
-        self.language_text[row] = (offset, u32::try_from(tag.len()).expect("fact text space exhausted"));
     }
 
     #[must_use]
@@ -1189,24 +1162,19 @@ impl StyleNodeFacts {
         }
     }
 
+    #[cfg(test)]
+    pub fn set_attribute_value_text_for_test(&mut self, value: StyleAtomID, text: &[u16]) {
+        Arc::make_mut(&mut self.attribute_catalogs)
+            .value_texts
+            .insert(value.0 as usize, Some(text.into()));
+    }
+
     #[must_use]
     pub fn text_of(&self, attribute: AttributeFact) -> Option<&[u16]> {
-        if let Some(text) = self.local_text_of(attribute) {
-            return Some(text);
-        }
         self.attribute_catalogs
             .value_texts
             .get(attribute.value.0 as usize)
             .and_then(Option::as_deref)
-    }
-
-    fn local_text_of(&self, attribute: AttributeFact) -> Option<&[u16]> {
-        if attribute.text_length == 0 && attribute.text_offset == u32::MAX {
-            return None;
-        }
-        let start = attribute.text_offset as usize;
-        let end = start + attribute.text_length as usize;
-        self.text.get(start..end)
     }
 
     #[must_use]
@@ -1247,12 +1215,7 @@ impl StyleNodeFacts {
             + size_of_val(self.custom_states_of(row))
             + size_of_val(self.parts_of(row))
             + size_of_val(self.classes_of(row))
-            + size_of_val(self.attributes_of(row))
-            + self
-                .attributes_of(row)
-                .iter()
-                .map(|attribute| attribute.text_length as usize * size_of::<u16>())
-                .sum::<usize>()) as u64
+            + size_of_val(self.attributes_of(row))) as u64
     }
 
     fn payload_bytes_of_row(&self, row: u32) -> u64 {
@@ -3051,6 +3014,7 @@ impl RuleDispatch {
         self.topology.universal_by_parent.get(&key).map_or(&[], Vec::as_slice)
     }
 
+    #[cfg(test)]
     pub fn bucket(&self, key: DispatchKey) -> impl ExactSizeIterator<Item = DispatchEntry> + '_ {
         self.bucket_ids(key, CandidateEntries::All)
             .iter()
@@ -3269,6 +3233,7 @@ impl RuleDispatch {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn capacity_bytes(&self) -> u64 {
         self.scope_capacity_bytes()
             + self.entries.capacity_bytes()
@@ -3299,11 +3264,6 @@ impl ElementDeclarations {
             written: written.into_boxed_slice(),
             checks,
         }
-    }
-
-    #[must_use]
-    pub fn declared(&self) -> &[DeclaredProperty] {
-        &self.declared
     }
 
     /// The value the declaration at `index` of `declared` was written with.
@@ -5118,6 +5078,7 @@ impl ElementFactStore {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn has_attribute_value_text(&self, value: StyleAtomID) -> bool {
         self.attribute_catalogs
             .value_texts
@@ -5614,7 +5575,6 @@ impl ElementFactStore {
 
 #[cfg(test)]
 mod tests {
-    use super::super::memory::DeviceClass;
     use super::super::tree::StyleNodeTree;
     use super::*;
 
@@ -5627,7 +5587,7 @@ mod tests {
 
     #[test]
     fn interaction_states_keep_a_posting() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut facts = ElementFactStore::new();
         let node = StyleNodeID::element(1);
         facts.set_state(node, StateFact::Focus, true, &mut memory);
@@ -5656,7 +5616,7 @@ mod tests {
 
     #[test]
     fn a_posting_stays_sorted_across_chunk_splits() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut postings = FeaturePostings::new();
         let key = SelectorPostingKey::Class(StyleAtomID(1));
 
@@ -5686,7 +5646,7 @@ mod tests {
 
     #[test]
     fn removing_the_last_member_reclaims_the_posting() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut postings = FeaturePostings::new();
         let key = SelectorPostingKey::Class(StyleAtomID(1));
         assert!(matches!(postings.lookup(key), Lookup::KnownAbsent));
@@ -5705,7 +5665,7 @@ mod tests {
 
     #[test]
     fn local_dispatch_keys_read_the_authoritative_element_row() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut facts = ElementFactStore::new();
         let node = StyleNodeID::element(1);
         let tag = StyleAtomID(10);
@@ -5751,7 +5711,7 @@ mod tests {
 
     #[test]
     fn directionality_reads_include_pending_changes() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut facts = ElementFactStore::new();
         let node = StyleNodeID::element(1);
 
@@ -5764,7 +5724,7 @@ mod tests {
 
     #[test]
     fn forgetting_an_element_removes_every_owned_posting() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut facts = ElementFactStore::new();
         let node = StyleNodeID::element(1);
         let name = StyleAtomID(10);
@@ -5807,7 +5767,7 @@ mod tests {
 
     #[test]
     fn resident_fact_rows_follow_dense_element_identity_slots() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut facts = ElementFactStore::new();
         let first = StyleNodeID::element(3);
         let later = StyleNodeID::element(64);
@@ -5833,7 +5793,7 @@ mod tests {
 
     #[test]
     fn primary_fact_rows_replace_element_slots_in_place() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut facts = ElementFactStore::new();
         let node = StyleNodeID::element(3);
         let first_class = StyleAtomID(20);
@@ -5874,7 +5834,7 @@ mod tests {
 
     #[test]
     fn fixed_fact_changes_reuse_primary_payload_handles() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut facts = ElementFactStore::new();
         let node = StyleNodeID::element(1);
         facts.set_class(node, StyleAtomID(10), true, &mut memory);
@@ -5905,7 +5865,7 @@ mod tests {
 
     #[test]
     fn element_fact_capacity_includes_auxiliary_catalogs_and_staging() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut facts = ElementFactStore::new();
         let node = StyleNodeID::element(64);
         let initial = facts.capacity_bytes();
@@ -5946,7 +5906,7 @@ mod tests {
 
     #[test]
     fn live_fact_atom_roots_use_incremental_counts() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut facts = ElementFactStore::new();
         let node = StyleNodeID::element(1);
         facts.set_tag(node, StyleAtomID(1), &mut memory);
@@ -5985,7 +5945,7 @@ mod tests {
 
     #[test]
     fn detached_element_churn_reuses_reclaimable_auxiliary_catalog_storage() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut facts = ElementFactStore::new();
         let node = StyleNodeID::element(1);
 
@@ -6028,7 +5988,7 @@ mod tests {
 
     #[test]
     fn element_declarations_follow_dense_element_identity_slots() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut facts = ElementFactStore::new();
         let first = StyleNodeID::element(3);
         let later = StyleNodeID::element(64);
@@ -6088,7 +6048,7 @@ mod tests {
 
     #[test]
     fn a_posting_that_crosses_the_limit_stays_exact_until_the_boundary() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         memory.set_tier3_limit_for_test(0);
         memory.begin_tier3_quota_period();
         let mut postings = FeaturePostings::new();
@@ -6103,7 +6063,7 @@ mod tests {
 
     #[test]
     fn closed_posting_admission_keeps_existing_postings_exact() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut postings = FeaturePostings::new();
         let key = SelectorPostingKey::Class(StyleAtomID(1));
         let missing_key = SelectorPostingKey::Class(StyleAtomID(2));
@@ -6124,7 +6084,7 @@ mod tests {
 
     #[test]
     fn high_cardinality_caps_apply_only_to_selector_postings() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut postings = FeaturePostings::new();
         let selector = SelectorPostingKey::Class(StyleAtomID(1));
         let dependency = DependencyPostingKey::AnimationName(StyleAtomID(2));
@@ -6142,7 +6102,7 @@ mod tests {
 
     #[test]
     fn grown_postings_are_rechecked_against_the_fresh_limit() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut postings = FeaturePostings::new();
         let key = SelectorPostingKey::Class(StyleAtomID(1));
         postings.set_selector_posting_limit(5000);
@@ -6166,7 +6126,7 @@ mod tests {
 
     #[test]
     fn evicting_every_posting_retains_only_the_missing_key_charge() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut postings = FeaturePostings::new();
         for feature in 1..20_u32 {
             for index in 1..50_u32 {
@@ -6194,7 +6154,7 @@ mod tests {
 
     #[test]
     fn applying_staged_facts_defers_posting_rebuilds_while_admission_is_closed() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut facts = ElementFactStore::new();
         let node = StyleNodeID::element(1);
         let class = StyleAtomID(1);
@@ -6225,7 +6185,7 @@ mod tests {
 
     #[test]
     fn missing_postings_rebuild_from_mutated_authoritative_facts_when_budget_returns() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut facts = ElementFactStore::new();
         let node = StyleNodeID::element(1);
         let old_class = StyleAtomID(1);
@@ -6274,7 +6234,7 @@ mod tests {
 
     #[test]
     fn evicting_one_posting_preserves_exact_absence_for_other_keys() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut postings = FeaturePostings::new();
         let evicted = SelectorPostingKey::Class(StyleAtomID(1));
         let absent = SelectorPostingKey::Class(StyleAtomID(2));
@@ -6288,7 +6248,7 @@ mod tests {
 
     #[test]
     fn primary_fact_capacity_matches_its_columns() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut store = ElementFactStore::new();
 
         // Grow: enough classes and attributes per row to force several reallocations.
@@ -6399,7 +6359,7 @@ mod tests {
 
     #[test]
     fn shared_dispatch_allocations_are_charged_once() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut dispatch = RuleDispatch::new();
         dispatch.insert(
             DispatchKey::Class(StyleAtomID(10)),
@@ -6478,8 +6438,6 @@ mod tests {
             &[AttributeFact {
                 name: StyleAtomID(30),
                 value: StyleAtomID::NONE,
-                text_offset: u32::MAX,
-                text_length: 0,
             }],
         );
 
@@ -6551,14 +6509,10 @@ mod tests {
                 AttributeFact {
                     name: StyleAtomID(31),
                     value: StyleAtomID(41),
-                    text_offset: u32::MAX,
-                    text_length: 0,
                 },
                 AttributeFact {
                     name: StyleAtomID(32),
                     value: matching_value,
-                    text_offset: u32::MAX,
-                    text_length: 0,
                 },
             ],
         );
@@ -6770,47 +6724,8 @@ mod tests {
     }
 
     #[test]
-    fn attribute_text_is_carried_only_where_a_string_operator_needs_it() {
-        let mut facts = StyleNodeFacts::new();
-        let href: Vec<u16> = "https://example.com".encode_utf16().collect();
-        let (offset, length) = facts.push_text(&href);
-        facts.push_row(
-            StyleNodeID::element(1),
-            StyleAtomID(10),
-            StyleAtomID::NONE,
-            StateSet::default(),
-            &[],
-            &[
-                AttributeFact {
-                    name: StyleAtomID(40),
-                    value: StyleAtomID::NONE,
-                    text_offset: offset,
-                    text_length: length,
-                },
-                AttributeFact {
-                    name: StyleAtomID(41),
-                    value: StyleAtomID(50),
-                    text_offset: u32::MAX,
-                    text_length: 0,
-                },
-            ],
-        );
-
-        let row = facts.row_of(StyleNodeID::element(1)).unwrap();
-        let with_text = facts.attribute_of(row, StyleAtomID(40)).unwrap();
-        assert_eq!(facts.text_of(with_text), Some(href.as_slice()));
-
-        // An attribute answered by an atom carries no text at all.
-        let interned = facts.attribute_of(row, StyleAtomID(41)).unwrap();
-        assert_eq!(facts.text_of(interned), None);
-        assert_eq!(interned.value, StyleAtomID(50));
-
-        assert_eq!(facts.attribute_of(row, StyleAtomID(42)), None);
-    }
-
-    #[test]
     fn pending_attribute_exposes_both_transaction_sides() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut tree = StyleNodeTree::new(&mut memory);
         let node = tree.allocate_element(&mut memory);
         let name = StyleAtomID(40);
@@ -6847,7 +6762,7 @@ mod tests {
 
     #[test]
     fn reclaimed_atoms_leave_no_catalog_or_posting_rows_for_reuse() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut store = ElementFactStore::new();
         let atom = StyleAtomID(40);
         store.note_attribute_name_forms(
@@ -6932,7 +6847,7 @@ mod tests {
 
     #[test]
     fn a_primary_fact_view_is_immutable_and_uncharged() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut tree = StyleNodeTree::new(&mut memory);
         let node = tree.allocate_element(&mut memory);
         let mut store = ElementFactStore::new();
@@ -6951,7 +6866,7 @@ mod tests {
 
     #[test]
     fn catalog_publication_does_not_copy_primary_fact_rows() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut store = ElementFactStore::new();
         let node = StyleNodeID::element(1);
         let name = StyleAtomID(20);
@@ -6985,7 +6900,7 @@ mod tests {
 
     #[test]
     fn catalog_synchronization_preserves_a_retained_primary_fact_view() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut store = ElementFactStore::new();
         let node = StyleNodeID::element(1);
         let name = StyleAtomID(20);
@@ -7131,8 +7046,8 @@ mod tests {
     }
 
     #[test]
-    fn attribute_facts_keep_only_identity_and_an_optional_text_handle() {
-        assert_eq!(size_of::<AttributeFact>(), 16);
+    fn attribute_facts_keep_only_their_name_and_value_atoms() {
+        assert_eq!(size_of::<AttributeFact>(), 8);
     }
 
     #[test]

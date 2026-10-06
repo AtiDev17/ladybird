@@ -151,21 +151,30 @@ public:
     void did_let_recording_fly(LocalNavigable&);
     // The frames of the navigables this event loop renders, in the order the compositor presents them.
     PresentationQueue& presentation_queue() { return *m_presentation_queue; }
+    // A test that injects its rendering opportunities injects its render clock's ticks as well.
+    void set_render_clock_is_manual_for_testing(bool manual) { m_render_clock_is_manual_for_testing = manual; }
+    bool render_clock_is_manual_for_testing() const { return m_render_clock_is_manual_for_testing; }
     // Called before a rendering update submits a recording, on a thread with a Core event loop.
     void ensure_frame_completion_registered();
     // Whether a frame flies beside the event loop, which has not taken it in yet.
     bool has_frame_in_flight() const;
     // Whether a rendering update has let its frame fly and has not run its steps from its style and layout on yet.
     bool has_rendering_update_in_flight() const { return m_rendering_update_in_flight; }
+    // Whether the layout of the rendering update in flight runs, or ran, beside the event loop.
+    bool lays_out_rendering_update_in_flight() const;
     // Runs the steps of the rendering update whose style transaction flies, which take the transaction in.
     void finish_rendering_update_in_flight();
-    // A rendering task that would find a frame still in flight, or a rendering update not yet finished, keeps its place
-    // in the queue until the frame has been taken in, rather than wait for it.
+    // A rendering task that would find a rendering update not yet finished keeps its place in the queue until the update
+    // has finished, rather than wait for it. One that finds a frame still in flight runs beside it.
     bool holds_rendering_opportunity() const;
     // Whether the tasks of `document` wait for the rendering update in flight: its steps after its style and layout
-    // deliver to the document's script what comes before any of its tasks. The tasks of other documents run beside it.
+    // deliver to the document's script what comes before any of its tasks. A task of no document waits whenever the
+    // tasks of any document do, and an update with intersection observations to update holds every task.
     bool holds_tasks_of(DOM::Document const*) const;
     void hold_next_frame_for_testing() { m_holds_next_frame_for_testing = true; }
+    // Has the next recording that flies leave its frame for the host to present once it lands.
+    void hold_next_frame_before_present_for_testing() { m_holds_next_frame_before_present_for_testing = true; }
+    bool takes_next_frame_presentation_for_testing() { return exchange(m_holds_next_frame_before_present_for_testing, false); }
     void release_held_frames_for_testing();
 
     RenderingSchedulerCounters const& rendering_scheduler_counters() const { return m_rendering_scheduler_counters; }
@@ -178,12 +187,22 @@ private:
 
     void process_input_events() const;
     void update_the_rendering();
-    void update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM::Document>> const& docs, double frame_timestamp, double update_start_time, Layout::RustFFI::FfiFlightBlocker recording_blocker);
+    // How the steps after style and layout take the layout of the docs: up to date, or as the update's layout that flew
+    // left it, whatever was written since.
+    enum class TakenLayout : u8 {
+        UpToDate,
+        AsItFlew,
+    };
+    void update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM::Document>> const& docs, double frame_timestamp, TakenLayout = TakenLayout::UpToDate);
     void finish_rendering_update(double update_start_time);
     Layout::RustFFI::FfiFlightBlocker style_flight_blocker(DOM::Document&) const;
     void resume_rendering_update_in_flight();
+    void finish_ended_rendering_update_in_flight();
+    bool finish_ended_rendering_update_as_its_layout_flew();
     // Goes on with the rendering update in flight where it has landed, and presents the recordings that have landed.
     void take_finished_frames_in();
+    bool let_layout_of_rendering_update_fly();
+    void lease_clocks_for_task();
 
     Type m_type { Type::Window };
 
@@ -236,8 +255,12 @@ private:
     GC::Ptr<GC::Function<void()>> m_rendering_task_function;
 
     NonnullOwnPtr<PresentationQueue> m_presentation_queue;
+    // The navigables whose active document the last rendering update left a plan for a clock lease, which a task takes.
+    Vector<GC::Ref<LocalNavigable>> m_navigables_with_clock_plans;
+    bool m_render_clock_is_manual_for_testing { false };
     bool m_frame_completion_registered { false };
     bool m_holds_next_frame_for_testing { false };
+    bool m_holds_next_frame_before_present_for_testing { false };
 
     struct RenderingUpdateInFlight;
     OwnPtr<RenderingUpdateInFlight> m_rendering_update_in_flight;

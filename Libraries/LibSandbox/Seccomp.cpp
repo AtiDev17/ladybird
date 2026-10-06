@@ -1516,17 +1516,6 @@ void SeccompPolicy::allow_ipc()
     append(SECCOMP_ALLOW);
     append(SECCOMP_LOAD_SYSCALL_NR);
 #endif
-#ifdef __NR_socketpair
-    // A datagram socketpair can send to arbitrary UNIX socket addresses without connect().
-    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socketpair, 0, 6));
-    append(SECCOMP_LOAD_ARGUMENT(1));
-    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, static_cast<u32>(~(SOCK_CLOEXEC | SOCK_NONBLOCK))));
-    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_STREAM, 2, 0));
-    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_SEQPACKET, 1, 0));
-    append(SECCOMP_ERRNO(ESOCKTNOSUPPORT));
-    append(SECCOMP_ALLOW);
-    append(SECCOMP_LOAD_SYSCALL_NR);
-#endif
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getsockname);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getpeername);
 
@@ -1540,11 +1529,37 @@ void SeccompPolicy::allow_ipc()
 #endif
 }
 
+// NB: A helper mints a socket pair to hand one end of a new IPC channel to another process. A helper that only ever
+//     uses the channels the Browser handed it does not need this.
+void SeccompPolicy::allow_socket_pairs()
+{
+#ifdef __NR_socketpair
+    // The kernel creates both sockets in the requested domain before it asks the domain whether it can pair them,
+    // loading the protocol's module if need be. Every other domain refuses to pair, so the domain is all that a
+    // request outside AF_UNIX would reach, and it can be a rarely used one.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socketpair, 0, 9));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 1, 0));
+    append(SECCOMP_ERRNO(EAFNOSUPPORT));
+    // A datagram socketpair can send to arbitrary UNIX socket addresses without connect().
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, static_cast<u32>(~(SOCK_CLOEXEC | SOCK_NONBLOCK))));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_STREAM, 2, 0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_SEQPACKET, 1, 0));
+    append(SECCOMP_ERRNO(ESOCKTNOSUPPORT));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+}
+
 // socket(AF_UNIX) asks the Browser for a stream or seqpacket socket. connect() goes to the
 // Browser too, and it connects only to a path it put on its own allowlist. Every other domain is
 // refused outright, so this cannot become a way onto the network either.
 void SeccompPolicy::broker_unix_socket_connections()
 {
+    // Each request to the broker carries a socket pair of its own for the answer.
+    allow_socket_pairs();
+
 #ifdef __NR_socket
     // Any other domain falls through to the refusal that install() puts at the end.
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, 3));

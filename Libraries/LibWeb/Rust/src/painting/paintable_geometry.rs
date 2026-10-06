@@ -16,7 +16,7 @@ use crate::painting::paintable_data::*;
 
 pub(crate) fn committed_offset(arena: &impl GeometryRead, slot: NodeSlotId) -> used_values::FfiCssPixelPoint {
     let data = arena.paintable_data(slot);
-    if node_painting::is_inline(arena, slot) {
+    if node_painting::is_fragmented_inline(arena, slot) {
         return data.offset;
     }
     arena.with_committed_fragment_link(slot, |link| {
@@ -26,7 +26,7 @@ pub(crate) fn committed_offset(arena: &impl GeometryRead, slot: NodeSlotId) -> u
 
 pub(crate) fn committed_content_size(arena: &impl GeometryRead, slot: NodeSlotId) -> used_values::FfiCssPixelSize {
     let data = arena.paintable_data(slot);
-    if node_painting::is_inline(arena, slot) {
+    if node_painting::is_fragmented_inline(arena, slot) {
         return data.content_size;
     }
     arena.with_committed_fragment_link(slot, |link| {
@@ -250,10 +250,16 @@ pub(crate) fn absolute_rect(arena: &impl GeometryRead, slot: NodeSlotId) -> CssP
         {
             break;
         }
-        rect = rect.translated_by(committed_offset(arena, block).into());
         if block_kind == Some(crate::layout::node_data::NodeKind::SVGForeignObjectBox) {
+            rect = rect.translated_by(committed_offset(arena, block).into());
             break;
         }
+        // A containing block whose rect this geometry already memoized carries its own containing blocks.
+        if let Some(block_rect) = arena.memoized_absolute_rect(block) {
+            rect = rect.translated_by(block_rect.location());
+            break;
+        }
+        rect = rect.translated_by(committed_offset(arena, block).into());
         block = block_data.containing_block;
     }
     arena.memoize_absolute_rect(slot, rect);
@@ -267,7 +273,7 @@ pub(crate) fn absolute_position(arena: &impl GeometryRead, slot: NodeSlotId) -> 
 pub(crate) fn absolute_padding_box_rect(arena: &impl GeometryRead, slot: NodeSlotId) -> CssPixelRect {
     let data = arena.paintable_data(slot);
     let absolute = absolute_rect(arena, slot);
-    if node_painting::is_inline(arena, slot) {
+    if node_painting::is_fragmented_inline(arena, slot) {
         return CssPixelRect::from(data.local_padding_box_union).translated_by(absolute.location());
     }
     let padding = committed_padding(arena, slot);
@@ -304,7 +310,7 @@ pub(crate) fn committed_border_box_edges(arena: &impl GeometryRead, slot: NodeSl
 
 pub(crate) fn absolute_border_box_rect(arena: &impl GeometryRead, slot: NodeSlotId) -> CssPixelRect {
     let data = arena.paintable_data(slot);
-    if node_painting::is_inline(arena, slot) {
+    if node_painting::is_fragmented_inline(arena, slot) {
         return CssPixelRect::from(data.local_border_box_union).translated_by(absolute_rect(arena, slot).location());
     }
     let padded = absolute_padding_box_rect(arena, slot);

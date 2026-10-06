@@ -83,8 +83,7 @@ void SyntheticPseudoElement::update_animated_properties(Badge<Web::Animations::K
 void SyntheticPseudoElement::replace_style_record(CSS::StyleRecordID style_record_identity)
 {
     VERIFY(m_originating_element);
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { m_originating_element->document(), false };
+    Layout::ForcedReadScope read { m_originating_element->document() };
     if (m_installed_style.record() == style_record_identity)
         return;
     m_installed_style = m_originating_element->document().style_computer().install_style(read, style_record_identity);
@@ -106,8 +105,7 @@ void SyntheticPseudoElement::set_computed_style(CSS::StyleRecordID style_record_
 void SyntheticPseudoElement::clear_computed_style(RefPtr<CSS::ComputedValues const> style_to_preserve_for_detachment)
 {
     if (m_originating_element) {
-        // The caller's own read of the render state.
-        Layout::ForcedReadScope read { m_originating_element->document(), false };
+        Layout::ForcedReadScope read { m_originating_element->document() };
         if (auto* layout_node = unsafe_layout_node(read)) {
             if (style_to_preserve_for_detachment)
                 layout_node->set_computed_values(read, style_to_preserve_for_detachment.release_nonnull());

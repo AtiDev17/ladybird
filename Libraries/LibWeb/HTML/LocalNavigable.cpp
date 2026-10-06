@@ -24,6 +24,7 @@
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/Compositor/CompositorFrame.h>
 #include <LibWeb/Compositor/CompositorHost.h>
+#include <LibWeb/Compositor/RenderClock.h>
 #include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.h>
 #include <LibWeb/ContentSecurityPolicy/PolicyList.h>
@@ -677,9 +678,10 @@ struct LocalNavigable::RecordingInFlight {
     AK_ALLOC_WITH_KMALLOC;
 
     GC::Ref<DOM::Document> document;
-    PaintConfig paint_config;
+    // The seal of the frame the host presents once the recording lands, or none where the recording took it, with the
+    // navigable's presenter, to present the frame itself.
+    Optional<Compositor::SealedPresentation> sealed;
     Painting::DisplayListRecording recording;
-    bool held_for_testing { false };
 };
 
 LocalNavigable::LocalNavigable(
@@ -799,6 +801,42 @@ void LocalNavigable::visit_edges(Cell::Visitor& visitor)
         visitor.visit(entry.target);
     if (m_recording_in_flight)
         visitor.visit(m_recording_in_flight->document);
+    if (auto* document = m_presenter_slot.get_pointer<GC::Ref<DOM::Document>>())
+        visitor.visit(*document);
+}
+
+Compositor::NavigablePresenter& LocalNavigable::presenter()
+{
+    auto* document = m_presenter_slot.get_pointer<GC::Ref<DOM::Document>>();
+    if (!document)
+        return *m_presenter_slot.get<NonnullOwnPtr<Compositor::NavigablePresenter>>();
+    if (m_recording_in_flight) {
+        take_recording_in_flight_in(TakeIn::Wait);
+        return *m_presenter_slot.get<NonnullOwnPtr<Compositor::NavigablePresenter>>();
+    }
+    // The document's clock lease holds the presenter, or brought it back already.
+    GC::Ref<DOM::Document> holder = *document;
+    Layout::RustFFI::FfiPresentation presentation {};
+    Layout::RustFFI::document_host_take_back_presentation(holder->layout_node_arena().host(), &presentation);
+    VERIFY(presentation.presenter);
+    m_presenter_slot = adopt_own(*static_cast<Compositor::NavigablePresenter*>(presentation.presenter));
+    auto& presenter = *m_presenter_slot.get<NonnullOwnPtr<Compositor::NavigablePresenter>>();
+    auto sealed = adopt_own(*static_cast<Compositor::SealedPresentation*>(presentation.sealed));
+    bool const published = sealed->published.has_value();
+    if (!published)
+        unseal_presentation(holder, *sealed);
+    // A tick that changed the visual context tree and published nothing leaves the tree to the next recording.
+    bool const records_again = published || sealed->visual_context_tree_changed;
+    if (!records_again || has_been_destroyed() || active_document().ptr() != holder.ptr() || !holder->has_committed_viewport_box())
+        return presenter;
+    // The ticks presented frames of boxes that took back the styles the host installed for them: the next recording
+    // copies from what the last tick published, and the document's boxes are recorded again, with their hit-test list.
+    if (published)
+        holder->adopt_published_recording({}, *sealed->recording, sealed->published->display_list, presenter.display_list_resource_storage());
+    m_needs_repaint = true;
+    m_needs_to_record_display_list = true;
+    page().client().request_frame();
+    return presenter;
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#script-closable
@@ -1157,6 +1195,8 @@ void LocalNavigable::activate_history_entry(RefPtr<SessionHistoryEntry> entry, G
     // 4. Set navigable's active session history entry to entry.
     m_active_session_history_entry = entry;
     if (m_active_document && m_active_document != new_document) {
+        // The outgoing document's frame in flight reaches the compositor before any of the new one's.
+        (void)presenter();
         // The pending post-scroll hover refresh and scrollend settlement belong to the outgoing document; drop them.
         // And so does the hover the page reported to its client; end it.
         cancel_hover_update_after_async_scroll();
@@ -1569,6 +1609,8 @@ void LocalNavigable::set_active_document(GC::Ptr<DOM::Document> document)
     if (is_top_level_traversable() && m_active_document != document)
         page().invalidate_compositor_keyboard_scroll_state();
     if (m_active_document && m_active_document != document) {
+        // The outgoing document's frame in flight reaches the compositor before any of the new one's.
+        (void)presenter();
         // The pending post-scroll hover refresh and scrollend settlement belong to the outgoing document; drop them.
         // And so does the hover the page reported to its client; end it.
         cancel_hover_update_after_async_scroll();
@@ -4030,6 +4072,21 @@ void LocalNavigable::navigate_to_a_fragment(URL::URL const& url, HistoryHandling
     // 14. Set navigable's active session history entry to historyEntry.
     m_active_session_history_entry = history_entry;
 
+    // AD-HOC: The spec sets a document's latest entry only in "update document for history step application" and in the
+    //         URL and history update steps, and an initial about:blank gets one only once something runs the latter on
+    //         it — as the window open steps and the shared attribute processing steps for iframe and frame elements do
+    //         when they're given about:blank. Thus, the initial about:blank of a fresh top-level traversable, or of a
+    //         popup or iframe whose first navigation is still loading, reaches this step with no latest entry. The
+    //         update below would then take it for a new document ("Let documentIsNew be true if document's latest entry
+    //         is null"), and fail "Assert: entriesForNavigationAPI is given".
+    //         https://github.com/whatwg/html/issues/13041
+    //         So instead, we set its latest entry to the entry it's displayed by — as the URL and history update steps
+    //         would have. The update then runs as a same-document navigation — which fires popstate and hashchange.
+    if (!active_document()->latest_entry()) {
+        VERIFY(active_document()->is_initial_about_blank());
+        active_document()->set_latest_entry(active_entry);
+    }
+
     // 15. Update document for history step application given navigable's active document, historyEntry, true,
     //     scriptHistoryIndex, scriptHistoryLength, and historyHandling.
     active_document()->update_for_history_step_application(*history_entry, true, script_history_length, script_history_index, navigation_type);
@@ -4879,7 +4936,7 @@ CSSPixelPoint LocalNavigable::to_page_position(CSSPixelPoint a_position)
         if (!ancestor->container())
             return {};
         // Each container's box is the caller's own read of its document's render state.
-        Layout::ForcedReadScope read { ancestor->container()->document(), false };
+        Layout::ForcedReadScope read { ancestor->container()->document() };
         auto const* layout_node = ancestor->container()->layout_node(read);
         if (!layout_node || !Painting::has_committed_box(*layout_node))
             return {};
@@ -4932,8 +4989,7 @@ void LocalNavigable::clamp_viewport_scroll_offset()
     auto document = active_document();
     if (!document || !document->layout_is_up_to_date())
         return;
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
     auto* layout_node = document->layout_node(read);
     if (!layout_node)
         return;
@@ -5219,8 +5275,7 @@ Layout::Node* LocalNavigable::layout_node_for_async_scroll_node_stable_id(Web::A
     auto document = active_document();
     if (!document)
         return nullptr;
-    // The scrolling box is the caller's own read of the document's render state.
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
     return layout_node_for_async_scroll_node(read, *document, stable_node_id);
 }
 
@@ -5240,7 +5295,7 @@ bool LocalNavigable::set_scroll_offset_for(Web::AsyncScrollNodeStableID stable_n
 
     if (!element_for_async_scroll_node_stable_id(*document, stable_node_id))
         return false;
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
     document->update_layout(DOM::UpdateLayoutReason::ElementScroll);
     auto* layout_node = layout_node_for_async_scroll_node(read, *document, stable_node_id);
     if (!layout_node)
@@ -5263,8 +5318,7 @@ RefPtr<Painting::Scrollbar> LocalNavigable::scrollbar_dragged_by_compositor(Layo
 // NB: A scroll the compositor reports can arrive while layout is out of date, so this reads the committed layout.
 static Layout::Node* committed_scrolling_box_for_async_scroll_node(DOM::Document& document, Web::AsyncScrollNodeStableID stable_node_id)
 {
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { document, false };
+    Layout::ForcedReadScope read { document };
     Layout::Node* scrolling_box = nullptr;
     if (stable_node_id.kind == Web::AsyncScrollNodeKind::Viewport) {
         if (stable_node_id.node_id == document.unique_id())
@@ -5669,8 +5723,7 @@ void LocalNavigable::user_scroll_did_settle(UserScrollSettlement settlement)
     auto document = active_document();
     if (!document)
         return;
-    // Snapping is the navigable's own read of the document's render state.
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
 
     // Settlement can occur inside a layout update when tearing down a scrollbar whose thumb is grabbed, so snapping
     // geometry is only consulted when layout is already up to date.
@@ -6740,7 +6793,7 @@ void LocalNavigable::repaint_after_compositor_process_reconnect()
 
         m_needs_repaint = true;
         m_needs_to_record_display_list = true;
-        m_presenter.forget_compositor_display_list();
+        presenter().forget_compositor_display_list();
     }
 
     for (auto const& child_navigable : child_navigables())
@@ -6801,23 +6854,6 @@ void LocalNavigable::set_should_show_caret_hit_test_debug_overlay(bool value)
         child_navigable->set_should_show_caret_hit_test_debug_overlay(value);
 }
 
-static Compositing::DisplayListResourceSet command_resources_of_display_list(Compositing::DisplayListResourceStorage const& resource_storage, Painting::DocumentPaintState const& document_paint_state, Compositing::DisplayList const& display_list)
-{
-    if (document_paint_state.display_list_used_as_paint_command_cache_source() == &display_list)
-        return document_paint_state.paint_command_cache_source_referenced_resources();
-    return resource_storage.collect_referenced_resources(display_list);
-}
-
-static Compositing::DisplayListResourceSet compositor_display_list_resources(Compositing::DisplayListResourceStorage const& resource_storage, Painting::DocumentPaintState const& document_paint_state, Compositing::DisplayListResourceSet const& display_list_command_resources, Compositing::AccumulatedVisualContextTree const& visual_context_tree)
-{
-    auto resources = display_list_command_resources;
-    // A recording downgraded to cache-read-only leaves the retained source and the cached ranges
-    // into it live, so the resources they reference must survive the pruning that follows.
-    document_paint_state.append_paint_command_cache_source_resources(resources);
-    resources.include(resource_storage.collect_referenced_resources(visual_context_tree));
-    return resources;
-}
-
 // A page listing 'dark' already offers a dark theme of its own; a page saying 'only' wants its colors kept as
 // written either way — CSS Color Adjust puts UA overrides like force-dark behind exactly that keyword.
 static bool lists_a_dark_scheme(ReadonlySpan<Utf16FlyString> schemes)
@@ -6837,8 +6873,7 @@ bool LocalNavigable::active_document_opts_out_of_force_dark() const
     auto document = active_document();
     if (!document)
         return false;
-    // The caller's own read of the render state.
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
 
     if (auto* html_element = document->html_element(); html_element && html_element->layout_node(read)) {
         auto const& layout_node = *html_element->layout_node(read);
@@ -6870,12 +6905,7 @@ Optional<Compositor::CompositorFrame> LocalNavigable::record_compositor_frame(Pa
     // The recording in flight has the document's recorder state, and its frame goes to the compositor before this one.
     take_recording_in_flight_in(TakeIn::Wait);
 
-    // Per-navigable state is stamped here rather than where PaintConfig is built, so no call site (the headless
-    // screenshot path above all) can leave it behind; kept in the config so a change compares unequal below.
-    paint_config.force_dark_enabled = force_dark_applies_to_active_document();
-    paint_config.force_dark_foreground_threshold = m_force_dark_foreground_threshold;
-    paint_config.force_dark_background_threshold = m_force_dark_background_threshold;
-    paint_config.should_show_line_box_borders = m_should_show_line_box_borders;
+    paint_config = stamp_paint_config(paint_config);
 
     if (!has_compositor_context())
         return {};
@@ -6884,188 +6914,248 @@ Optional<Compositor::CompositorFrame> LocalNavigable::record_compositor_frame(Pa
     if (!document)
         return {};
 
-    // The frame's recording is the host's own read of the document's render state.
-    Layout::ForcedReadScope read { *document, false };
+    Layout::ForcedReadScope read { *document };
     adopt_pending_async_scroll_offsets();
     document->update_paint_and_hit_testing_properties_if_needed();
     document->update_compositor_animations(read);
 
     // Hit testing can publish a display list before the next frame. Give both paths the same canvas fill so that
     // switching between them does not force another recording. Screenshots can supply their own fill rectangle.
-    if (is_local_root() && !paint_config.canvas_fill_rect.has_value()) {
-        auto viewport_size = page().css_to_device_rect(viewport_rect()).size().to_type<int>();
-        paint_config.canvas_fill_rect = Gfx::IntRect { {}, viewport_size };
-    }
+    if (is_local_root() && !paint_config.canvas_fill_rect.has_value())
+        paint_config.canvas_fill_rect = Gfx::IntRect { {}, page().css_to_device_rect(viewport_rect()).size().to_type<int>() };
 
-    auto const& compositor_display_list_paint_config = m_presenter.compositor_display_list_paint_config();
+    auto const& compositor_display_list_paint_config = presenter().compositor_display_list_paint_config();
     auto should_record_display_list = m_needs_to_record_display_list
         || !compositor_display_list_paint_config.has_value()
         || !(compositor_display_list_paint_config.value() == paint_config);
+    auto sealed = seal_presentation(*document, paint_config, should_record_display_list);
     if (!should_record_display_list)
-        return finish_compositor_frame(*document, paint_config, nullptr);
+        return presenter().build_frame(sealed, {});
 
     main_thread_event_loop().ensure_frame_completion_registered();
-    auto recording = document->start_display_list_recording(read, paint_config, Painting::PaintCommandCacheMode::ReadWrite, blocker);
-    if (!recording.has_value())
+    // A recording that flies presents its frame itself, beside the event loop, holding the navigable's presenter until
+    // it lands. One whose navigable hosts navigables leaves its frame to the presentation queue, as their frames go along
+    // with it.
+    Optional<Compositor::FlightPresentation> flight;
+    if (blocker == Layout::RustFFI::FfiFlightBlocker::None && !main_thread_event_loop().takes_next_frame_presentation_for_testing()
+        && !any_of(all_local_navigables(), [&](auto navigable) { return navigable->parent().ptr() == this; })) {
+        if (auto sink = compositor_context().frame_sink()) {
+            sealed.sink = move(sink);
+            sealed.context_id = compositor_context().id();
+            sealed.present_viewport_rect = present_viewport_rect();
+            flight = Compositor::FlightPresentation {
+                .presenter = move(m_presenter_slot.get<NonnullOwnPtr<Compositor::NavigablePresenter>>()),
+                .sealed = make<Compositor::SealedPresentation>(move(sealed)),
+            };
+            m_presenter_slot = GC::Ref { *document };
+        }
+    }
+    bool const offers_presentation = flight.has_value();
+    auto recording = document->start_display_list_recording(read, paint_config, Painting::PaintCommandCacheMode::ReadWrite, blocker, &flight);
+    // A recording that took the presentation presents its frame itself; otherwise the host keeps the seal.
+    bool const recording_presents = offers_presentation && !flight.has_value();
+    if (flight.has_value()) {
+        m_presenter_slot = move(flight->presenter);
+        sealed = move(*flight->sealed);
+    }
+    if (!recording.has_value()) {
+        unseal_presentation(*document, sealed);
         return {};
+    }
+    // What asks for another recording once this one has started asks for the next one, even where the host presents
+    // this one's frame after the ask.
+    m_needs_to_record_display_list = false;
     if (recording->in_flight) {
-        // What asks for another recording once this one has started asks for the next one.
-        m_needs_to_record_display_list = false;
-        m_recording_in_flight = make<RecordingInFlight>(*document, paint_config, recording.release_value());
+        m_recording_in_flight = make<RecordingInFlight>(*document, recording_presents ? Optional<Compositor::SealedPresentation> {} : move(sealed), recording.release_value());
         main_thread_event_loop().did_let_recording_fly(*this);
         return {};
     }
-    auto display_list = document->finish_display_list_recording(read, *recording, m_presenter.display_list_resource_storage());
-    if (!display_list)
-        return {};
-    return finish_compositor_frame(*document, paint_config, move(display_list));
+    return finish_recording(read, *document, sealed, *recording);
 }
 
-// Makes the frame that brings the compositor context up to date with `display_list`, the display list the document
-// just recorded, or with what changed for the one the compositor has where it recorded none.
-Optional<Compositor::CompositorFrame> LocalNavigable::finish_compositor_frame(DOM::Document& document, PaintConfig const& paint_config, RefPtr<Compositing::DisplayList> display_list)
+// Stamps the per-navigable state onto `paint_config`, here rather than where it is built, so no call site (the headless
+// screenshot path above all) can leave it behind; kept in the config so a change compares unequal.
+PaintConfig LocalNavigable::stamp_paint_config(PaintConfig paint_config) const
 {
-    auto& presenter = m_presenter;
-    auto& resource_storage = presenter.display_list_resource_storage();
-    Compositing::DisplayListResourceSet display_list_command_resources;
-    Compositing::DisplayListResourceSet display_list_resources;
-    Compositing::DisplayListResourceTransaction resource_transaction;
-    Optional<Compositing::AccumulatedVisualContextTree> visual_context_tree;
-    auto& document_paint_state = document.paint_state();
-    bool compositor_display_list_is_unchanged = false;
-    if (display_list) {
-        VERIFY(document.has_committed_viewport_box());
-        compositor_display_list_is_unchanged = presenter.compositor_display_list() == display_list;
-        if (!compositor_display_list_is_unchanged) {
-            visual_context_tree = document_paint_state.visual_context_tree(document);
-            display_list_command_resources = command_resources_of_display_list(resource_storage, document_paint_state, *display_list);
-            display_list_resources = compositor_display_list_resources(resource_storage, document_paint_state, display_list_command_resources, *visual_context_tree);
-            resource_transaction = resource_storage.create_transaction(
-                presenter.compositor_display_list_resources(),
-                display_list_resources);
-        }
-    }
+    paint_config.force_dark_enabled = force_dark_applies_to_active_document();
+    paint_config.force_dark_foreground_threshold = m_force_dark_foreground_threshold;
+    paint_config.force_dark_background_threshold = m_force_dark_background_threshold;
+    paint_config.should_show_line_box_borders = m_should_show_line_box_borders;
+    return paint_config;
+}
 
+// Leases the active document's render state to the render clock as a task begins, with this navigable's presenter and a
+// seal of the frames the clock presents, where the last rendering update left the document a plan for a lease, and arms
+// the render clock to tick it.
+void LocalNavigable::lease_clock_for_task()
+{
+    auto document = active_document();
+    if (has_been_destroyed() || !document || !has_compositor_context() || !document->has_committed_viewport_box())
+        return;
+    auto* host = document->layout_node_arena().host();
+    if (!Layout::RustFFI::document_host_has_clock_plan(host))
+        return;
+    // Only a recording that still runs keeps the presenter. The clock waits for it to finish rather than leave the plan
+    // to a later task, which may begin only after a long task the animations would have stood still through. A lease
+    // that ended left the presenter with the document, which gives it back below, though no rendering update painted
+    // since.
+    if (m_recording_in_flight)
+        take_recording_in_flight_in(TakeIn::Wait);
+    // A task since the update that changed what the document lays out leaves the rest to the next update.
+    if (!document->layout_is_up_to_date())
+        return;
+    auto sink = compositor_context().frame_sink();
+    if (!sink)
+        return;
+    // A tick records the document again as the recording it published last did, which the compositor shows.
+    auto& presenter = this->presenter();
+    auto compositor_display_list = presenter.compositor_display_list();
+    if (!compositor_display_list || compositor_display_list != document->paint_state().display_list_used_as_paint_command_cache_source())
+        return;
+
+    auto sealed = make<Compositor::SealedPresentation>(seal_presentation(*document, presenter.compositor_display_list_paint_config().value(), true));
+    sealed->recording = Painting::DisplayListRecording {
+        .visual_context_tree = sealed->visual_context_tree.value(),
+        .placeholder_display_list = Compositing::DisplayList::create(sealed->visual_context_tree.value()),
+        .cache_mode = Painting::PaintCommandCacheMode::ReadWrite,
+        .in_flight = true,
+        .async_scrolling_metadata = compositor_display_list->async_scrolling_metadata(),
+        .paint_command_cache_source = compositor_display_list,
+    };
+    if (auto color = compositor_display_list->surface_clear_color(); color.has_value())
+        sealed->recording->placeholder_display_list->set_surface_clear_color(*color);
+    sealed->sink = move(sink);
+    sealed->context_id = compositor_context().id();
+    sealed->present_viewport_rect = page().css_to_device_rect(viewport_rect()).to_type<int>();
+    sealed->presented_by = Compositor::PresentedBy::Clock;
+
+    auto leased_presenter = move(m_presenter_slot.get<NonnullOwnPtr<Compositor::NavigablePresenter>>());
+    Layout::RustFFI::FfiPresentation presentation { .presenter = leased_presenter.ptr(), .sealed = sealed.ptr() };
+    auto const* ticks = Layout::RustFFI::document_host_lease_clock(host, &presentation);
+    if (presentation.presenter) {
+        m_presenter_slot = move(leased_presenter);
+        unseal_presentation(*document, *sealed);
+        return;
+    }
+    (void)leased_presenter.leak_ptr();
+    (void)sealed.leak_ptr();
+    m_presenter_slot = GC::Ref { *document };
+
+    // A test injects its ticks itself.
+    if (main_thread_event_loop().render_clock_is_manual_for_testing()) {
+        Layout::RustFFI::clock_ticks_release(ticks);
+        return;
+    }
+    // The first tick runs at once, rather than at the next display tick: the frame the rendering update presented is the
+    // last one until a tick presents.
+    (void)Layout::RustFFI::clock_ticks_tick(ticks, static_cast<i64>(HighResolutionTime::unsafe_shared_current_time() * 1'000'000.0), nullptr, 0);
+    Compositor::RenderClock::the().arm(compositor_context().id(), page().client().maximum_frames_per_second(),
+        [ticks = Compositor::ClockTicksHandle { ticks }](i64 frame_time_nanoseconds, ReadonlySpan<Web::CompositorScrollOffset> scroll_offsets) {
+            return ticks.tick(frame_time_nanoseconds, scroll_offsets);
+        });
+}
+
+// Seals what a frame of `document` reads of the document and this navigable where the frame begins: the frame is built
+// from nothing else (see SealedPresentation).
+Compositor::SealedPresentation LocalNavigable::seal_presentation(DOM::Document& document, PaintConfig const& paint_config, bool records_display_list)
+{
     VERIFY(document.has_committed_viewport_box());
-    auto visual_context_tree_needs_compositor_update = document_paint_state.visual_context_tree_needs_compositor_update();
-
-    Compositing::ScrollStateSnapshot scroll_state_snapshot { document_paint_state.scroll_state_snapshot() };
+    auto& paint_state = document.paint_state();
+    bool const sends_visual_context_tree = paint_state.visual_context_tree_needs_compositor_update();
+    Optional<Compositing::AccumulatedVisualContextTree> visual_context_tree;
+    if (records_display_list || sends_visual_context_tree)
+        visual_context_tree = paint_state.visual_context_tree(document);
+    paint_state.did_update_visual_context_tree_in_compositor();
+    Compositing::ScrollStateSnapshot scroll_state_snapshot { paint_state.scroll_state_snapshot() };
     scroll_state_snapshot.set_adopted_async_scroll_sequence(m_adopted_async_scroll_sequence);
+    Optional<Compositing::KeyboardScrollState> keyboard_scroll_state;
+    if (is_top_level_traversable())
+        keyboard_scroll_state = page().take_keyboard_scroll_state_for_compositor(0);
+    return Compositor::SealedPresentation {
+        .paint_config = paint_config,
+        .visual_context_tree = move(visual_context_tree),
+        .sends_visual_context_tree = sends_visual_context_tree,
+        .scroll_state_snapshot = move(scroll_state_snapshot),
+        .keyboard_scroll_state = move(keyboard_scroll_state),
+        .paint_command_cache_source = paint_state.display_list_used_as_paint_command_cache_source(),
+        .paint_command_cache_source_resources = paint_state.paint_command_cache_source_referenced_resources(),
+        .recording = {},
+        .sink = {},
+        .context_id = {},
+        .present_viewport_rect = {},
+        .published = {},
+    };
+}
 
-    // Keyboard eligibility belongs to this publication, not to the cached paint commands. Refresh it even if
-    // recording was skipped or returned the same display list, and send it with the corresponding scroll state.
-    auto& published_display_list = display_list ? *display_list : *presenter.compositor_display_list();
-    auto keyboard_scroll_state = is_top_level_traversable()
-        ? page().take_keyboard_scroll_state_for_compositor(published_display_list.compatible_visual_context_tree_structural_epoch())
-        : Compositing::KeyboardScrollState {};
-    auto async_scrolling_metadata = published_display_list.async_scrolling_metadata().value_or({});
-    async_scrolling_metadata.keyboard_scroll_state = keyboard_scroll_state;
-    published_display_list.set_async_scrolling_metadata(move(async_scrolling_metadata));
+// Hands `document` back what a sealed frame took of it, where no frame is built from the seal. A document whose layout
+// tree was torn down since (one destroyed beside the seal) has no paint state to take it back: the next tree comes with
+// a paint state of its own.
+void LocalNavigable::unseal_presentation(DOM::Document& document, Compositor::SealedPresentation const& sealed)
+{
+    if (sealed.sends_visual_context_tree && document.has_paint_state())
+        document.paint_state().did_update_visual_context_values();
+}
 
-    Compositor::CompositorFrame frame;
-    if (display_list && !compositor_display_list_is_unchanged) {
-        frame.display_list_update = Compositor::CompositorFrame::DisplayListUpdate {
-            .display_list = *display_list,
-            .visual_context_tree = visual_context_tree.release_value(),
-            .resource_transaction = move(resource_transaction),
-            .scroll_state_snapshot = move(scroll_state_snapshot),
-        };
-        document_paint_state.did_update_visual_context_tree_in_compositor();
-        presenter.did_hand_display_list_to_compositor(*display_list, paint_config, move(display_list_command_resources), move(display_list_resources));
-        m_needs_to_record_display_list = false;
-    } else {
-        if (compositor_display_list_is_unchanged) {
-            m_needs_to_record_display_list = false;
-            presenter.set_compositor_display_list_paint_config(paint_config);
-            if (resource_storage.has_resources_added_since_last_retain())
-                resource_storage.retain_only(presenter.compositor_display_list_resources());
-        }
-        if (visual_context_tree_needs_compositor_update) {
-            auto updated_visual_context_tree = document_paint_state.visual_context_tree(document);
-            VERIFY(updated_visual_context_tree.structural_epoch() == presenter.compositor_display_list_visual_context_tree_structural_epoch());
-            auto updated_display_list_resources = compositor_display_list_resources(resource_storage, document_paint_state, presenter.compositor_display_list_command_resources(), updated_visual_context_tree);
-            auto updated_resource_transaction = resource_storage.create_transaction(presenter.compositor_display_list_resources(), updated_display_list_resources);
-            frame.visual_context_tree_update = Compositor::CompositorFrame::VisualContextTreeUpdate {
-                .visual_context_tree = move(updated_visual_context_tree),
-                .resource_transaction = move(updated_resource_transaction),
-            };
-            document_paint_state.did_update_visual_context_tree_in_compositor();
-            presenter.did_hand_visual_context_tree_to_compositor(move(updated_display_list_resources));
-        }
-        frame.scroll_state_update = Compositor::CompositorFrame::ScrollStateUpdate {
-            .scroll_state_snapshot = move(scroll_state_snapshot),
-            .keyboard_scroll_state = move(keyboard_scroll_state),
-        };
+// Publishes `recording`, which has landed, and builds the frame that presents what it recorded.
+Optional<Compositor::CompositorFrame> LocalNavigable::finish_recording(Layout::BegunRead const& read, DOM::Document& document, Compositor::SealedPresentation const& sealed, Painting::DisplayListRecording const& recording, Painting::HitTestListStands hit_test_list_stands)
+{
+    auto display_list = document.finish_display_list_recording(read, recording, presenter().display_list_resource_storage(), hit_test_list_stands);
+    if (!display_list) {
+        unseal_presentation(document, sealed);
+        return {};
     }
-    return frame;
+    bool const replaces_paint_command_cache_source = recording.cache_mode == Painting::PaintCommandCacheMode::ReadWrite
+        && display_list != sealed.paint_command_cache_source;
+    return presenter().build_frame(sealed, Compositor::PublishedDisplayList { display_list.release_nonnull(), replaces_paint_command_cache_source });
 }
 
 bool LocalNavigable::take_recording_in_flight_in(TakeIn take_in)
 {
     if (!m_recording_in_flight)
         return true;
-    if (take_in == TakeIn::IfFinished && m_recording_in_flight->held_for_testing)
-        return false;
     auto* host = m_recording_in_flight->document->layout_node_arena().host();
+    Layout::RustFFI::FfiPresentation given_back {};
     auto landing = take_in == TakeIn::Wait
-        ? Layout::RustFFI::render_state_join_recording_in_flight(host)
-        : Layout::RustFFI::render_state_take_finished_recording_in(host);
+        ? Layout::RustFFI::render_state_join_recording_in_flight(host, &given_back)
+        : Layout::RustFFI::render_state_take_finished_recording_in(host, &given_back);
     if (landing == Layout::RustFFI::FfiRecordingLanding::StillInFlight)
         return false;
     auto in_flight = m_recording_in_flight.release_nonnull();
-    // The frame of the recording takes the recording's place in the presentation queue, where the recording stands.
-    main_thread_event_loop().presentation_queue().recording_landed(*this, finish_recording_in_flight(*in_flight, landing == Layout::RustFFI::FfiRecordingLanding::Stands));
+    // The frame the host presents in the recording's place, if any, takes that place in the presentation queue.
+    main_thread_event_loop().presentation_queue().recording_landed(*this, finish_recording_in_flight(*in_flight, landing, given_back));
     return true;
 }
 
-// The frame of a recording in flight that has landed, where it still stands: `landed_standing` where the document's rows
-// are still those of the frame it recorded.
-Optional<Compositor::CompositorFrame> LocalNavigable::finish_recording_in_flight(RecordingInFlight& in_flight, bool landed_standing)
+// Takes in a recording in flight that has landed, and answers the frame the host presents in its place: none where the
+// recording presented its own, or where what it made does not go to this navigable's active document.
+Optional<Compositor::CompositorFrame> LocalNavigable::finish_recording_in_flight(RecordingInFlight& in_flight, Layout::RustFFI::FfiRecordingLanding landing, Layout::RustFFI::FfiPresentation given_back)
 {
-    auto* host = in_flight.document->layout_node_arena().host();
     GC::Ref<DOM::Document> document = in_flight.document;
-
-    // The recording stands if the document's rows are still those of the frame it recorded, nothing asked for another
-    // recording since it started, its layout is still up to date (the frame's keyboard scroll state reads it), and the
-    // navigable still presents the document. A recording that does not stand is dropped unpublished, and the next
-    // rendering update records in step with the event loop, so that it presents. Asking whether layout is up to date
-    // drains the document's invalidation journal, whose marks (such as a repaint for an image that finished decoding
-    // during the flight) may ask for another recording, so that is asked before whether anything did.
-    bool const stands = landed_standing && !has_been_destroyed()
-        && has_compositor_context() && active_document().ptr() == document.ptr() && document->layout_is_up_to_date()
-        && !m_needs_to_record_display_list;
-    if (!stands) {
-        if (landed_standing)
-            Layout::RustFFI::render_state_discard_pending_recording(host);
-        m_last_recording_in_flight_stood = false;
-        m_needs_repaint = true;
-        m_needs_to_record_display_list = true;
-        if (!has_been_destroyed())
-            page().client().request_frame();
-        return {};
+    auto sealed = move(in_flight.sealed);
+    if (given_back.presenter) {
+        m_presenter_slot = adopt_own(*static_cast<Compositor::NavigablePresenter*>(given_back.presenter));
+        sealed = move(*adopt_own(*static_cast<Compositor::SealedPresentation*>(given_back.sealed)));
     }
 
-    // Publishing the recording is the host's own read of the document's render state.
-    Layout::ForcedReadScope read { *document, false };
-    auto display_list = document->finish_display_list_recording(read, in_flight.recording, m_presenter.display_list_resource_storage());
-    if (!display_list)
+    Layout::ForcedReadScope read { *document };
+    // What the recording made goes to a document this navigable still presents, which still has the boxes it recorded.
+    // Otherwise it stays pending, for the document's next recording to drop.
+    if (has_been_destroyed() || !has_compositor_context() || active_document().ptr() != document.ptr() || !document->has_committed_viewport_box())
         return {};
-    auto frame = finish_compositor_frame(*document, in_flight.paint_config, move(display_list));
+    // What the recording made stands as the compositor's frame. One that landed after the host wrote the document's rows
+    // leaves no hit-test list, as the boxes it names may be gone.
+    auto const hit_test_list_stands = landing == Layout::RustFFI::FfiRecordingLanding::LandedBehindRows ? Painting::HitTestListStands::No : Painting::HitTestListStands::Yes;
+    // A recording that presented its frame itself leaves the document to take in what it published.
+    if (sealed->published.has_value()) {
+        Painting::take_recording_trace_if_pending(read, *document);
+        document->adopt_published_recording(Painting::hit_test_list_read(read, hit_test_list_stands), in_flight.recording, sealed->published->display_list, presenter().display_list_resource_storage());
+        return {};
+    }
+    // Otherwise the host presents what it recorded, as it would have presented it in step.
+    auto frame = finish_recording(read, *document, *sealed, in_flight.recording, hit_test_list_stands);
     if (frame.has_value())
         frame->present_viewport_rect = present_viewport_rect();
     return frame;
-}
-
-void LocalNavigable::hold_recording_in_flight_for_testing()
-{
-    if (m_recording_in_flight)
-        m_recording_in_flight->held_for_testing = true;
-}
-
-void LocalNavigable::release_recording_in_flight_for_testing()
-{
-    if (m_recording_in_flight)
-        m_recording_in_flight->held_for_testing = false;
 }
 
 bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_config)
@@ -7118,18 +7208,15 @@ Layout::RustFFI::FfiFlightBlocker LocalNavigable::recording_flight_blocker(DOM::
 {
     if (layout_reason != DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate || main_thread_event_loop().running_synchronous_rendering_update())
         return Layout::RustFFI::FfiFlightBlocker::NotInRenderingUpdate;
-    if (!exchange(m_last_recording_in_flight_stood, true))
-        return Layout::RustFFI::FfiFlightBlocker::LastFlightDidNotStand;
     return Layout::RustFFI::FfiFlightBlocker::None;
 }
 
-bool LocalNavigable::paint_next_frame_if_needed(DOM::UpdateLayoutReason layout_reason, Layout::RustFFI::FfiFlightBlocker blocker)
+bool LocalNavigable::paint_next_frame_if_needed(DOM::UpdateLayoutReason layout_reason, LayOutFirst lay_out_first)
 {
-    // The marks the document's invalidation journal holds decide what this paint has to redo.
+    // The selection and find-in-page match states the document holds stale decide what this paint has to redo.
     if (auto document = active_document()) {
-        // Draining the journal is the paint's own read of the document's render state.
-        Layout::ForcedReadScope read { *document, false };
-        document->drain_invalidation_journal(read);
+        Layout::ForcedReadScope read { *document };
+        document->update_highlight_states_if_needed(read);
     }
     if (!needs_repaint())
         return false;
@@ -7140,11 +7227,12 @@ bool LocalNavigable::paint_next_frame_if_needed(DOM::UpdateLayoutReason layout_r
     if (is_svg_page())
         return false;
     if (auto document = active_document()) {
-        document->update_layout(layout_reason);
+        if (lay_out_first == LayOutFirst::Yes)
+            document->update_layout(layout_reason);
         if (document->font_computer().should_defer_initial_paint())
             return false;
     }
-    paint_next_frame(blocker != Layout::RustFFI::FfiFlightBlocker::None ? blocker : recording_flight_blocker(layout_reason));
+    paint_next_frame(recording_flight_blocker(layout_reason));
     return true;
 }
 
@@ -7223,7 +7311,7 @@ GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_a_scrolling_box(Web
     // exist then no snapping occurs).
     if (trigger == ScrollTrigger::Programmatic && destination_snapping == DestinationSnapping::SelectSnapPosition) {
         abandon_snapping_of_user_scroll_gesture(stable_node_id);
-        Layout::ForcedReadScope read { *document, false };
+        Layout::ForcedReadScope read { *document };
         document->update_layout(DOM::UpdateLayoutReason::ElementScroll);
         if (auto const* snap_container = layout_node_for_async_scroll_node(read, *document, stable_node_id)) {
             Compositing::SnapSelectionStrategy strategy;
@@ -7553,7 +7641,7 @@ GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_the_viewport(CSSPix
         queue_scrollend_event(*doc, *vv, {}, trigger);
 
     // NB: Must update layout before accessing paintables.
-    Layout::ForcedReadScope read { *doc, false };
+    Layout::ForcedReadScope read { *doc };
     doc->update_layout(DOM::UpdateLayoutReason::NavigableViewportScroll);
 
     auto minimum_scroll_offset = Painting::minimum_scroll_offset(*doc->layout_node(read)).to_type<double>();

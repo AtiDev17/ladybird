@@ -56,11 +56,10 @@ impl RetainedState {
         old_is_list_item: bool,
         flipped_pseudo_rules: u64,
         republication: Option<WinnerRepublication>,
-        counters: &mut Counters,
     ) -> Drive<()> {
         use pseudo_kind::{AFTER, BACKDROP, BEFORE, MARKER};
 
-        let mut required = self.pseudo_kinds_with_rules(node, settlement, counters)?
+        let mut required = self.pseudo_kinds_with_rules(node, settlement)?
             & settlement
                 .kinds()
                 .iter()
@@ -104,10 +103,10 @@ impl RetainedState {
         // keep it and publish only the pseudo rows. An evicted answer is matched again.
         let republished = self.current_winner_groups().row_stamp(node) == Some(self.flush_stamp)
             && self
-                .republish_pseudo_winners_from_retained_answer(node, republication, counters)
+                .republish_pseudo_winners_from_retained_answer(node, republication)
                 .is_some();
         if !republished {
-            let rematched = self.republish_winners_from_answer(node, republication, counters);
+            let rematched = self.republish_winners_from_answer(node, republication);
             debug_assert!(rematched.is_some(), "a settled node's pseudo winners republish");
         }
         Ok(())
@@ -131,7 +130,6 @@ impl RetainedState {
         generation: u64,
         full_drive_reason: Option<FullDriveReason>,
         scratch: &mut EngineComputedRecordScratch,
-        counters: &mut Counters,
     ) -> Drive<()> {
         // The records earlier reads of the node's styles were answered with are no style's now.
         self.release_demand_records(node);
@@ -144,7 +142,6 @@ impl RetainedState {
             PseudoSettlement::Generated,
             full_drive_reason,
             scratch,
-            counters,
         )
     }
 
@@ -160,7 +157,6 @@ impl RetainedState {
         settlement: PseudoSettlement,
         full_drive_reason: Option<FullDriveReason>,
         scratch: &mut EngineComputedRecordScratch,
-        counters: &mut Counters,
     ) -> Drive<()> {
         use pseudo_kind::{BACKDROP, MARKER};
 
@@ -201,7 +197,6 @@ impl RetainedState {
             old_is_list_item,
             scratch.flipped_pseudo_rules,
             scratch.winner_republication(),
-            counters,
         )?;
         let program_version = self.program.version();
         // A row still stale after the refresh is one of a kind that generates no box, or one whose
@@ -267,7 +262,7 @@ impl RetainedState {
         let element_environment = element_environment.unwrap_or(0);
         // The kinds the node's match answer has rules for: a winner row is published for each
         // the engine cascaded itself, and a kind with rules but no row is not decided.
-        let kinds_with_rules = self.pseudo_kinds_with_rules(node, settlement, counters)?;
+        let kinds_with_rules = self.pseudo_kinds_with_rules(node, settlement)?;
         let mut pseudo_uses_substitution = scratch.pseudo_uses_substitution;
         for (pseudo_index, &kind) in settlement.kinds().iter().enumerate().skip(scratch.next_pseudo) {
             scratch.next_pseudo = pseudo_index + 1;
@@ -279,7 +274,7 @@ impl RetainedState {
             // until it installs the removal.
             if kind == BACKDROP && !in_top_layer && settlement == PseudoSettlement::Generated {
                 if let Some(old) = self.computed_group_sets.pseudo_style_record(node, kind) {
-                    counters.bump(Counter::EngineComputedPseudoRecords);
+                    self.counters.bump(Counter::EngineComputedPseudoRecords);
                     self.note_engine_computed_pseudo_record(
                         node,
                         kind,
@@ -318,14 +313,14 @@ impl RetainedState {
             // Rules whose cascade order the row could not settle, as `:host::before` rules from
             // the host's shadow tree are, leave the kind to the host.
             if has_rules && state.is_none() {
-                counters.bump(Counter::EngineComputedRecordBailIncompleteWinners);
+                self.counters.bump(Counter::EngineComputedRecordBailIncompleteWinners);
                 return Err(Unanswered::Refused);
             }
             let old_record = old.unwrap_or(computed::FinalStyleRecordID::NONE);
-            let remove = |engine: &mut Self, scratch: &mut EngineComputedRecordScratch, counters: &mut Counters| {
+            let remove = |engine: &mut Self, scratch: &mut EngineComputedRecordScratch| {
                 if old.is_some() {
                     if settlement == PseudoSettlement::Generated {
-                        counters.bump(Counter::EngineComputedPseudoRecords);
+                        engine.counters.bump(Counter::EngineComputedPseudoRecords);
                     }
                     engine.note_engine_computed_pseudo_record(
                         node,
@@ -345,7 +340,7 @@ impl RetainedState {
                 && highlight_parent_record.is_none()
                 && !matches!(settlement, PseudoSettlement::Computed(_))
             {
-                remove(self, scratch, counters);
+                remove(self, scratch);
                 continue;
             }
             // Reuse only when the originating element preserves every input the pseudo reads,
@@ -390,14 +385,8 @@ impl RetainedState {
             // provisionally against the element's font until the drive settles the pseudo-element's
             // own.
             let has_registered_declarations = self.declares_registered_custom_property(node, Some(kind), &inputs);
-            let mut environment = self.engine_custom_property_environment_of(
-                node,
-                Some(kind),
-                element_environment,
-                &inputs,
-                None,
-                counters,
-            )?;
+            let mut environment =
+                self.engine_custom_property_environment_of(node, Some(kind), element_environment, &inputs, None)?;
             // A store substituting `attr()` or `inherit()` holds the element's attributes or its
             // parent's values, which no other element shares.
             let element_alone = state.is_some_and(|state| self.state_reads_beyond_environment(node, state));
@@ -419,7 +408,6 @@ impl RetainedState {
                                 inherited: element_environment,
                             },
                             &mut substituted,
-                            counters,
                         )?);
                         if substituted {
                             scratch.substituted_states.insert((state, environment));
@@ -443,14 +431,15 @@ impl RetainedState {
                 if matches!(settlement, PseudoSettlement::Read(_)) {
                     scratch.boxless_read_environment = environment;
                 }
-                remove(self, scratch, counters);
+                remove(self, scratch);
                 continue;
             }
             // What the record is derived from: the element's inherited style, display and
             // environment, and the element's record itself only when the state inherits a
-            // non-inherited property from it. A record whose winners read beyond its environment
-            // is the originating element's alone, as is one declaring registered custom
-            // properties, which its own font decides.
+            // non-inherited property from it, or when the element's animations sampled values
+            // into its inherited style. A record whose winners read beyond its environment is
+            // the originating element's alone, as is one declaring registered custom properties,
+            // which its own font decides.
             let key = self
                 .computed_group_sets
                 .node_inherited_groups_identity(node)
@@ -461,6 +450,7 @@ impl RetainedState {
                     parent_record: if pseudo_kind::is_highlight(kind)
                         || kind == BACKDROP
                         || state.is_some_and(|state| self.state_explicitly_inherits_non_inherited_property(node, state))
+                        || !self.computed_group_sets.record_inherits_as_its_base(new_element_record)
                     {
                         new_element_record.raw()
                     } else {
@@ -514,9 +504,8 @@ impl RetainedState {
                         record.raw(),
                         computed::ENGINE_INHERITED_GROUP_COUNT,
                         false,
-                        counters,
                     );
-                    counters.bump(Counter::EngineComputedRecordCohortHits);
+                    self.counters.bump(Counter::EngineComputedRecordCohortHits);
                     (publication.style_record_identity, 0, detached_composition)
                 }
                 None => {
@@ -533,7 +522,6 @@ impl RetainedState {
                         &mut scratch.font_drive,
                         FontDriveGoal::Complete,
                         has_registered_declarations,
-                        counters,
                     );
                     // The registered custom properties compute against the font the drive
                     // settled, and the winners substitute what they computed to.
@@ -542,18 +530,16 @@ impl RetainedState {
                             target,
                             state.or_refused()?,
                             element_environment,
-                            |engine, counters| {
+                            |engine| {
                                 engine.engine_custom_property_environment_of(
                                     node,
                                     Some(kind),
                                     element_environment,
                                     &inputs,
                                     Some(&registered),
-                                    counters,
                                 )
                             },
                             scratch,
-                            counters,
                         )?;
                         environment = settled;
                         store = std::sync::Arc::new(settled_store);
@@ -566,7 +552,6 @@ impl RetainedState {
                             &mut scratch.font_drive,
                             FontDriveGoal::Complete,
                             false,
-                            counters,
                         );
                     }
                     if let Err(Unanswered::Suspended(_)) = driven {
@@ -604,7 +589,6 @@ impl RetainedState {
                         registry,
                         cascade_state,
                         &mut scratch.computability,
-                        counters,
                     );
                     let (record, _) = match published {
                         Ok(published) => published,
@@ -627,7 +611,7 @@ impl RetainedState {
             };
             // A read's record is the read's, which no style update installs.
             if settlement == PseudoSettlement::Generated {
-                counters.bump(Counter::EngineComputedPseudoRecords);
+                self.counters.bump(Counter::EngineComputedPseudoRecords);
             }
             let reads_sibling_position = store.uses_tree_counting_function(self);
             self.note_engine_computed_pseudo_record(
@@ -693,6 +677,7 @@ impl RetainedState {
                 pseudo_kind,
                 old_style_record,
                 new_style_record,
+                replaced: None,
                 cascade_state,
                 longhand_evaluations,
                 owes_a_transition_step: false,
@@ -708,11 +693,7 @@ impl RetainedState {
     /// Put a pseudo-element back the way it was before the engine settled it, unless a
     /// publication has moved it on since, with the composition the settlement detached composing
     /// over it again.
-    pub(super) fn revert_engine_computed_pseudo_record(
-        &mut self,
-        pending: PendingEngineComputedRecord,
-        counters: &mut Counters,
-    ) {
+    pub(super) fn revert_engine_computed_pseudo_record(&mut self, pending: PendingEngineComputedRecord) {
         let target = computed::ComputedStyleTarget::new(pending.node, pending.pseudo_kind);
         // A removal is applied only on acknowledgement.
         let moved_on = pending.new_style_record == computed::FinalStyleRecordID::NONE
@@ -734,13 +715,7 @@ impl RetainedState {
         if previous != computed::FinalStyleRecordID::NONE
             && self.computed_group_sets.final_style_record_is_live(previous.raw())
         {
-            self.assign_shared_style_record(
-                target,
-                previous.raw(),
-                computed::ENGINE_INHERITED_GROUP_COUNT,
-                false,
-                counters,
-            );
+            self.assign_shared_style_record(target, previous.raw(), computed::ENGINE_INHERITED_GROUP_COUNT, false);
         } else {
             self.computed_group_sets
                 .remove_pseudo(pending.node, pending.pseudo_kind);
@@ -753,32 +728,25 @@ impl RetainedState {
     /// The kinds `settlement` may settle that the node's match answer has rules for: those its
     /// pseudo-style mask names, or a read's kind past the synthetic ones the mask carries where the
     /// answer has rules for it. Refused when the node has no answer to read.
-    fn pseudo_kinds_with_rules(
-        &mut self,
-        node: StyleNodeID,
-        settlement: PseudoSettlement,
-        counters: &mut Counters,
-    ) -> Drive<u64> {
+    fn pseudo_kinds_with_rules(&mut self, node: StyleNodeID, settlement: PseudoSettlement) -> Drive<u64> {
         match settlement {
             PseudoSettlement::Computed(kind) if u16::from(kind) > bridge::LAST_SYNTHETIC_PSEUDO_ELEMENT_KIND => {
                 let target = tree::PseudoElementTarget::new(tree::PseudoElementKind(u16::from(kind)));
-                let matches = self
-                    .backing_element_rule_matches(node, target, true, counters)
-                    .or_refused()?;
+                let matches = self.backing_element_rule_matches(node, target, true).or_refused()?;
                 Ok(u64::from(!matches.is_empty()) << kind)
             }
-            _ => Ok(self.pseudo_style_mask_or_rematch(node, counters)),
+            _ => Ok(self.pseudo_style_mask_or_rematch(node)),
         }
     }
 
     /// The kinds the node's match answer has rules for, matching the element again when that
     /// answer was evicted. A match that cannot complete for want of a fact generates no
     /// pseudo-element.
-    pub(super) fn pseudo_style_mask_or_rematch(&mut self, node: StyleNodeID, counters: &mut Counters) -> u64 {
+    pub(super) fn pseudo_style_mask_or_rematch(&mut self, node: StyleNodeID) -> u64 {
         if let Some(mask) = self.pseudo_style_mask(node) {
             return mask;
         }
-        match self.match_element_for_cascade(node, counters) {
+        match self.match_element_for_cascade(node) {
             Ok(matches) => matches.iter().fold(0, |mask, rule_match| {
                 mask | synthetic_pseudo_bit(rule_match.pseudo_element)
             }),
@@ -807,7 +775,6 @@ impl RetainedState {
         host: StyleNodeID,
         target: tree::PseudoElementTarget,
         backing_answer_is_complete: bool,
-        counters: &mut Counters,
     ) -> Option<Vec<RuleMatch>> {
         if !backing_answer_is_complete {
             return None;
@@ -850,7 +817,7 @@ impl RetainedState {
                 })
                 .map(|entry| entry.materialize(host, &self.programs, 0))
                 .collect(),
-            _ => Some(for_target(&self.exact_match_answer(host, counters).ok()?)),
+            _ => Some(for_target(&self.exact_match_answer(host).ok()?)),
         }
     }
 
@@ -899,7 +866,6 @@ impl RetainedState {
         (kind, host): (u8, StyleNodeID),
         backing_answer_is_complete: bool,
         scratch: &mut EngineComputedRecordScratch,
-        counters: &mut Counters,
     ) -> Drive<RecordDelta> {
         use bridge::element_adjustment_fact as fact;
         let facts = self.computed_group_sets.adjustment_facts(node);
@@ -910,28 +876,27 @@ impl RetainedState {
         if animates
             && (!scratch.host_applies_animation_plans || self.css_defined_animations.node_runs_a_css_animation(node))
         {
-            counters.bump(Counter::EngineComputedRecordBailWinnerElement);
+            self.counters.bump(Counter::EngineComputedRecordBailWinnerElement);
             return Err(Unanswered::Refused);
         }
         // A record it already holds is replaced by a full drive. A composition laid over it is
         // the element's own effects, sampled again over the new base.
         let old_record = self.computed_group_sets.assigned_style_record(node);
         if old_record.is_some_and(|old| !animates && self.record_holds_an_animation_overlay(old)) {
-            counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
+            self.counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
             return Err(Unanswered::Refused);
         }
         let target = tree::PseudoElementTarget::new(tree::PseudoElementKind(u16::from(kind)));
         // The host's rules for the pseudo-element, cascaded as the element's own with its own
         // declarations, as C++ cascades them for it.
-        let Some(mut matches) = self.backing_element_rule_matches(host, target, backing_answer_is_complete, counters)
-        else {
-            counters.bump(Counter::EngineComputedRecordBailIncompleteWinners);
+        let Some(mut matches) = self.backing_element_rule_matches(host, target, backing_answer_is_complete) else {
+            self.counters.bump(Counter::EngineComputedRecordBailIncompleteWinners);
             return Err(Unanswered::Refused);
         };
         // The pseudo-element's custom declarations cascade from these matches too: a shadow host
         // retains no answer to read them from.
         let Some(custom_declarations) = self.cascade_custom_declarations(host, Some(kind), Some(&matches)) else {
-            counters.bump(Counter::EngineComputedRecordBailCustomProperties);
+            self.counters.bump(Counter::EngineComputedRecordBailCustomProperties);
             return Err(Unanswered::Refused);
         };
         for entry in &mut matches {
@@ -967,10 +932,10 @@ impl RetainedState {
             ));
             winners.sort_unstable_by_key(|winner| winner.property);
         }
-        let state = self.with_cascade_interning_counters(|groups| groups.intern_sorted(&winners, None), counters);
+        let state = self.with_cascade_interning_counters(|groups| groups.intern_sorted(&winners, None));
         for property in self.winner_groups.semantic_delta_properties(None, state) {
             if self.first_record_winner_needs_cpp(property) {
-                counters.bump(Counter::EngineComputedRecordBailProperty);
+                self.counters.bump(Counter::EngineComputedRecordBailProperty);
                 return Err(Unanswered::Refused);
             }
         }
@@ -979,7 +944,7 @@ impl RetainedState {
         let owes_a_transition_step = match old_record {
             Some(old) => {
                 let Some(underlying_style_record) = self.computed_group_sets.underlying_style_record(old) else {
-                    counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
+                    self.counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
                     return Err(Unanswered::Refused);
                 };
                 let moves_transition_declarations = self
@@ -991,7 +956,6 @@ impl RetainedState {
                     underlying_style_record,
                     moves_transition_declarations,
                     scratch.host_applies_animation_plans,
-                    counters,
                 )?
             }
             None => false,
@@ -1002,12 +966,12 @@ impl RetainedState {
         {
             root_inputs.apply_to(&mut inputs);
         }
-        let subject = self.element_drive_subject(node, counters)?;
+        let subject = self.element_drive_subject(node)?;
         let parent_record = subject
             .parent
             .and_then(|parent| self.computed_group_sets.assigned_style_record(parent));
         let parent_environment = match subject.parent {
-            Some(parent) => self.held_custom_property_environment(parent, counters)?,
+            Some(parent) => self.held_custom_property_environment(parent)?,
             None => 0,
         };
         self.note_custom_declaration_reads(node, None, &custom_declarations);
@@ -1023,7 +987,6 @@ impl RetainedState {
             parent_environment,
             &inputs,
             None,
-            counters,
         )?;
         let mut substituted = false;
         let mut store = self.cascaded_store_for_state(
@@ -1035,9 +998,8 @@ impl RetainedState {
                 inherited: parent_environment,
             },
             &mut substituted,
-            counters,
         )?;
-        let pseudo_styles = self.pseudo_style_mask_or_rematch(node, counters);
+        let pseudo_styles = self.pseudo_style_mask_or_rematch(node);
         let mut driven = self.engine_full_drive(
             subject,
             None,
@@ -1046,7 +1008,6 @@ impl RetainedState {
             &mut scratch.font_drive,
             FontDriveGoal::Complete,
             registered_declarations.is_some(),
-            counters,
         )?;
         if let FullDrive::AwaitsRegisteredContext(registered) = driven
             && let Some(custom_declarations) = registered_declarations
@@ -1055,7 +1016,7 @@ impl RetainedState {
                 subject.target,
                 state,
                 parent_environment,
-                |engine, counters| {
+                |engine| {
                     engine.engine_custom_property_environment_over(
                         host,
                         None,
@@ -1063,11 +1024,9 @@ impl RetainedState {
                         parent_environment,
                         &inputs,
                         Some(&registered),
-                        counters,
                     )
                 },
                 scratch,
-                counters,
             )?;
             driven = self.engine_full_drive(
                 subject,
@@ -1077,7 +1036,6 @@ impl RetainedState {
                 &mut scratch.font_drive,
                 FontDriveGoal::Complete,
                 false,
-                counters,
             )?;
         }
         let FullDrive::Driven(DrivenTable {
@@ -1098,6 +1056,7 @@ impl RetainedState {
         let detached_composition = animates
             .then(|| self.computed_group_sets.detach_composition(node))
             .flatten();
+        let replaced = self.computed_group_sets.replaced_columns(node);
         let record = match self.assemble_and_publish_engine_record(
             Some(computed::ComputedStyleTarget::new(node, u8::MAX)),
             parent_record,
@@ -1109,7 +1068,6 @@ impl RetainedState {
             counter_style_registry,
             None,
             &mut scratch.computability,
-            counters,
         ) {
             Ok((record, _)) => record,
             Err(unanswered) => {
@@ -1134,6 +1092,7 @@ impl RetainedState {
                     pseudo_kind: u8::MAX,
                     old_style_record: old_record,
                     new_style_record: record,
+                    replaced: Some(replaced),
                     cascade_state: None,
                     longhand_evaluations: 0,
                     owes_a_transition_step,
@@ -1194,7 +1153,6 @@ impl RetainedState {
         old_is_list_item: bool,
         republication: WinnerRepublication,
         scratch: &mut EngineComputedRecordScratch,
-        counters: &mut Counters,
     ) -> Drive<()> {
         // The host installed the element's record before it asked.
         let record = self.computed_group_sets.assigned_style_record(node);
@@ -1204,28 +1162,48 @@ impl RetainedState {
         );
         let record = record.or_refused()?;
         if !scratch.font_drive.is_pending_for(node)
-            && !self.refresh_pseudo_winners_beside_host_record(node, republication, scratch, counters)
+            && !self.refresh_pseudo_winners_beside_host_record(node, republication, scratch)
         {
-            counters.bump(Counter::EngineComputedRecordBailIncompleteWinners);
+            self.counters.bump(Counter::EngineComputedRecordBailIncompleteWinners);
             return Err(Unanswered::Refused);
         }
         let generation = self.winner_groups.generation();
-        if let Err(unanswered) = self.engine_pseudo_records(
-            node,
-            None,
-            Some(old_is_list_item),
-            record,
-            generation,
-            None,
-            scratch,
-            counters,
-        ) {
+        if let Err(unanswered) =
+            self.engine_pseudo_records(node, None, Some(old_is_list_item), record, generation, None, scratch)
+        {
             if unanswered != Unanswered::Suspended(Suspension::Font) {
-                self.put_back_pseudo_records_beside_host_record(node, scratch, counters);
+                self.put_back_pseudo_records_beside_host_record(node, scratch);
             }
             return Err(unanswered);
         }
         Ok(())
+    }
+
+    /// The kinds among `::before` and `::after` with rules for `node` that a settle beside any record of it leaves
+    /// alone: it holds no record of the kind, and the kind's current winners declare no `content`, so they generate no
+    /// box, and substitute nothing.
+    pub(crate) fn inert_pseudo_kinds(&self, node: StyleNodeID) -> u64 {
+        use crate::css::property_metadata::property_id as prop;
+        use pseudo_kind::{AFTER, BEFORE};
+
+        let program_version = self.program.version();
+        let mut inert = 0;
+        for (pseudo, version, state, priority_current) in self.current_winner_groups().pseudo_states(node) {
+            let Ok(kind) = u8::try_from(pseudo.kind.0) else {
+                continue;
+            };
+            if (kind == BEFORE || kind == AFTER)
+                && version == program_version
+                && priority_current
+                && self.computed_group_sets.pseudo_style_record(node, kind).is_none()
+                && self.winner_groups.winner_in_state(state, prop::CONTENT).is_none()
+                && self.winner_groups.custom_declarations_of(state) == Default::default()
+                && !self.state_has_substitutions(node, state)
+            {
+                inert |= 1 << kind;
+            }
+        }
+        inert
     }
 
     /// Bring the winners the pseudo-elements of an element are settled from up to date beside the
@@ -1236,11 +1214,10 @@ impl RetainedState {
         node: StyleNodeID,
         republication: WinnerRepublication,
         scratch: &mut EngineComputedRecordScratch,
-        counters: &mut Counters,
     ) -> bool {
         // What the engine settled for the node in a style update whose record the host computed
         // instead was settled beside a record the host never installed, and goes back.
-        self.put_back_pseudo_records_beside_host_record(node, scratch, counters);
+        self.put_back_pseudo_records_beside_host_record(node, scratch);
         // Every declaration the pseudo-elements' rules make has to be a winner the engine holds, as
         // it has for any record it derives; what the element's own declarations make is in the
         // record C++ computed. Winners that are missing, or were published while an ancestor's
@@ -1249,16 +1226,13 @@ impl RetainedState {
         // verdicts the installed record moved by making the element a container, which the
         // pseudo-elements' conditions ask about first.
         let republished = if !self.holds_pseudo_match_answer(node) || !self.pseudo_winners_are_complete(node) {
-            self.republish_winners_from_answer(node, republication, counters)
-                .is_some()
+            self.republish_winners_beside_host_record(node, republication).is_some()
         } else {
             !self.container_verdicts_moved(node)
                 || self
-                    .republish_pseudo_winners_from_retained_answer(node, republication, counters)
+                    .republish_pseudo_winners_from_retained_answer(node, republication)
                     .is_some()
-                || self
-                    .republish_winners_from_answer(node, republication, counters)
-                    .is_some()
+                || self.republish_winners_beside_host_record(node, republication).is_some()
         };
         // Matching the element again only fails for want of facts the host publishes before it
         // styles the element.
@@ -1277,7 +1251,6 @@ impl RetainedState {
         &mut self,
         node: StyleNodeID,
         scratch: &mut EngineComputedRecordScratch,
-        counters: &mut Counters,
     ) {
         for pending in self.engine_computed_records_pending.remove(&node).into_iter().flatten() {
             if pending.pseudo_kind == u8::MAX {
@@ -1289,7 +1262,7 @@ impl RetainedState {
                 continue;
             }
             let derived = pending.new_style_record;
-            self.revert_engine_computed_pseudo_record(pending, counters);
+            self.revert_engine_computed_pseudo_record(pending);
             scratch.pseudo_cohorts.retain(|_, record| *record != derived);
             self.engine_pseudo_record_cache.retain(|_, record| *record != derived);
         }
@@ -1343,7 +1316,7 @@ fn pseudo_content_generates_nothing(store: &impl crate::css::cascaded_properties
     }
 }
 
-impl StyleEngineState {
+impl StyleEngine {
     /// Settle the synthetic pseudo-elements of an element whose record the host has just installed
     /// or composed, so the host installs the engine's records for them: their inputs are the
     /// element's record and the published winner states. `old_is_list_item` is whether the element
@@ -1352,7 +1325,6 @@ impl StyleEngineState {
         &mut self,
         node: StyleNodeID,
         old_is_list_item: bool,
-        counters: &mut Counters,
     ) -> bridge::FfiSettledPseudoRecords {
         let font_environment_generation = self
             .retained
@@ -1371,12 +1343,11 @@ impl StyleEngineState {
                 old_is_list_item,
                 republication,
                 &mut scratch,
-                counters,
             ) {
                 Err(Unanswered::Suspended(Suspension::Font)) => {
                     let request = scratch.font_drive.take_suspended_request();
                     suspended_memory.resize_required_to(&mut self.memory, scratch.font_drive.capacity_bytes());
-                    self.refill_font_request(node, request, counters);
+                    self.refill_font_request(node, request);
                 }
                 attempt => break attempt,
             }

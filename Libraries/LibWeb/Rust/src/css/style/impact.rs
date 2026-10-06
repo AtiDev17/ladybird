@@ -123,26 +123,6 @@ impl ImpactRegion {
             (Self::Node(node), InverseStep::FollowingSiblings) => Self::FollowingSiblings(node),
             (Self::Node(node), InverseStep::SiblingSequence) => Self::SiblingSequence(node),
 
-            // Relational anchors: from a possible witness back to the elements whose `:has()`
-            // Boolean it can flip.
-            (Self::Node(node), InverseStep::AnchorParent) => match tree.parent(node) {
-                Some(parent) => Self::Node(parent),
-                None => Self::Node(node),
-            },
-            (Self::Node(node), InverseStep::AnchorAncestors) => Self::Ancestors(node),
-            (Self::Node(node), InverseStep::AnchorPreviousSibling) => Self::PreviousSibling(node),
-            (Self::Node(node), InverseStep::AnchorPrecedingSiblings) => Self::PrecedingSiblings(node),
-
-            // From anything wider, an anchor step can reach any ancestor of the region, so it
-            // widens to the enclosing scope rather than guessing a narrower one.
-            (
-                _,
-                InverseStep::AnchorParent
-                | InverseStep::AnchorAncestors
-                | InverseStep::AnchorPreviousSibling
-                | InverseStep::AnchorPrecedingSiblings,
-            ) => Self::Document,
-
             // Children of a node's children, and everything below them, stay inside its subtree.
             (Self::Children(node), InverseStep::Descendants | InverseStep::Children) => Self::Subtree(node),
             (Self::Subtree(node), InverseStep::Descendants | InverseStep::Children) => Self::Subtree(node),
@@ -1387,7 +1367,7 @@ impl ImpactRegions {
         self.rebuild_indexes();
     }
 
-    pub fn widen_to_document(&mut self, counters: &mut Counters) {
+    pub fn widen_to_document(&mut self, counters: &Counters) {
         counters.bump(Counter::DocumentWidenings);
         self.regions.clear();
         self.region_index.clear();
@@ -1703,7 +1683,6 @@ pub fn choose_plan(region_nodes: usize, candidate_cardinality: Option<usize>, ex
 
 #[cfg(test)]
 mod tests {
-    use super::super::memory::DeviceClass;
     use super::super::memory::MemoryController;
     use super::*;
 
@@ -1716,7 +1695,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+            let mut memory = MemoryController::new();
             let mut tree = StyleNodeTree::new(&mut memory);
             let nodes: Vec<StyleNodeID> = (0..8).map(|_| tree.allocate_element(&mut memory)).collect();
             // root=0, children a=1, b=2, c=3; a's children a1=4, a2=5
@@ -1778,7 +1757,7 @@ mod tests {
 
     #[test]
     fn a_document_region_includes_shadow_tree_scopes() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut tree = StyleNodeTree::new(&mut memory);
         let document_root = tree.allocate_element(&mut memory);
         let host = tree.allocate_element(&mut memory);
@@ -1961,10 +1940,10 @@ mod tests {
 
     #[test]
     fn widening_replaces_the_plan_rather_than_adding_to_it() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut regions = ImpactRegions::new();
         regions.add(ImpactRegion::Node(fixture.nodes[4]));
-        regions.widen_to_document(&mut fixture.counters);
+        regions.widen_to_document(&fixture.counters);
         assert_eq!(regions.regions(), &[ImpactRegion::Document]);
         assert_eq!(fixture.counters.get(Counter::DocumentWidenings), 1);
     }
@@ -2229,7 +2208,7 @@ mod tests {
 
     #[test]
     fn patch_attributions_are_indexed_without_preorder_coordinates() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+        let mut memory = MemoryController::new();
         let mut tree = StyleNodeTree::new(&mut memory);
         let root = tree.allocate_element(&mut memory);
         let host = tree.allocate_element(&mut memory);

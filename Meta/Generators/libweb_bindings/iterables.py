@@ -36,14 +36,8 @@ def write_iterator_prototype_declaration(out: TextIO, interface: Interface) -> N
         return
 
     out.write(
-        f"""class {interface.name}IteratorPrototype : public JS::Object {{
-    JS_OBJECT({interface.name}IteratorPrototype, JS::Object);
-    GC_DECLARE_ALLOCATOR({interface.name}IteratorPrototype);
-
-public:
-    explicit {interface.name}IteratorPrototype(JS::Realm&);
-    virtual void initialize(JS::Realm&) override;
-    virtual ~{interface.name}IteratorPrototype() override;
+        f"""struct {interface.name}IteratorPrototype {{
+    static void initialize(JS::Realm&, JS::Object&);
 
 private:
     JS_DECLARE_NATIVE_FUNCTION(next);
@@ -58,14 +52,8 @@ def write_async_iterator_prototype_declaration(out: TextIO, interface: Interface
         return
 
     out.write(
-        f"""class {interface.name}AsyncIteratorPrototype : public JS::Object {{
-    JS_OBJECT({interface.name}AsyncIteratorPrototype, JS::Object);
-    GC_DECLARE_ALLOCATOR({interface.name}AsyncIteratorPrototype);
-
-public:
-    explicit {interface.name}AsyncIteratorPrototype(JS::Realm&);
-    virtual void initialize(JS::Realm&) override;
-    virtual ~{interface.name}AsyncIteratorPrototype() override;
+        f"""struct {interface.name}AsyncIteratorPrototype {{
+    static void initialize(JS::Realm&, JS::Object&);
 
 private:
     JS_DECLARE_NATIVE_FUNCTION(next);
@@ -277,8 +265,8 @@ def write_iterator_prototype_implementation(
     if interface.iterable is None or interface.iterable.key_type is None:
         return
 
-    includes.add("AK/TypeCasts.h")
     includes.add("LibJS/Runtime/Error.h")
+    includes.add("LibJS/Runtime/HostObject.h")
     includes.add("LibJS/Runtime/IteratorPrototype.h")
     includes.add("LibJS/Runtime/PrimitiveString.h")
     includes.add("LibJS/Runtime/ValueInlines.h")
@@ -286,31 +274,20 @@ def write_iterator_prototype_implementation(
     includes.add(iterator_implementation_header_for_interface(interface))
 
     iterator_interface_name = f"{interface.name}Iterator"
-    out.write(f"""GC_DEFINE_ALLOCATOR({interface.name}IteratorPrototype);
-
-{interface.name}IteratorPrototype::{interface.name}IteratorPrototype(JS::Realm& realm)
-    : Object(ConstructWithPrototypeTag::Tag, realm.intrinsics().iterator_prototype())
+    out.write(f"""void {interface.name}IteratorPrototype::initialize(JS::Realm& realm, JS::Object& object)
 {{
-}}
-
-{interface.name}IteratorPrototype::~{interface.name}IteratorPrototype()
-{{
-}}
-
-void {interface.name}IteratorPrototype::initialize(JS::Realm& realm)
-{{
-    auto& vm = this->vm();
-    Base::initialize(realm);
-    define_native_function(realm, vm.names.next, next, 0, JS::Attribute::Writable | JS::Attribute::Enumerable | JS::Attribute::Configurable);
-    define_direct_property(vm.well_known_symbol_to_string_tag(), JS::PrimitiveString::create(vm, "{interface.name} Iterator"_utf16), JS::Attribute::Configurable);
+    auto& vm = realm.vm();
+    object.define_native_function(realm, vm.names.next, next, 0, JS::Attribute::Writable | JS::Attribute::Enumerable | JS::Attribute::Configurable);
+    object.define_direct_property(vm.well_known_symbol_to_string_tag(), JS::PrimitiveString::create(vm, "{interface.name} Iterator"_utf16), JS::Attribute::Configurable);
 }}
 
 static JS::ThrowCompletionOr<{fully_qualified_name_for_interface(interface)}Iterator*> {make_name_acceptable_cpp(title_case_to_snake_case(iterator_interface_name))}_impl_from(JS::VM& vm)
 {{
     auto this_object = TRY(vm.this_value().to_object(vm));
-    if (!is<{fully_qualified_name_for_interface(interface)}Iterator>(*this_object))
+    auto* iterator = JS::host_data_if<{fully_qualified_name_for_interface(interface)}Iterator>(*this_object);
+    if (!iterator)
         return vm.throw_completion<JS::TypeError>(JS::ErrorType::NotAnObjectOfType, "{iterator_interface_name}");
-    return static_cast<{fully_qualified_name_for_interface(interface)}Iterator*>(this_object.ptr());
+    return iterator;
 }}
 
 JS_DEFINE_NATIVE_FUNCTION({interface.name}IteratorPrototype::next)
@@ -389,25 +366,13 @@ def write_async_iterator_prototype_implementation(
     includes.add(async_iterator_implementation_header_for_interface(interface))
 
     out.write(
-        f"""GC_DEFINE_ALLOCATOR({interface.name}AsyncIteratorPrototype);
-
-{interface.name}AsyncIteratorPrototype::{interface.name}AsyncIteratorPrototype(JS::Realm& realm)
-    : Object(ConstructWithPrototypeTag::Tag, realm.intrinsics().async_iterator_prototype())
+        f"""void {interface.name}AsyncIteratorPrototype::initialize(JS::Realm& realm, JS::Object& object)
 {{
-}}
+    auto& vm = realm.vm();
+    object.define_direct_property(vm.well_known_symbol_to_string_tag(), JS::PrimitiveString::create(vm, "{interface.name} AsyncIterator"_utf16), JS::Attribute::Configurable);
 
-{interface.name}AsyncIteratorPrototype::~{interface.name}AsyncIteratorPrototype()
-{{
-}}
-
-void {interface.name}AsyncIteratorPrototype::initialize(JS::Realm& realm)
-{{
-    auto& vm = this->vm();
-    Base::initialize(realm);
-    define_direct_property(vm.well_known_symbol_to_string_tag(), JS::PrimitiveString::create(vm, "{interface.name} AsyncIterator"_utf16), JS::Attribute::Configurable);
-
-    define_native_function(realm, vm.names.next, next, 0, JS::default_attributes);
-    {"define_native_function(realm, vm.names.return_, return_, 1, JS::default_attributes);" if "DefinesAsyncIteratorReturn" in interface.extended_attributes else ""}
+    object.define_native_function(realm, vm.names.next, next, 0, JS::default_attributes);
+    {"object.define_native_function(realm, vm.names.return_, return_, 1, JS::default_attributes);" if "DefinesAsyncIteratorReturn" in interface.extended_attributes else ""}
 }}
 
 JS_DEFINE_NATIVE_FUNCTION({interface.name}AsyncIteratorPrototype::next)
@@ -495,7 +460,7 @@ JS_DEFINE_NATIVE_FUNCTION({interface.prototype_class}::entries)
     GC::Ref<JS::Map> map = map_entries(this_object_realm, *this_impl);
 
     // 3. Return the result of creating a map iterator from map with kind "key+value".
-    return JS::MapIterator::create(this_object_realm, *map, PropertyKind::KeyAndValue);
+    return JS::MapIterator::create(this_object_realm, *map, JS::Object::PropertyKind::KeyAndValue);
 }}
 
 // https://webidl.spec.whatwg.org/#js-map-keys
@@ -514,7 +479,7 @@ JS_DEFINE_NATIVE_FUNCTION({interface.prototype_class}::keys)
     GC::Ref<JS::Map> map = map_entries(this_object_realm, *this_impl);
 
     // 3. Return the result of creating a map iterator from map with kind "key".
-    return JS::MapIterator::create(this_object_realm, *map, PropertyKind::Key);
+    return JS::MapIterator::create(this_object_realm, *map, JS::Object::PropertyKind::Key);
 }}
 
 // https://webidl.spec.whatwg.org/#js-map-values
@@ -533,7 +498,7 @@ JS_DEFINE_NATIVE_FUNCTION({interface.prototype_class}::values)
     GC::Ref<JS::Map> map = map_entries(this_object_realm, *this_impl);
 
     // 3. Return the result of creating a map iterator from map with kind "value".
-    return JS::MapIterator::create(this_object_realm, *map, PropertyKind::Value);
+    return JS::MapIterator::create(this_object_realm, *map, JS::Object::PropertyKind::Value);
 }}
 
 // https://webidl.spec.whatwg.org/#js-map-forEach
@@ -562,11 +527,12 @@ JS_DEFINE_NATIVE_FUNCTION({interface.prototype_class}::for_each)
     auto this_arg = vm.argument(1);
 
     // 6. For each key → value of map:
-    for (auto [key, value] : *map) {{
+    TRY(map->for_each_entry([&](JS::Value key, JS::Value value) -> JS::ThrowCompletionOr<void> {{
         // 1. Let jsKey and jsValue be key and value converted to a JavaScript value.
         // 2. Perform ? Call(callbackFn, thisArg, « jsValue, jsKey, O »).
         TRY(JS::call(vm, callback.as_function(), this_arg, value, key, this_value));
-    }}
+        return {{}};
+    }}));
 
     // 7. Return undefined.
     return JS::js_undefined();
@@ -770,7 +736,7 @@ JS_DEFINE_NATIVE_FUNCTION({interface.prototype_class}::entries)
     GC::Ref<JS::Set> set = setlike_entries(this_object_realm, wrapper_world, *this_impl);
 
     // 3. Return the result of creating a set iterator from set with kind "key+value".
-    return JS::SetIterator::create(realm, *set, PropertyKind::KeyAndValue);
+    return JS::SetIterator::create(realm, *set, JS::Object::PropertyKind::KeyAndValue);
 }}
 
 // https://webidl.spec.whatwg.org/#js-set-values
@@ -790,7 +756,7 @@ JS_DEFINE_NATIVE_FUNCTION({interface.prototype_class}::values)
     GC::Ref<JS::Set> set = setlike_entries(this_object_realm, wrapper_world, *this_impl);
 
     // 3. Return the result of creating a set iterator from set with kind "value".
-    return JS::SetIterator::create(realm, *set, PropertyKind::Value);
+    return JS::SetIterator::create(realm, *set, JS::Object::PropertyKind::Value);
 }}
 
 // https://webidl.spec.whatwg.org/#js-set-forEach
@@ -819,12 +785,13 @@ JS_DEFINE_NATIVE_FUNCTION({interface.prototype_class}::for_each)
     auto this_arg = vm.argument(1);
 
     // 6. For each value of set:
-    for (auto value : *set) {{
+    TRY(set->for_each_value([&](JS::Value value) -> JS::ThrowCompletionOr<void> {{
         // 1. Let jsValue be value converted to a JavaScript value.
 
         // 2. Perform ? Call(callbackFn, thisArg, « jsValue, jsValue, O»).
         TRY(JS::call(vm, callback.as_function(), this_arg, value, value, this_value));
-    }}
+        return {{}};
+    }}));
 
     // 7. Return undefined.
     return JS::js_undefined();

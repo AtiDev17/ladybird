@@ -47,7 +47,6 @@ ENVIRONMENT_SWITCH = "read-once environment switch; every thread sees the same a
 IDENTITY = "process-wide atomic counter handing out unique identities"
 BUILT_ONCE = "built once and read-only after; every thread shares the same table"
 LOCKED = "process-wide and behind a mutex or a lock"
-REPLAY = "style replay capture; replay builds only, or off unless an environment variable turns it on"
 TEST_ONLY = "test only"
 
 
@@ -97,9 +96,6 @@ RENDER_STATE_ALLOWED = {
             "css/style/mod.rs:SELECTOR_TRUTH_DERIVATION",
             "css/style/mod.rs:STYLE_ANSWER_PATCH",
             "css/style/mod.rs:STYLE_PLAN_PROVENANCE",
-            "layout/fc_run_cache.rs:MODE",
-            "layout/update_layout.rs:ENABLED",
-            "painting/record/verify.rs:ENABLED",
         ],
     ),
     **render_state_entries(
@@ -107,7 +103,6 @@ RENDER_STATE_ALLOWED = {
         [
             "css/declaration_block.rs:NEXT_DECLARATION_BLOCK_IDENTITY",
             "css/rule.rs:NEXT_RULE_IDENTITY",
-            "css/selector.rs:NEXT_SELECTOR_ID",
             "css/style/index.rs:NEXT",
             "css/style/prefix.rs:NEXT",
             "css/style_sheet.rs:NEXT_SHEET_IDENTITY",
@@ -145,15 +140,6 @@ RENDER_STATE_ALLOWED = {
             "css/parser/stylesheet_cache.rs:CACHE",
             "css/style/atoms.rs:GLOBAL_ATOMS",
             "css/style/user_agent_selectors.rs:PROGRAMS",
-        ],
-    ),
-    **render_state_entries(
-        REPLAY,
-        [
-            "css/computed_values.rs:REPLAY_STYLE_GROUPS",
-            "css/computed_values.rs:REPLAY_STYLE_GROUP_SIZES",
-            "css/style/record_replay.rs:CAPTURE",
-            "css/style_value.rs:REPLAY_STYLE_VALUES",
         ],
     ),
     **render_state_entries(

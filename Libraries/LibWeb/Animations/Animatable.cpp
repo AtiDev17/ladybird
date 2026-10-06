@@ -223,7 +223,7 @@ void Animatable::associate_with_animation(GC::Ref<Animation> animation)
     impl.associated_animations.append(animation);
     impl.is_sorted_by_composite_order = false;
     // The style engine computes no record for an element whose animations compose its style.
-    CSS::record_element_adjustment_facts(as<DOM::Element>(*this));
+    CSS::record_element_animations_changed(as<DOM::Element>(*this));
 
     as<DOM::Element>(*this).change_associated_animation_count_in_subtree(1);
 
@@ -236,7 +236,7 @@ void Animatable::disassociate_with_animation(GC::Ref<Animation> animation)
     auto& impl = *m_impl;
     auto was_associated = impl.associated_animations.remove_first_matching([&](auto element) { return animation == element; });
     impl.is_sorted_by_composite_order = false;
-    CSS::record_element_adjustment_facts(as<DOM::Element>(*this));
+    CSS::record_element_animations_changed(as<DOM::Element>(*this));
 
     if (was_associated)
         as<DOM::Element>(*this).change_associated_animation_count_in_subtree(-1);
@@ -340,6 +340,12 @@ Vector<CSS::PropertyID> Animatable::property_ids_with_matching_transition_proper
         property_ids.unchecked_append(static_cast<CSS::PropertyID>(entry.property_id));
     CSS::StyleValueFFI::rust_transition_entries_release(entries);
     return property_ids;
+}
+
+bool Animatable::has_existing_transitions(Optional<CSS::PseudoElement> pseudo_element) const
+{
+    auto const* transition = transition_if_exists(pseudo_element);
+    return transition && !transition->associated_transitions.is_empty();
 }
 
 Vector<CSS::PropertyID> Animatable::property_ids_with_existing_transitions(Optional<CSS::PseudoElement> pseudo_element) const

@@ -41,9 +41,14 @@ class Window;
 
 }
 
+namespace JS {
+
+class HostObject;
+
+}
+
 namespace Web::Bindings {
 
-class PlatformObject;
 class WrapperWorld;
 
 struct IdleRequestOptions;
@@ -51,8 +56,8 @@ struct WindowPostMessageOptions;
 
 WEB_API HTML::Window* window_from_global_object(JS::Object&);
 WEB_API HTML::Window const* window_from_global_object(JS::Object const&);
-WEB_API PlatformObject& platform_object_for_window(HTML::Window&);
-WEB_API PlatformObject& platform_object_for_window(HTML::Window&, JS::Realm&);
+WEB_API JS::HostObject& platform_object_for_window(HTML::Window&);
+WEB_API JS::HostObject& platform_object_for_window(HTML::Window&, JS::Realm&);
 WEB_API WebIDL::ExceptionOr<void> initialize_window_web_interfaces(HTML::Window&);
 WEB_API WebIDL::ExceptionOr<void> initialize_window_web_interfaces(HTML::Window&, JS::Realm&);
 WEB_API WebIDL::ExceptionOr<void> post_message(JS::Realm&, HTML::Window&, JS::Value, WindowPostMessageOptions const&);
@@ -201,7 +206,7 @@ public:
     GC::Ref<WindowProxy> frames() const;
     u32 length();
     GC::Ptr<WindowProxy const> top() const;
-    GC::Ptr<WindowProxy const> opener() const;
+    JS::Value opener() const;
     WebIDL::ExceptionOr<void> set_opener(JS::Value);
     GC::Ptr<WindowProxy const> parent() const;
     GC::Ptr<DOM::Element const> frame_element() const;

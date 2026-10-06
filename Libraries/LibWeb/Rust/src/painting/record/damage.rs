@@ -298,7 +298,7 @@ impl LayoutNodeArena {
         }
         if !self
             .node_kind_if_live(row)
-            .is_some_and(node_painting::forms_unconnected_subtree)
+            .is_some_and(crate::layout::node_facts::kind_is_svg_resource_box)
         {
             return None;
         }
@@ -333,7 +333,7 @@ impl LayoutNodeArena {
             // A line's plan also places content nested inside ordinary inline boxes.
             // Changes there must reach the block or self-painting inline that owns it.
             let rows = self.paintable_rows();
-            if node_painting::is_inline(&rows, owner) {
+            if node_painting::is_fragmented_inline(&rows, owner) {
                 let line_owner = crate::painting::fragment_ownership::nearest_self_painting_inline_box(&rows, node)
                     .unwrap_or(rows.paintable_data(owner).containing_block);
                 if !line_owner.is_invalid() {

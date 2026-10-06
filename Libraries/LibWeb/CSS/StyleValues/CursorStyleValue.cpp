@@ -23,36 +23,12 @@
 
 namespace Web::CSS {
 
-StyleValueFFI::StyleValueData const* CursorStyleValue::make_cursor_data(NonnullRefPtr<AbstractImageStyleValue const> const& image, RefPtr<StyleValue const> const& x, RefPtr<StyleValue const> const& y)
-{
-    // The Rust allocation takes ownership of one strong reference to the image and to each
-    // non-null coordinate.
-    return StyleValueFFI::rust_style_value_create_cursor(
-        StyleValueFFI::rust_style_value_retain(image->rust_style_value_data()),
-        x ? StyleValueFFI::rust_style_value_retain(x->rust_style_value_data()) : nullptr,
-        y ? StyleValueFFI::rust_style_value_retain(y->rust_style_value_data()) : nullptr);
-}
-
 CursorStyleValue::CursorStyleValue(StyleValueFFI::StyleValueData const* data)
     : StyleValueWithDefaultOperators(Type::Cursor, data)
     , m_image(StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
                                                           static_cast<StyleValueFFI::StyleValueData const*>(data->cursor.image.pointer)))
               ->as_abstract_image())
 {
-}
-
-ValueComparingNonnullRefPtr<StyleValue const> CursorStyleValue::absolutized(ComputationContext const& computation_context) const
-{
-    RefPtr<StyleValue const> absolutized_x;
-    RefPtr<StyleValue const> absolutized_y;
-
-    if (x())
-        absolutized_x = x()->absolutized(computation_context);
-
-    if (y())
-        absolutized_y = y()->absolutized(computation_context);
-
-    return CursorStyleValue::create(image().absolutized(computation_context)->as_abstract_image(), absolutized_x, absolutized_y);
 }
 
 Optional<Gfx::ImageCursor> CursorStyleValue::make_image_cursor(Layout::NodeWithStyle const& layout_node, GC::Ptr<HTML::DecodedImageData> decoded_image_data) const

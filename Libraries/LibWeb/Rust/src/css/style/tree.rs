@@ -875,6 +875,7 @@ impl StyleNodeTree {
 
     /// Retire an element identity. The slot stays reserved until [`Self::release_retired_identities`]
     /// runs at epoch retirement, so no reader can observe a reused identity.
+    #[cfg(test)]
     pub fn retire_element(&mut self, node: StyleNodeID, memory: &mut MemoryController) {
         self.retire_elements(&[node], memory);
     }
@@ -1964,6 +1965,7 @@ impl StyleNodeTree {
 
     /// Exact capacity of every column, charged to Tier 1.
     #[must_use]
+    #[cfg(test)]
     pub fn capacity_bytes(&self) -> u64 {
         self.capacity_bytes
     }
@@ -2176,7 +2178,6 @@ impl Iterator for Preorder<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::memory::DeviceClass;
     use super::*;
 
     #[test]
@@ -2270,7 +2271,7 @@ mod tests {
 
     impl TreeFixture {
         fn new() -> Self {
-            let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
+            let mut memory = MemoryController::new();
             let tree = StyleNodeTree::new(&mut memory);
             Self { memory, tree }
         }

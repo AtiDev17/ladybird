@@ -451,6 +451,7 @@ void ConnectionFromClient::connect_to_compositor_process(IPC::TransportHandle ha
         m_compositor_connection->transport().set_peer_pid(response->compositor_pid());
     }
 #endif
+    m_compositor_connection->attach_render_clock();
 }
 
 void ConnectionFromClient::compositor_process_reconnected()
@@ -980,8 +981,7 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
     if (request == "dump-layout-tree") {
         if (auto doc = page->page().local_traversable()->active_document()) {
             page->page().local_traversable()->update_layout_of_hosted_inclusive_descendant_documents(Web::DOM::UpdateLayoutReason::Debugging);
-            // The dump's own read of the document's render state.
-            Web::Layout::ForcedReadScope read { *doc, false };
+            Web::Layout::ForcedReadScope read { *doc };
             if (auto* viewport = doc->layout_node(read))
                 Web::dump_tree(*viewport);
         }
@@ -990,8 +990,7 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
 
     if (request == "dump-stacking-context-tree") {
         if (auto doc = page->page().local_traversable()->active_document()) {
-            // The dump's own read of the document's render state.
-            Web::Layout::ForcedReadScope read { *doc, false };
+            Web::Layout::ForcedReadScope read { *doc };
             if (doc->layout_node(read)) {
                 VERIFY(doc->has_committed_viewport_box());
                 doc->update_paint_and_hit_testing_properties_if_needed();
@@ -1326,7 +1325,7 @@ void ConnectionFromClient::inspect_dom_node(Web::PageId page_id, WebView::DOMNod
         return;
     }
 
-    Web::Layout::ForcedReadScope read { node->document(), false };
+    Web::Layout::ForcedReadScope read { node->document() };
     node->document().update_layout(Web::DOM::UpdateLayoutReason::Debugging);
 
     // Nodes without layout (aka non-visible nodes) do not have box metrics, but DevTools can still ask for their style
@@ -1443,8 +1442,7 @@ void ConnectionFromClient::inspect_dom_node(Web::PageId page_id, WebView::DOMNod
 
 static Optional<JsonObject> flex_layout_for_node(Web::DOM::Node const& node)
 {
-    // The inspector's own read of the node's render state.
-    Web::Layout::ForcedReadScope read { node.document(), false };
+    Web::Layout::ForcedReadScope read { node.document() };
     auto const* layout_node = node.layout_node(read);
     if (!layout_node || !Web::Painting::has_committed_box(*layout_node))
         return {};
@@ -1460,8 +1458,7 @@ static Optional<JsonObject> flex_layout_for_node(Web::DOM::Node const& node)
 
 static Optional<JsonObject> grid_layout_for_node(Web::DOM::Node const& node)
 {
-    // The inspector's own read of the node's render state.
-    Web::Layout::ForcedReadScope read { node.document(), false };
+    Web::Layout::ForcedReadScope read { node.document() };
     auto const* layout_node = node.layout_node(read);
     if (!layout_node || !Web::Painting::has_committed_box(*layout_node))
         return {};
@@ -1691,7 +1688,7 @@ void ConnectionFromClient::highlight_dom_node(Web::PageId page_id, Web::UniqueNo
     if (!navigable || navigable->active_document() != GC::Ref { document })
         return;
 
-    Web::Layout::ForcedReadScope read { document, false };
+    Web::Layout::ForcedReadScope read { document };
     document.update_layout(Web::DOM::UpdateLayoutReason::Debugging);
     if (!node->layout_node(read))
         return;
@@ -1748,7 +1745,7 @@ void ConnectionFromClient::highlight_flexbox(Web::PageId page_id, Web::UniqueNod
         return;
 
     auto& document = node->document();
-    Web::Layout::ForcedReadScope read { document, false };
+    Web::Layout::ForcedReadScope read { document };
     document.update_layout(Web::DOM::UpdateLayoutReason::Debugging);
     if (!node->layout_node(read))
         return;
@@ -1786,7 +1783,7 @@ void ConnectionFromClient::highlight_grid(Web::PageId page_id, Web::UniqueNodeID
         return;
 
     auto& document = node->document();
-    Web::Layout::ForcedReadScope read { document, false };
+    Web::Layout::ForcedReadScope read { document };
     document.update_layout(Web::DOM::UpdateLayoutReason::Debugging);
     if (!node->layout_node(read))
         return;
@@ -2377,8 +2374,7 @@ static void append_layout_tree(Web::Page& page, StringBuilder& builder)
 
     page.local_traversable()->update_layout_of_hosted_inclusive_descendant_documents(Web::DOM::UpdateLayoutReason::Debugging);
 
-    // The dump's own read of the document's render state.
-    Web::Layout::ForcedReadScope read { *document, false };
+    Web::Layout::ForcedReadScope read { *document };
     auto* layout_root = document->layout_node(read);
     if (!layout_root) {
         builder.append("(no layout tree)"sv);
@@ -2396,7 +2392,7 @@ static void append_stacking_context_tree(Web::Page& page, StringBuilder& builder
         return;
     }
 
-    Web::Layout::ForcedReadScope read { *document, false };
+    Web::Layout::ForcedReadScope read { *document };
     document->update_layout(Web::DOM::UpdateLayoutReason::Debugging);
 
     auto* layout_root = document->layout_node(read);
@@ -2480,8 +2476,7 @@ static WebView::DictionaryLookupTextStyle dictionary_lookup_text_style_from_layo
 
 static Web::Layout::Node const* layout_node_for_dictionary_lookup(Web::DOM::Node const& node)
 {
-    // The lookup's own read of the node's render state.
-    Web::Layout::ForcedReadScope read { node.document(), false };
+    Web::Layout::ForcedReadScope read { node.document() };
     for (auto const* current = &node; current; current = current->parent_or_shadow_host_node()) {
         auto const* layout_node = current->layout_node(read);
         if (layout_node && layout_node->has_style_or_parent_with_style())
@@ -2602,13 +2597,13 @@ void ConnectionFromClient::redo(Web::PageId page_id)
     update_input_method_state(page_id);
 }
 
-void ConnectionFromClient::find_in_page(Web::PageId page_id, Utf16String query, CaseSensitivity case_sensitivity)
+void ConnectionFromClient::find_in_page(Web::PageId page_id, Utf16String query, CaseSensitivity case_sensitivity, bool highlight_all_matches)
 {
     auto page = this->page(page_id);
     if (!page.has_value())
         return;
 
-    auto result = page->page().find_in_page({ .string = query, .case_sensitivity = case_sensitivity });
+    auto result = page->page().find_in_page({ .string = query, .case_sensitivity = case_sensitivity, .highlight_all_matches = highlight_all_matches });
     async_did_find_in_page(page_id, result.current_match_index, result.total_match_count);
 }
 

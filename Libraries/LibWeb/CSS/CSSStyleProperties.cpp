@@ -650,7 +650,7 @@ static void install_engine_pseudo_element_style(Layout::BegunRead const& read, D
         element.set_custom_property_data(pseudo_element, nullptr);
     if (!!record)
         element.document().style_computer().compose_installed_engine_record(read, target, {});
-    style_engine.acknowledge_engine_computed_record(element.style_node_id());
+    StyleEngineFFI::style_engine_acknowledge_engine_computed_record(style_engine.host(), element.style_node_id());
 }
 
 static void ensure_pseudo_element_style_for_cssom(Layout::BegunRead const& read, DOM::AbstractElement abstract_element)
@@ -706,8 +706,7 @@ static Optional<Layout::NodeWithStyle*> prepare_computed_style_and_layout_for_pr
     if (!element_exposes_computed_style(abstract_element.element()))
         return {};
 
-    // The script API's read of the render state.
-    Layout::ForcedReadScope read { abstract_element.document(), true };
+    Layout::ForcedReadScope read { abstract_element.document() };
 
     // NB: We grab the layout node before deciding whether update_layout() is needed.
     //     For properties that don't need layout or a layout node (the else branch below),
@@ -810,8 +809,7 @@ Optional<StyleProperty> CSSStyleProperties::get_direct_property(PropertyNameAndI
             return {};
 
         auto abstract_element = *owner_node();
-        // The script API's read of the render state.
-        Layout::ForcedReadScope read { abstract_element.document(), true };
+        Layout::ForcedReadScope read { abstract_element.document() };
 
         auto maybe_layout_node = prepare_computed_style_and_layout_for_property(abstract_element, property_id);
         if (!maybe_layout_node.has_value())
@@ -1050,11 +1048,12 @@ static RefPtr<StyleValue const> resolve_color_style_value(StyleValue const& styl
     if (color_resolution_context && style_value.is_color_function()) {
         auto const& color_function = as<ColorFunctionStyleValue>(style_value);
         if (color_function.origin_color() && color_function.color_type().has_value()) {
-            auto resolved = color_function.resolve_relative_form(*color_resolution_context);
+            Optional<ComputedValuesFFI::FfiLengthResolutionContext> length_storage;
+            auto input = make_rust_color_resolution_input(*color_resolution_context, length_storage);
+            auto const* resolved = StyleValueFFI::rust_relative_color_resolved_value(style_value.rust_style_value_data(), &input);
             if (!resolved)
                 return style_value;
-
-            return as<ColorFunctionStyleValue>(*resolved).computed_value_form();
+            return StyleValue::adopt_rust_style_value_data(static_cast<StyleValueFFI::StyleValueData const*>(resolved));
         }
     }
 
@@ -1886,43 +1885,6 @@ void CSSStyleProperties::set_declarations_from_text(Utf16View css_text)
 void CSSStyleProperties::set_declarations_from(CSSStyleProperties const& source)
 {
     m_declarations.replace(source.m_declarations);
-}
-
-CSSStyleProperties::CustomPropertyReferences const& CSSStyleProperties::custom_property_references() const
-{
-    if (m_custom_property_references && m_custom_property_references_revision == revision())
-        return *m_custom_property_references;
-
-    auto references = make<CustomPropertyReferences>();
-    auto visit = [](void* context, u16 const* name, size_t name_length) {
-        static_cast<Vector<Utf16FlyString>*>(context)->append(Utf16FlyString::from_utf16({ reinterpret_cast<char16_t const*>(name), name_length }));
-    };
-    auto visit_value = [&](StyleValue const& value) {
-        if (!value.is_unresolved() || !value.as_unresolved().includes_var_function())
-            return;
-        if (!StyleValueFFI::rust_unresolved_style_value_visit_custom_property_references(value.rust_style_value_data(), &references->names, visit))
-            references->all_references_visible = false;
-    };
-    for (auto const& property : properties())
-        visit_value(*property.value);
-    for (auto const& [name, property] : custom_properties()) {
-        visit_value(*property.value);
-        // `--x: inherit` (or `unset`, `revert`) takes the parent's value of the same name, which is a
-        // read of that name.
-        if (property.value->is_css_wide_keyword() && !property.value->is_initial())
-            references->names.append(name);
-    }
-    quick_sort(references->names);
-    size_t unique_count = 0;
-    for (size_t index = 0; index < references->names.size(); ++index) {
-        if (index == 0 || references->names[index] != references->names[unique_count - 1])
-            references->names[unique_count++] = references->names[index];
-    }
-    references->names.shrink(unique_count);
-
-    m_custom_property_references = move(references);
-    m_custom_property_references_revision = revision();
-    return *m_custom_property_references;
 }
 
 }

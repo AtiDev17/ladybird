@@ -26,6 +26,8 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HighResolutionTime/Performance.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/WebIDL/Promise.h>
 
@@ -1235,10 +1237,7 @@ void Animation::update()
     }
 
     // Act on the pending play or pause task
-    if (m_pending_play_task == TaskState::Scheduled && is_ready()) {
-        m_pending_play_task = TaskState::None;
-        run_pending_play_task();
-    }
+    run_pending_play_task_if_ready();
 
     if (m_pending_pause_task == TaskState::Scheduled && is_ready_to_run_pending_pause_task()) {
         m_pending_pause_task = TaskState::None;
@@ -1261,6 +1260,14 @@ void Animation::update()
             }
         }
     }
+}
+
+void Animation::run_pending_play_task_if_ready()
+{
+    if (m_pending_play_task != TaskState::Scheduled || !is_ready())
+        return;
+    m_pending_play_task = TaskState::None;
+    run_pending_play_task();
 }
 
 void Animation::effect_timing_changed(Badge<AnimationEffect>)
@@ -1728,6 +1735,9 @@ void Animation::invalidate_effect()
         return;
 
     auto& effect = static_cast<KeyframeEffect&>(*m_effect);
+    // A clock lease ticks the document's animations as the last rendering update planned them.
+    if (auto target = effect.target(); target && target->document().layout_node_arena_if_created())
+        Layout::RustFFI::document_host_end_clock_lease_for_animation(target->document().layout_node_arena_if_created()->host());
     effect.invalidate_effect();
 }
 

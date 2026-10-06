@@ -31,7 +31,9 @@ use super::intern_table::InternTable;
 use super::memory::MemoryCategory;
 use super::memory::MemoryController;
 use super::memory::MemoryLease;
+#[cfg(test)]
 use super::tree::PseudoElementKind;
+#[cfg(test)]
 use super::tree::PseudoElementTarget;
 use super::tree::StyleNodeID;
 use crate::css::computed_longhand_table::{
@@ -40,8 +42,6 @@ use crate::css::computed_longhand_table::{
 };
 use crate::css::computed_values::computed_group_output_mask;
 use crate::css::computed_values::release_group_payload;
-use crate::css::computed_values::replay_style_group_identity;
-use crate::css::computed_values::replaying_style_groups;
 use crate::css::computed_values::retain_group_payload;
 use crate::css::computed_values::retained_group_payload_bytes;
 use crate::css::computed_values::style_group_payloads_equal;
@@ -63,7 +63,7 @@ pub(crate) const HOLDS_IMAGE_VALUES: u8 = 1 << 4;
 pub(crate) const IN_DISPLAY_NONE_SUBTREE: u8 = 1 << 2;
 
 /// The inherited style groups lead every group tuple; a node's inherited-group column names them.
-pub(super) const ENGINE_INHERITED_GROUP_COUNT: usize = 7;
+pub(crate) const ENGINE_INHERITED_GROUP_COUNT: usize = 7;
 
 /// Whether a record with this table may take an inherited-group swap: every property inherits
 /// the way its definition says, no marker is generated for it, and no transition runs on it.
@@ -80,59 +80,35 @@ pub(super) struct EngineComputedAssembly {
     pub(super) canonicalized_groups: u32,
     /// Whether the node's group tuple identity stayed put, so nothing propagates from it.
     pub(super) group_set_unchanged: bool,
+    /// What the record took the place of, for reverting it.
+    pub(super) replaced: ReplacedColumns,
+}
+
+/// What an element's columns held before an engine derivation put its record there, which
+/// reverting the derivation puts back. The swap eligibility is the element's, as the host
+/// published it, and not its record's. A composition detached for the derivation is not held
+/// here: `reattach_composition` puts it back.
+#[derive(Clone, Copy)]
+pub(super) struct ReplacedColumns {
+    inputs: Option<PublishedComputedInputs>,
+    inherited_group_swap_eligible: bool,
 }
 const COMPUTED_VALUE_DEPENDENCY_FLAGS: u8 = (INHERITED_GROUP_SWAP_ELIGIBLE - 1)
     | HOLDS_IMAGE_VALUES
     | HIGHLIGHT_COLORS_AUTHORED
     | HIGHLIGHT_COLOR_IS_CURRENT_COLOR;
 
-define_id! { pub struct ComputedGroupID(); }
+define_id! { interned pub struct ComputedGroupID(); }
 
-impl InternIdentity for ComputedGroupID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+define_id! { interned pub struct ComputedGroupSetID(); }
 
-define_id! { pub struct ComputedGroupSetID(); }
+define_id! { interned pub struct InheritedGroupSetID(); }
 
-impl InternIdentity for ComputedGroupSetID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+define_id! { interned pub struct CustomPropertyEnvironmentID(); }
 
-define_id! { pub struct InheritedGroupSetID(); }
+define_id! { interned pub struct ComputedFixedMetadataID(); }
 
-impl InternIdentity for InheritedGroupSetID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-define_id! { pub struct CustomPropertyEnvironmentID(); }
-
-impl InternIdentity for CustomPropertyEnvironmentID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-define_id! { pub struct ComputedFixedMetadataID(); }
-
-impl InternIdentity for ComputedFixedMetadataID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-define_id! { pub struct ComputedLonghandTableID(); }
-
-impl InternIdentity for ComputedLonghandTableID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+define_id! { interned pub struct ComputedLonghandTableID(); }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StyleRecordID(NonZeroU32);
@@ -605,16 +581,6 @@ impl PublishedComputedColumns {
         }
     }
 
-    fn set_inherited_group_swap_eligible(&mut self, index: usize, eligible: bool) {
-        if let Some(flags) = self.flags.get_mut(index) {
-            if eligible {
-                *flags |= Self::INHERITED_GROUP_SWAP_ELIGIBLE;
-            } else {
-                *flags &= !Self::INHERITED_GROUP_SWAP_ELIGIBLE;
-            }
-        }
-    }
-
     fn cascade_state(&self, index: usize) -> Option<(u64, CascadeStateID)> {
         self.flags
             .get(index)
@@ -822,6 +788,7 @@ impl ComputedStyleTarget {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(super) fn pseudo_element_target(self) -> Option<PseudoElementTarget> {
         self.is_pseudo()
             .then(|| PseudoElementTarget::new(PseudoElementKind(u16::from(self.pseudo_kind))))
@@ -1191,9 +1158,13 @@ impl ComputedGroupSets {
         if record.base_record().is_some() {
             return Some(record);
         }
-        let slot = *self.animation_overlay_slots_by_record.get(&record)?;
-        let overlay = self.animation_overlay_slots.get(slot)?;
-        Some(self.final_base_style_record(overlay.base_style_record))
+        Some(self.final_base_style_record(self.overlay_base_style_record(record)?))
+    }
+
+    /// The base record an animation overlay record composes over.
+    fn overlay_base_style_record(&self, overlay: FinalStyleRecordID) -> Option<StyleRecordID> {
+        let slot = *self.animation_overlay_slots_by_record.get(&overlay)?;
+        Some(self.animation_overlay_slots.get(slot)?.base_style_record)
     }
 
     /// The record a target holds beneath its composition, and the composition's slot.
@@ -1759,6 +1730,7 @@ impl ComputedGroupSets {
             longhand_table: Some(longhand_table),
         };
         let new_style_record = self.intern_style_record(new_record).0;
+        let replaced = self.replaced_columns(node);
         // Descendant swaps read the node's inherited groups from their own column.
         self.columns.publish(
             index,
@@ -1780,16 +1752,36 @@ impl ComputedGroupSets {
             delta: (previous_style_record, self.final_base_style_record(new_style_record)),
             canonicalized_groups,
             group_set_unchanged: group_set == old_record.groups,
+            replaced,
         })
     }
 
-    /// Put a node back on the record it held before an engine derivation C++ never installed,
-    /// unless a publication has moved it on since.
+    /// What `node`'s columns hold now, for an engine derivation about to replace its record.
+    pub(super) fn replaced_columns(&self, node: StyleNodeID) -> ReplacedColumns {
+        let index = node.element_index().map(|index| index as usize);
+        let inputs = index.and_then(|index| {
+            Some(PublishedComputedInputs {
+                groups: self.columns.groups(index)?,
+                inherited_groups: self.columns.inherited_groups(index)?,
+                custom_properties: self.columns.custom_properties(index)?,
+                fixed_metadata: self.columns.fixed_metadata(index)?,
+                style_record: (*self.style_record_column.get(index)?)?,
+                animation_overlay_slot: None,
+            })
+        });
+        ReplacedColumns {
+            inputs,
+            inherited_group_swap_eligible: index.is_some_and(|index| self.columns.inherited_group_swap_eligible(index)),
+        }
+    }
+
+    /// Put a node back on what its columns held before an engine derivation C++ never installed,
+    /// `replaced`, unless a publication has moved it on since.
     pub(super) fn revert_engine_computed_record(
         &mut self,
         node: StyleNodeID,
         derived_style_record: FinalStyleRecordID,
-        previous_style_record: FinalStyleRecordID,
+        replaced: ReplacedColumns,
     ) {
         let Some(index) = node.element_index().map(|index| index as usize) else {
             return;
@@ -1803,21 +1795,13 @@ impl ComputedGroupSets {
         // A first record never installed leaves the node the way it was: unassigned, with what
         // the host and its match answer published for it, which the layout tree and the next
         // derivation read.
-        if previous_style_record == FinalStyleRecordID::NONE {
+        let Some(inputs) = replaced.inputs else {
             self.unassign(node);
             return;
-        }
-        let Some(previous_base) = previous_style_record.base_record() else {
-            return;
         };
-        let Some(record) = self.style_records.get_index(previous_base.index()).copied() else {
-            return;
-        };
-        let inherited_identity = record.inherited_groups;
-        self.columns.groups[index] = record.groups.0;
-        self.columns.inherited_groups[index] = inherited_identity.0;
-        self.columns.custom_properties[index] = record.custom_properties.0;
-        self.style_record_column[index] = Some(previous_base);
+        self.columns
+            .publish(index, inputs, replaced.inherited_group_swap_eligible);
+        self.style_record_column[index] = Some(inputs.style_record);
     }
 
     fn intern_fixed_metadata(&mut self, metadata: ComputedFixedMetadata) -> (ComputedFixedMetadataID, bool) {
@@ -1840,19 +1824,23 @@ impl ComputedGroupSets {
 
     /// Assign a node the record another node of its cohort already derived this flush: the same
     /// old record moved to the same new winner state produces the same new record, so only the
-    /// node's columns move.
+    /// node's columns move. An `old_style_record` of `NONE` assigns a node that holds no record.
+    /// Answers what the record took the place of, for reverting it.
     pub(super) fn assign_engine_computed_record(
         &mut self,
         node: StyleNodeID,
         old_style_record: FinalStyleRecordID,
         new_style_record: FinalStyleRecordID,
-    ) -> Option<(FinalStyleRecordID, FinalStyleRecordID)> {
+    ) -> Option<ReplacedColumns> {
         let index = node.element_index()? as usize;
         if self.columns.animation_overlay_slot(index).is_some() {
             return None;
         }
-        let current = *self.style_record_column.get(index)?.as_ref()?;
-        if self.final_base_style_record(current) != old_style_record {
+        let current = self.style_record_column.get(index).copied().flatten();
+        if current.map_or(FinalStyleRecordID::NONE, |current| {
+            self.final_base_style_record(current)
+        }) != old_style_record
+        {
             return None;
         }
         let new_base_record = new_style_record.base_record()?;
@@ -1861,13 +1849,24 @@ impl ComputedGroupSets {
             .longhand_table
             .and_then(|table| self.computed_longhand_tables.get_index(table.index()))
             .is_some_and(|retained| table_inherited_group_swap_eligible(retained.table()));
-        let inherited_identity = new_record.inherited_groups;
-        self.columns.groups[index] = new_record.groups.0;
-        self.columns.inherited_groups[index] = inherited_identity.0;
-        self.columns.custom_properties[index] = new_record.custom_properties.0;
-        self.columns.set_inherited_group_swap_eligible(index, swap_eligible);
+        let replaced = self.replaced_columns(node);
+        self.columns.publish(
+            index,
+            PublishedComputedInputs {
+                groups: new_record.groups,
+                inherited_groups: new_record.inherited_groups,
+                custom_properties: new_record.custom_properties,
+                fixed_metadata: new_record.fixed_metadata,
+                style_record: new_base_record,
+                animation_overlay_slot: None,
+            },
+            swap_eligible,
+        );
+        if self.style_record_column.len() <= index {
+            self.style_record_column.resize(index + 1, None);
+        }
         self.style_record_column[index] = Some(new_base_record);
-        Some((old_style_record, new_style_record))
+        Some(replaced)
     }
 
     /// The identity of a record's inherited groups, the way a node assigned it would hold them.
@@ -2192,41 +2191,8 @@ impl ComputedGroupSets {
         let mut canonical_output_groups_reused = 0;
         let mut transferred = PendingRecordOwnership::default();
         let mut groups = Vec::with_capacity(payloads.len());
-        let replaying_style_groups = replaying_style_groups();
         for (index, &payload) in payloads.iter().enumerate() {
             assert!(!payload.is_null(), "computed group payload is null");
-            if replaying_style_groups {
-                let raw_identity =
-                    replay_style_group_identity(payload.as_ptr()).expect("replay group identity exceeds u32");
-                let identity = ComputedGroupID(raw_identity);
-                match self.groups.get_index(raw_identity as usize) {
-                    Some(group) => {
-                        assert_eq!(group.index, index);
-                        assert_eq!(group.payload, payload);
-                    }
-                    None => {
-                        assert_eq!(raw_identity as usize, self.groups.len());
-                        let identity = ComputedGroupID(raw_identity);
-                        let payload_content_hash = style_group_payloads_hash(index, payload.as_ptr());
-                        self.groups.insert(
-                            content_hash((index, payload.addr())),
-                            identity,
-                            ComputedGroup {
-                                index,
-                                payload,
-                                content_hash: payload_content_hash,
-                            },
-                        );
-                        self.groups_by_content.insert_identity(payload_content_hash, identity);
-                        self.identity_mints.groups += 1;
-                        self.group_set_nested_memory
-                            .grow_committed(retained_group_payload_bytes(index, payload.as_ptr()) as u64);
-                        new_groups += 1;
-                    }
-                }
-                groups.push(identity);
-                continue;
-            }
             let previous_identity = previous_group_set.and_then(|set| self.sets[set].groups.get(index).copied());
             let previous_equal_identity = previous_identity.filter(|identity| {
                 style_group_payloads_equal(index, payload.as_ptr(), self.groups[*identity].payload.as_ptr())
@@ -2719,6 +2685,36 @@ impl ComputedGroupSets {
         }))
     }
 
+    /// Whether what a record gives its element's pseudo-elements to inherit is the inherited groups
+    /// of its base record: always for a base record, and for an animation overlay whose sampled
+    /// values left those groups as they were.
+    #[must_use]
+    pub(super) fn record_inherits_as_its_base(&self, record: FinalStyleRecordID) -> bool {
+        if record.base_record().is_some() {
+            return true;
+        }
+        let Some(overlay) = self
+            .animation_overlay_slots_by_record
+            .get(&record)
+            .and_then(|&slot| self.animation_overlay_slots.get(slot))
+        else {
+            return false;
+        };
+        let Some(base) = self.style_records.get_index(overlay.base_style_record.index()) else {
+            return false;
+        };
+        let base_groups = &self.sets[base.groups].payloads;
+        (0..ENGINE_INHERITED_GROUP_COUNT).all(|group| {
+            let sampled = overlay.payloads[group];
+            sampled == base_groups[group]
+                || crate::css::computed_values::style_group_payloads_equal(
+                    group,
+                    sampled.as_ptr(),
+                    base_groups[group].as_ptr(),
+                )
+        })
+    }
+
     /// Whether a record's inherited groups, past the ones in `own_groups` that its own
     /// declarations rebuild, are the node's own inherited groups: what a record derived under the
     /// node as its parent must hold, whatever identities the two were keyed by when the record
@@ -2864,16 +2860,6 @@ impl ComputedGroupSets {
         ))
     }
 
-    #[cfg(feature = "style-recording")]
-    /// The longhands whose previous specified values read the effective color scheme.
-    #[must_use]
-    pub fn color_scheme_dependency_properties(&self, target: ComputedStyleTarget) -> Option<[u64; 6]> {
-        Self::specified_value_dependency_properties(
-            self.longhand_table_for_target(target)?,
-            retained_value_depends_on_color_scheme,
-        )
-    }
-
     /// The groups whose previous specified values may read font metrics.
     #[must_use]
     pub fn font_dependency_mask(&self, target: ComputedStyleTarget) -> Option<u32> {
@@ -2881,16 +2867,6 @@ impl ComputedGroupSets {
             self.longhand_table_for_target(target)?,
             retained_value_may_depend_on_font_metrics,
         ))
-    }
-
-    #[cfg(feature = "style-recording")]
-    /// The longhands whose previous specified values may read font metrics.
-    #[must_use]
-    pub fn font_dependency_properties(&self, target: ComputedStyleTarget) -> Option<[u64; 6]> {
-        Self::specified_value_dependency_properties(
-            self.longhand_table_for_target(target)?,
-            retained_value_may_depend_on_font_metrics,
-        )
     }
 
     /// Whether a raw final record identity still names a live base record.
@@ -2988,11 +2964,14 @@ impl ComputedGroupSets {
             .map(|identity| *self.custom_property_environments.get(identity))
     }
 
-    /// The raw custom-property environment identity a record was published with.
+    /// The raw custom-property environment identity a record was published with. An animation overlay record animates
+    /// no custom property, and holds the environment of the base record it composes over.
     pub fn style_record_custom_property_environment(&self, raw_style_record: u64) -> Option<u64> {
-        let record = self
-            .style_records
-            .get_index(FinalStyleRecordID(raw_style_record).base_record()?.index())?;
+        let record = FinalStyleRecordID(raw_style_record);
+        let base = record
+            .base_record()
+            .or_else(|| self.overlay_base_style_record(record))?;
+        let record = self.style_records.get_index(base.index())?;
         Some(self.custom_property_environments[record.custom_properties])
     }
 
@@ -3404,10 +3383,6 @@ impl ComputedGroupSets {
             retained: self.groups.live_identities().len(),
             reachable: reachable.groups.iter().filter(|&&reachable| reachable).count(),
         };
-        if replaying_style_groups() {
-            return retention;
-        }
-
         let mut unreachable_style_records = self
             .style_records
             .live_identities()
@@ -3565,80 +3540,6 @@ impl ComputedGroupSets {
         );
         let record = self.style_records.get_index(style_record.index())?;
         Some(self.computed_fixed_metadata.get(record.fixed_metadata).dependency_flags)
-    }
-
-    #[cfg(feature = "style-recording")]
-    pub(crate) fn recording_group_identities(&self, raw_style_record: u64) -> Option<Vec<u32>> {
-        let final_style_record = FinalStyleRecordID(raw_style_record);
-        let base_style_record = match final_style_record.base_record() {
-            Some(style_record) => {
-                assert!(
-                    self.style_record_generation_is_live(style_record, final_style_record.base_generation()),
-                    "base style-record is not live"
-                );
-                style_record
-            }
-            None => {
-                let slot = *self.animation_overlay_slots_by_record.get(&final_style_record)?;
-                self.animation_overlay_slots.get(slot)?.base_style_record
-            }
-        };
-        assert!(
-            self.style_record_is_live(base_style_record),
-            "base style-record is not live"
-        );
-        let record = self.style_records.get_index(base_style_record.index())?;
-        Some(
-            self.group_identities(record.groups)
-                .map(|identity| identity.0)
-                .collect(),
-        )
-    }
-
-    #[cfg(feature = "style-recording")]
-    pub(crate) fn recording_group_retained_bytes(&self, raw_style_record: u64) -> Option<Vec<u64>> {
-        let identities = self.recording_group_identities(raw_style_record)?;
-        Some(
-            identities
-                .into_iter()
-                .map(|identity| {
-                    let group = &self.groups[identity as usize];
-                    retained_group_payload_bytes(group.index, group.payload.as_ptr()) as u64
-                })
-                .collect(),
-        )
-    }
-
-    #[cfg(feature = "style-recording")]
-    pub(crate) fn recording_longhand_table(&self, raw_style_record: u64) -> Option<(u32, &[SharedPayload])> {
-        let final_style_record = FinalStyleRecordID(raw_style_record);
-        let base_style_record = match final_style_record.base_record() {
-            Some(style_record) => {
-                assert!(
-                    self.style_record_generation_is_live(style_record, final_style_record.base_generation()),
-                    "base style-record is not live"
-                );
-                style_record
-            }
-            None => {
-                let slot = *self.animation_overlay_slots_by_record.get(&final_style_record)?;
-                self.animation_overlay_slots.get(slot)?.base_style_record
-            }
-        };
-        assert!(
-            self.style_record_is_live(base_style_record),
-            "base style-record is not live"
-        );
-        let identity = self
-            .style_records
-            .get_index(base_style_record.index())?
-            .longhand_table?;
-        Some((
-            identity.0,
-            self.computed_longhand_tables
-                .get_index(identity.0 as usize)?
-                .value_view(),
-        ))
     }
 
     pub(crate) fn style_record_view(&self, raw_style_record: u64) -> Option<StyleRecordView<'_>> {
@@ -4303,6 +4204,25 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_record_restores_the_metadata_and_swap_eligibility_it_replaced() {
+        let mut sets = ComputedGroupSets::default();
+        let node = StyleNodeID::element(1);
+        let target = Some(ComputedStyleTarget::new(node, u8::MAX));
+        let host = sets.publish_unowned(target, &[], 0, 0, metadata(0, 0, 0));
+        let index = node.element_index().unwrap() as usize;
+        let host_metadata = sets.columns.fixed_metadata(index);
+        let replaced = sets.replaced_columns(node);
+        let derived = sets.publish_unowned(target, &[], 0, 0, metadata(0, 1 | INHERITED_GROUP_SWAP_ELIGIBLE, 0));
+        assert_ne!(sets.columns.fixed_metadata(index), host_metadata);
+        assert!(sets.node_inherited_group_swap_eligible(node));
+
+        sets.revert_engine_computed_record(node, derived.style_record_identity, replaced);
+        assert_eq!(sets.assigned_style_record(node), Some(host.style_record_identity));
+        assert_eq!(sets.columns.fixed_metadata(index), host_metadata);
+        assert!(!sets.node_inherited_group_swap_eligible(node));
+    }
+
+    #[test]
     fn a_dropped_first_record_keeps_what_the_host_and_the_answer_published() {
         let mut sets = ComputedGroupSets::default();
         let node = StyleNodeID::element(1);
@@ -4310,6 +4230,7 @@ mod tests {
         sets.set_associated_pseudo_kind(node, 3);
         sets.set_node_answer_incomplete(node, true);
         sets.set_node_pseudo_style_mask(node, Some(1 << 2));
+        let replaced = sets.replaced_columns(node);
         let derived = sets.publish_unowned(
             Some(ComputedStyleTarget::new(node, u8::MAX)),
             &[],
@@ -4318,7 +4239,7 @@ mod tests {
             metadata(0, 0, 0),
         );
 
-        sets.revert_engine_computed_record(node, derived.style_record_identity, FinalStyleRecordID::NONE);
+        sets.revert_engine_computed_record(node, derived.style_record_identity, replaced);
         assert!(sets.assigned_style_record(node).is_none());
         assert_eq!(sets.adjustment_facts(node), 1 << 29);
         assert_eq!(

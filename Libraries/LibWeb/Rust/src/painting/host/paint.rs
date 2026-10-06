@@ -21,7 +21,6 @@ pub struct FfiRecordingInputs {
     pub force_dark_foreground_threshold: i32,
     pub force_dark_background_threshold: i32,
     pub should_paint_overlay: bool,
-    pub is_recording_async_scrolling_metadata: bool,
     pub document_id: i64,
     pub has_blocking_wheel_event_region_covering_viewport: bool,
     pub wheel_event_listener_state_generation: u64,
@@ -107,14 +106,11 @@ impl FfiRecordingInputs {
         RecordingInputs {
             device_pixels_per_css_pixel: tree_inputs.device_pixels_per_css_pixel,
             uncaptured: crate::painting::record::inputs::UncapturedContentInputs {
-                viewport_wheel_overflow_x: tree_inputs.viewport_wheel_overflow_x,
-                viewport_wheel_overflow_y: tree_inputs.viewport_wheel_overflow_y,
                 root_background_source,
                 device_viewport_size: libgfx_rust::IntSize {
                     width: self.device_viewport_rect.width,
                     height: self.device_viewport_rect.height,
                 },
-                is_recording_async_scrolling_metadata: self.is_recording_async_scrolling_metadata,
                 document_id: UniqueNodeId(self.document_id),
                 has_blocking_wheel_event_region_covering_viewport: self
                     .has_blocking_wheel_event_region_covering_viewport,
@@ -194,8 +190,6 @@ impl FfiRecordingInputs {
             focused_area_outline: (!outline_path.is_empty()).then(|| FocusedAreaOutline {
                 image: self.focused_area_outline.image,
                 path_bytes: outline_path.into(),
-                color: self.focused_area_outline.color,
-                width: self.focused_area_outline.width,
             }),
         }
     }
@@ -203,6 +197,7 @@ impl FfiRecordingInputs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiCaretPaintKind {
     None,
     /// `block` paints the caret, in the fragment run owned by the self-painting inline `owner`
@@ -244,8 +239,6 @@ pub struct FfiFocusedAreaOutline {
     /// A serialised `Gfx::Path` in the image's own coordinate space, live for the recording call.
     pub path_bytes: *const u8,
     pub path_byte_count: usize,
-    pub color: Color,
-    pub width: crate::css::css_pixels::CssPixels,
 }
 
 /// The platform default font at an overlay label's CSS size and at that size in device pixels.
@@ -303,6 +296,7 @@ pub struct FfiFlexOverlayInput {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiImageContentKind {
     #[default]
     None,
@@ -350,6 +344,7 @@ pub struct FfiLayerImagePaintFactsEntry {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiVideoRepresentation {
     #[default]
     VideoFrame,
@@ -378,6 +373,7 @@ pub struct FfiVideoPaintFacts {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiSvgGradientSpreadMethod {
     #[default]
     Pad,
@@ -387,6 +383,7 @@ pub enum FfiSvgGradientSpreadMethod {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiSvgGradientKind {
     #[default]
     Linear,
@@ -463,8 +460,6 @@ pub struct FfiVectorImageRenderRequest {
     pub css_height: crate::css::css_pixels::CssPixels,
     pub raster_scale: f32,
 }
-
-pub use crate::painting::display_list::storage::FfiRecordedDisplayList;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]

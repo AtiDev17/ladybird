@@ -33,8 +33,8 @@ set(SOURCES
     Clipboard/ClipboardItem.cpp
     Compositor/CompositorConnection.cpp
     Compositor/CompositorHost.cpp
-    Compositor/CompositorHostBase.cpp
     Compositor/NavigablePresenter.cpp
+    Compositor/RenderClock.cpp
     Compression/CompressionStream.cpp
     Compression/DecompressionStream.cpp
     ContentSecurityPolicy/BlockingAlgorithms.cpp
@@ -94,8 +94,6 @@ set(SOURCES
     CSS/RustDescriptorBlock.cpp
     CSS/ContainerQuery.cpp
     CSS/CountersSet.cpp
-    CSS/CounterStyle.cpp
-    CSS/CounterStyleDefinition.cpp
     CSS/CustomPropertyRegistration.cpp
     CSS/GeneratedContent.cpp
     CSS/CSS.cpp
@@ -173,7 +171,6 @@ set(SOURCES
     CSS/FontResolution.cpp
     CSS/FontFaceSet.cpp
     CSS/FontFaceSetLoadEvent.cpp
-    CSS/FontFeatureData.cpp
     CSS/Frequency.cpp
     CSS/HypotheticalElement.cpp
     CSS/Invalidation/AdoptedStyleSheetInvalidator.cpp
@@ -231,25 +228,16 @@ set(SOURCES
     CSS/StyleSheetList.cpp
     CSS/StyleSheetState.cpp
     CSS/StyleValues/AbstractImageStyleValue.cpp
-    CSS/StyleValues/AnchorStyleValue.cpp
     CSS/StyleValues/AngleStyleValue.cpp
-    CSS/StyleValues/BackgroundSizeStyleValue.cpp
-    CSS/StyleValues/BorderRadiusStyleValue.cpp
-    CSS/StyleValues/BorderRadiusRectStyleValue.cpp
     CSS/StyleValues/CalculatedStyleValue.cpp
     CSS/StyleValues/ColorFunctionStyleValue.cpp
     CSS/StyleValues/ColorStyleValue.cpp
-    CSS/StyleValues/ConicGradientStyleValue.cpp
     CSS/StyleValues/ContentStyleValue.cpp
     CSS/StyleValues/CounterDefinitionsStyleValue.cpp
-    CSS/StyleValues/CounterStyleSystemStyleValue.cpp
-    CSS/StyleValues/CounterStyleValue.cpp
-    CSS/StyleValues/CounterStyleStyleValue.cpp
     CSS/StyleValues/CursorStyleValue.cpp
     CSS/StyleValues/CustomIdentStyleValue.cpp
     CSS/StyleValues/DimensionStyleValue.cpp
     CSS/StyleValues/DisplayStyleValue.cpp
-    CSS/StyleValues/EdgeStyleValue.cpp
     CSS/StyleValues/FilterStyleValue.cpp
     CSS/StyleValues/FunctionStyleValue.cpp
     CSS/StyleValues/FontSourceStyleValue.cpp
@@ -259,26 +247,15 @@ set(SOURCES
     CSS/StyleValues/IntegerStyleValue.cpp
     CSS/StyleValues/KeywordStyleValue.cpp
     CSS/StyleValues/LengthStyleValue.cpp
-    CSS/StyleValues/LinearGradientStyleValue.cpp
     CSS/StyleValues/NumberStyleValue.cpp
     CSS/StyleValues/OpacityValueStyleValue.cpp
     CSS/StyleValues/OpenTypeTaggedStyleValue.cpp
-    CSS/StyleValues/OverflowClipMarginStyleValue.cpp
-    CSS/StyleValues/PositionStyleValue.cpp
-    CSS/StyleValues/RadialGradientStyleValue.cpp
-    CSS/StyleValues/RadialSizeStyleValue.cpp
-    CSS/StyleValues/RandomValueSharingStyleValue.cpp
     CSS/StyleValues/RatioStyleValue.cpp
-    CSS/StyleValues/RectStyleValue.cpp
-    CSS/StyleValues/ScrollbarColorStyleValue.cpp
     CSS/StyleValues/ShadowStyleValue.cpp
     CSS/StyleValues/ShorthandStyleValue.cpp
     CSS/StyleValues/StyleValue.cpp
     CSS/StyleValues/StyleValueList.cpp
-    CSS/StyleValues/SuperellipseStyleValue.cpp
-    CSS/StyleValues/TextIndentStyleValue.cpp
     CSS/StyleValues/TransformationStyleValue.cpp
-    CSS/StyleValues/TreeCountingFunctionStyleValue.cpp
     CSS/StyleValues/UnresolvedStyleValue.cpp
     CSS/Supports.cpp
     CSS/SyntaxHighlighter/SyntaxHighlighter.cpp
@@ -320,7 +297,6 @@ set(SOURCES
     DOM/EventTarget.cpp
     DOM/HTMLCollection.cpp
     DOM/IDLEventListener.cpp
-    DOM/InvalidationJournal.cpp
     DOM/LiveNodeList.cpp
     DOM/MutationObserver.cpp
     DOM/MutationRecord.cpp
@@ -509,6 +485,7 @@ set(SOURCES
     HTML/ErrorEvent.cpp
     HTML/ErrorInformation.cpp
     HTML/EventHandler.cpp
+    HTML/EventLoop/ClockPlan.cpp
     HTML/EventLoop/EventLoop.cpp
     HTML/EventLoop/FrameCompletion.cpp
     HTML/EventLoop/PresentationQueue.cpp
@@ -1210,7 +1187,7 @@ foreach(angle_target IN LISTS ANGLE_TARGETS)
     target_compile_options(LibWeb PRIVATE $<TARGET_PROPERTY:${angle_target},INTERFACE_COMPILE_OPTIONS>)
 endforeach()
 
-set(libweb_rust_features style-recording)
+set(libweb_rust_features)
 if (ENABLE_THREAD_SANITIZER)
     list(APPEND libweb_rust_features thread-sanitizer)
 endif()
@@ -1227,24 +1204,13 @@ import_rust_crate(
         ValueParserRustFFI.h
         ComputedValuesRustFFI.h
         StyleEngineRustFFI.h
-        StyleEngineBridgeGenerated.h
-        StyleEngineBridgeGenerated.inc
         StyleEngineStateFactsGenerated.inc
         SelectorStateFactsGenerated.inc
         Layout/TreeBuilderRustFFI.h
         Layout/LayoutRustFFI.h
+    # The copy of libgfx_rust in this crate, which TestRustCrateCopies reaches by name.
+    KEEP_SYMBOLS ladybird_gfx_register_rust_crate_copy
 )
-build_rust_binary(
-    MANIFEST_PATH Rust/Cargo.toml
-    CRATE_NAME libweb_rust
-    BINARY_NAME style-replay
-    FEATURES style-replay
-)
-# The replay tool currently requires POSIX memory mapping.
-if (UNIX)
-    add_custom_target(style-replay ALL)
-    add_dependencies(style-replay style-replay-build)
-endif()
 target_link_libraries(libweb_rust INTERFACE LibGfx)
 test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libweb_rust)
 
