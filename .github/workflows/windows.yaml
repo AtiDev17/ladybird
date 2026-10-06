@@ -33,6 +33,13 @@ jobs:
           ref: 'master'
           fetch-depth: 1
 
+      - name: Get Upstream Commit Hash
+        id: upstream
+        shell: bash
+        run: |
+          UPSTREAM_SHA=$(git rev-parse HEAD)
+          echo "sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+
       - uses: ilammy/msvc-dev-cmd@v1.13.0
 
       - name: MSVC Version Hash
@@ -154,7 +161,7 @@ jobs:
 
           if (Test-Path "LICENSE") { Copy-Item "LICENSE" -Destination "$pkgDir/LICENSE.txt" }
 
-          "Commit: ${{ github.sha }}`nBuild Date: $(Get-Date)" | Out-File -FilePath "$pkgDir/version.txt"
+          "Commit: ${{ steps.upstream.outputs.sha }}`nBuild Date: $(Get-Date)" | Out-File -FilePath "$pkgDir/version.txt"
 
           "@echo off`r`nstart `"`" `"%~dp0bin\Ladybird.exe`"" | Out-File -FilePath "$pkgDir/Launch Ladybird.bat" -Encoding ASCII
 
@@ -321,7 +328,7 @@ jobs:
 
             Please **do not** report bugs or issues found in this build to the official Ladybird repository.
 
-            Commit: ${{ github.sha }}
+            Commit: ${{ steps.upstream.outputs.sha }}
           files: |
             ladybird-windows-x64.zip
             ladybird-windows-x64.zip.sha256
