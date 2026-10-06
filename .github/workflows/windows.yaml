@@ -26,8 +26,11 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout Ladybird Official Upstream
+        uses: actions/checkout@v7
         with:
+          repository: 'LadybirdBrowser/ladybird'
+          ref: 'master'
           fetch-depth: 1
 
       - uses: ilammy/msvc-dev-cmd@v1.13.0
@@ -313,7 +316,7 @@ jobs:
           name: "Windows Build ${{ steps.tag.outputs.tag }}"
           body: |
             **UNOFFICIAL BUILD**
-            This is an automated, experimental build created from a personal fork.
+            This is an automated, experimental build created from the official Ladybird repository.
             It is **NOT** affiliated with, endorsed by, or supported by the official Ladybird Browser Initiative.
 
             Please **do not** report bugs or issues found in this build to the official Ladybird repository.
